@@ -1,0 +1,27 @@
+[package]
+name = "session-state"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+
+# Redis support (default for Docker deployment)
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"], optional = true }
+tokio = { version = "1.0", features = ["full"], optional = true }
+
+# PostgreSQL support (optional, for enterprises)
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres"], optional = true }
+
+[features]
+default = ["redis-store", "inmemory-store"]
+redis-store = ["redis", "tokio"]
+postgres-store = ["sqlx", "tokio"]
+inmemory-store = ["tokio"]
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full", "test-util"] }

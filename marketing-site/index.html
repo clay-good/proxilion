@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Proxilion - Open-source MCP security gateway that prevents insider threats when employees use AI coding assistants. Real-time threat detection for Claude Code, Copilot, and Cursor.">
+    <title>Proxilion - MCP Security Gateway for AI Coding Assistants</title>
+
+    <!-- Favicons -->
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+
+    <!-- SEO Meta Tags -->
+    <meta name="keywords" content="proxilion, mcp security, ai security gateway, claude code security, github copilot security, cursor security, insider threat detection, ai tool monitoring">
+    <meta name="author" content="Clay Good">
+    <meta name="robots" content="index, follow">
+    <link rel="canonical" href="https://proxilion.com/">
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://proxilion.com/">
+    <meta property="og:title" content="Proxilion - MCP Security Gateway for AI Coding Assistants">
+    <meta property="og:description" content="Prevent insider threats when employees use AI coding assistants. Open-source security gateway for Claude Code, Copilot, and Cursor. Deploy in 10 minutes.">
+    <meta property="og:image" content="https://proxilion.com/og-image.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image">
+    <meta property="twitter:url" content="https://proxilion.com/">
+    <meta property="twitter:title" content="Proxilion - MCP Security Gateway for AI Coding Assistants">
+    <meta property="twitter:description" content="Prevent insider threats when employees use AI coding assistants. Open-source security gateway for Claude Code, Copilot, and Cursor.">
+    <meta property="twitter:image" content="https://proxilion.com/og-image.png">
+
+    <!-- Structured Data -->
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Proxilion MCP Security Gateway",
+        "applicationCategory": "SecurityApplication",
+        "operatingSystem": "Linux, Windows, macOS",
+        "offers": {
+            "@type": "Offer",
+            "price": "0",
+            "priceCurrency": "USD"
+        },
+        "description": "Open-source MCP security gateway that prevents insider threats when employees use AI coding assistants. Real-time threat detection for Claude Code, Copilot, and Cursor.",
+        "url": "https://github.com/clay-good/proxilion",
+        "softwareVersion": "1.0",
+        "author": {
+            "@type": "Person",
+            "name": "Clay Good"
+        },
+        "license": "https://opensource.org/licenses/MIT"
+    }
+    </script>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg: #000000;
+            --bg-secondary: #0a0a0a;
+            --text: #ffffff;
+            --text-muted: #999999;
+            --accent: #ffffff;
+            --border: #222222;
+            --shadow: rgba(255, 255, 255, 0.1);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-20px); }
+        }
+
+        @keyframes glow {
+            0%, 100% { text-shadow: 0 0 20px rgba(255, 255, 255, 0.3); }
+            50% { text-shadow: 0 0 40px rgba(255, 255, 255, 0.5); }
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 40px;
+            position: relative;
+        }
+
+        /* Hero Section */
+        header {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            animation: fadeIn 1s ease-out;
+            position: relative;
+        }
+
+        .logo-container {
+            margin-bottom: 40px;
+            animation: float 3s ease-in-out infinite;
+        }
+
+        .logo {
+            font-size: 8rem;
+            font-weight: 900;
+            letter-spacing: -0.05em;
+            background: linear-gradient(180deg, #ffffff 0%, #666666 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: glow 2s ease-in-out infinite;
+        }
+
+        .tagline {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 25px;
+            color: var(--text);
+            letter-spacing: -0.03em;
+            max-width: 900px;
+            line-height: 1.2;
+        }
+
+        .subtitle {
+            font-size: 1.3rem;
+            color: var(--text-muted);
+            margin-bottom: 60px;
+            max-width: 750px;
+            font-weight: 300;
+            line-height: 1.7;
+        }
+
+        .cta-group {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 50px;
+        }
+
+        .btn-primary {
+            display: inline-block;
+            padding: 20px 50px;
+            background: var(--accent);
+            color: var(--bg);
+            text-decoration: none;
+            font-weight: 700;
+            font-size: 1.1rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            transition: all 0.3s ease;
+            border: 2px solid var(--accent);
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(255, 255, 255, 0.1);
+        }
+
+        .btn-primary:hover {
+            background: transparent;
+            color: var(--accent);
+            transform: translateY(-3px);
+            box-shadow: 0 8px 30px rgba(255, 255, 255, 0.2);
+        }
+
+        .btn-secondary {
+            display: inline-block;
+            padding: 20px 50px;
+            background: transparent;
+            color: var(--text-muted);
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1.1rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            transition: all 0.3s ease;
+            border: 2px solid var(--border);
+            border-radius: 8px;
+        }
+
+        .btn-secondary:hover {
+            border-color: var(--text-muted);
+            color: var(--text);
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .stats-banner {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 40px;
+            margin-top: 80px;
+            padding: 60px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-number {
+            font-size: 3.5rem;
+            font-weight: 900;
+            color: var(--accent);
+            letter-spacing: -0.03em;
+            margin-bottom: 8px;
+            background: linear-gradient(180deg, #ffffff 0%, #888888 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            font-size: 1rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            font-weight: 600;
+        }
+
+        /* Sections */
+        section {
+            padding: 120px 0;
+            border-top: 1px solid var(--border);
+        }
+
+        .section-header {
+            text-align: center;
+            margin-bottom: 80px;
+        }
+
+        .section-title {
+            font-size: 3.5rem;
+            font-weight: 900;
+            letter-spacing: -0.04em;
+            margin-bottom: 20px;
+            color: var(--text);
+        }
+
+        .section-subtitle {
+            font-size: 1.3rem;
+            color: var(--text-muted);
+            max-width: 700px;
+            margin: 0 auto;
+            line-height: 1.6;
+        }
+
+        /* Features Grid */
+        .features {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 30px;
+        }
+
+        .feature {
+            padding: 45px;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            transition: all 0.4s ease;
+        }
+
+        .feature:hover {
+            transform: translateY(-8px);
+            background: rgba(255, 255, 255, 0.04);
+            border-color: var(--text-muted);
+            box-shadow: 0 12px 40px rgba(255, 255, 255, 0.1);
+        }
+
+        .feature-title {
+            font-size: 1.6rem;
+            font-weight: 700;
+            margin-bottom: 15px;
+            letter-spacing: -0.02em;
+            color: var(--text);
+        }
+
+        .feature-text {
+            font-size: 1.05rem;
+            color: var(--text-muted);
+            line-height: 1.7;
+        }
+
+        /* Use Cases */
+        .use-cases {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 35px;
+        }
+
+        .use-case {
+            padding: 50px;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 16px;
+            border: 2px solid var(--border);
+            transition: all 0.4s ease;
+        }
+
+        .use-case:hover {
+            border-color: var(--text-muted);
+            background: rgba(255, 255, 255, 0.04);
+            transform: translateY(-5px);
+            box-shadow: 0 12px 40px rgba(255, 255, 255, 0.1);
+        }
+
+        .use-case-title {
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin-bottom: 18px;
+            color: var(--text);
+            letter-spacing: -0.02em;
+        }
+
+        .use-case-text {
+            font-size: 1.1rem;
+            color: var(--text-muted);
+            line-height: 1.8;
+        }
+
+        /* CTA Section */
+        .final-cta {
+            text-align: center;
+            padding: 120px 60px;
+            background: var(--accent);
+            color: var(--bg);
+            border-radius: 24px;
+            margin: 80px 0;
+            box-shadow: 0 20px 60px rgba(255, 255, 255, 0.15);
+        }
+
+        .final-cta h2 {
+            font-size: 3.5rem;
+            font-weight: 900;
+            margin-bottom: 25px;
+            letter-spacing: -0.03em;
+        }
+
+        .final-cta p {
+            font-size: 1.4rem;
+            margin-bottom: 50px;
+            opacity: 0.9;
+            max-width: 700px;
+            margin-left: auto;
+            margin-right: auto;
+            line-height: 1.6;
+        }
+
+        .final-cta .btn-primary {
+            background: var(--bg);
+            color: var(--accent);
+            border-color: var(--bg);
+        }
+
+        .final-cta .btn-primary:hover {
+            background: transparent;
+            color: var(--bg);
+            border-color: var(--bg);
+        }
+
+        /* Footer */
+        footer {
+            text-align: center;
+            padding: 60px 0;
+            color: var(--text-muted);
+            font-size: 1rem;
+        }
+
+        footer a {
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+            transition: opacity 0.3s ease;
+        }
+
+        footer a:hover {
+            opacity: 0.7;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 1024px) {
+            .features {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .stats-banner {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .use-cases {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 0 25px;
+            }
+
+            .logo {
+                font-size: 4rem;
+            }
+
+            .tagline {
+                font-size: 1.8rem;
+            }
+
+            .subtitle {
+                font-size: 1.1rem;
+            }
+
+            .section-title {
+                font-size: 2.5rem;
+            }
+
+            .section-subtitle {
+                font-size: 1.1rem;
+            }
+
+            .features,
+            .use-cases {
+                grid-template-columns: 1fr;
+                gap: 25px;
+            }
+
+            .stats-banner {
+                grid-template-columns: repeat(2, 1fr);
+                padding: 40px 30px;
+                gap: 30px;
+            }
+
+            .stat-number {
+                font-size: 2.5rem;
+            }
+
+            .btn-primary,
+            .btn-secondary {
+                padding: 18px 40px;
+                font-size: 1rem;
+                width: 100%;
+            }
+
+            .cta-group {
+                flex-direction: column;
+                gap: 15px;
+            }
+
+            section {
+                padding: 80px 0;
+            }
+
+            .feature,
+            .use-case {
+                padding: 35px;
+            }
+
+            .final-cta {
+                padding: 80px 30px;
+                margin: 60px 0;
+            }
+
+            .final-cta h2 {
+                font-size: 2.5rem;
+            }
+
+            .final-cta p {
+                font-size: 1.2rem;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .logo {
+                font-size: 3rem;
+            }
+
+            .tagline {
+                font-size: 1.5rem;
+            }
+
+            .subtitle {
+                font-size: 1rem;
+            }
+
+            .section-title {
+                font-size: 2rem;
+            }
+
+            .btn-primary,
+            .btn-secondary {
+                padding: 16px 30px;
+                font-size: 0.95rem;
+            }
+
+            .stats-banner {
+                grid-template-columns: 1fr;
+                padding: 30px 20px;
+            }
+
+            .stat-number {
+                font-size: 2rem;
+            }
+
+            .final-cta h2 {
+                font-size: 2rem;
+            }
+
+            .final-cta p {
+                font-size: 1.1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-container">
+                <h1 class="logo">PROXILION</h1>
+            </div>
+            <p class="tagline">Prevent Insider Threats When Your Employees Have AI Coding Assistants</p>
+            <p class="subtitle">
+                Open-source MCP security gateway that monitors every tool execution from Claude Code, Copilot, and Cursor.
+                Block credential theft, data exfiltration, and network reconnaissance before execution.
+            </p>
+            <div class="cta-group">
+                <a href="https://github.com/clay-good/proxilion" class="btn-primary" target="_blank" rel="noopener">Get Started on GitHub</a>
+                <a href="technical-deep-dive.html" class="btn-secondary">Technical Deep Dive</a>
+            </div>
+
+            <div class="stats-banner">
+                <div class="stat-item">
+                    <div class="stat-number">75-85%</div>
+                    <div class="stat-label">Detection Rate</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number">&lt;50ms</div>
+                    <div class="stat-label">P95 Latency</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number">25</div>
+                    <div class="stat-label">Threat Analyzers</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number">10min</div>
+                    <div class="stat-label">Setup Time</div>
+                </div>
+            </div>
+        </header>
+
+        <section>
+            <div class="section-header">
+                <h2 class="section-title">The Real Threat</h2>
+                <p class="section-subtitle">
+                    Organizations deploy Claude Code, Copilot, and Cursor to thousands of employees with zero security monitoring.
+                </p>
+            </div>
+            <div class="use-cases">
+                <div class="use-case">
+                    <h3 class="use-case-title">Disgruntled Employees</h3>
+                    <p class="use-case-text">
+                        Employee gives notice on Friday. Monday morning, they use Claude Code to exfiltrate the entire customer database
+                        to a personal S3 bucket before security notices.
+                    </p>
+                </div>
+
+                <div class="use-case">
+                    <h3 class="use-case-title">Compromised Accounts</h3>
+                    <p class="use-case-text">
+                        Attacker gains access via phishing. Uses GitHub Copilot to scan internal networks, harvest SSH keys,
+                        and move laterally before detection systems catch up.
+                    </p>
+                </div>
+
+                <div class="use-case">
+                    <h3 class="use-case-title">Rogue AI Agents</h3>
+                    <p class="use-case-text">
+                        AI agent exceeds its intended scope and starts accessing production credentials,
+                        running network scans, or exfiltrating sensitive files autonomously.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <section style="background: var(--bg-secondary); margin: 0 -40px; padding: 120px 40px; border-top: 1px solid var(--border);">
+            <div class="container" style="padding: 0;">
+                <div class="section-header">
+                    <h2 class="section-title">How Proxilion Works</h2>
+                    <p class="section-subtitle">
+                        Real-time threat analysis at the Model Context Protocol (MCP) layer. Every bash command, file access, and API call analyzed before execution.
+                    </p>
+                </div>
+                <div class="features">
+                    <div class="feature">
+                        <h3 class="feature-title">25 Threat Analyzers</h3>
+                        <p class="feature-text">
+                            Pattern-based detection for reconnaissance tools, credential access, hacking tools, privilege escalation, and exfiltration.
+                            Session-aware analyzers track multi-phase kill chains across hours and days.
+                        </p>
+                    </div>
+
+                    <div class="feature">
+                        <h3 class="feature-title">Real-Time Blocking</h3>
+                        <p class="feature-text">
+                            Commands scored 0-100. Block threats scoring 70+. Terminate entire sessions scoring 90+.
+                            Alert security teams for suspicious activity scoring 50-69.
+                        </p>
+                    </div>
+
+                    <div class="feature">
+                        <h3 class="feature-title">Kill Chain Detection</h3>
+                        <p class="feature-text">
+                            Redis-backed session state tracks reconnaissance, credential access, and exfiltration phases.
+                            Individual requests may pass, but multi-phase progression triggers termination.
+                        </p>
+                    </div>
+
+                    <div class="feature">
+                        <h3 class="feature-title">Universal MCP Coverage</h3>
+                        <p class="feature-text">
+                            Works with Claude Code, Cursor, Windsurf, and any MCP-compatible AI coding assistant.
+                            Drop-in proxy with no modifications to AI models.
+                        </p>
+                    </div>
+
+                    <div class="feature">
+                        <h3 class="feature-title">High Performance</h3>
+                        <p class="feature-text">
+                            Built in Rust for memory safety and speed. Pattern analysis in <50ms P95.
+                            Single instance handles 10,000+ requests/second with predictable latency.
+                        </p>
+                    </div>
+
+                    <div class="feature">
+                        <h3 class="feature-title">Self-Hosted Security</h3>
+                        <p class="feature-text">
+                            Not a SaaS product. Data never leaves your infrastructure. Deploy via Docker Compose, Kubernetes, or bare metal.
+                            Source code is auditable and modifiable.
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <div class="section-header">
+                <h2 class="section-title">What We Actually Catch</h2>
+                <p class="section-subtitle">
+                    Honest detection coverage against sophisticated insider threats
+                </p>
+            </div>
+            <div class="features">
+                <div class="feature">
+                    <h3 class="feature-title">Network Reconnaissance (90-100%)</h3>
+                    <p class="feature-text">
+                        nmap, masscan, port scans, service enumeration, internal network discovery,
+                        multi-port scanning, CIDR range targeting.
+                    </p>
+                </div>
+
+                <div class="feature">
+                    <h3 class="feature-title">Credential Theft (90-100%)</h3>
+                    <p class="feature-text">
+                        SSH keys, .env files, .aws/credentials, cloud configs, /etc/shadow,
+                        database passwords, API tokens, certificate files.
+                    </p>
+                </div>
+
+                <div class="feature">
+                    <h3 class="feature-title">Data Exfiltration (85-90%)</h3>
+                    <p class="feature-text">
+                        curl to pastebin, large transfers to external IPs, database dumps,
+                        compression before transfer, bulk file operations.
+                    </p>
+                </div>
+
+                <div class="feature">
+                    <h3 class="feature-title">Hacking Tools (95-100%)</h3>
+                    <p class="feature-text">
+                        sqlmap, metasploit, burpsuite, nikto, hydra, john, hashcat,
+                        custom exploit frameworks, reverse shells.
+                    </p>
+                </div>
+
+                <div class="feature">
+                    <h3 class="feature-title">Privilege Escalation (85-90%)</h3>
+                    <p class="feature-text">
+                        sudo abuse, setuid binaries, capabilities manipulation, IAM policy changes,
+                        role assumption, container escapes.
+                    </p>
+                </div>
+
+                <div class="feature">
+                    <h3 class="feature-title">Social Engineering (70-80%)</h3>
+                    <p class="feature-text">
+                        Conversation analysis detects pretexting, authority manipulation, urgency tactics,
+                        jailbreak attempts, and context manipulation.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <section style="background: var(--bg-secondary); margin: 0 -40px; padding: 120px 40px; border-top: 1px solid var(--border);">
+            <div class="container" style="padding: 0;">
+                <div class="section-header">
+                    <h2 class="section-title">Deploy in 10 Minutes</h2>
+                    <p class="section-subtitle">
+                        Docker Compose for single-server deployments. Kubernetes for HA deployments. Terraform for cloud deployments.
+                    </p>
+                </div>
+                <div style="background: #0f0f0f; border: 1px solid var(--border); border-radius: 12px; padding: 40px; max-width: 800px; margin: 0 auto;">
+                    <pre style="color: var(--text); font-family: 'SF Mono', 'Monaco', monospace; font-size: 1.1rem; line-height: 1.8; overflow-x: auto;"><code>git clone https://github.com/clay-good/proxilion
+cd proxilion
+docker compose up -d
+./demo.sh</code></pre>
+                    <p style="color: var(--text-muted); margin-top: 30px; font-size: 1.1rem; text-align: center;">
+                        Gateway running on port 8787. Dashboard on port 3000. Grafana on port 3001.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <div class="final-cta">
+            <h2>Ready to Protect Your Organization?</h2>
+            <p>
+                Open source. Self-hosted. Deploy in 10 minutes.
+                75-85% detection against sophisticated insider threats. MIT license.
+            </p>
+            <a href="https://github.com/clay-good/proxilion" class="btn-primary" target="_blank" rel="noopener">Star on GitHub</a>
+        </div>
+
+        <footer>
+            <p>Built with transparency by <a href="https://github.com/clay-good" target="_blank" rel="noopener">Clay Good</a></p>
+            <p style="margin-top: 15px; font-size: 0.9rem;">Open Source • MIT License • Self-Hosted • <a href="technical-deep-dive.html">Technical Deep Dive</a></p>
+        </footer>
+    </div>
+</body>
+</html>

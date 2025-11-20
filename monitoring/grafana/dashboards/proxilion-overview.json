@@ -1,0 +1,149 @@
+{
+  "dashboard": {
+    "title": "Proxilion MCP Security Gateway - Overview",
+    "tags": ["proxilion", "security", "mcp"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Threat Detection Rate (Last 24h)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(rate(proxilion_threats_detected_total[5m]))",
+            "legendFormat": "Threats Detected/sec"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Top Threat Patterns",
+        "type": "bargauge",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "topk(10, sum by (analyzer) (proxilion_threats_blocked_total))",
+            "legendFormat": "{{analyzer}}"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Analysis Latency (P95)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(proxilion_total_analysis_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 Latency"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(proxilion_total_analysis_duration_seconds_bucket[5m]))",
+            "legendFormat": "P50 Latency"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Decision Breakdown",
+        "type": "piechart",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [
+          {
+            "expr": "sum by (decision) (proxilion_requests_total)",
+            "legendFormat": "{{decision}}"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Active Sessions",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
+        "targets": [
+          {
+            "expr": "proxilion_active_sessions",
+            "legendFormat": "Active Sessions"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Terminated Sessions (24h)",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 16},
+        "targets": [
+          {
+            "expr": "increase(proxilion_sessions_terminated_total[24h])",
+            "legendFormat": "Terminated Sessions"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Requests per Second",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16},
+        "targets": [
+          {
+            "expr": "sum(rate(proxilion_requests_total[5m]))",
+            "legendFormat": "Requests/sec"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "False Positive Rate",
+        "type": "gauge",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 16},
+        "targets": [
+          {
+            "expr": "sum(proxilion_false_positives_total) / sum(proxilion_threats_detected_total)",
+            "legendFormat": "FP Rate"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 0.05, "color": "yellow"},
+                {"value": 0.10, "color": "red"}
+              ]
+            },
+            "max": 0.20,
+            "unit": "percentunit"
+          }
+        }
+      },
+      {
+        "id": 9,
+        "title": "Top Users by Threat Activity",
+        "type": "table",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+        "targets": [
+          {
+            "expr": "topk(10, sum by (user_id) (proxilion_threats_detected_total))",
+            "format": "table"
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Threat Score Distribution",
+        "type": "heatmap",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+        "targets": [
+          {
+            "expr": "sum(rate(proxilion_threat_score_bucket[5m])) by (le)",
+            "format": "heatmap"
+          }
+        ]
+      }
+    ],
+    "refresh": "10s",
+    "time": {"from": "now-6h", "to": "now"}
+  }
+}

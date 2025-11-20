@@ -1,0 +1,121 @@
+{
+  "dashboard": {
+    "title": "Proxilion MCP Security Gateway - Cost Tracking",
+    "tags": ["proxilion", "costs", "semantic-analysis"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Semantic Analysis Cost (Last 30 Days)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(increase(proxilion_semantic_analysis_cost_usd_total[30d]))",
+            "legendFormat": "Total Cost ($)"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Prompt Cache Hit Rate",
+        "type": "gauge",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(proxilion_prompt_cache_hits_total) / (sum(proxilion_prompt_cache_hits_total) + sum(proxilion_prompt_cache_misses_total))",
+            "legendFormat": "Cache Hit Rate"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 0.5, "color": "yellow"},
+                {"value": 0.8, "color": "green"}
+              ]
+            },
+            "max": 1.0,
+            "unit": "percentunit"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "Cost Savings from Prompt Caching",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 8, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "sum(proxilion_prompt_cache_cost_saved_usd_total)",
+            "legendFormat": "Saved ($)"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Semantic Analysis Requests",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 8, "x": 8, "y": 8},
+        "targets": [
+          {
+            "expr": "sum(proxilion_semantic_analysis_requests_total)",
+            "legendFormat": "Total Requests"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Average Cost per Request",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 8, "x": 16, "y": 8},
+        "targets": [
+          {
+            "expr": "sum(proxilion_semantic_analysis_cost_usd_total) / sum(proxilion_semantic_analysis_requests_total)",
+            "legendFormat": "Cost/Request ($)"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Daily Cost Trend",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+        "targets": [
+          {
+            "expr": "sum(increase(proxilion_semantic_analysis_cost_usd_total[1d]))",
+            "legendFormat": "Daily Cost ($)"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Cost by Analyzer",
+        "type": "piechart",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+        "targets": [
+          {
+            "expr": "sum by (analyzer) (proxilion_semantic_analysis_cost_usd_total)",
+            "legendFormat": "{{analyzer}}"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Projected Monthly Cost",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+        "targets": [
+          {
+            "expr": "sum(increase(proxilion_semantic_analysis_cost_usd_total[7d])) * 4.3",
+            "legendFormat": "Projected ($)"
+          }
+        ]
+      }
+    ],
+    "refresh": "1m",
+    "time": {"from": "now-30d", "to": "now"}
+  }
+}

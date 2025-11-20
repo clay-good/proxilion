@@ -1,0 +1,264 @@
+# Proxilion MCP Security Gateway - Docker Compose
+#
+# 100% Open Source, Docker-First Deployment
+# No Cloudflare dependencies - runs anywhere
+#
+# Quick start:
+#   docker compose up -d
+#   docker compose logs -f gateway
+#
+# Modes:
+#   - monitor:   Analyze but never block (perfect for trials)
+#   - block:     Block threats >= 70 score
+#   - terminate: Block >= 70, terminate sessions >= 90
+
+version: '3.8'
+
+services:
+  # ========================================================================
+  # Proxilion Gateway - Main Application
+  # ========================================================================
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: proxilion/gateway:latest
+    container_name: proxilion-gateway
+    ports:
+      - "8787:8787"  # HTTP API
+      - "3000:3000"  # Dashboard (WebSocket)
+    environment:
+      # Core settings
+      MODE: ${MODE:-monitor}
+      LISTEN_ADDR: "0.0.0.0:8787"
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # Session storage (Redis - no Cloudflare!)
+      SESSION_STORE: redis
+      REDIS_URL: redis://redis:6379
+
+      # Database (PostgreSQL - optional, for analytics)
+      DATABASE_URL: postgres://proxilion:proxilion@postgres:5432/proxilion
+
+      # Anthropic API (bring your own key - optional)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SEMANTIC_MODEL: ${SEMANTIC_MODEL:-claude-sonnet-4-5}
+      ENABLE_SEMANTIC_ANALYSIS: ${ENABLE_SEMANTIC_ANALYSIS:-false}
+
+      # Threat thresholds
+      ALERT_THRESHOLD: ${ALERT_THRESHOLD:-50}
+      BLOCK_THRESHOLD: ${BLOCK_THRESHOLD:-70}
+      TERMINATE_THRESHOLD: ${TERMINATE_THRESHOLD:-90}
+
+      # Rate limits
+      MAX_REQUESTS_PER_MINUTE: ${MAX_REQUESTS_PER_MINUTE:-100}
+      MAX_REQUESTS_PER_HOUR: ${MAX_REQUESTS_PER_HOUR:-1000}
+
+      # Session settings
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-24}
+
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8787/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - proxilion
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================================================
+  # Redis - Session State Storage (FAST, NO CLOUDFLARE!)
+  # ========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: proxilion-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - proxilion
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ========================================================================
+  # PostgreSQL - Analytics & Audit Logs (Optional)
+  # ========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: proxilion-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: proxilion
+      POSTGRES_USER: proxilion
+      POSTGRES_PASSWORD: proxilion
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proxilion"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - proxilion
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ========================================================================
+  # Prometheus - Metrics Collection (Optional)
+  # ========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: proxilion-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    depends_on:
+      - gateway
+    restart: unless-stopped
+    networks:
+      - proxilion
+    profiles:
+      - monitoring  # Only start with: docker compose --profile monitoring up
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ========================================================================
+  # Grafana - Real-Time Dashboard (Optional)
+  # ========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: proxilion-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - proxilion
+    profiles:
+      - monitoring  # Only start with: docker compose --profile monitoring up
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  redis-data:
+    driver: local
+  postgres-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  proxilion:
+    driver: bridge
+
+# ========================================================================
+# Usage Examples:
+# ========================================================================
+#
+# 1. Start in monitor mode (default - safe for production):
+#    docker compose up -d
+#
+# 2. Start in block mode (enforce security):
+#    MODE=block docker compose up -d
+#
+# 3. Start with Anthropic API for semantic analysis:
+#    ANTHROPIC_API_KEY=sk-ant-xxx ENABLE_SEMANTIC_ANALYSIS=true docker compose up -d
+#
+# 4. Start with Grafana dashboard:
+#    docker compose --profile monitoring up -d
+#
+# 5. View logs:
+#    docker compose logs -f gateway
+#
+# 6. Test the gateway:
+#    curl -X POST http://localhost:8787/analyze \
+#      -H "Content-Type: application/json" \
+#      -d '{"command":"nmap","args":["-sV","10.0.0.0/24"]}'
+#
+# 7. Run demo attack (GTG-1002 simulation):
+#    curl -X POST http://localhost:8787/demo/gtg1002
+#
+# 8. Stop everything:
+#    docker compose down
+#
+# 9. Stop and remove data:
+#    docker compose down -v
+#
+# 10. Rebuild after code changes:
+#     docker compose build
+#     docker compose up -d
+#
+# ========================================================================
+# Environment Variables (.env file):
+# ========================================================================
+#
+# Create a .env file in the same directory with:
+#
+# MODE=monitor
+# ANTHROPIC_API_KEY=sk-ant-your-key-here
+# SEMANTIC_MODEL=claude-sonnet-4-5
+# ENABLE_SEMANTIC_ANALYSIS=true
+# ALERT_THRESHOLD=50
+# BLOCK_THRESHOLD=70
+# TERMINATE_THRESHOLD=90
+# GRAFANA_PASSWORD=secure-password-here
+#

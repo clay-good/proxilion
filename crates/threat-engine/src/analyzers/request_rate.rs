@@ -119,7 +119,12 @@ impl RequestRateAnalyzer {
         // Take last 10 timestamps
         let recent: Vec<i64> = timestamps.iter().rev().take(10).cloned().collect();
 
-        // Calculate intervals
+        // Safety check: need at least 2 timestamps to calculate intervals
+        if recent.len() < 2 {
+            return None;
+        }
+
+        // Calculate intervals - now safe from underflow
         let mut intervals = Vec::new();
         for i in 0..recent.len()-1 {
             intervals.push((recent[i] - recent[i+1]).abs());

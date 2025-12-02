@@ -488,7 +488,13 @@ async fn analyze_tool_call(
         session_id,
     };
 
-    (StatusCode::OK, Json(serde_json::to_value(response).unwrap()))
+    // Safe to use unwrap_or_else here since AnalyzeResponse is always serializable
+    let json_value = serde_json::to_value(response).unwrap_or_else(|e| {
+        error!("Failed to serialize response: {}", e);
+        serde_json::json!({"error": "Serialization failed"})
+    });
+
+    (StatusCode::OK, Json(json_value))
 }
 
 async fn demo_gtg1002(State(state): State<Arc<AppState>>) -> impl IntoResponse {

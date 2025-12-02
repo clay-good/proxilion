@@ -69,7 +69,9 @@ impl SessionProgressionAnalyzer {
         let content = Self::extract_content(tool_call).to_lowercase();
 
         // Phase 12: Exfiltration (highest severity)
-        if content.contains("curl") && (content.contains("post") || content.contains("-d") || content.contains("--data"))
+        // Also check for wget with --post to catch all upload methods
+        if (content.contains("curl") && (content.contains("post") || content.contains("-d") || content.contains("--data")))
+            || (content.contains("wget") && content.contains("--post"))
             || content.contains("scp ")
             || content.contains("rsync ")
             || content.contains("upload")
@@ -89,7 +91,10 @@ impl SessionProgressionAnalyzer {
         }
 
         // Phase 10: Lateral Movement
-        if content.contains("ssh ") && !content.contains("ssh-keygen")
+        // Check for ssh-keygen FIRST to exclude it, then check for ssh
+        if content.contains("ssh-keygen") {
+            // ssh-keygen is key generation, not lateral movement
+        } else if content.contains("ssh ")
             || content.contains("psexec")
             || content.contains("winrs")
             || content.contains("lateral")

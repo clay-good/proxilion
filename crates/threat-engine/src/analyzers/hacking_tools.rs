@@ -47,7 +47,7 @@ impl HackingToolsAnalyzer {
                 "wfuzz",
             ],
             password_crackers: vec![
-                "john",
+                "john the ripper",  // More specific to avoid false positives on "john" name
                 "hashcat",
                 "hydra",
                 "medusa",
@@ -107,66 +107,86 @@ impl HackingToolsAnalyzer {
         let mut tool_categories = Vec::new();
 
         // Check for network scanners (High - 80 points)
+        // Track if category matched to avoid double-counting but still detect all tools
+        let mut network_scanner_matched = false;
         for &tool in &self.network_scanners {
             if content_lower.contains(tool) {
                 patterns_found.push(format!("Network scanner detected: {}", tool));
-                score += 80.0;
-                tool_categories.push("network_scanner");
-                break;
+                if !network_scanner_matched {
+                    score += 80.0;
+                    tool_categories.push("network_scanner");
+                    network_scanner_matched = true;
+                }
             }
         }
 
         // Check for vulnerability scanners (Critical - 90 points)
+        let mut vuln_scanner_matched = false;
         for &tool in &self.vuln_scanners {
             if content_lower.contains(tool) {
                 patterns_found.push(format!("Vulnerability scanner detected: {}", tool));
-                score += 90.0;
-                tool_categories.push("vuln_scanner");
-                break;
+                if !vuln_scanner_matched {
+                    score += 90.0;
+                    tool_categories.push("vuln_scanner");
+                    vuln_scanner_matched = true;
+                }
             }
         }
 
         // Check for password crackers (Critical - 95 points)
+        let mut password_cracker_matched = false;
         for &tool in &self.password_crackers {
             if content_lower.contains(tool) {
                 patterns_found.push(format!("Password cracker detected: {}", tool));
-                score += 95.0;
-                tool_categories.push("password_cracker");
-                break;
+                if !password_cracker_matched {
+                    score += 95.0;
+                    tool_categories.push("password_cracker");
+                    password_cracker_matched = true;
+                }
             }
         }
 
         // Check for exploitation frameworks (Critical - 100 points)
+        let mut exploit_framework_matched = false;
         for &tool in &self.exploit_frameworks {
             if content_lower.contains(tool) {
                 patterns_found.push(format!("Exploitation framework detected: {}", tool));
-                score += 100.0;
-                tool_categories.push("exploit_framework");
-                break;
+                if !exploit_framework_matched {
+                    score += 100.0;
+                    tool_categories.push("exploit_framework");
+                    exploit_framework_matched = true;
+                }
             }
         }
 
         // Check for post-exploitation tools (Critical - 95 points)
+        let mut post_exploit_matched = false;
         for &tool in &self.post_exploit_tools {
             if content_lower.contains(tool) {
                 patterns_found.push(format!("Post-exploitation tool detected: {}", tool));
-                score += 95.0;
-                tool_categories.push("post_exploit");
-                break;
+                if !post_exploit_matched {
+                    score += 95.0;
+                    tool_categories.push("post_exploit");
+                    post_exploit_matched = true;
+                }
             }
         }
 
         // Check for cloud exploitation tools (High - 85 points)
+        let mut cloud_exploit_matched = false;
         for &tool in &self.cloud_exploit_tools {
             if content_lower.contains(tool) {
                 patterns_found.push(format!("Cloud exploitation tool detected: {}", tool));
-                score += 85.0;
-                tool_categories.push("cloud_exploit");
-                break;
+                if !cloud_exploit_matched {
+                    score += 85.0;
+                    tool_categories.push("cloud_exploit");
+                    cloud_exploit_matched = true;
+                }
             }
         }
 
         // Check for multiple tool categories (indicates sophisticated attack)
+        // Note: This is intentionally added AFTER individual scores, providing bonus for sophistication
         if tool_categories.len() >= 2 {
             patterns_found.push(format!("Multiple attack tool categories detected ({} types)", tool_categories.len()));
             score += 50.0;

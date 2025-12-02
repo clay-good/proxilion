@@ -113,33 +113,51 @@ impl ExfiltrationAnalyzer {
     }
 
     /// Check if a URL is external (not localhost/internal)
+    /// Uses proper RFC1918 private IP detection
     fn is_external_url(url: &str) -> bool {
-        let internal_patterns = [
-            "localhost",
-            "127.0.0.1",
-            "0.0.0.0",
-            "::1",
-            "192.168.",
-            "10.",
-            "172.16.",
-            "172.17.",
-            "172.18.",
-            "172.19.",
-            "172.20.",
-            "172.21.",
-            "172.22.",
-            "172.23.",
-            "172.24.",
-            "172.25.",
-            "172.26.",
-            "172.27.",
-            "172.28.",
-            "172.29.",
-            "172.30.",
-            "172.31.",
-        ];
+        let url_lower = url.to_lowercase();
 
-        !internal_patterns.iter().any(|pattern| url.contains(pattern))
+        // Check for localhost patterns
+        if url_lower.contains("localhost")
+            || url_lower.contains("127.0.0.1")
+            || url_lower.contains("0.0.0.0")
+            || url_lower.contains("::1") {
+            return false;
+        }
+
+        // Check for 10.0.0.0/8
+        if url_lower.contains("10.") {
+            return false;
+        }
+
+        // Check for 192.168.0.0/16
+        if url_lower.contains("192.168.") {
+            return false;
+        }
+
+        // Check for 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
+        // Parse the second octet to check if it's in range [16, 31]
+        if url_lower.contains("172.") {
+            // Extract IP-like patterns
+            if let Some(start_idx) = url_lower.find("172.") {
+                let after_172 = &url_lower[start_idx + 4..];
+                // Try to extract second octet
+                if let Some(dot_idx) = after_172.find('.') {
+                    if let Ok(second_octet) = after_172[..dot_idx].parse::<u8>() {
+                        if (16..=31).contains(&second_octet) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for link-local addresses
+        if url_lower.contains("169.254.") {
+            return false;
+        }
+
+        true  // Assume external if not matched
     }
 
     /// Analyze a single MCP tool call for exfiltration patterns
@@ -303,8 +321,9 @@ impl ExfiltrationAnalyzer {
 
                 // Check for bulk SELECT queries (data harvesting)
                 let query_lower = query.to_lowercase();
+                // Fixed operator precedence: (star OR (limit AND 1000))
                 if query_lower.contains("select") &&
-                   (query_lower.contains("*") || query_lower.contains("limit") && query.contains("1000")) {
+                   (query_lower.contains("*") || (query_lower.contains("limit") && query.contains("1000"))) {
                     patterns.push("Bulk database query detected".to_string());
                     max_severity = f64::max(max_severity, 70.0);
                 }

@@ -26,6 +26,7 @@ use mcp_protocol::MCPToolCall;
 use serde_json::json;
 use crate::AnalyzerResult;
 use std::collections::HashMap;
+use regex::Regex;
 
 pub struct MultiTargetOrchestrationAnalyzer {
     /// Track targets per user (cross-session correlation)
@@ -35,6 +36,10 @@ pub struct MultiTargetOrchestrationAnalyzer {
     /// Track targets per org (cross-user correlation)
     /// Key: org_id, Value: (target, user_id, timestamp)
     org_targets: HashMap<String, Vec<(String, String, i64)>>,
+
+    /// Pre-compiled regex patterns for performance
+    ip_regex: Regex,
+    domain_regex: Regex,
 }
 
 impl MultiTargetOrchestrationAnalyzer {
@@ -42,6 +47,9 @@ impl MultiTargetOrchestrationAnalyzer {
         Self {
             user_targets: HashMap::new(),
             org_targets: HashMap::new(),
+            // Pre-compile regex patterns to avoid recompilation on every call
+            ip_regex: Regex::new(r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b").unwrap(),
+            domain_regex: Regex::new(r"\b[a-z0-9][-a-z0-9]*\.[a-z]{2,}\b").unwrap(),
         }
     }
 
@@ -196,15 +204,14 @@ impl MultiTargetOrchestrationAnalyzer {
 
     /// Extract network targets (IPs, domains) from command
     fn extract_network_targets(&self, command: &str) -> Option<String> {
-        // Look for IP addresses
-        let ip_regex = regex::Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").ok()?;
-        if let Some(ip_match) = ip_regex.find(command) {
+        // Look for IP addresses using pre-compiled regex
+        if let Some(ip_match) = self.ip_regex.find(command) {
+            // Validate IP octets are in range 0-255 (already validated by regex)
             return Some(ip_match.as_str().to_string());
         }
 
-        // Look for domains
-        let domain_regex = regex::Regex::new(r"\b[a-z0-9][-a-z0-9]*\.[a-z]{2,}\b").ok()?;
-        if let Some(domain_match) = domain_regex.find(command) {
+        // Look for domains using pre-compiled regex
+        if let Some(domain_match) = self.domain_regex.find(command) {
             return Some(domain_match.as_str().to_string());
         }
 

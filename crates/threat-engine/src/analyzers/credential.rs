@@ -301,7 +301,8 @@ impl CredentialAnalyzer {
                 CloudProvider {
                     name: "AWS",
                     key_pattern: Regex::new(r#"AKIA[0-9A-Z]{16}"#).unwrap(),
-                    secret_pattern: Some(Regex::new(r#"[A-Za-z0-9/+=]{40}"#).unwrap()),
+                    // More specific AWS secret pattern with context to reduce false positives
+                    secret_pattern: Some(Regex::new(r#"(?i)(?:aws[_-]?)?secret[_-]?(?:access[_-]?)?key[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9/+=]{40})[\"']?"#).unwrap()),
                 },
                 CloudProvider {
                     name: "Google Cloud",
@@ -310,8 +311,9 @@ impl CredentialAnalyzer {
                 },
                 CloudProvider {
                     name: "Azure",
+                    // More specific Azure pattern with context to avoid false positives on UUIDs
                     key_pattern: Regex::new(
-                        r#"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"#,
+                        r#"(?i)(?:azure[_-]?)?(?:client[_-]?)?(?:secret|key|password)[\"']?\s*[:=]\s*[\"']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[\"']?"#,
                     )
                     .unwrap(),
                     secret_pattern: None,
@@ -467,10 +469,22 @@ impl CredentialAnalyzer {
 
                 // Check for sensitive file access in commands (cat, grep, less, tail, head, etc.)
                 let file_commands = ["cat", "grep", "less", "tail", "head", "more", "vim", "nano", "emacs"];
-                if file_commands.iter().any(|&cmd| command == cmd || full_command.starts_with(&format!("{} ", cmd))) {
+                let is_file_command = file_commands.iter().any(|&cmd| command == cmd || full_command.starts_with(&format!("{} ", cmd)));
+
+                // Also check command alone without args (e.g., "cat .env")
+                if is_file_command || file_commands.contains(&command.as_str()) {
                     // Extract potential file paths from arguments
                     for arg in args {
                         if let Some((pattern, severity, category)) = self.check_sensitive_file(arg) {
+                            patterns.push(pattern);
+                            max_severity = f64::max(max_severity, severity);
+                            metadata.insert("file_category".to_string(), serde_json::json!(format!("{:?}", category)));
+                        }
+                    }
+
+                    // Also check if command itself contains filename (for merged command strings)
+                    if let Some((pattern, severity, category)) = self.check_sensitive_file(&full_command) {
+                        if !patterns.contains(&pattern) {  // Avoid duplicates
                             patterns.push(pattern);
                             max_severity = f64::max(max_severity, severity);
                             metadata.insert("file_category".to_string(), serde_json::json!(format!("{:?}", category)));
@@ -510,21 +524,22 @@ impl CredentialAnalyzer {
                 if let Some(content_bytes) = content {
                     if let Ok(content_str) = String::from_utf8(content_bytes.clone()) {
                         // Limit analysis to first 50KB to avoid performance issues
-                        let analyzed_content = if content_str.len() > 50000 {
-                            &content_str[..50000]
+                        // Use character-aware truncation to avoid panic on UTF-8 boundaries
+                        let analyzed_content: String = if content_str.len() > 50000 {
+                            content_str.chars().take(50000).collect()
                         } else {
-                            &content_str
+                            content_str.clone()
                         };
 
                         // Check for credential patterns
-                        let credential_detections = self.detect_credential_patterns(analyzed_content);
+                        let credential_detections = self.detect_credential_patterns(&analyzed_content);
                         for (pattern, severity) in credential_detections {
                             patterns.push(pattern);
                             max_severity = f64::max(max_severity, severity);
                         }
 
                         // Check for cloud credentials
-                        let cloud_detections = self.detect_cloud_credentials(analyzed_content);
+                        let cloud_detections = self.detect_cloud_credentials(&analyzed_content);
                         for (pattern, severity) in cloud_detections {
                             patterns.push(pattern);
                             max_severity = f64::max(max_severity, severity);

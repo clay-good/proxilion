@@ -10,8 +10,10 @@ use std::collections::{HashMap, HashSet};
 
 pub struct EnumerationAnalyzer {
     ip_patterns: Vec<Regex>,
+    cidr_pattern: Regex,
     recon_tools: Vec<ReconTool>,
     path_patterns: Vec<PathPattern>,
+    url_path_patterns: Vec<PathPattern>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,10 +44,13 @@ struct PathPattern {
 impl EnumerationAnalyzer {
     pub fn new() -> Self {
         Self {
+            // Better IPv4 pattern that validates octet ranges (0-255)
             ip_patterns: vec![
-                Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap(),
+                Regex::new(r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b").unwrap(),
                 Regex::new(r"(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}").unwrap(), // IPv6
             ],
+            // Pre-compile CIDR pattern to avoid panic in hot path
+            cidr_pattern: Regex::new(r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/(?:[0-9]|[1-2][0-9]|3[0-2])").unwrap(),
             recon_tools: vec![
                 ReconTool {
                     name: "nmap",
@@ -102,6 +107,7 @@ impl EnumerationAnalyzer {
                     category: ToolCategory::ServiceDetection,
                 },
             ],
+            // Filesystem path patterns (for Filesystem tool calls)
             path_patterns: vec![
                 PathPattern {
                     name: "directory_traversal",
@@ -109,13 +115,26 @@ impl EnumerationAnalyzer {
                     severity: 80.0,
                 },
                 PathPattern {
-                    name: "common_paths",
-                    pattern: Regex::new(r"(?i)/(admin|config|backup|test|dev|staging|api/v[0-9])").unwrap(),
-                    severity: 60.0,
+                    name: "sensitive_files",
+                    pattern: Regex::new(r"(?i)(\.env|web\.config|phpinfo|config\.php|\.git/)").unwrap(),
+                    severity: 75.0,
+                },
+            ],
+            // URL path patterns (for Network tool calls) - excludes legitimate API paths
+            url_path_patterns: vec![
+                PathPattern {
+                    name: "directory_traversal",
+                    pattern: Regex::new(r"\.\./|\.\.\\").unwrap(),
+                    severity: 80.0,
+                },
+                PathPattern {
+                    name: "admin_paths",
+                    pattern: Regex::new(r"(?i)/(admin|phpmyadmin|wp-admin|cpanel|backup|\.git/)").unwrap(),
+                    severity: 65.0,
                 },
                 PathPattern {
                     name: "sensitive_files",
-                    pattern: Regex::new(r"(?i)(\.env|web\.config|phpinfo|config\.php|\.git/)").unwrap(),
+                    pattern: Regex::new(r"(?i)(\.env|web\.config|phpinfo\.php|config\.php)").unwrap(),
                     severity: 75.0,
                 },
             ],
@@ -161,11 +180,8 @@ impl EnumerationAnalyzer {
                     max_severity = f64::max(max_severity, 70.0);
                 }
 
-                // Check for network range notation (e.g., 192.168.1.0/24)
-                if Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}")
-                    .unwrap()
-                    .is_match(&full_command)
-                {
+                // Check for network range notation (e.g., 192.168.1.0/24) using pre-compiled regex
+                if self.cidr_pattern.is_match(&full_command) {
                     patterns.push("Network range scanning detected".to_string());
                     max_severity = f64::max(max_severity, 90.0);
                 }
@@ -185,17 +201,22 @@ impl EnumerationAnalyzer {
                 metadata.insert("url".to_string(), serde_json::json!(url));
                 metadata.insert("method".to_string(), serde_json::json!(method));
 
-                // Check for suspicious path patterns
-                for path_pattern in &self.path_patterns {
-                    if path_pattern.pattern.is_match(url) {
-                        patterns.push(format!("{} detected in URL", path_pattern.name));
-                        max_severity = f64::max(max_severity, path_pattern.severity);
+                // Check for suspicious URL path patterns (using URL-specific patterns)
+                for url_pattern in &self.url_path_patterns {
+                    if url_pattern.pattern.is_match(url) {
+                        patterns.push(format!("{} detected in URL", url_pattern.name));
+                        max_severity = f64::max(max_severity, url_pattern.severity);
                     }
                 }
 
-                // Check for parameter fuzzing
-                if url.contains('?') {
-                    let param_count = url.matches('&').count() + 1;
+                // Check for parameter fuzzing - fixed to only count if '?' exists
+                if let Some(query_start) = url.find('?') {
+                    let query_part = &url[query_start..];
+                    let param_count = if query_part.len() > 1 {
+                        query_part.matches('&').count() + 1
+                    } else {
+                        0
+                    };
                     if param_count > 5 {
                         patterns.push(format!("Multiple parameters ({}) - possible fuzzing", param_count));
                         max_severity = f64::max(max_severity, 65.0);

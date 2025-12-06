@@ -173,10 +173,8 @@ impl LegitimacyAnalyzer {
         }
 
         // Check for legitimate development tools
-        let mut tool_matches = 0;
         for &tool in &self.legitimate_tools {
             if content_lower.contains(tool) {
-                tool_matches += 1;
                 patterns_found.push(format!("Legitimate development tool: {}", tool));
                 legitimacy_score += 0.6;
                 break; // Only count once

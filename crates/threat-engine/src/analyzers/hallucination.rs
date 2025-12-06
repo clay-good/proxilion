@@ -219,7 +219,7 @@ impl HallucinationAnalyzer {
         let has_success = content.contains("successfully exploited") || content.contains("exploitation successful");
         let is_short = content.len() < 120;
 
-        (has_fake_header || (has_success && is_short))
+        has_fake_header || (has_success && is_short)
     }
 }
 

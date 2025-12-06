@@ -8,23 +8,19 @@
 
 use crate::AnalyzerResult;
 use mcp_protocol::MCPToolCall;
+use lazy_static::lazy_static;
+use regex::Regex;
 
-pub struct ToolCallAnalyzer {
-    dangerous_combinations: Vec<(&'static str, &'static str)>,
-    rapid_threshold: usize,
+lazy_static! {
+    /// Pre-compiled regex for IPv4 address detection
+    static ref IP_ADDRESS_REGEX: Regex = Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}").unwrap();
 }
+
+pub struct ToolCallAnalyzer;
 
 impl ToolCallAnalyzer {
     pub fn new() -> Self {
-        Self {
-            dangerous_combinations: vec![
-                ("bash", "network"),  // Command execution + network
-                ("filesystem", "network"),  // File access + network (exfil)
-                ("database", "network"),  // DB query + network (exfil)
-                ("bash", "database"),  // Command + DB (injection)
-            ],
-            rapid_threshold: 10,  // 10+ calls in quick succession
-        }
+        Self
     }
 
     pub fn analyze(&self, tool_call: &MCPToolCall) -> AnalyzerResult {
@@ -97,9 +93,8 @@ impl ToolCallAnalyzer {
     }
 
     fn contains_ip_address(&self, url: &str) -> bool {
-        // Simple IP address detection (IPv4)
-        let ip_pattern = regex::Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}").unwrap();
-        ip_pattern.is_match(url)
+        // Simple IP address detection (IPv4) using pre-compiled regex
+        IP_ADDRESS_REGEX.is_match(url)
     }
 }
 

@@ -1,7 +1,12 @@
-///! Performance Optimization Module
-///!
-///! Provides caching, pre-compilation, and other optimizations for high-throughput scenarios.
-///! Designed to handle >10K requests/second with minimal latency impact.
+//! Performance Optimization Module
+//!
+//! Provides caching, pre-compilation, and other optimizations for high-throughput scenarios.
+//! Designed to handle >10K requests/second with minimal latency impact.
+//!
+//! NOTE: This module is prepared infrastructure for future caching optimizations.
+//! Currently unused but tests are in place.
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

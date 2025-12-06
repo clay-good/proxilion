@@ -299,7 +299,7 @@ impl MultiTargetOrchestrationAnalyzer {
     }
 
     /// Detect systematic enumeration (sequential IPs, etc.)
-    fn is_systematic_enumeration(&self, user_id: &str, current_target: &str) -> bool {
+    fn is_systematic_enumeration(&self, user_id: &str, _current_target: &str) -> bool {
         if let Some(targets) = self.user_targets.get(user_id) {
             // Get last 5 targets
             let recent: Vec<&String> = targets.iter().rev().take(5).map(|(t, _)| t).collect();

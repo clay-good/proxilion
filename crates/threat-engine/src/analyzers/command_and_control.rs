@@ -10,6 +10,12 @@
 use crate::AnalyzerResult;
 use mcp_protocol::MCPToolCall;
 use regex::Regex;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Pre-compiled regex for port detection
+    static ref PORT_REGEX: Regex = Regex::new(r":(\d{1,5})").unwrap();
+}
 
 pub struct CommandAndControlAnalyzer {
     reverse_shell: Vec<&'static str>,
@@ -122,9 +128,8 @@ impl CommandAndControlAnalyzer {
             }
         }
 
-        // Check for suspicious ports
-        let port_regex = Regex::new(r":(\d{1,5})").unwrap();
-        for cap in port_regex.captures_iter(&content) {
+        // Check for suspicious ports (using pre-compiled regex)
+        for cap in PORT_REGEX.captures_iter(&content) {
             if let Ok(port) = cap[1].parse::<u16>() {
                 if self.suspicious_ports.contains(&port) {
                     patterns_found.push(format!("Suspicious port detected: {}", port));

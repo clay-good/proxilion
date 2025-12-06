@@ -7,7 +7,6 @@
 /// GTG-1002 used multiple AI instances simultaneously - this detects that pattern.
 
 use crate::{AnalyzerResult, MCPToolCall};
-use mcp_protocol::FileOperation;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -36,16 +35,12 @@ pub struct UserActivity {
 pub struct MultiUserCorrelationAnalyzer {
     /// Minimum users for coordinated attack detection
     min_users_for_coordination: usize,
-
-    /// Time window for correlation (milliseconds)
-    correlation_window_ms: i64,
 }
 
 impl MultiUserCorrelationAnalyzer {
     pub fn new() -> Self {
         Self {
             min_users_for_coordination: 3,
-            correlation_window_ms: 3_600_000, // 1 hour
         }
     }
 
@@ -373,6 +368,7 @@ impl Default for MultiUserCorrelationAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_protocol::FileOperation;
 
     fn create_test_org_stats(
         users: Vec<(&str, Vec<&str>, Vec<&str>)>,

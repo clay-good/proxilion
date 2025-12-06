@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mcp_protocol::{MCPMessage, MCPResponse, MCPToolCall};
+use mcp_protocol::MCPToolCall;
 use session_state::{SessionState, SessionStore};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -425,14 +425,11 @@ async fn analyze_tool_call(
     let should_block = state.config.mode.should_block(analysis.threat_score);
     let should_terminate = state.config.mode.should_terminate(analysis.threat_score);
 
-    let mut session_terminated = false;
-
     if should_terminate {
         info!("🚨 TERMINATING SESSION: Critical threat (score={:.1})", analysis.threat_score);
         if let Err(e) = state.session_store.delete_session(&session_id).await {
             error!("⚠️  Failed to delete session: {}", e);
         }
-        session_terminated = true;
 
         // Record session termination
         metrics::record_session_terminated(analysis.threat_score);
@@ -484,7 +481,7 @@ async fn analyze_tool_call(
         decision: format!("{:?}", decision),
         threat_score: analysis.threat_score,
         patterns: analysis.patterns_detected,
-        session_terminated,
+        session_terminated: false,
         session_id,
     };
 

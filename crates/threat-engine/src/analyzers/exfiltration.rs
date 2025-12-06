@@ -7,6 +7,21 @@ use crate::AnalyzerResult;
 use mcp_protocol::MCPToolCall;
 use regex::Regex;
 use std::collections::HashMap;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Pre-compiled regex for RFC1918 private IP detection
+    /// This prevents false matches like "10.example.com" or "192.168.domain.com"
+    static ref PRIVATE_IP_REGEX: Regex = Regex::new(
+        r"(?:^|[/@])(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})(?:[:/]|$)"
+    ).unwrap();
+
+    /// Pre-compiled regex for detecting HTTP/HTTPS URLs
+    static ref URL_SCHEME_REGEX: Regex = Regex::new(r"https?://").unwrap();
+
+    /// Pre-compiled regex for extracting full URLs
+    static ref URL_EXTRACT_REGEX: Regex = Regex::new(r"(https?://[^\s]+)").unwrap();
+}
 
 pub struct ExfiltrationAnalyzer {
     encoding_patterns: Vec<EncodingPattern>,
@@ -113,7 +128,7 @@ impl ExfiltrationAnalyzer {
     }
 
     /// Check if a URL is external (not localhost/internal)
-    /// Uses proper RFC1918 private IP detection
+    /// Uses proper RFC1918 private IP detection with pre-compiled regex for performance
     fn is_external_url(url: &str) -> bool {
         let url_lower = url.to_lowercase();
 
@@ -125,35 +140,16 @@ impl ExfiltrationAnalyzer {
             return false;
         }
 
-        // Check for 10.0.0.0/8
-        if url_lower.contains("10.") {
+        // Use pre-compiled regex for accurate private IP detection
+        if PRIVATE_IP_REGEX.is_match(&url_lower) {
             return false;
         }
 
-        // Check for 192.168.0.0/16
-        if url_lower.contains("192.168.") {
-            return false;
-        }
-
-        // Check for 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
-        // Parse the second octet to check if it's in range [16, 31]
-        if url_lower.contains("172.") {
-            // Extract IP-like patterns
-            if let Some(start_idx) = url_lower.find("172.") {
-                let after_172 = &url_lower[start_idx + 4..];
-                // Try to extract second octet
-                if let Some(dot_idx) = after_172.find('.') {
-                    if let Ok(second_octet) = after_172[..dot_idx].parse::<u8>() {
-                        if (16..=31).contains(&second_octet) {
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check for link-local addresses
-        if url_lower.contains("169.254.") {
+        // Also check for internal hostnames (common patterns)
+        if url_lower.contains(".internal")
+            || url_lower.contains(".local")
+            || url_lower.contains(".corp")
+            || url_lower.contains(".lan") {
             return false;
         }
 
@@ -204,10 +200,10 @@ impl ExfiltrationAnalyzer {
                         }
                     }
 
-                    // Check for any external URL
-                    if Regex::new(r"https?://").unwrap().is_match(&full_command) {
+                    // Check for any external URL (using pre-compiled regex)
+                    if URL_SCHEME_REGEX.is_match(&full_command) {
                         // Extract URL
-                        if let Some(caps) = Regex::new(r"(https?://[^\s]+)").unwrap().captures(&full_command) {
+                        if let Some(caps) = URL_EXTRACT_REGEX.captures(&full_command) {
                             if let Some(url) = caps.get(1) {
                                 let url_str = url.as_str();
                                 if Self::is_external_url(url_str) {

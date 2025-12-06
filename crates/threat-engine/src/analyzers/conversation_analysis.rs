@@ -301,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conversation_analyzer_creation() {
-        let analyzer = ConversationAnalyzer::new();
+        let _analyzer = ConversationAnalyzer::new();
         // Just verify it can be created
         assert!(true);
     }

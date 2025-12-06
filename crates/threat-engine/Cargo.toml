@@ -16,6 +16,7 @@ base64 = { workspace = true, optional = true }
 sha2.workspace = true
 regex = "1.10"
 url = "2.5"
+lazy_static = "1.4"
 
 [features]
 default = []

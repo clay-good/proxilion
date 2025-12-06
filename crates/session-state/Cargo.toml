@@ -11,7 +11,7 @@ chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 
 # Redis support (default for Docker deployment)
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager"], optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
 tokio = { version = "1.0", features = ["full"], optional = true }
 
 # PostgreSQL support (optional, for enterprises)

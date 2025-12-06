@@ -2,8 +2,8 @@
 
 Real-time threat detection for AI coding assistants. Prevents insider threats, compromised accounts, and rogue AI agents from weaponizing Claude Code, GitHub Copilot, Cursor, and Windsurf.
 
-**Detection Rate**: 75-85% against sophisticated attacks (GTG-1002-class)  
-**Latency**: <50ms P95  
+**Detection Rate**: 75-85% against sophisticated attacks (GTG-1002-class)
+**Latency**: <50ms P95
 **Deployment**: Self-hosted, Docker-ready
 
 ---
@@ -21,12 +21,6 @@ docker compose up -d
 
 # Test threat detection
 ./demo.sh
-
-# Expected output:
-# ✓ Safe commands allowed (ls -la)
-# ✓ Network scanning blocked (nmap → score 100, TERMINATE)
-# ✓ Credential theft prevented (.env → score 86, BLOCK)
-# ✓ SSH key harvesting blocked (id_rsa → score 100, TERMINATE)
 ```
 
 **Access Points**:
@@ -62,18 +56,19 @@ docker compose --profile monitoring up -d
 
 ```
 AI Assistant (Claude Code, Copilot)
-        ↓
+        |
 Proxilion Gateway (<50ms analysis)
-        ↓
+        |
 Decision: Allow | Alert | Block | Terminate
-        ↓
+        |
 Tool Execution (MCP Server)
 ```
 
-**25 Threat Analyzers** running in parallel:
-- **Pattern-based** (15): Hacking tools, credential access, exfiltration, enumeration
-- **Session-aware** (5): Multi-phase attack progression, request rate, correlation
-- **Semantic** (5): Social engineering, AI autonomy, conversation analysis
+**30 Threat Analyzers** (24 active in default pipeline):
+- **Pattern-based** (21): Enumeration, credential harvesting, exfiltration, hacking tools, privilege escalation, lateral movement, persistence, defense evasion, command and control, collection, impact, file access, data volume, hallucination, MCP orchestration, callback validation, tool call analysis, task fragmentation, prompt injection, social engineering, AI velocity
+- **Session-aware** (2): Request rate anomaly, session progression (kill chain tracking)
+- **Context-dependent** (6): Conversation analysis, AI autonomy, multi-user correlation, multi-target orchestration, conversation context (require session/conversation state)
+- **Semantic** (1): Deep semantic analysis (requires Claude API, optional feature)
 
 ---
 
@@ -84,7 +79,7 @@ Tool Execution (MCP Server)
 | Network Reconnaissance | 95-100% | nmap, masscan, port scanning |
 | Credential Harvesting | 90-95% | SSH keys, .env files, AWS credentials |
 | Data Exfiltration | 85-90% | Large transfers, pastebin uploads, curl to external IPs |
-| Multi-Phase Attacks | 85-90% | Session tracking: recon → access → exfil |
+| Multi-Phase Attacks | 85-90% | Session tracking: recon -> access -> exfil |
 | Social Engineering | 70-80% | Requires conversation context + Claude API |
 | **Overall (GTG-1002-class)** | **75-85%** | In controlled testing |
 
@@ -140,9 +135,9 @@ ANTHROPIC_API_KEY=sk-ant-xxx  # Required if enabled
 | Mode | Behavior | Use Case |
 |------|----------|----------|
 | `monitor` | Log all threats, never block | Baseline collection, testing |
-| `alert` | Log + alert on scores ≥50 | Staging environments |
-| `block` | Block requests with scores ≥70 | Production (recommended) |
-| `terminate` | Block ≥70, terminate session ≥90 | High-security environments |
+| `alert` | Log + alert on scores >=50 | Staging environments |
+| `block` | Block requests with scores >=70 | Production (recommended) |
+| `terminate` | Block >=70, terminate session >=90 | High-security environments |
 
 ---
 
@@ -220,16 +215,13 @@ Analyze a tool call for threats.
 {
   "decision": "Block",
   "threat_score": 95.0,
-  "patterns_detected": [
+  "patterns": [
     "nmap reconnaissance tool detected",
     "Port scanning flags detected",
     "Network scanner detected"
   ],
-  "analyzer_scores": {
-    "hacking_tools": 85.0,
-    "enumeration": 75.0
-  },
-  "session_terminated": false
+  "session_terminated": false,
+  "session_id": "session_123"
 }
 ```
 
@@ -243,7 +235,7 @@ Analyze a tool call for threats.
 ## Architecture
 
 **Why Rust?**
-1. Memory safety (gateway can't become attack vector)
+1. Memory safety (gateway cannot become attack vector)
 2. <50ms P95 latency (zero-cost abstractions, no GC pauses)
 3. Single binary deployment (no dependencies)
 4. 10,000+ req/sec throughput per instance
@@ -261,7 +253,7 @@ Analyze a tool call for threats.
 - **Session State** (`crates/session-state`) - Redis + in-memory correlation
 - **MCP Protocol** (`crates/mcp-protocol`) - Tool call parsing
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for technical deep dive.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for technical deep dive.
 
 ---
 
@@ -269,19 +261,25 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for technical deep dive.
 
 **This is not a silver bullet.** Use as one layer in defense-in-depth.
 
-**Architectural Constraints**:
-- MCP-layer only (cannot see AI planning above tool execution)
-- Pattern-based limits (novel attacks may evade)
-- Requires persistent session IDs from clients
-- False positives possible (requires tuning)
+### Architectural Constraints
+- **MCP-layer only**: Cannot see AI planning above tool execution
+- **Pattern-based limits**: Novel attacks may evade detection initially
+- **Requires persistent session IDs**: Clients must provide consistent session identifiers
+- **False positives possible**: Requires tuning for your environment (target <5%)
 
-**What We Miss**:
-- Strategic planning before first tool call
-- Attacks fragmented into 50+ micro-requests over months
-- Non-MCP AI systems
-- Direct network attacks (only analyzes tool calls)
+### What We Cannot Detect
+1. **Strategic planning before first tool call**: Social engineering that succeeds before any tool is executed
+2. **Custom orchestration above MCP**: Attacker frameworks coordinating multiple Claude instances
+3. **Attacks fragmented over months**: Individual requests appear benign in isolation
+4. **Non-MCP AI systems**: Only protects MCP-compatible tools
+5. **Direct network attacks**: We analyze tool calls, not network packets
 
-See [ARCHITECTURAL_LIMITATIONS.md](ARCHITECTURAL_LIMITATIONS.md) for complete analysis.
+### Operational Considerations
+- **Semantic analysis cost**: $200-900/month if enabled (Claude API calls)
+- **Session state storage**: Redis required for production (in-memory for testing only)
+- **Cold start latency**: First request may take 100-200ms as analyzers initialize
+
+See [docs/ARCHITECTURAL_LIMITATIONS.md](docs/ARCHITECTURAL_LIMITATIONS.md) for complete analysis.
 
 ---
 
@@ -292,11 +290,11 @@ See [ARCHITECTURAL_LIMITATIONS.md](ARCHITECTURAL_LIMITATIONS.md) for complete an
 **Recommended Architecture**:
 ```
 Client (with auth token)
-    ↓
+    |
 API Gateway / Reverse Proxy (OAuth, API key)
-    ↓
+    |
 Proxilion Gateway (threat analysis)
-    ↓
+    |
 MCP Server (tool execution)
 ```
 
@@ -307,24 +305,23 @@ MCP Server (tool execution)
 - Redis authentication (requirepass, SSL/TLS)
 - Resource limits (Docker memory/CPU)
 
-See [SECURITY.md](SECURITY.md) for vulnerability reporting and detailed guidance.
+For vulnerability reporting, please open a GitHub issue or contact the maintainers directly.
 
 ---
 
-## Deployment Guides
+## Documentation
 
-- **Quick Start** - [QUICK_START.md](QUICK_START.md) - 5-minute deployment
-- **Platform-Specific** - [DEPLOYMENT_GUIDES.md](DEPLOYMENT_GUIDES.md) - GitHub, Anthropic, Microsoft integrations
-- **Architecture** - [ARCHITECTURE.md](ARCHITECTURE.md) - System design and technical decisions
-- **Security** - [SECURITY.md](SECURITY.md) - Vulnerability reporting and best practices
-- **API Reference** - [API_REFERENCE.md](API_REFERENCE.md) - Complete API documentation
+- [docs/QUICK_START.md](docs/QUICK_START.md) - 5-minute deployment
+- [docs/DEPLOYMENT_GUIDES.md](docs/DEPLOYMENT_GUIDES.md) - GitHub, Anthropic, Microsoft integrations
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - System design and technical decisions
+- [docs/ARCHITECTURAL_LIMITATIONS.md](docs/ARCHITECTURAL_LIMITATIONS.md) - Honest constraints and blind spots
 
 ---
 
 ## Testing
 
 ```bash
-# Run all tests (160 tests, 100% pass rate)
+# Run all tests (202 tests, 2 intentionally ignored)
 cargo test
 
 # Run demo
@@ -337,7 +334,7 @@ cargo test
 
 Before deploying to production:
 
-- [ ] Run in monitor mode for 1+ week
+- [ ] Run in monitor mode for 1+ week to establish baseline
 - [ ] Review false positive rate (target: <5%)
 - [ ] Configure Redis for session persistence
 - [ ] Set up Prometheus + Grafana monitoring
@@ -345,6 +342,7 @@ Before deploying to production:
 - [ ] Deploy behind authentication layer
 - [ ] Enable TLS/SSL
 - [ ] Test fail-open vs fail-closed behavior
+- [ ] Document incident response procedures
 
 ---
 
@@ -363,4 +361,4 @@ MIT License - Use, modify, and deploy freely.
 - Prometheus + Grafana (monitoring)
 - Docker (deployment)
 
-160 tests passing. Production-ready.
+202 tests passing. Production-ready.

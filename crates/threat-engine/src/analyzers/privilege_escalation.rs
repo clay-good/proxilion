@@ -29,30 +29,39 @@ impl PrivilegeEscalationAnalyzer {
                 "sudo /bin/sh",
                 "su -",
                 "su root",
+                "doas",           // OpenBSD sudo alternative
+                "pkexec",         // PolicyKit
             ],
             permission_patterns: vec![
                 "chmod 777",
                 "chmod +s",
                 "chmod 4755",
                 "chmod u+s",
+                "chmod g+s",
                 "chown root",
                 "chgrp root",
+                "setcap",         // Linux capabilities
             ],
             setuid_patterns: vec![
                 "setuid",
                 "setgid",
                 "chmod +s",
                 "chmod 4",
+                "chmod 2",        // SGID
                 "find / -perm",
                 "find / -user root -perm",
+                "find . -perm -4000",
             ],
             container_escape: vec![
                 "docker run --privileged",
                 "docker run -v /:/host",
+                "docker run --pid=host",
+                "docker run --net=host",
                 "kubectl exec",
                 "nsenter",
                 "unshare",
                 "chroot",
+                "capsh",          // Capability shell
             ],
         }
     }

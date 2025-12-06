@@ -11,14 +11,12 @@ use crate::AnalyzerResult;
 use mcp_protocol::MCPToolCall;
 
 pub struct DataVolumeAnalyzer {
-    large_file_threshold_mb: f64,
     mass_operation_patterns: Vec<&'static str>,
 }
 
 impl DataVolumeAnalyzer {
     pub fn new() -> Self {
         Self {
-            large_file_threshold_mb: 10.0, // 10MB+ is suspicious for single operation
             mass_operation_patterns: vec![
                 "tar -",
                 "zip -r",

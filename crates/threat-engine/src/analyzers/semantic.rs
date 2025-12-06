@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_semantic_analyzer_creation() {
-        let analyzer = SemanticAnalyzer::new();
+        let _analyzer = SemanticAnalyzer::new();
         // Just verify it can be created
         assert!(true);
     }

@@ -161,14 +161,50 @@ pub fn analyze_tool_call(tool_call: &MCPToolCall) -> ThreatAnalysisResult {
     all_patterns.extend(hallucination_result.patterns.clone());
     analyzer_results.push(hallucination_result);
 
+    // Run persistence analyzer
+    let persistence_analyzer = analyzers::PersistenceAnalyzer::new();
+    let persistence_result = persistence_analyzer.analyze(tool_call);
+    all_patterns.extend(persistence_result.patterns.clone());
+    analyzer_results.push(persistence_result);
+
+    // Run defense evasion analyzer
+    let defense_analyzer = analyzers::DefenseEvasionAnalyzer::new();
+    let defense_result = defense_analyzer.analyze(tool_call);
+    all_patterns.extend(defense_result.patterns.clone());
+    analyzer_results.push(defense_result);
+
+    // Run command and control analyzer
+    let c2_analyzer = analyzers::CommandAndControlAnalyzer::new();
+    let c2_result = c2_analyzer.analyze(tool_call);
+    all_patterns.extend(c2_result.patterns.clone());
+    analyzer_results.push(c2_result);
+
+    // Run collection analyzer
+    let collection_analyzer = analyzers::CollectionAnalyzer::new();
+    let collection_result = collection_analyzer.analyze(tool_call);
+    all_patterns.extend(collection_result.patterns.clone());
+    analyzer_results.push(collection_result);
+
+    // Run impact analyzer
+    let impact_analyzer = analyzers::ImpactAnalyzer::new();
+    let impact_result = impact_analyzer.analyze(tool_call);
+    all_patterns.extend(impact_result.patterns.clone());
+    analyzer_results.push(impact_result);
+
+    // Run tool call analyzer (command chaining, piping to network tools, suspicious SQL)
+    let tool_call_analyzer = analyzers::ToolCallAnalyzer::new();
+    let tool_call_result = tool_call_analyzer.analyze(tool_call);
+    all_patterns.extend(tool_call_result.patterns.clone());
+    analyzer_results.push(tool_call_result);
+
     // Run legitimacy analyzer (does not add threat score, only adjusts)
     let legitimacy_analyzer = analyzers::LegitimacyAnalyzer::new();
     let legitimacy_result = legitimacy_analyzer.analyze(tool_call);
     all_patterns.extend(legitimacy_result.patterns.clone());
     analyzer_results.push(legitimacy_result.clone());
 
-    // Note: Session-aware analyzers (session_progression, request_rate, multi_user_correlation)
-    // are run separately in analyze_with_session() below to leverage session state
+    // Note: Session-aware analyzers (session_progression, request_rate, ai_autonomy,
+    // multi_user_correlation) are run in analyze_with_session() to leverage session state
 
     // Calculate aggregate threat score
     let base_threat_score = calculate_aggregate_score(&analyzer_results);
@@ -268,26 +304,61 @@ pub fn analyze_with_session(
 }
 
 /// Calculate aggregate threat score from multiple analyzers
+/// Uses weighted max with correlation bonus for multi-vector attacks
 fn calculate_aggregate_score(results: &[AnalyzerResult]) -> f64 {
     if results.is_empty() {
         return 0.0;
     }
 
-    // Take the maximum score among all analyzers
-    let max_score = results
+    // Get all non-zero scores sorted descending
+    let mut scores: Vec<f64> = results
         .iter()
+        .filter(|r| r.threat_score > 0.0)
         .map(|r| r.threat_score)
-        .fold(0.0f64, f64::max);
+        .collect();
 
-    // Add small bonus for multiple analyzers detecting threats
-    let active_analyzers = results.iter().filter(|r| r.threat_score > 0.0).count();
-    let bonus = if active_analyzers > 1 {
-        (active_analyzers as f64 - 1.0) * 3.0
+    if scores.is_empty() {
+        return 0.0;
+    }
+
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Primary score is the maximum
+    let max_score = scores[0];
+
+    // Add diminishing contributions from other high-scoring analyzers
+    // This captures multi-vector attacks more accurately
+    let secondary_contribution: f64 = scores
+        .iter()
+        .skip(1)
+        .take(3)  // Only consider top 3 secondary scores
+        .enumerate()
+        .map(|(i, &score)| {
+            // Diminishing weights: 15%, 10%, 5%
+            let weight = match i {
+                0 => 0.15,
+                1 => 0.10,
+                2 => 0.05,
+                _ => 0.0,
+            };
+            score * weight
+        })
+        .sum();
+
+    // Correlation bonus: multiple unrelated analyzers detecting threats
+    // indicates higher confidence in malicious intent
+    let active_count = scores.len();
+    let correlation_bonus = if active_count >= 4 {
+        10.0  // 4+ analyzers triggered
+    } else if active_count >= 3 {
+        6.0   // 3 analyzers triggered
+    } else if active_count >= 2 {
+        3.0   // 2 analyzers triggered
     } else {
         0.0
     };
 
-    (max_score + bonus).min(100.0)
+    (max_score + secondary_contribution + correlation_bonus).min(100.0)
 }
 
 #[cfg(test)]

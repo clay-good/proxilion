@@ -12,17 +12,22 @@
 use mcp_protocol::MCPToolCall;
 use crate::AnalyzerResult;
 use serde_json::json;
+use lazy_static::lazy_static;
+use regex::Regex;
 
-pub struct AIVelocityAnalyzer {
-    // Thresholds for detecting automation
-    min_batch_size: usize,
+lazy_static! {
+    /// Pre-compiled regex for IP address detection
+    static ref IP_PATTERN: Regex = Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap();
+
+    /// Pre-compiled regex for port range detection
+    static ref PORT_RANGE_PATTERN: Regex = Regex::new(r"(\d+)-(\d+)").unwrap();
 }
+
+pub struct AIVelocityAnalyzer;
 
 impl AIVelocityAnalyzer {
     pub fn new() -> Self {
-        Self {
-            min_batch_size: 10, // 10+ targets suggests automation
-        }
+        Self
     }
 
     /// Detect batch processing patterns in commands
@@ -122,9 +127,8 @@ impl AIVelocityAnalyzer {
     fn count_targets(&self, command: &str) -> Option<usize> {
         let mut count = 0;
 
-        // Count IP addresses (simple pattern)
-        let ip_pattern = regex::Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").ok()?;
-        count += ip_pattern.find_iter(command).count();
+        // Count IP addresses using pre-compiled regex
+        count += IP_PATTERN.find_iter(command).count();
 
         // Count comma-separated items in common flags
         for flag in &["-t", "--target", "--host", "-h", "--ip"] {
@@ -137,8 +141,8 @@ impl AIVelocityAnalyzer {
             }
         }
 
-        // Count port ranges (e.g., 1-1000)
-        if let Some(caps) = regex::Regex::new(r"(\d+)-(\d+)").ok()?.captures(command) {
+        // Count port ranges (e.g., 1-1000) using pre-compiled regex
+        if let Some(caps) = PORT_RANGE_PATTERN.captures(command) {
             if let (Ok(start), Ok(end)) = (caps[1].parse::<usize>(), caps[2].parse::<usize>()) {
                 if end > start {
                     count += end - start;
@@ -287,7 +291,6 @@ impl Default for AIVelocityAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_mass_network_scan() {

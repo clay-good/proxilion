@@ -12,9 +12,6 @@ use crate::AnalyzerResult;
 use mcp_protocol::MCPToolCall;
 
 pub struct RequestRateAnalyzer {
-    critical_rate: f64,  // 2.0 req/sec
-    high_rate: f64,      // 1.0 req/sec
-    medium_rate: f64,    // 0.5 req/sec
     burst_threshold: u32, // 100 requests/minute
 }
 
@@ -29,15 +26,12 @@ pub struct RateStats {
 impl RequestRateAnalyzer {
     pub fn new() -> Self {
         Self {
-            critical_rate: 2.0,
-            high_rate: 1.0,
-            medium_rate: 0.5,
             burst_threshold: 100,
         }
     }
 
     /// Analyze request rate with session state
-    pub fn analyze_with_session(&self, _tool_call: &MCPToolCall, rate_stats: &RateStats, now: i64) -> AnalyzerResult {
+    pub fn analyze_with_session(&self, _tool_call: &MCPToolCall, rate_stats: &RateStats, _now: i64) -> AnalyzerResult {
         let mut score: f64 = 0.0;
         let mut patterns_found = Vec::new();
 

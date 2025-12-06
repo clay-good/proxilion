@@ -3,16 +3,15 @@
 //! Ported from Proxilion v2 POC and adapted for MCP protocol.
 //! Detects: nmap, masscan, directory brute-forcing, port scanning, etc.
 
-use crate::{AnalyzerResult, ThreatAnalysisResult};
+use crate::AnalyzerResult;
 use mcp_protocol::MCPToolCall;
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub struct EnumerationAnalyzer {
     ip_patterns: Vec<Regex>,
     cidr_pattern: Regex,
     recon_tools: Vec<ReconTool>,
-    path_patterns: Vec<PathPattern>,
     url_path_patterns: Vec<PathPattern>,
 }
 
@@ -29,7 +28,6 @@ enum ToolCategory {
     NetworkScanner,
     PortScanner,
     DirectoryBrute,
-    SubdomainEnum,
     VulnScanner,
     ServiceDetection,
 }
@@ -105,19 +103,6 @@ impl EnumerationAnalyzer {
                     pattern: Regex::new(r"(?i)\bshodan\b").unwrap(),
                     severity: 70.0,
                     category: ToolCategory::ServiceDetection,
-                },
-            ],
-            // Filesystem path patterns (for Filesystem tool calls)
-            path_patterns: vec![
-                PathPattern {
-                    name: "directory_traversal",
-                    pattern: Regex::new(r"\.\./|\.\.\\").unwrap(),
-                    severity: 80.0,
-                },
-                PathPattern {
-                    name: "sensitive_files",
-                    pattern: Regex::new(r"(?i)(\.env|web\.config|phpinfo|config\.php|\.git/)").unwrap(),
-                    severity: 75.0,
                 },
             ],
             // URL path patterns (for Network tool calls) - excludes legitimate API paths

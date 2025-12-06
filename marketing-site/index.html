@@ -68,35 +68,55 @@
         :root {
             --bg: #000000;
             --bg-secondary: #0a0a0a;
+            --bg-card: #111111;
             --text: #ffffff;
-            --text-muted: #999999;
+            --text-muted: #a0a0a0;
             --accent: #ffffff;
-            --border: #222222;
-            --shadow: rgba(255, 255, 255, 0.1);
+            --accent-dim: #e0e0e0;
+            --border: #1a1a1a;
+            --border-hover: #333333;
+            --shadow: rgba(255, 255, 255, 0.05);
+            --radius-sm: 8px;
+            --radius-md: 12px;
+            --radius-lg: 20px;
+            --radius-xl: 28px;
+            --transition-fast: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            --transition-smooth: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
         @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(30px); }
+            from { opacity: 0; transform: translateY(24px); }
             to { opacity: 1; transform: translateY(0); }
         }
 
         @keyframes float {
             0%, 100% { transform: translateY(0px); }
-            50% { transform: translateY(-20px); }
+            50% { transform: translateY(-12px); }
         }
 
-        @keyframes glow {
-            0%, 100% { text-shadow: 0 0 20px rgba(255, 255, 255, 0.3); }
-            50% { text-shadow: 0 0 40px rgba(255, 255, 255, 0.5); }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        @keyframes shimmer {
+            0% { background-position: -200% center; }
+            100% { background-position: 200% center; }
+        }
+
+        html {
+            scroll-behavior: smooth;
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', system-ui, sans-serif;
             background: var(--bg);
             color: var(--text);
-            line-height: 1.6;
+            line-height: 1.7;
             -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
             overflow-x: hidden;
+            font-size: 16px;
         }
 
         body::before {
@@ -106,211 +126,241 @@
             left: 0;
             right: 0;
             bottom: 0;
-            background: radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.03) 0%, transparent 50%);
+            background:
+                radial-gradient(ellipse 80% 50% at 50% -20%, rgba(255, 255, 255, 0.04) 0%, transparent 50%),
+                radial-gradient(ellipse 60% 40% at 80% 60%, rgba(255, 255, 255, 0.02) 0%, transparent 50%);
             pointer-events: none;
+            z-index: 0;
         }
 
         .container {
-            max-width: 1400px;
+            max-width: 1200px;
             margin: 0 auto;
-            padding: 0 60px;
+            padding: 0 clamp(24px, 5vw, 80px);
             position: relative;
+            z-index: 1;
         }
 
         /* Hero Section */
         header {
             min-height: 100vh;
+            min-height: 100dvh;
             display: flex;
             flex-direction: column;
             justify-content: center;
             align-items: center;
             text-align: center;
-            animation: fadeIn 1s ease-out;
+            animation: fadeIn 0.8s ease-out;
             position: relative;
+            padding: clamp(60px, 10vh, 100px) 0;
         }
 
         .logo-container {
-            margin-bottom: 30px;
-            animation: float 3s ease-in-out infinite;
+            margin-bottom: clamp(24px, 4vw, 40px);
+            animation: float 4s ease-in-out infinite;
         }
 
         .logo {
-            font-size: 8rem;
-            font-weight: 900;
-            letter-spacing: -0.05em;
-            background: linear-gradient(180deg, #ffffff 0%, #666666 100%);
+            font-size: clamp(3rem, 10vw, 7rem);
+            font-weight: 800;
+            letter-spacing: -0.04em;
+            background: linear-gradient(180deg, #ffffff 20%, #888888 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
-            animation: glow 2s ease-in-out infinite;
+            line-height: 1.1;
         }
 
         .tagline {
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin-bottom: 20px;
+            font-size: clamp(1.5rem, 4vw, 2.5rem);
+            font-weight: 600;
+            margin-bottom: clamp(16px, 2vw, 24px);
             color: var(--text);
-            letter-spacing: -0.03em;
-            max-width: 900px;
-            line-height: 1.2;
+            letter-spacing: -0.02em;
+            max-width: 800px;
+            line-height: 1.25;
+            padding: 0 16px;
         }
 
         .subtitle {
-            font-size: 1.3rem;
+            font-size: clamp(1rem, 2vw, 1.25rem);
             color: var(--text-muted);
-            margin-bottom: 40px;
-            max-width: 750px;
-            font-weight: 300;
+            margin-bottom: clamp(32px, 5vw, 48px);
+            max-width: 680px;
+            font-weight: 400;
             line-height: 1.7;
+            padding: 0 16px;
         }
 
         .cta-group {
             display: flex;
-            gap: 20px;
+            gap: clamp(12px, 2vw, 16px);
             flex-wrap: wrap;
             justify-content: center;
-            margin-bottom: 30px;
+            margin-bottom: clamp(24px, 4vw, 40px);
+            padding: 0 16px;
+            width: 100%;
+            max-width: 500px;
         }
 
         .btn-primary {
-            display: inline-block;
-            padding: 20px 50px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: clamp(14px, 2vw, 18px) clamp(28px, 4vw, 40px);
             background: var(--accent);
             color: var(--bg);
             text-decoration: none;
-            font-weight: 700;
-            font-size: 1.1rem;
-            letter-spacing: 0.03em;
+            font-weight: 600;
+            font-size: clamp(0.9rem, 1.5vw, 1rem);
+            letter-spacing: 0.02em;
             text-transform: uppercase;
-            transition: all 0.3s ease;
+            transition: all var(--transition-smooth);
             border: 2px solid var(--accent);
-            border-radius: 8px;
-            box-shadow: 0 4px 20px rgba(255, 255, 255, 0.1);
+            border-radius: var(--radius-md);
+            box-shadow: 0 4px 24px rgba(255, 255, 255, 0.1);
+            min-height: 52px;
+            flex: 1;
+            min-width: 200px;
         }
 
         .btn-primary:hover {
             background: transparent;
             color: var(--accent);
-            transform: translateY(-3px);
-            box-shadow: 0 8px 30px rgba(255, 255, 255, 0.2);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(255, 255, 255, 0.15);
+        }
+
+        .btn-primary:active {
+            transform: translateY(0);
         }
 
         .btn-secondary {
-            display: inline-block;
-            padding: 20px 50px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: clamp(14px, 2vw, 18px) clamp(28px, 4vw, 40px);
             background: transparent;
             color: var(--text-muted);
             text-decoration: none;
             font-weight: 600;
-            font-size: 1.1rem;
-            letter-spacing: 0.03em;
+            font-size: clamp(0.9rem, 1.5vw, 1rem);
+            letter-spacing: 0.02em;
             text-transform: uppercase;
-            transition: all 0.3s ease;
-            border: 2px solid var(--border);
-            border-radius: 8px;
+            transition: all var(--transition-smooth);
+            border: 2px solid var(--border-hover);
+            border-radius: var(--radius-md);
+            min-height: 52px;
+            flex: 1;
+            min-width: 200px;
         }
 
         .btn-secondary:hover {
             border-color: var(--text-muted);
             color: var(--text);
-            background: rgba(255, 255, 255, 0.02);
+            background: rgba(255, 255, 255, 0.03);
         }
 
         .stats-banner {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 30px;
-            margin-top: 60px;
-            padding: 40px 30px;
-            background: var(--bg-secondary);
+            gap: clamp(16px, 3vw, 32px);
+            margin-top: clamp(40px, 6vw, 64px);
+            padding: clamp(28px, 4vw, 44px) clamp(20px, 3vw, 40px);
+            background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 16px;
-            box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+            border-radius: var(--radius-lg);
+            box-shadow: 0 8px 48px rgba(0, 0, 0, 0.4);
+            width: 100%;
+            max-width: 900px;
         }
 
         .stat-item {
             text-align: center;
+            padding: clamp(8px, 1.5vw, 12px) 0;
         }
 
         .stat-number {
-            font-size: 3.5rem;
-            font-weight: 900;
+            font-size: clamp(1.75rem, 4vw, 2.75rem);
+            font-weight: 800;
             color: var(--accent);
             letter-spacing: -0.03em;
-            margin-bottom: 8px;
-            background: linear-gradient(180deg, #ffffff 0%, #888888 100%);
+            margin-bottom: clamp(4px, 1vw, 8px);
+            background: linear-gradient(180deg, #ffffff 20%, #999999 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
+            line-height: 1.2;
         }
 
         .stat-label {
-            font-size: 1rem;
+            font-size: clamp(0.7rem, 1.2vw, 0.85rem);
             color: var(--text-muted);
             text-transform: uppercase;
-            letter-spacing: 0.1em;
+            letter-spacing: 0.08em;
             font-weight: 600;
         }
 
         /* Sections */
         section {
-            padding: 80px 0;
+            padding: clamp(64px, 10vw, 120px) 0;
             border-top: 1px solid var(--border);
         }
 
         .section-header {
             text-align: center;
-            margin-bottom: 50px;
+            margin-bottom: clamp(40px, 6vw, 64px);
         }
 
         .section-title {
-            font-size: 3.5rem;
-            font-weight: 900;
-            letter-spacing: -0.04em;
-            margin-bottom: 20px;
+            font-size: clamp(2rem, 5vw, 3rem);
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            margin-bottom: clamp(16px, 2vw, 24px);
             color: var(--text);
+            line-height: 1.2;
         }
 
         .section-subtitle {
-            font-size: 1.3rem;
+            font-size: clamp(1rem, 2vw, 1.2rem);
             color: var(--text-muted);
-            max-width: 700px;
+            max-width: 640px;
             margin: 0 auto;
-            line-height: 1.6;
+            line-height: 1.7;
         }
 
         /* Features Grid */
         .features {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 25px;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+            gap: clamp(16px, 2.5vw, 24px);
         }
 
         .feature {
-            padding: 35px;
-            background: rgba(255, 255, 255, 0.02);
+            padding: clamp(24px, 3vw, 36px);
+            background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 16px;
-            transition: all 0.4s ease;
+            border-radius: var(--radius-lg);
+            transition: all var(--transition-smooth);
         }
 
         .feature:hover {
-            transform: translateY(-8px);
-            background: rgba(255, 255, 255, 0.04);
-            border-color: var(--text-muted);
-            box-shadow: 0 12px 40px rgba(255, 255, 255, 0.1);
+            transform: translateY(-4px);
+            background: rgba(255, 255, 255, 0.03);
+            border-color: var(--border-hover);
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
         }
 
         .feature-title {
-            font-size: 1.6rem;
-            font-weight: 700;
-            margin-bottom: 15px;
-            letter-spacing: -0.02em;
+            font-size: clamp(1.2rem, 2vw, 1.4rem);
+            font-weight: 600;
+            margin-bottom: clamp(10px, 1.5vw, 14px);
+            letter-spacing: -0.01em;
             color: var(--text);
         }
 
         .feature-text {
-            font-size: 1.05rem;
+            font-size: clamp(0.95rem, 1.5vw, 1.05rem);
             color: var(--text-muted);
             line-height: 1.7;
         }
@@ -318,75 +368,112 @@
         /* Use Cases */
         .use-cases {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 25px;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+            gap: clamp(16px, 2.5vw, 24px);
         }
 
         .use-case {
-            padding: 35px;
-            background: rgba(255, 255, 255, 0.02);
-            border-radius: 16px;
-            border: 2px solid var(--border);
-            transition: all 0.4s ease;
+            padding: clamp(24px, 3vw, 36px);
+            background: var(--bg-card);
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--border);
+            transition: all var(--transition-smooth);
         }
 
         .use-case:hover {
-            border-color: var(--text-muted);
-            background: rgba(255, 255, 255, 0.04);
-            transform: translateY(-5px);
-            box-shadow: 0 12px 40px rgba(255, 255, 255, 0.1);
+            border-color: var(--border-hover);
+            background: rgba(255, 255, 255, 0.03);
+            transform: translateY(-4px);
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
         }
 
         .use-case-title {
-            font-size: 1.8rem;
-            font-weight: 700;
-            margin-bottom: 18px;
+            font-size: clamp(1.3rem, 2.5vw, 1.6rem);
+            font-weight: 600;
+            margin-bottom: clamp(12px, 2vw, 18px);
             color: var(--text);
-            letter-spacing: -0.02em;
+            letter-spacing: -0.01em;
         }
 
         .use-case-text {
-            font-size: 1.1rem;
+            font-size: clamp(0.95rem, 1.5vw, 1.05rem);
             color: var(--text-muted);
+            line-height: 1.75;
+        }
+
+        /* Alt Section Background */
+        .section-alt {
+            background: var(--bg-secondary);
+            margin: 0 calc(-1 * clamp(24px, 5vw, 80px));
+            padding-left: clamp(24px, 5vw, 80px);
+            padding-right: clamp(24px, 5vw, 80px);
+        }
+
+        /* Code Block */
+        .code-block {
+            background: #0d0d0d;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: clamp(24px, 3vw, 36px);
+            max-width: 720px;
+            margin: 0 auto;
+        }
+
+        .code-block pre {
+            color: var(--text);
+            font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Fira Code', monospace;
+            font-size: clamp(0.85rem, 1.5vw, 1rem);
             line-height: 1.8;
+            overflow-x: auto;
+            margin: 0;
+        }
+
+        .code-block p {
+            color: var(--text-muted);
+            margin-top: clamp(20px, 3vw, 28px);
+            font-size: clamp(0.9rem, 1.5vw, 1.05rem);
+            text-align: center;
+            margin-bottom: 0;
         }
 
         /* CTA Section */
         .final-cta {
             text-align: center;
-            padding: 80px 60px;
+            padding: clamp(48px, 8vw, 80px) clamp(24px, 5vw, 60px);
             background: var(--accent);
             color: var(--bg);
-            border-radius: 24px;
-            margin: 60px 0;
-            box-shadow: 0 20px 60px rgba(255, 255, 255, 0.15);
+            border-radius: var(--radius-xl);
+            margin: clamp(48px, 8vw, 80px) 0;
+            box-shadow: 0 24px 64px rgba(255, 255, 255, 0.12);
         }
 
         .final-cta h2 {
-            font-size: 3.5rem;
-            font-weight: 900;
-            margin-bottom: 25px;
-            letter-spacing: -0.03em;
+            font-size: clamp(1.75rem, 5vw, 3rem);
+            font-weight: 700;
+            margin-bottom: clamp(16px, 3vw, 28px);
+            letter-spacing: -0.02em;
+            line-height: 1.2;
         }
 
         .final-cta p {
-            font-size: 1.4rem;
-            margin-bottom: 50px;
-            opacity: 0.9;
-            max-width: 700px;
+            font-size: clamp(1rem, 2vw, 1.25rem);
+            margin-bottom: clamp(32px, 5vw, 48px);
+            opacity: 0.85;
+            max-width: 600px;
             margin-left: auto;
             margin-right: auto;
-            line-height: 1.6;
+            line-height: 1.65;
         }
 
         .final-cta .btn-primary {
             background: var(--bg);
             color: var(--accent);
             border-color: var(--bg);
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
         }
 
         .final-cta .btn-primary:hover {
-            background: transparent;
+            background: rgba(0, 0, 0, 0.1);
             color: var(--bg);
             border-color: var(--bg);
         }
@@ -394,151 +481,91 @@
         /* Footer */
         footer {
             text-align: center;
-            padding: 60px 0;
+            padding: clamp(40px, 6vw, 64px) 0;
             color: var(--text-muted);
-            font-size: 1rem;
+            font-size: clamp(0.9rem, 1.5vw, 1rem);
         }
 
         footer a {
             color: var(--accent);
             text-decoration: none;
             font-weight: 600;
-            transition: opacity 0.3s ease;
+            transition: opacity var(--transition-fast);
         }
 
         footer a:hover {
             opacity: 0.7;
         }
 
-        /* Responsive Design */
-        @media (max-width: 1024px) {
-            .features {
-                grid-template-columns: repeat(2, 1fr);
-            }
-
-            .stats-banner {
-                grid-template-columns: repeat(2, 1fr);
-            }
-
-            .use-cases {
-                grid-template-columns: repeat(2, 1fr);
-            }
+        footer p + p {
+            margin-top: clamp(12px, 2vw, 16px);
+            font-size: clamp(0.8rem, 1.3vw, 0.9rem);
         }
 
+        /* Responsive Design */
         @media (max-width: 768px) {
-            .container {
-                padding: 0 25px;
-            }
-
-            .logo {
-                font-size: 4rem;
-            }
-
-            .tagline {
-                font-size: 1.8rem;
-            }
-
-            .subtitle {
-                font-size: 1.1rem;
-            }
-
-            .section-title {
-                font-size: 2.5rem;
-            }
-
-            .section-subtitle {
-                font-size: 1.1rem;
-            }
-
-            .features,
-            .use-cases {
-                grid-template-columns: 1fr;
-                gap: 25px;
-            }
-
             .stats-banner {
                 grid-template-columns: repeat(2, 1fr);
-                padding: 40px 30px;
-                gap: 30px;
-            }
-
-            .stat-number {
-                font-size: 2.5rem;
-            }
-
-            .btn-primary,
-            .btn-secondary {
-                padding: 18px 40px;
-                font-size: 1rem;
-                width: 100%;
+                gap: clamp(20px, 4vw, 28px);
             }
 
             .cta-group {
                 flex-direction: column;
-                gap: 15px;
-            }
-
-            section {
-                padding: 80px 0;
-            }
-
-            .feature,
-            .use-case {
-                padding: 35px;
-            }
-
-            .final-cta {
-                padding: 80px 30px;
-                margin: 60px 0;
-            }
-
-            .final-cta h2 {
-                font-size: 2.5rem;
-            }
-
-            .final-cta p {
-                font-size: 1.2rem;
-            }
-        }
-
-        @media (max-width: 480px) {
-            .logo {
-                font-size: 3rem;
-            }
-
-            .tagline {
-                font-size: 1.5rem;
-            }
-
-            .subtitle {
-                font-size: 1rem;
-            }
-
-            .section-title {
-                font-size: 2rem;
+                align-items: stretch;
             }
 
             .btn-primary,
             .btn-secondary {
-                padding: 16px 30px;
-                font-size: 0.95rem;
+                width: 100%;
+                min-width: unset;
             }
 
+            .section-alt {
+                margin-left: -24px;
+                margin-right: -24px;
+                padding-left: 24px;
+                padding-right: 24px;
+            }
+        }
+
+        @media (max-width: 480px) {
             .stats-banner {
-                grid-template-columns: 1fr;
-                padding: 30px 20px;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 16px;
+                padding: 24px 16px;
             }
 
-            .stat-number {
-                font-size: 2rem;
+            .stat-item {
+                padding: 8px 4px;
             }
 
-            .final-cta h2 {
-                font-size: 2rem;
+            .feature,
+            .use-case {
+                padding: 24px 20px;
+            }
+        }
+
+        /* Touch-friendly tap targets */
+        @media (hover: none) and (pointer: coarse) {
+            .btn-primary,
+            .btn-secondary {
+                min-height: 56px;
             }
 
-            .final-cta p {
-                font-size: 1.1rem;
+            .feature:hover,
+            .use-case:hover {
+                transform: none;
+            }
+        }
+
+        /* Reduced motion */
+        @media (prefers-reduced-motion: reduce) {
+            *,
+            *::before,
+            *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
             }
         }
     </style>
@@ -613,62 +640,60 @@
             </div>
         </section>
 
-        <section style="background: var(--bg-secondary); margin: 0 -60px; padding: 80px 60px; border-top: 1px solid var(--border);">
-            <div class="container" style="padding: 0;">
-                <div class="section-header">
-                    <h2 class="section-title">How Proxilion Works</h2>
-                    <p class="section-subtitle">
-                        Real-time threat analysis at the Model Context Protocol (MCP) layer. Every bash command, file access, and API call analyzed before execution.
+        <section class="section-alt">
+            <div class="section-header">
+                <h2 class="section-title">How Proxilion Works</h2>
+                <p class="section-subtitle">
+                    Real-time threat analysis at the Model Context Protocol (MCP) layer. Every bash command, file access, and API call analyzed before execution.
+                </p>
+            </div>
+            <div class="features">
+                <div class="feature">
+                    <h3 class="feature-title">25 Threat Analyzers</h3>
+                    <p class="feature-text">
+                        Pattern-based detection for reconnaissance tools, credential access, hacking tools, privilege escalation, and exfiltration.
+                        Session-aware analyzers track multi-phase kill chains across hours and days.
                     </p>
                 </div>
-                <div class="features">
-                    <div class="feature">
-                        <h3 class="feature-title">25 Threat Analyzers</h3>
-                        <p class="feature-text">
-                            Pattern-based detection for reconnaissance tools, credential access, hacking tools, privilege escalation, and exfiltration.
-                            Session-aware analyzers track multi-phase kill chains across hours and days.
-                        </p>
-                    </div>
 
-                    <div class="feature">
-                        <h3 class="feature-title">Real-Time Blocking</h3>
-                        <p class="feature-text">
-                            Commands scored 0-100. Block threats scoring 70+. Terminate entire sessions scoring 90+.
-                            Alert security teams for suspicious activity scoring 50-69.
-                        </p>
-                    </div>
+                <div class="feature">
+                    <h3 class="feature-title">Real-Time Blocking</h3>
+                    <p class="feature-text">
+                        Commands scored 0-100. Block threats scoring 70+. Terminate entire sessions scoring 90+.
+                        Alert security teams for suspicious activity scoring 50-69.
+                    </p>
+                </div>
 
-                    <div class="feature">
-                        <h3 class="feature-title">Kill Chain Detection</h3>
-                        <p class="feature-text">
-                            Redis-backed session state tracks reconnaissance, credential access, and exfiltration phases.
-                            Individual requests may pass, but multi-phase progression triggers termination.
-                        </p>
-                    </div>
+                <div class="feature">
+                    <h3 class="feature-title">Kill Chain Detection</h3>
+                    <p class="feature-text">
+                        Redis-backed session state tracks reconnaissance, credential access, and exfiltration phases.
+                        Individual requests may pass, but multi-phase progression triggers termination.
+                    </p>
+                </div>
 
-                    <div class="feature">
-                        <h3 class="feature-title">Universal MCP Coverage</h3>
-                        <p class="feature-text">
-                            Works with Claude Code, Cursor, Windsurf, and any MCP-compatible AI coding assistant.
-                            Drop-in proxy with no modifications to AI models.
-                        </p>
-                    </div>
+                <div class="feature">
+                    <h3 class="feature-title">Universal MCP Coverage</h3>
+                    <p class="feature-text">
+                        Works with Claude Code, Cursor, Windsurf, and any MCP-compatible AI coding assistant.
+                        Drop-in proxy with no modifications to AI models.
+                    </p>
+                </div>
 
-                    <div class="feature">
-                        <h3 class="feature-title">High Performance</h3>
-                        <p class="feature-text">
-                            Built in Rust for memory safety and speed. Pattern analysis in <50ms P95.
-                            Single instance handles 10,000+ requests/second with predictable latency.
-                        </p>
-                    </div>
+                <div class="feature">
+                    <h3 class="feature-title">High Performance</h3>
+                    <p class="feature-text">
+                        Built in Rust for memory safety and speed. Pattern analysis in &lt;50ms P95.
+                        Single instance handles 10,000+ requests/second with predictable latency.
+                    </p>
+                </div>
 
-                    <div class="feature">
-                        <h3 class="feature-title">Self-Hosted Security</h3>
-                        <p class="feature-text">
-                            Not a SaaS product. Data never leaves your infrastructure. Deploy via Docker Compose, Kubernetes, or bare metal.
-                            Source code is auditable and modifiable.
-                        </p>
-                    </div>
+                <div class="feature">
+                    <h3 class="feature-title">Self-Hosted Security</h3>
+                    <p class="feature-text">
+                        Not a SaaS product. Data never leaves your infrastructure. Deploy via Docker Compose, Kubernetes, or bare metal.
+                        Source code is auditable and modifiable.
+                    </p>
                 </div>
             </div>
         </section>
@@ -731,23 +756,19 @@
             </div>
         </section>
 
-        <section style="background: var(--bg-secondary); margin: 0 -60px; padding: 80px 60px; border-top: 1px solid var(--border);">
-            <div class="container" style="padding: 0;">
-                <div class="section-header">
-                    <h2 class="section-title">Deploy in 10 Minutes</h2>
-                    <p class="section-subtitle">
-                        Docker Compose for single-server deployments. Kubernetes for HA deployments. Terraform for cloud deployments.
-                    </p>
-                </div>
-                <div style="background: #0f0f0f; border: 1px solid var(--border); border-radius: 12px; padding: 40px; max-width: 800px; margin: 0 auto;">
-                    <pre style="color: var(--text); font-family: 'SF Mono', 'Monaco', monospace; font-size: 1.1rem; line-height: 1.8; overflow-x: auto;"><code>git clone https://github.com/clay-good/proxilion
+        <section class="section-alt">
+            <div class="section-header">
+                <h2 class="section-title">Deploy in 10 Minutes</h2>
+                <p class="section-subtitle">
+                    Docker Compose for single-server deployments. Kubernetes for HA deployments. Terraform for cloud deployments.
+                </p>
+            </div>
+            <div class="code-block">
+                <pre><code>git clone https://github.com/clay-good/proxilion
 cd proxilion
 docker compose up -d
 ./demo.sh</code></pre>
-                    <p style="color: var(--text-muted); margin-top: 30px; font-size: 1.1rem; text-align: center;">
-                        Gateway running on port 8787. Dashboard on port 3000. Grafana on port 3001.
-                    </p>
-                </div>
+                <p>Gateway running on port 8787. Dashboard on port 3000. Grafana on port 3001.</p>
             </div>
         </section>
 

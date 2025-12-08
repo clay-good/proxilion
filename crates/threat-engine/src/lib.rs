@@ -6,6 +6,9 @@ use mcp_protocol::MCPToolCall;
 use serde::{Deserialize, Serialize};
 
 pub mod analyzers;
+pub mod policy;
+
+pub use policy::{Policy, PolicyError, RuleEvaluation, RuleAction};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreatAnalysisResult {

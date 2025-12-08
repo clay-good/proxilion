@@ -17,7 +17,15 @@ sha2.workspace = true
 regex = "1.10"
 url = "2.5"
 lazy_static = "1.4"
+toml = "0.8"
 
 [features]
 default = []
 semantic-analysis = ["reqwest", "base64"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "threat_analysis"
+harness = false

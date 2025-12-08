@@ -1,0 +1,188 @@
+# Proxilion MCP Security Gateway - Prometheus Alert Rules
+# Copy this file to your Prometheus configuration directory
+# and reference it in prometheus.yml under rule_files
+
+groups:
+  #############################################################################
+  # CRITICAL ALERTS - Require immediate response (15 minutes)
+  #############################################################################
+  - name: proxilion_critical
+    interval: 30s
+    rules:
+      - alert: ProxilionSessionTerminated
+        expr: increase(proxilion_sessions_terminated_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Proxilion session terminated due to threat"
+          description: "{{ $value }} session(s) terminated in the last 5 minutes. Reason: {{ $labels.reason }}. Immediate investigation required."
+
+      - alert: ProxilionHighThreatBurst
+        expr: increase(proxilion_threats_detected_total{decision="Terminate"}[5m]) > 3
+        for: 0m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Multiple high-severity threats detected"
+          description: "{{ $value }} terminate-level threats detected in 5 minutes. Possible active attack."
+
+      - alert: ProxilionGatewayDown
+        expr: proxilion_gateway_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Proxilion gateway is down"
+          description: "Proxilion gateway has been down for more than 1 minute. Security monitoring is offline."
+
+      - alert: ProxilionRedisDown
+        expr: proxilion_redis_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Proxilion lost Redis connection"
+          description: "Redis connection lost for 2+ minutes. Session tracking disabled."
+
+  #############################################################################
+  # HIGH ALERTS - Respond within 4 hours
+  #############################################################################
+  - name: proxilion_high
+    interval: 60s
+    rules:
+      - alert: ProxilionThreatsBlocked
+        expr: increase(proxilion_threats_blocked_total[15m]) > 5
+        for: 5m
+        labels:
+          severity: high
+          team: security
+        annotations:
+          summary: "Multiple threats blocked"
+          description: "{{ $value }} threats blocked in the last 15 minutes. Analyzer: {{ $labels.analyzer }}."
+
+      - alert: ProxilionCredentialAccess
+        expr: increase(proxilion_threats_detected_total{analyzer="credential"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          team: security
+        annotations:
+          summary: "Credential access attempt detected"
+          description: "Credential harvesting attempt detected. Decision: {{ $labels.decision }}."
+
+      - alert: ProxilionExfiltrationAttempt
+        expr: increase(proxilion_threats_detected_total{analyzer="exfiltration"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          team: security
+        annotations:
+          summary: "Data exfiltration attempt detected"
+          description: "Data exfiltration attempt detected. Decision: {{ $labels.decision }}."
+
+      - alert: ProxilionGTG1002Indicator
+        expr: increase(proxilion_gtg1002_indicators_total[30m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          team: security
+        annotations:
+          summary: "GTG-1002 attack indicator detected"
+          description: "Indicator type: {{ $labels.indicator_type }}. This matches patterns of sophisticated AI-orchestrated attacks."
+
+      - alert: ProxilionHighErrorRate
+        expr: rate(proxilion_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: high
+          team: platform
+        annotations:
+          summary: "Proxilion experiencing high error rate"
+          description: "Error rate: {{ $value | printf \"%.2f\" }}/sec. Error type: {{ $labels.error_type }}."
+
+  #############################################################################
+  # MEDIUM ALERTS - Review within 24 hours
+  #############################################################################
+  - name: proxilion_medium
+    interval: 120s
+    rules:
+      - alert: ProxilionAlertThreats
+        expr: increase(proxilion_threats_detected_total{decision="Alert"}[1h]) > 10
+        for: 15m
+        labels:
+          severity: medium
+          team: security
+        annotations:
+          summary: "Elevated alert-level threats"
+          description: "{{ $value }} alert-level threats in the last hour."
+
+      - alert: ProxilionReconnaissance
+        expr: increase(proxilion_threats_detected_total{analyzer="enumeration"}[1h]) > 3
+        for: 0m
+        labels:
+          severity: medium
+          team: security
+        annotations:
+          summary: "Network reconnaissance activity"
+          description: "{{ $value }} reconnaissance attempts detected."
+
+      - alert: ProxilionHighLatency
+        expr: histogram_quantile(0.95, rate(proxilion_total_analysis_duration_seconds_bucket[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: medium
+          team: platform
+        annotations:
+          summary: "Proxilion analysis latency elevated"
+          description: "P95 latency: {{ $value | printf \"%.3f\" }}s. Target: <50ms."
+
+      - alert: ProxilionUserHighActivity
+        expr: increase(proxilion_requests_by_user_total[1h]) > 1000
+        for: 0m
+        labels:
+          severity: medium
+          team: security
+        annotations:
+          summary: "Single user with high request volume"
+          description: "User {{ $labels.user_id }} made {{ $value }} requests in 1 hour."
+
+      - alert: ProxilionSemanticCostHigh
+        expr: increase(proxilion_semantic_analysis_cost_usd[1h]) > 10
+        for: 0m
+        labels:
+          severity: medium
+          team: platform
+        annotations:
+          summary: "Semantic analysis cost elevated"
+          description: "Spent ${{ $value | printf \"%.2f\" }} on Claude API in the last hour."
+
+  #############################################################################
+  # LOW ALERTS - Review in weekly report
+  #############################################################################
+  - name: proxilion_low
+    interval: 300s
+    rules:
+      - alert: ProxilionThreatActivity
+        expr: increase(proxilion_threats_detected_total[24h]) > 50
+        for: 0m
+        labels:
+          severity: low
+          team: security
+        annotations:
+          summary: "Elevated threat detection rate"
+          description: "{{ $value }} total threats detected in 24 hours."
+
+      - alert: ProxilionAnalyzerErrors
+        expr: increase(proxilion_analyzer_errors_total[1h]) > 5
+        for: 0m
+        labels:
+          severity: low
+          team: platform
+        annotations:
+          summary: "Analyzer errors detected"
+          description: "{{ $value }} errors from {{ $labels.analyzer }} analyzer."

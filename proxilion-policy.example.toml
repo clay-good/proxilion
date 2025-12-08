@@ -1,0 +1,187 @@
+# Proxilion Policy Configuration
+# ================================
+# Copy this file to proxilion-policy.toml and customize for your environment.
+#
+# Usage:
+#   POLICY_FILE=./proxilion-policy.toml ./target/release/proxilion-gateway
+
+# =============================================================================
+# GLOBAL SETTINGS
+# =============================================================================
+
+[settings]
+# Threat score thresholds (0-100)
+alert_threshold = 50        # Score >= this triggers an alert
+block_threshold = 70        # Score >= this blocks the request
+terminate_threshold = 90    # Score >= this terminates the session
+
+# Maximum score adjustment from custom rules (-100 to +100)
+# Prevents a single rule from dramatically changing scores
+max_score_adjustment = 50
+
+# Disable specific built-in analyzers (use analyzer names from lib.rs)
+# disabled_analyzers = ["hallucination", "ai_velocity"]
+
+# Enable optional analyzers (requires additional configuration)
+# enabled_analyzers = ["semantic", "conversation_analysis"]
+
+# =============================================================================
+# CUSTOM RULES
+# =============================================================================
+# Rules are evaluated in priority order (higher priority first).
+# Actions: allow, alert, block, terminate, adjust
+# Targets: command, path, url, query, all
+
+# Allow standard development tools
+[[rules]]
+name = "allow-git-operations"
+description = "Standard git operations are safe"
+pattern = "^git (status|log|diff|add|commit|push|pull|fetch|branch|checkout|merge|rebase|stash)"
+action = "allow"
+score = 0
+priority = 100
+target = "command"
+
+[[rules]]
+name = "allow-npm-yarn"
+description = "Package manager operations"
+pattern = "^(npm|yarn|pnpm) (install|add|remove|update|run|test|build)"
+action = "allow"
+score = 0
+priority = 100
+target = "command"
+
+[[rules]]
+name = "allow-cargo"
+description = "Rust cargo operations"
+pattern = "^cargo (build|test|run|check|clippy|fmt|doc|bench)"
+action = "allow"
+score = 0
+priority = 100
+target = "command"
+
+# Block dangerous patterns
+[[rules]]
+name = "block-reverse-shell"
+description = "Reverse shell patterns"
+pattern = "bash -i >& /dev/tcp|nc -e /bin/|python -c.*socket.*connect"
+action = "block"
+score = 95
+priority = 200
+target = "command"
+
+[[rules]]
+name = "block-data-destruction"
+description = "Destructive commands on root"
+pattern = "rm -rf /[^/]|mkfs\\.|dd if=.* of=/dev/"
+action = "terminate"
+score = 100
+priority = 200
+target = "command"
+
+# Security team exceptions
+[[rules]]
+name = "security-team-nmap"
+description = "Allow security team to use scanning tools"
+pattern = "nmap|masscan|nikto"
+action = "allow"
+score = 0
+priority = 150
+target = "command"
+[rules.conditions]
+user_pattern = "security-.*@company\\.com"
+
+# Adjust scores for context
+[[rules]]
+name = "reduce-dev-environment"
+description = "Lower scores in development paths"
+pattern = "/home/.*/dev/|/tmp/test"
+action = "adjust"
+score = -20
+priority = 50
+target = "path"
+
+[[rules]]
+name = "increase-production-paths"
+description = "Higher scores for production paths"
+pattern = "/var/www/|/opt/app/|/etc/"
+action = "adjust"
+score = 15
+priority = 50
+target = "path"
+
+# =============================================================================
+# ALLOWLISTS
+# =============================================================================
+
+# User-based allowlists
+[[allowlists.users]]
+id = "security-team@company\\.com"
+bypass_patterns = ["nmap", "metasploit", "burpsuite"]
+max_score = 95  # Higher threshold for security team
+
+[[allowlists.users]]
+id = "devops-.*@company\\.com"
+bypass_patterns = ["kubectl", "docker", "terraform"]
+
+# Command allowlists (always allowed regardless of other rules)
+[[allowlists.commands]]
+pattern = "^ls( -[a-zA-Z]+)*$"
+reason = "Basic directory listing"
+
+[[allowlists.commands]]
+pattern = "^pwd$"
+reason = "Print working directory"
+
+[[allowlists.commands]]
+pattern = "^whoami$"
+reason = "Current user check"
+
+# Path allowlists
+[[allowlists.paths]]
+pattern = "^/tmp/proxilion-test/"
+reason = "Testing directory"
+
+# =============================================================================
+# BLOCKLISTS
+# =============================================================================
+
+# Command blocklists (always blocked regardless of other rules)
+[[blocklists.commands]]
+pattern = "curl.*\\|.*sh$|wget.*\\|.*bash"
+reason = "Piped download to shell execution"
+score = 100
+
+[[blocklists.commands]]
+pattern = "chmod.*777.*/"
+reason = "World-writable permissions on root paths"
+score = 85
+
+[[blocklists.commands]]
+pattern = "base64 -d.*\\|.*sh"
+reason = "Base64 decoded shell execution"
+score = 95
+
+# Path blocklists
+[[blocklists.paths]]
+pattern = "/etc/shadow|/etc/passwd"
+reason = "System credential files"
+score = 90
+
+[[blocklists.paths]]
+pattern = "\\.aws/credentials|\\.ssh/id_"
+reason = "Cloud/SSH credential files"
+score = 85
+
+# Network blocklists
+[[blocklists.network]]
+pattern = "169\\.254\\.169\\.254"
+reason = "AWS metadata endpoint (SSRF)"
+
+[[blocklists.network]]
+pattern = "\\.(onion|i2p)$"
+reason = "Dark web domains"
+
+[[blocklists.network]]
+pattern = "pastebin\\.com|hastebin\\.com|ghostbin\\."
+reason = "Code paste services (potential exfiltration)"

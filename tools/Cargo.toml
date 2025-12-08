@@ -1,0 +1,13 @@
+[package]
+name = "proxilion-tools"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tools for Proxilion MCP Security Gateway"
+
+[workspace]
+
+[[bin]]
+name = "cost-calculator"
+path = "cost-calculator.rs"
+
+[dependencies]

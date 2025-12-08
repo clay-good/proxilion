@@ -11,6 +11,8 @@
 use mcp_protocol::MCPToolCall;
 use crate::AnalyzerResult;
 use serde_json::json;
+
+#[cfg(feature = "semantic-analysis")]
 use std::collections::HashMap;
 
 #[cfg(feature = "semantic-analysis")]
@@ -78,6 +80,8 @@ impl SemanticAnalyzer {
 
         #[cfg(not(feature = "semantic-analysis"))]
         {
+            // Suppress unused parameter warnings when feature is disabled
+            let _ = (tool_call, pattern_score);
             return AnalyzerResult {
                 analyzer_name: "semantic".to_string(),
                 threat_score: 0.0,
@@ -311,6 +315,7 @@ impl Default for SemanticAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_semantic_analyzer_creation() {

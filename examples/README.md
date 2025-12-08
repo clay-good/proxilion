@@ -14,11 +14,17 @@ This directory contains examples of how to integrate Proxilion with various AI c
 - Shows: Python-based MCP client integration
 - Features: Async execution, conversation tracking, error handling
 
-### Cursor (Coming Soon)
-- Integration example for Cursor AI editor
+### Cursor
+- Location: [cursor/](cursor/)
+- Shows: MCP wrapper with Proxilion analysis
+- Features: Bash, file read/write with threat detection
+- Note: Requires workaround (MCP wrapper or network proxy) as Cursor lacks native proxy support
 
-### Windsurf (Coming Soon)
-- Integration example for Windsurf AI assistant
+### Windsurf
+- Location: [windsurf/](windsurf/)
+- Shows: MCP wrapper with Proxilion analysis
+- Features: Bash, file read/write with threat detection
+- Note: Requires workaround (MCP wrapper or network proxy) as Windsurf lacks native proxy support
 
 ## Quick Start
 

@@ -86,6 +86,8 @@ impl ConversationAnalyzer {
     pub async fn analyze(&mut self, conversation_context: &str, current_tool_call: &str) -> AnalyzerResult {
         #[cfg(not(feature = "semantic-analysis"))]
         {
+            // Suppress unused parameter warnings when feature is disabled
+            let _ = (conversation_context, current_tool_call);
             return AnalyzerResult {
                 analyzer_name: "conversation_analysis".to_string(),
                 threat_score: 0.0,

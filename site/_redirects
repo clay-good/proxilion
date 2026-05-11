@@ -1,4 +1,2 @@
-# Canonicalize apex; Cloudflare Pages serves both, prefer non-www if you configure it that way.
-# 404 handling — fall back to index.html for unknown paths so deep-link sharing of anchors works.
-/index.html  /  301
+# SPA fallback — serve index.html for unknown paths so deep-link anchors work.
 /*  /index.html  200

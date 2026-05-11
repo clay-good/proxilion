@@ -36,7 +36,11 @@ ID_TOKEN=$(curl -fsS -X POST "$MOCK_OKTA/token" \
   -d client_id=proxilion-dev \
   -d client_secret=dev-secret \
   -d scope=openid \
-  | jq -r .id_token)
+  | jq -r '.id_token // .access_token')
+# mock-oauth2-server's client_credentials grant returns access_token only (no
+# id_token per RFC 6749). The Trust Plane stub validator decodes payload only,
+# so the access_token JWT works identically here. When we switch to a real
+# bridge with JWKS, we'll switch to a grant that does emit id_token.
 
 if [[ -z "$ID_TOKEN" || "$ID_TOKEN" == "null" ]]; then
   echo "mock-okta did not return an id_token; is the service up on $MOCK_OKTA ?" >&2

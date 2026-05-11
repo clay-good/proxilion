@@ -20,7 +20,7 @@ use tracing::{Instrument, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::adapters::action_stream::BroadcastingActionStream;
-use crate::adapters::{AdapterState, google_drive};
+use crate::adapters::{AdapterState, google_drive, google_gmail};
 use crate::api::{self, ApiState};
 use crate::auth_middleware::{AuthState, RefreshCoordinator, auth_middleware};
 use crate::config::Config;
@@ -444,7 +444,11 @@ fn build_adapter_state(
 }
 
 fn adapter_router(adapter: AdapterState, auth: AuthState) -> Router {
-    google_drive::router(adapter).route_layer(middleware::from_fn_with_state(auth, auth_middleware))
+    let drive = google_drive::router(adapter.clone());
+    let gmail = google_gmail::router(adapter);
+    drive
+        .merge(gmail)
+        .route_layer(middleware::from_fn_with_state(auth, auth_middleware))
 }
 
 /// A small router for endpoints that require a `SessionCtx`. The real meat

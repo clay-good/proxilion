@@ -1,0 +1,39 @@
+# Proxilion Layer-B policy bundle. Authority: spec.md §9 + ui-less-surfaces.md §2.
+#
+# Per-policy `pic_mode: audit | runtime-gate` toggles Layer-A enforcement.
+# `decision: allow | block | require_confirmation | rate_limit` is Layer B.
+
+- id: drive-injection-filter
+  vendor: google
+  action: drive.files.get
+  decision: allow
+  read_filter:
+    quarantine_patterns:
+      - "ignore previous instructions"
+      - "system prompt:"
+      - regex: '<\|.*?\|>'
+    quarantine_action: replace_with_marker
+  required_ops:
+    - "drive:read:file/${path.id}"
+  pic_mode: audit
+
+# spec.md §9 — external send gate. Blocks any gmail.messages.send that has at
+# least one external recipient. (`body.external_recipient` is a boolean
+# computed by the Gmail adapter; per spec §5.4 the policy engine only sees
+# fields the adapter explicitly exposes.) Multi-domain ops-atom expansion is
+# §2.2 work; this policy carries one required ops atom keyed on the first
+# unique recipient domain.
+- id: gmail-external-send-gate
+  vendor: google
+  action: gmail.messages.send
+  match:
+    body.external_recipient:
+      equals: true
+  decision: block
+  override: requires_justification
+  # ${body.to_domains} is list-valued; the policy engine expands this template
+  # into one atom per unique recipient domain (spec.md §2.2). The leaf PCA
+  # must carry a `gmail:send:<user>:to:<domain>` atom for every recipient.
+  required_ops:
+    - "gmail:send:${user.email}:to:${body.to_domains}"
+  pic_mode: runtime-gate

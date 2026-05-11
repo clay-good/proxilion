@@ -28,6 +28,30 @@ pub struct UserCtx {
 }
 
 impl RequestContext {
+    /// Look up a list-valued template variable. Returns `Some(vec)` only when
+    /// the bound value is genuinely a JSON array of strings — scalars and
+    /// other shapes return `None` so the caller can fall back to the scalar
+    /// `lookup` path. Used by `OpsExpression::resolve` (spec.md §2.2) to
+    /// expand a single template into N atoms, e.g.
+    /// `gmail:send:to:${body.to_domains}` over 3 recipient domains yields 3
+    /// required-ops atoms.
+    pub fn lookup_list(&self, dotted: &str) -> Option<Vec<String>> {
+        let (head, tail) = dotted.split_once('.')?;
+        let value = match head {
+            "body" => self.body.get(tail)?,
+            // path / headers / user are flat string maps — never list-valued.
+            _ => return None,
+        };
+        let arr = value.as_array()?;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            // A list with a non-string element is not a valid expansion; fall
+            // back to the scalar path by returning None.
+            out.push(v.as_str()?.to_string());
+        }
+        Some(out)
+    }
+
     /// Look up `dotted.path` against `path.*`, `user.*`, `body.*`, `headers.*`,
     /// and the bare `customer_domain` identifier used in YAML templates.
     pub fn lookup(&self, dotted: &str) -> Option<String> {

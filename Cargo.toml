@@ -78,6 +78,7 @@ mime = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 async-stream = "0.3"
+mailparse = "0.15"
 
 [profile.release]
 lto = "thin"

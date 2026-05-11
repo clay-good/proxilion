@@ -76,6 +76,12 @@ services:
       PROXILION_LOG_FORMAT: json
       DATABASE_URL: postgres://proxilion:proxilion@postgres/proxilion
       RUST_LOG: info,proxy=debug
+      PROXILION_TOKEN_ENCRYPTION_KEY: "${PROXILION_TOKEN_ENCRYPTION_KEY:-}"
+      GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
+      GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-}"
+      PROXILION_BASE_URL: "${PROXILION_BASE_URL:-https://localhost:8443}"
+      PROXILION_POLICY_PATH: "${PROXILION_POLICY_PATH:-/config/policy.yaml}"
+      PROXILION_CUSTOMER_DOMAIN: "${PROXILION_CUSTOMER_DOMAIN:-acme.com}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,6 +89,7 @@ services:
         condition: service_started
     volumes:
       - proxy-certs:/certs
+      - ./config:/config:ro
     ports:
       - "8443:8443"
 
@@ -92,7 +99,6 @@ services:
       JSON_CONFIG: |
         {
           "interactiveLogin": true,
-          "tokenProvider": { "issuerId": "default" },
           "tokenCallbacks": [
             {
               "issuerId": "default",
@@ -105,7 +111,8 @@ services:
                     "sub": "alice@demo.local",
                     "preferred_username": "alice@demo.local",
                     "email": "alice@demo.local",
-                    "groups": ["engineering"]
+                    "groups": ["engineering"],
+                    "pic_ops": ["drive:read:alice@demo.local", "drive:read:engineering"]
                   }
                 }
               ]
@@ -113,7 +120,7 @@ services:
           ]
         }
     ports:
-      - "9090:9090"
+      - "9090:8080"
 
 volumes:
   postgres-data:

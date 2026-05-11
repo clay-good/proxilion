@@ -64,11 +64,17 @@ impl OpsExpression {
         OpsAtom::parse(&resolved)
     }
 
-    /// Resolve a list of templates.
+    /// Resolve a list of templates. Each template produces one *or more*
+    /// atoms: if exactly one `${var}` reference in the template resolves to a
+    /// list-valued context lookup (`RequestContext::lookup_list`), the
+    /// template is expanded once per list element. Templates referencing
+    /// multiple list-valued vars are rejected with `OpsParseError::Malformed`
+    /// (Cartesian-product expansion is out of scope; the recipient-domain use
+    /// case in spec.md §2.1 needs only a single list var).
     pub fn resolve(templates: &[String], ctx: &RequestContext) -> Result<Self, OpsParseError> {
         let mut required = Vec::with_capacity(templates.len());
         for t in templates {
-            required.push(Self::resolve_one(t, ctx)?);
+            required.extend(expand_template(t, ctx)?);
         }
         Ok(Self { required })
     }
@@ -86,6 +92,54 @@ impl OpsExpression {
             Err(MissingOps { missing })
         }
     }
+}
+
+/// Expand a single template into one or more atoms, supporting at most one
+/// list-valued substitution per template. See `OpsExpression::resolve`.
+pub(crate) fn expand_template(
+    template: &str,
+    ctx: &RequestContext,
+) -> Result<Vec<OpsAtom>, OpsParseError> {
+    // Find every `${var}` reference. If exactly one resolves list-valued,
+    // expand. Otherwise fall through to scalar substitution.
+    let vars = collect_vars(template)?;
+    let mut list_var: Option<(String, Vec<String>)> = None;
+    for v in &vars {
+        if let Some(list) = ctx.lookup_list(v) {
+            if list_var.is_some() {
+                // Two list-valued vars → ambiguous Cartesian product. Reject.
+                return Err(OpsParseError::Malformed);
+            }
+            list_var = Some((v.clone(), list));
+        }
+    }
+    match list_var {
+        None => Ok(vec![OpsExpression::resolve_one(template, ctx)?]),
+        Some((var, values)) => {
+            let mut atoms = Vec::with_capacity(values.len());
+            for v in values {
+                // Substitute the list-var inline, then resolve the rest.
+                let placeholder = format!("${{{var}}}");
+                let staged = template.replace(&placeholder, &v);
+                atoms.push(OpsExpression::resolve_one(&staged, ctx)?);
+            }
+            Ok(atoms)
+        }
+    }
+}
+
+fn collect_vars(template: &str) -> Result<Vec<String>, OpsParseError> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| OpsParseError::UnknownVar(after.to_owned()))?;
+        out.push(after[..end].to_owned());
+        rest = &after[end + 1..];
+    }
+    Ok(out)
 }
 
 /// Substitute `${dotted.path}` references in `template` against `ctx`.
@@ -143,6 +197,65 @@ mod tests {
         let err =
             OpsExpression::resolve_one("drive:read:file/${path.missing}", &ctx()).unwrap_err();
         assert!(matches!(err, OpsParseError::UnknownVar(ref v) if v == "path.missing"));
+    }
+
+    #[test]
+    fn list_valued_template_expands_to_n_atoms() {
+        let mut body = std::collections::HashMap::new();
+        body.insert(
+            "to_domains".into(),
+            serde_json::json!(["evil.example", "spam.example"]),
+        );
+        let mut c = ctx();
+        c.body = body;
+        let atoms = OpsExpression::resolve(
+            &["gmail:send:${user.email}:to:${body.to_domains}".to_string()],
+            &c,
+        )
+        .unwrap();
+        assert_eq!(atoms.required.len(), 2);
+        assert!(atoms.required.iter().any(|a| a.object.contains("evil.example")));
+        assert!(atoms.required.iter().any(|a| a.object.contains("spam.example")));
+    }
+
+    #[test]
+    fn scalar_template_still_resolves() {
+        let exp = OpsExpression::resolve(
+            &["drive:read:file/${path.id}".to_string()],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(exp.required.len(), 1);
+        assert_eq!(exp.required[0].object, "file/abc123");
+    }
+
+    #[test]
+    fn two_list_vars_rejected() {
+        let mut body = std::collections::HashMap::new();
+        body.insert("a".into(), serde_json::json!(["x", "y"]));
+        body.insert("b".into(), serde_json::json!(["p", "q"]));
+        let mut c = ctx();
+        c.body = body;
+        let err = OpsExpression::resolve(
+            &["test:do:${body.a}:${body.b}".to_string()],
+            &c,
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpsParseError::Malformed));
+    }
+
+    #[test]
+    fn empty_list_yields_zero_atoms() {
+        let mut body = std::collections::HashMap::new();
+        body.insert("to_domains".into(), serde_json::json!([]));
+        let mut c = ctx();
+        c.body = body;
+        let atoms = OpsExpression::resolve(
+            &["gmail:send:${user.email}:to:${body.to_domains}".to_string()],
+            &c,
+        )
+        .unwrap();
+        assert!(atoms.required.is_empty());
     }
 
     #[test]

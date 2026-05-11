@@ -1,0 +1,41 @@
+# Cloudflare Workers deployment for proxilion.com.
+#
+# This config lets Cloudflare's GitHub integration deploy the static
+# marketing site under `site/` straight from `main` with no build step.
+#
+# Setup in the Cloudflare dashboard (one-time):
+#   1. Workers & Pages → Create application → Workers → Connect to Git
+#   2. Pick this repo and the `main` branch
+#   3. Build command:   (empty — no build step)
+#      Deploy command:  npx wrangler@latest deploy
+#      Root directory:  (leave blank — wrangler.toml lives at repo root)
+#   4. After the first deploy, Custom Domains → Add `proxilion.com` and
+#      `www.proxilion.com`. The dashboard is the authoritative place for
+#      hostnames; we don't replicate that here so subsequent deploys don't
+#      fight it.
+#
+# Local equivalents:
+#   wrangler dev      # serve site/ on http://127.0.0.1:8787
+#   wrangler deploy   # one-shot deploy from a developer machine
+#
+# Workers Static Assets natively honors `site/_headers` and `site/_redirects`
+# (same syntax as Pages). See:
+#   https://developers.cloudflare.com/workers/static-assets/
+
+name = "proxilion"
+main = ".cloudflare/worker.js"
+compatibility_date = "2026-05-11"
+workers_dev = false   # don't expose proxilion.workers.dev; production-only
+
+[assets]
+directory = "./site"
+binding = "ASSETS"
+# Fall back to /index.html for any unmatched path so deep-link anchors work
+# (e.g. proxilion.com/#how-it-works). Matches site/_redirects but is
+# redundantly declared here as a guard against accidental _redirects edits.
+not_found_handling = "single-page-application"
+# Static assets are served before the worker runs. The worker is only invoked
+# if `ASSETS.fetch()` is called explicitly (see .cloudflare/worker.js).
+run_worker_first = false
+
+# No KV, R2, D1, queues, or secrets — pure static site.

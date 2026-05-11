@@ -57,6 +57,7 @@ regex = { workspace = true }
 tokio-stream = { workspace = true }
 futures-util = { workspace = true }
 async-stream = { workspace = true }
+mailparse = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

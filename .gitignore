@@ -91,9 +91,9 @@ coverage/
 # Rust-analyzer metadata/cache
 .rust-analyzer/
 
-# Generated dependency lock file (usually tracked, but sometimes ignored in small snippets)
-# Keeping the existing line, but note that Cargo.lock is typically committed in applications.
-Cargo.lock
+# Cargo.lock IS committed for this workspace — Proxilion ships application
+# binaries (proxy, cli) and the spec (§3, §3.2) relies on Cargo.lock pinning
+# the upstream `provenance-core` SHA so `cargo update` can't silently bump it.
 
 # Build artifacts and temporary files
 *.rs.bk

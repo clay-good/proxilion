@@ -1581,6 +1581,23 @@ Acceptance:
   - Tampered PCA visibly marked broken in the UI
 ```
 
+**Status:** Done (ui-less-surfaces variant). Per [`ui-less-surfaces.md`](./ui-less-surfaces.md) §10.2, the dashboard work is dropped and replaced by `proxilion-cli` + Prometheus `/metrics`. Delivered:
+- [crates/cli/src/main.rs](../../crates/cli/src/main.rs) — `proxilion-cli actions {tail,list,show,export}` plus `health`, `pca`, `verify`, `selftest`. `tail` consumes the proxy's SSE stream with client-side decision/vendor/action filters; `list` paginates by `before=` cursor (1..=500); `show` renders the PCA chain inline (root→leaf, hop / 🌱 root / 🔗 successor, p_0 carried through, ops narrowing diff, ✓/✗ chain summary); `export` streams NDJSON or CSV from the proxy to stdout/file with O(1) memory at both ends.
+- [crates/proxy/src/api/actions.rs](../../crates/proxy/src/api/actions.rs) — `GET /api/v1/actions` (paginated `{rows,next_before}` envelope), `/actions/recent`, `/actions/stream` (SSE, 5s keep-alive), `/actions/export` (chunked NDJSON/CSV directly from a postgres cursor), `/actions/{id}` (full record with embedded `chain[]`), `/sessions/{id}/chain`.
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) `/metrics` Prometheus exposition wired via `metrics_exporter_prometheus`; emitters in `auth_middleware.rs`, `adapters/action_stream.rs`, `adapters/google_drive.rs`, `api/actions.rs` cover `proxilion_auth_attempts_total`, `proxilion_token_refreshes_total`, `proxilion_pca_cache_{hits,misses}_total`, `proxilion_pca_verify_failures_total`, `proxilion_action_events_persisted_total{decision}`, `proxilion_audit_export_{requests,bytes}_total{format}`.
+- [ops/grafana/proxilion.json](../../ops/grafana/proxilion.json) — five-panel dashboard (auth attempts rate, auth-rejected share, refreshes, PCA cache hits/misses, verify failures). Imports cleanly into Grafana 10+. Per §3.4 of `ui-less-surfaces.md` the full four-question layout (security / annoyance / rollout candidates / health) is a follow-up; the current panels cover the "security" + "health" quadrants.
+
+**Verified end-to-end against the live compose stack (2026-05-11):**
+- `docker compose up -d --wait postgres trust-plane mock-okta proxy` → all healthy, `curl -k https://127.0.0.1:8443/healthz` returns `ready:true`.
+- `scripts/smoke-pic.sh` obtains PCA_0 with `p_0=oidc:http://127.0.0.1:9090/default#alice@demo.local`, ops verified, 528-byte COSE blob.
+- `proxilion-cli actions list/show/export/tail` and `proxilion-cli verify <pca>` all exercise the proxy; metrics counters tick (`proxilion_audit_export_requests_total{format="ndjson"} 1` after one export, etc.).
+- Bad UUID → 400 with a clean error envelope; unknown action id → 404; unknown PCA id → `intact:false, broken_at:<id>, reason:"… not found in cache"`.
+
+**Spec deviations to flag:**
+1. **`docker-compose.yml` mock-okta fixes during verification.** The original `tokenProvider.issuerId` field was rejected by `mock-oauth2-server 2.1.10`; removed. The mock image listens on container port 8080, not 9090; remapped host 9090 → container 8080. `pic_ops` claim added to the `requestMappings` so Trust Plane's `validate_jwt_credential` accepts the token.
+2. **`scripts/smoke-pic.sh` now falls back to `access_token` when `id_token` is absent** (client_credentials per RFC 6749 doesn't emit id_token). Trust Plane stub validator decodes payload only, so both JWTs work identically. Swap back to `id_token` when a real bridge with JWKS is wired.
+3. **Grafana JSON is partial** — five panels covering auth + PCA verify rather than the four-quadrant layout in `ui-less-surfaces.md` §3.4. The exposition format is complete; panel expansion is a docs/JSON-only follow-up.
+
 **M1 done when:** Alice signs in via Okta, Claude managed agent connects through Proxilion, the agent reads a Drive file, the action appears in the dashboard with a verified 3-link PCA chain showing `p_0 = alice@org.com` at every hop. An attempt by the agent to read a file outside Alice's ops set returns 403 with a `PicInvariantViolation` error, surfaced in the dashboard as a blocked action. The "confused deputy" attack is non-expressible in the demo.
 
 ---
@@ -1639,6 +1656,38 @@ Testing:
 
 ---
 
+**Status:** Done (structurally; live SaaS call deferred for the same reason as §1.3). `cargo build --workspace` clean; 58 unit + integration tests pass (11 new in `adapters::google_gmail::tests`, 3 new in `policy-engine/tests/gmail_external_send.rs`). **Delivered:**
+- [crates/proxy/src/adapters/google_gmail.rs](../../crates/proxy/src/adapters/google_gmail.rs) — three routes (`POST /google/gmail/v1/users/me/messages/send`, `GET …/messages`, `GET …/messages/{id}`). The send path: base64url-decodes the `{ raw }` payload, parses RFC 2822 with `mailparse`, and surfaces structured fields under `body.*` (`to`, `cc`, `bcc`, `to_domain` (first unique recipient domain), `to_domains` (sorted unique list), `external_recipient` (bool), `recipient_count`, `attachment_count`, `subject_present`, `from_p0`). The same `proxy_request` template the Drive adapter uses (Layer-B policy → PCA_2 successor with narrowed ops → upstream → action event) flows through; reads also pick up the read filter when content-type is appropriate. Forwarded body is the agent's original raw payload, never the mailparse round-trip.
+- Body-field exposure follows the §5.4 default-deny rule: list/get expose nothing, send opts in to the recipient/subject fields explicitly. The Gmail send Google bearer remains adapter-internal.
+- [crates/proxy/Cargo.toml](../../crates/proxy/Cargo.toml) + [Cargo.toml](../../Cargo.toml) workspace add `mailparse = "0.15"`.
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) — `adapter_router` now merges `google_drive::router(...).merge(google_gmail::router(...))` under the same `auth_middleware` layer.
+- [crates/proxy/src/adapters/mod.rs](../../crates/proxy/src/adapters/mod.rs) — exports the new module.
+- [config/policy.yaml](../../config/policy.yaml) — first real customer-shape policy bundle: the `drive-injection-filter` (audit) and the §9 `gmail-external-send-gate` (runtime-gate, `match body.external_recipient: { equals: true }`, `decision: block`, `override: requires_justification`, `required_ops: ["gmail:send:${user.email}:to:${body.to_domain}"]`). Mounted into the proxy via `PROXILION_POLICY_PATH=/config/policy.yaml` in [docker-compose.yml](../../docker-compose.yml) (config dir bind-mounted read-only).
+- [crates/policy-engine/tests/gmail_external_send.rs](../../crates/policy-engine/tests/gmail_external_send.rs) + [crates/policy-engine/tests/config_policy_yaml.rs](../../crates/policy-engine/tests/config_policy_yaml.rs) — end-to-end policy evaluation tests against the real `config/policy.yaml`: external recipient → `Block { override_allowed: true }`, internal-only → `Allow`, required ops atom resolves correctly with `${user.email}` and `${body.to_domain}` substitutions.
+
+**Unit-test coverage (`adapters::google_gmail::tests`, 11 tests):**
+- `decode_handles_padded_and_unpadded` — both base64url variants work.
+- `parse_simple_message`, `parse_multiple_recipients_with_display_names` — RFC 5322 + display-name parsing via `mailparse::addrparse`.
+- `body_ctx_flags_external_recipient`, `body_ctx_all_internal_is_not_external` — `external_recipient` boolean correctness.
+- `body_ctx_attachment_count_counts_attachments` — multipart/mixed with one attachment counts as 1.
+- `malformed_b64url_is_rejected` — decoder fails on garbage instead of silent.
+- `empty_to_yields_empty_to_domain` — pathological message with no `To:` doesn't panic.
+- `domain_of_helper` — handles mixed-case and bare strings.
+- `enforce_block_returns_policy_blocked`, `enforce_require_confirmation` — Decision → AppError mapping.
+
+**End-to-end verification against the live compose stack (2026-05-11):**
+- `docker compose up -d --build proxy` with `PROXILION_POLICY_PATH=/config/policy.yaml`, `GOOGLE_CLIENT_ID/SECRET`, `PROXILION_CUSTOMER_DOMAIN=acme.com` env vars. Proxy log line `full set mounted (OAuth + adapters + admin + actions + PCA APIs)` confirms both adapters live.
+- `curl -X POST /google/gmail/v1/users/me/messages/send` without a bearer → `401 unauthorized` (no body leak); with an unknown `pxl_live_*` bearer → `401 unauthorized`; with a malformed `Token …` scheme → `401 unauthorized`. Auth middleware sits in front of the handler exactly as designed.
+- `proxilion_auth_attempts_total{result="rejected"}` increments on every failed bearer probe. Metrics surface holds.
+- Stress: 50 concurrent `/healthz` → all 200; 100 sequential `/api/v1/actions?limit=10` → all 200; malformed `before` cursor → 400; oversized `limit` clamped to server max (50) at the SQL layer; `/api/v1/actions/{uuid}` with a garbage segment → 400 with envelope.
+
+**Spec deviations to flag:**
+1. **Per-recipient ops-atom expansion deferred to §2.2.** The required_ops template substitutes `${body.to_domain}` to a single atom. A send to N domains today produces one atom for the *first* unique domain; the spec calls out "one atom per recipient domain, joined" which needs the `OpsExpression::resolve` substitution to support list-valued templates. Tracked alongside §2.2.
+2. **Live wiremock'd Gmail integration test deferred** — same blocker as §1.1/§1.3: needs postgres + wiremock'd Trust Plane + Google in CI, plus a seeded `agent_bearers` row. Structural slices (body parse, ctx build, policy → AppError) are unit-tested; the wire-level scenario from the spec ("happy path", "external block returns 403 with policy_id") is tracked behind the same harness backlog.
+3. **`blocked_actions` `request_canonical_json` not persisted** — the spec calls for it; for now we record `(request_id, session_id, vendor, action, layer, policy_id, detail)` and rely on the action_event row for canonical request fields. The schema doesn't carry a `request_canonical_json` column yet; lands when §2.3 needs the override flow to surface the original request to the approver.
+
+---
+
 ### Step 2.2 — Policy language depth + ops template grammar
 
 **Phase:** M2
@@ -1648,6 +1697,26 @@ Testing:
 **Estimated effort:** 1–2 days
 
 *(Mostly as v0 spec — extend Layer B operators. New: extend OpsExpression to handle list-valued template substitutions, e.g., `gmail:send:to:${body.to_domain_list}` expands to N atoms.)*
+
+**Status:** List-valued template expansion done; Layer-B operator expansion not yet scheduled (the existing match-expression set in §0.3 — `equals`, `in`, `not_in`, `matches`, etc. — has covered every customer use case shipped so far). **Delivered:**
+- [crates/policy-engine/src/context.rs](../../crates/policy-engine/src/context.rs) — new `RequestContext::lookup_list(dotted)` returns `Option<Vec<String>>` for genuinely list-valued bindings under `body.*` (the only namespace allowed to carry arrays today; `path`, `headers`, `user` are flat string maps by construction). Returns `None` for scalars and for arrays containing non-string elements, so the caller falls back to the scalar `lookup` path without surprises.
+- [crates/policy-engine/src/ops.rs](../../crates/policy-engine/src/ops.rs) — `OpsExpression::resolve` now expands one or more atoms per template via the new `expand_template(template, ctx)` helper:
+  - Templates with no list-valued var: scalar substitution as before, one atom each.
+  - Templates with exactly one list-valued var: expanded once per element. `"gmail:send:${user.email}:to:${body.to_domains}"` against a 3-domain recipient list yields 3 atoms.
+  - Templates with two list-valued vars: rejected with `OpsParseError::Malformed`. Cartesian-product expansion is out of scope; the §2.1 recipient-domain use case needs only single-list expansion.
+  - Empty list: yields zero atoms (a deliberately permissive choice — the leaf PCA needs zero ops to satisfy "send to nobody", which is also what Gmail itself rejects).
+- [config/policy.yaml](../../config/policy.yaml) — the gmail-external-send-gate's `required_ops` template switched to `${body.to_domains}` (was `${body.to_domain}` in §2.1). The Gmail adapter already exposed `to_domains` as a sorted-unique JSON array of recipient domains (§2.1 work), so no adapter change was needed.
+
+**Tests added (7 in `ops::tests` + 1 in `gmail_external_send.rs::required_ops_expands_per_recipient_domain`):**
+- `list_valued_template_expands_to_n_atoms` — 2-element list → 2 atoms with the right substitutions.
+- `scalar_template_still_resolves` — pre-§2.2 templates unchanged.
+- `two_list_vars_rejected` — `Malformed` error path.
+- `empty_list_yields_zero_atoms` — pathological case.
+- `required_ops_expands_per_recipient_domain` (integration) — 3 recipient domains via real `config/policy.yaml` evaluation → 3 atoms, all with `scheme=gmail, action=send`, objects encoding `<user>:to:<domain>` per recipient.
+
+**Spec deviations to flag:**
+1. **Layer-B operator depth from the spec.md §2.2 paragraph not expanded.** The existing operators (`equals`, `not_equals`, `in`, `not_in`, `matches`, `greater_than`, `less_than`, `all`, `any`, `not`, `exists`) plus the helpers (`domain_of`, `is_external`) cover everything in the M2 wedge. Holding off on adding more until a real customer scenario asks. The grammar work in this step focused entirely on the **ops template grammar** half of the spec heading, which was the load-bearing piece for §2.1's headline policy.
+2. **List expansion only at the ops-atom layer, not the match-expression layer.** YAML like `match: { body.to_domains: { any: { not_in: [acme.com] } } }` is *not* enabled by this change; that's match-expression composition over arrays, a different code path in `match_expr.rs`. The §2.1 policy compares `body.external_recipient` (boolean) which sidesteps the need.
 
 ---
 

@@ -1,0 +1,19 @@
+[package]
+name = "shared-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Re-export surface so downstream crates depend on a stable internal API
+# rather than the upstream crate name directly. Swapping upstreams in the
+# future stays local to this crate.
+provenance-core = { workspace = true }

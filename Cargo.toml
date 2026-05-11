@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/proxy",
+    "crates/policy-engine",
+    "crates/shared-types",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Proxilion contributors"]
+repository = "https://github.com/clay-good/proxilion"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "request-id", "util"] }
+http = "1"
+hyper = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+ciborium = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid", "chrono", "json"] }
+regex = "1"
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+rustls-pemfile = "2"
+
+# Single upstream PIC dependency. `provenance-core` is a self-contained
+# implementation (its own COSE/CBOR/Ed25519 stack) — it does NOT pull
+# `pic-protocol/pic-rust` transitively. We previously also depended on
+# `pic-protocol` and `provenance-bridge`; neither is used by our code, so
+# they're gone.
+#
+# Pinned to a specific SHA so `cargo update` cannot silently bump us to an
+# upstream commit that hasn't been reviewed. To deliberately bump, replace
+# the rev below in a single PR (this is the only line that lets upstream
+# Rust code into our build).
+provenance-core = { git = "https://github.com/clay-good/provenance", rev = "400c83510cbb4c14f263e31292691f262baf265c" }
+
+# COSE + crypto direct deps (mostly transitive but explicit for clarity)
+coset = "0.3"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Policy / Rego
+regorus = "0.5"
+
+# OAuth / crypto / encoding
+aes-gcm = { version = "0.10", features = ["aes"] }
+sha2 = "0.10"
+base32 = "0.5"
+base64 = "0.22"
+data-encoding = "2"
+rand = "0.8"
+subtle = "2"
+url = "2"
+percent-encoding = "2"
+clap = { version = "4", features = ["derive"] }
+moka = { version = "0.12", features = ["future"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+async-trait = "0.1"
+bytes = "1"
+mime = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+async-stream = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

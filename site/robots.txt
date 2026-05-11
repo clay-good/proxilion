@@ -1,0 +1,15 @@
+User-agent: *
+Allow: /
+
+# Major AI training crawlers — allow indexing (helps discoverability for security teams researching agent risks)
+User-agent: GPTBot
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+Sitemap: https://proxilion.com/sitemap.xml
+Host: https://proxilion.com

@@ -1,0 +1,120 @@
+# Proxilion dev compose stack.
+#
+# Build context is the repo root (`proxilion/`). Upstream dependencies
+# (`pic-protocol`, `provenance-*`) are fetched by Cargo from git during the
+# image builds; nothing outside this directory is needed.
+#
+# Run with: docker compose up
+
+name: proxilion-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: proxilion
+      POSTGRES_PASSWORD: proxilion
+      POSTGRES_DB: proxilion
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proxilion"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  trust-plane:
+    build:
+      context: .
+      dockerfile: docker/trust-plane.Dockerfile
+    environment:
+      TRUST_PLANE_PORT: "8080"
+      TRUST_PLANE_NAME: "proxilion-dev"
+      TRUST_PLANE_CAT_KID: dev-cat-key-1
+      # Required: 64-char hex of a 32-byte ed25519 seed.
+      # Generate one with: openssl rand -hex 32
+      TRUST_PLANE_CAT_KEY_HEX: "${TRUST_PLANE_CAT_KEY_HEX:?set TRUST_PLANE_CAT_KEY_HEX in .env (openssl rand -hex 32)}"
+      # NOTE: provenance-plane's main.rs has TRUST_PLANE_DATABASE_URL wired as a
+      # TODO; until upstream finishes the postgres path, an in-memory store is
+      # used. We still depend on postgres so dashboard / proxy share a DB.
+      TRUST_PLANE_DATABASE_URL: postgres://proxilion:proxilion@postgres/trust_plane
+      TRUST_PLANE_LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+  # Federation Bridge: deferred. The upstream `provenance-bridge` crate is a
+  # library (no main.rs). Trust Plane's POST /v1/pca/issue currently accepts
+  # JWTs directly (credential_type: "jwt") with payload-only parsing, which is
+  # sufficient for the M0 smoke test. A bridge service for proper JWKS
+  # signature verification is tracked as a follow-up — see spec.md §0.4 Status.
+
+  # In-cluster event bus for the action stream (spec.md §3.1). Brought up in
+  # M0 so downstream services can connect without needing a compose rewrite.
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"   # client
+      - "8222:8222"   # http monitoring
+
+  proxy:
+    build:
+      context: .
+      dockerfile: docker/proxy.Dockerfile
+    environment:
+      PROXILION_DEV: "1"
+      PROXILION_BIND_ADDR: "0.0.0.0:8443"
+      PROXILION_TLS_CERT: /certs/dev.crt
+      PROXILION_TLS_KEY: /certs/dev.key
+      PROXILION_TRUST_PLANE_URL: http://trust-plane:8080
+      PROXILION_FEDERATION_BRIDGE_URL: http://federation-bridge:8081
+      PROXILION_LOG_FORMAT: json
+      DATABASE_URL: postgres://proxilion:proxilion@postgres/proxilion
+      RUST_LOG: info,proxy=debug
+    depends_on:
+      postgres:
+        condition: service_healthy
+      trust-plane:
+        condition: service_started
+    volumes:
+      - proxy-certs:/certs
+    ports:
+      - "8443:8443"
+
+  mock-okta:
+    image: ghcr.io/navikt/mock-oauth2-server:2.1.10
+    environment:
+      JSON_CONFIG: |
+        {
+          "interactiveLogin": true,
+          "tokenProvider": { "issuerId": "default" },
+          "tokenCallbacks": [
+            {
+              "issuerId": "default",
+              "tokenExpiry": 3600,
+              "requestMappings": [
+                {
+                  "requestParam": "client_id",
+                  "match": "proxilion-dev",
+                  "claims": {
+                    "sub": "alice@demo.local",
+                    "preferred_username": "alice@demo.local",
+                    "email": "alice@demo.local",
+                    "groups": ["engineering"]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+    ports:
+      - "9090:9090"
+
+volumes:
+  postgres-data:
+  proxy-certs:

@@ -1,0 +1,19 @@
+[package]
+name = "policy-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+regex = { workspace = true }
+regorus = { workspace = true }
+tracing = { workspace = true }
+
+shared-types = { path = "../shared-types" }

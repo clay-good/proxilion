@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07090d"/>
+      <stop offset="1" stop-color="#0d1117"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.78" cy="0.15" r="0.7">
+      <stop offset="0" stop-color="#00e5a8" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#00e5a8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+  <g transform="translate(80,120)">
+    <g>
+      <circle cx="14" cy="20" r="9" fill="#00e5a8"/>
+      <text x="40" y="28" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="22" font-weight="800" letter-spacing="4" fill="#f5f7fa">PROXILION</text>
+    </g>
+    <text x="0" y="140" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="68" font-weight="800" fill="#f5f7fa" letter-spacing="-1.5">Confused-deputy defense</text>
+    <text x="0" y="220" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="68" font-weight="800" fill="#00e5a8" letter-spacing="-1.5">for managed AI agents.</text>
+    <text x="0" y="310" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="28" font-weight="500" fill="#c8ccd4">A self-hosted reverse proxy that cryptographically binds every</text>
+    <text x="0" y="348" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="28" font-weight="500" fill="#c8ccd4">managed-agent action to the human user it is acting for.</text>
+    <text x="0" y="430" font-family="ui-monospace, monospace" font-size="22" font-weight="700" fill="#00e5a8">MIT  .  Self-hosted  .  Zero telemetry  .  Prevention by construction</text>
+  </g>
+</svg>

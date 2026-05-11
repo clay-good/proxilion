@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Proxilion · admin</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #111; --bg: #fafafa; --muted: #666; --line: #e5e5e5;
+        --ok: #0a7; --warn: #c87b00; --bad: #c33; --info: #25a;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { --fg: #eee; --bg: #0c0c0c; --muted: #999; --line: #222;
+                --ok: #6f9; --warn: #fb6; --bad: #f88; --info: #6cf; }
+      }
+      * { box-sizing: border-box; }
+      body { font: 14px/1.45 ui-sans-serif, system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; }
+      header { padding: 1.25rem 2rem; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: baseline; }
+      h1 { font-size: 1.3rem; margin: 0; font-weight: 600; }
+      header .muted { color: var(--muted); font-size: 0.85rem; }
+      nav { display: flex; gap: 0.25rem; padding: 0 2rem; border-bottom: 1px solid var(--line); }
+      nav button { background: none; border: none; padding: 0.75rem 1rem; color: var(--muted); cursor: pointer; font: inherit; border-bottom: 2px solid transparent; }
+      nav button:hover { color: var(--fg); }
+      nav button.active { color: var(--fg); border-bottom-color: var(--fg); }
+      main { max-width: 1200px; margin: 0 auto; padding: 1.5rem 2rem; display: grid; gap: 1.5rem; }
+      section { border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.25rem; background: color-mix(in srgb, var(--bg) 90%, transparent); }
+      section h2 { margin: 0 0 0.75rem 0; font-size: 0.85rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+      .row { display: flex; gap: 0.5rem; align-items: center; }
+      input[type="text"], select { padding: 0.4rem 0.6rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; }
+      input[type="text"] { flex: 1; }
+      button.primary { padding: 0.4rem 0.8rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; cursor: pointer; }
+      button.primary:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
+      pre { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: color-mix(in srgb, var(--fg) 5%, transparent); padding: 0.75rem; border-radius: 6px; overflow: auto; }
+      .kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; font-size: 13px; }
+      .kv dt { color: var(--muted); }
+      .kv dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+      table.feed { width: 100%; border-collapse: collapse; font-size: 13px; }
+      table.feed th { text-align: left; color: var(--muted); font-weight: 500; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--line); }
+      table.feed td { padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+      table.feed tr.row { cursor: pointer; }
+      table.feed tr.row:hover { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+      .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+      .badge-ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+      .badge-bad { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+      .badge-warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+      .badge-info { background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info); }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+      .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); margin-right: 0.5rem; vertical-align: middle; }
+      .dot.live { background: var(--ok); box-shadow: 0 0 8px color-mix(in srgb, var(--ok) 60%, transparent); animation: pulse 2s ease-in-out infinite; }
+      @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.4 } }
+      .empty { padding: 2rem; text-align: center; color: var(--muted); }
+      .filters { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.75rem; }
+      .filters label { color: var(--muted); font-size: 13px; }
+      .hidden { display: none; }
+      details.drawer summary { cursor: pointer; color: var(--muted); font-size: 12px; padding: 0.4rem 0; }
+      details.drawer[open] summary { color: var(--fg); }
+      footer { padding: 1.25rem 2rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Proxilion · admin</h1>
+      <span class="muted">embedded · read-only · /admin/</span>
+    </header>
+
+    <nav>
+      <button id="tab-feed" class="active" data-tab="feed">Live feed</button>
+      <button id="tab-inspector" data-tab="inspector">PCA inspector</button>
+      <button id="tab-health" data-tab="health">Health</button>
+      <a id="tab-setup-link" href="/admin/setup" style="margin-left: auto; padding: 0.75rem 1rem; color: var(--muted); text-decoration: none; align-self: center;">Setup ↗</a>
+    </nav>
+
+    <main>
+      <section id="panel-feed">
+        <h2><span id="stream-dot" class="dot"></span> Live action feed</h2>
+        <div class="filters">
+          <label>Decision</label>
+          <select id="filter-decision">
+            <option value="">all</option>
+            <option value="allow">allow</option>
+            <option value="block">block</option>
+            <option value="require_confirmation">require_confirmation</option>
+            <option value="rate_limit">rate_limit</option>
+          </select>
+          <label>p_0</label>
+          <input id="filter-p0" type="text" placeholder="user:alice@…" style="flex: 0 1 280px;" />
+          <button id="filter-apply" class="primary">Filter</button>
+          <span class="mono" id="feed-status" style="margin-left: auto;">—</span>
+        </div>
+        <table class="feed">
+          <thead>
+            <tr>
+              <th style="width: 95px;">time</th>
+              <th>p_0</th>
+              <th>vendor</th>
+              <th>action</th>
+              <th style="width: 110px;">decision</th>
+              <th style="width: 60px;">status</th>
+              <th style="width: 60px;">filter</th>
+            </tr>
+          </thead>
+          <tbody id="feed-body">
+            <tr><td colspan="7" class="empty">connecting to live stream…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="panel-inspector" class="hidden">
+        <h2>PCA chain inspector</h2>
+        <div class="row">
+          <input id="pca-id" type="text" placeholder="paste a PCA id (UUID)…" />
+          <button id="pca-load" class="primary">Load</button>
+          <button id="pca-verify" class="primary">Verify chain</button>
+        </div>
+        <div id="pca-out" style="margin-top: 0.75rem;" class="mono">paste a PCA id and click Load or Verify.</div>
+      </section>
+
+      <section id="panel-health" class="hidden">
+        <h2>Health</h2>
+        <pre id="health">loading…</pre>
+      </section>
+    </main>
+
+    <footer>
+      Single embedded page served by the proxy at <code>/admin/</code>. Calls
+      <code>/healthz</code>, <code>/api/v1/pca/{id}</code>, <code>/api/v1/pca/{id}/verify</code>,
+      <code>/api/v1/actions/recent</code>, <code>/api/v1/actions/stream</code> (SSE).
+      For SQL audit, killswitch, override flows: use <code>proxilion-cli</code>.
+    </footer>
+
+    <script>
+      // ----------- Tabs -----------
+      document.querySelectorAll("nav button").forEach(btn => {
+        btn.addEventListener("click", () => {
+          document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b === btn));
+          document.querySelectorAll("main > section").forEach(s => s.classList.add("hidden"));
+          const id = "panel-" + btn.dataset.tab;
+          document.getElementById(id).classList.remove("hidden");
+        });
+      });
+
+      // ----------- Helpers -----------
+      async function getJSON(url) {
+        const res = await fetch(url, { cache: "no-store" });
+        const body = await res.json().catch(() => null);
+        if (!res.ok) throw new Error(`${res.status} ${JSON.stringify(body)}`);
+        return body;
+      }
+      function fmtTime(iso) {
+        try {
+          const d = new Date(iso);
+          const hh = String(d.getHours()).padStart(2, "0");
+          const mm = String(d.getMinutes()).padStart(2, "0");
+          const ss = String(d.getSeconds()).padStart(2, "0");
+          return `${hh}:${mm}:${ss}`;
+        } catch { return "—"; }
+      }
+      function decisionBadge(d) {
+        const cls = ({
+          allow: "badge-ok",
+          block: "badge-bad",
+          require_confirmation: "badge-warn",
+          rate_limit: "badge-warn",
+        })[d] || "badge-info";
+        return `<span class="badge ${cls}">${d}</span>`;
+      }
+      function statusBadge(s) {
+        const n = Number(s);
+        if (n >= 500) return `<span class="badge badge-bad">${s}</span>`;
+        if (n >= 400) return `<span class="badge badge-warn">${s}</span>`;
+        if (n >= 200 && n < 300) return `<span class="badge badge-ok">${s}</span>`;
+        return `<span class="badge badge-info">${s}</span>`;
+      }
+
+      // ----------- Live feed -----------
+      const FEED_MAX = 200;
+      let feedRows = []; // newest-first
+      let filterDecision = "";
+      let filterP0 = "";
+      const feedBody = document.getElementById("feed-body");
+      const feedStatus = document.getElementById("feed-status");
+      const streamDot = document.getElementById("stream-dot");
+
+      function rowMatchesFilters(r) {
+        if (filterDecision && r.decision !== filterDecision) return false;
+        if (filterP0 && !r.p_0.includes(filterP0)) return false;
+        return true;
+      }
+
+      function renderFeed() {
+        const rows = feedRows.filter(rowMatchesFilters);
+        if (!rows.length) {
+          feedBody.innerHTML = `<tr><td colspan="7" class="empty">no matching events yet.</td></tr>`;
+          return;
+        }
+        feedBody.innerHTML = rows.map(r => `
+          <tr class="row" data-id="${r.id}">
+            <td class="mono">${fmtTime(r.at)}</td>
+            <td class="mono" title="${r.p_0}">${r.p_0.length > 28 ? r.p_0.slice(0, 28) + "…" : r.p_0}</td>
+            <td>${r.vendor}</td>
+            <td class="mono">${r.action}</td>
+            <td>${decisionBadge(r.decision)}</td>
+            <td>${statusBadge(r.status)}</td>
+            <td>${r.read_filter_triggered ? `<span class="badge badge-warn">${r.quarantined_count}</span>` : ""}</td>
+          </tr>
+        `).join("");
+
+        // Click row → drawer with details
+        feedBody.querySelectorAll("tr.row").forEach(tr => {
+          tr.addEventListener("click", () => {
+            const id = tr.dataset.id;
+            const r = feedRows.find(x => x.id === id);
+            if (!r) return;
+            const detail = document.createElement("tr");
+            detail.innerHTML = `<td colspan="7">${renderRowDrawer(r)}</td>`;
+            tr.after(detail);
+            tr.addEventListener("click", () => detail.remove(), { once: true });
+          }, { once: true });
+        });
+      }
+
+      function renderRowDrawer(r) {
+        return `
+          <dl class="kv">
+            <dt>request_id</dt><dd>${r.request_id}</dd>
+            <dt>session</dt><dd>${r.session_id ?? "—"}</dd>
+            <dt>leaf PCA</dt><dd>${r.leaf_pca_id ?? "—"} ${r.leaf_pca_id ? `<button class="primary" onclick="loadInspector('${r.leaf_pca_id}')">inspect</button>` : ""}</dd>
+            <dt>policy</dt><dd>${r.policy_id ?? "—"}</dd>
+            <dt>method</dt><dd>${r.method}</dd>
+            <dt>path</dt><dd>${r.path}</dd>
+            <dt>block_reason</dt><dd>${r.block_reason ?? "—"}</dd>
+            <dt>extra</dt><dd><pre style="margin: 0;">${JSON.stringify(r.extra ?? {}, null, 2)}</pre></dd>
+          </dl>
+        `;
+      }
+
+      function pushEvent(r) {
+        feedRows.unshift(r);
+        if (feedRows.length > FEED_MAX) feedRows.length = FEED_MAX;
+        renderFeed();
+      }
+
+      async function loadRecent() {
+        const params = new URLSearchParams({ limit: "100" });
+        if (filterDecision) params.set("decision", filterDecision);
+        if (filterP0) params.set("p_0", filterP0);
+        try {
+          const rows = await getJSON("/api/v1/actions/recent?" + params.toString());
+          feedRows = rows;
+          renderFeed();
+        } catch (e) {
+          feedBody.innerHTML = `<tr><td colspan="7" class="empty">history fetch failed: ${e}</td></tr>`;
+        }
+      }
+
+      function connectStream() {
+        const sse = new EventSource("/api/v1/actions/stream");
+        sse.addEventListener("open", () => {
+          streamDot.classList.add("live");
+          feedStatus.textContent = "connected";
+        });
+        sse.addEventListener("action", e => {
+          try { pushEvent(JSON.parse(e.data)); } catch {}
+        });
+        sse.addEventListener("lagged", () => {
+          feedStatus.textContent = "lagged — resyncing";
+          loadRecent();
+        });
+        sse.addEventListener("error", () => {
+          streamDot.classList.remove("live");
+          feedStatus.textContent = "reconnecting…";
+        });
+      }
+
+      document.getElementById("filter-apply").addEventListener("click", () => {
+        filterDecision = document.getElementById("filter-decision").value;
+        filterP0 = document.getElementById("filter-p0").value.trim();
+        loadRecent();
+      });
+
+      loadRecent().then(connectStream);
+
+      // ----------- PCA inspector (cross-tab) -----------
+      function loadInspector(id) {
+        document.querySelector('[data-tab="inspector"]').click();
+        document.getElementById("pca-id").value = id;
+        document.getElementById("pca-load").click();
+      }
+      window.loadInspector = loadInspector;
+
+      document.getElementById("pca-load").addEventListener("click", async () => {
+        const id = document.getElementById("pca-id").value.trim();
+        const out = document.getElementById("pca-out");
+        if (!id) { out.textContent = "paste a PCA id first."; return; }
+        out.textContent = "loading…";
+        try {
+          const doc = await getJSON(`/api/v1/pca/${encodeURIComponent(id)}`);
+          out.innerHTML = `
+            <dl class="kv">
+              <dt>pca_id</dt><dd>${doc.pca_id}</dd>
+              <dt>p_0</dt><dd>${doc.p_0}</dd>
+              <dt>hop</dt><dd>${doc.hop}</dd>
+              <dt>predecessor</dt><dd>${doc.predecessor_id ?? "(none — PCA_0)"}</dd>
+              <dt>ops</dt><dd>${(doc.ops ?? []).map(o => `<div>${o}</div>`).join("") || "—"}</dd>
+              <dt>cbor (hex)</dt><dd style="font-size: 11px; color: var(--muted);">${doc.cbor_hex.slice(0, 240)}${doc.cbor_hex.length > 240 ? "…" : ""}</dd>
+            </dl>`;
+        } catch (e) { out.textContent = String(e); }
+      });
+
+      document.getElementById("pca-verify").addEventListener("click", async () => {
+        const id = document.getElementById("pca-id").value.trim();
+        const out = document.getElementById("pca-out");
+        if (!id) { out.textContent = "paste a PCA id first."; return; }
+        out.textContent = "verifying…";
+        try {
+          const v = await getJSON(`/api/v1/pca/${encodeURIComponent(id)}/verify`);
+          const cls = v.intact ? "badge-ok" : "badge-bad";
+          out.innerHTML = `
+            <span class="badge ${cls}">${v.intact ? "✓ chain intact" : "✗ chain broken"}</span>
+            <dl class="kv" style="margin-top: 0.75rem;">
+              <dt>links_verified</dt><dd>${v.links_verified}</dd>
+              <dt>p_0</dt><dd>${v.p_0 ?? "—"}</dd>
+              <dt>broken_at</dt><dd>${v.broken_at ?? "—"}</dd>
+              <dt>reason</dt><dd>${v.reason ?? "—"}</dd>
+            </dl>`;
+        } catch (e) { out.textContent = String(e); }
+      });
+
+      // ----------- Health -----------
+      async function refreshHealth() {
+        const out = document.getElementById("health");
+        try {
+          out.textContent = JSON.stringify(await getJSON("/healthz"), null, 2);
+        } catch (e) { out.textContent = String(e); }
+      }
+      refreshHealth();
+      setInterval(refreshHealth, 5000);
+    </script>
+  </body>
+</html>

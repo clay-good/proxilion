@@ -1,0 +1,99 @@
+{
+  "title": "Proxilion",
+  "uid": "proxilion",
+  "tags": ["proxilion", "pic", "agent-security"],
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "result",
+        "type": "query",
+        "datasource": { "type": "prometheus" },
+        "query": "label_values(proxilion_auth_attempts_total, result)",
+        "multi": true,
+        "includeAll": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Auth attempts (1m rate)",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "sum(rate(proxilion_auth_attempts_total[1m]))", "legendFormat": "all" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Auth rejected (5m share)",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(proxilion_auth_attempts_total{result=\"rejected\"}[5m])) / clamp_min(sum(rate(proxilion_auth_attempts_total[5m])), 1)",
+          "legendFormat": "rejection rate"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Token refreshes by result (1m rate)",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(proxilion_token_refreshes_total[1m]))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "PCA cache hits vs misses (1m rate)",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(proxilion_pca_cache_hits_total[1m])", "legendFormat": "hits" },
+        { "expr": "rate(proxilion_pca_cache_misses_total[1m])", "legendFormat": "misses" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "PCA verify failures (5m sum)",
+      "description": "Should be zero in steady state. Any non-zero value indicates a tampered PCA in cache or a CAT-key rotation that hasn't propagated.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 6 },
+      "targets": [
+        {
+          "expr": "increase(proxilion_pca_verify_failures_total[5m])",
+          "legendFormat": "failures (5m)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 30, "lineWidth": 2 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": 0, "color": "green" },
+              { "value": 1, "color": "red" }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

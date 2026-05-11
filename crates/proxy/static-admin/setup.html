@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Proxilion · setup</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #111; --bg: #fafafa; --muted: #666; --line: #e5e5e5;
+        --ok: #0a7; --warn: #c87b00; --bad: #c33;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { --fg: #eee; --bg: #0c0c0c; --muted: #999; --line: #222;
+                --ok: #6f9; --warn: #fb6; --bad: #f88; }
+      }
+      * { box-sizing: border-box; }
+      body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; }
+      header { padding: 1.5rem 2rem; border-bottom: 1px solid var(--line); }
+      h1 { font-size: 1.5rem; margin: 0; font-weight: 600; }
+      header p { color: var(--muted); margin: 0.25rem 0 0 0; font-size: 0.9rem; }
+      main { max-width: 800px; margin: 0 auto; padding: 2rem; display: grid; gap: 1rem; }
+      .banner { border-radius: 8px; padding: 1rem 1.25rem; }
+      .banner.green { background: color-mix(in srgb, var(--ok) 12%, transparent); border: 1px solid color-mix(in srgb, var(--ok) 30%, transparent); }
+      .banner.amber { background: color-mix(in srgb, var(--warn) 12%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); }
+      .banner.red { background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid color-mix(in srgb, var(--bad) 30%, transparent); }
+      .banner h2 { margin: 0 0 0.25rem 0; font-size: 1.1rem; }
+      .banner p { margin: 0; color: var(--muted); }
+      .item { border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.25rem; background: color-mix(in srgb, var(--bg) 90%, transparent); }
+      .item .head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+      .item .title { font-weight: 600; }
+      .item .badge { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 10px; }
+      .item .badge.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+      .item .badge.todo { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+      .item .detail { color: var(--muted); margin: 0.25rem 0 0.5rem 0; font-size: 13px; }
+      .item .fix { background: color-mix(in srgb, var(--fg) 4%, transparent); padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 13px; line-height: 1.55; }
+      .item a.docs { display: inline-block; margin-top: 0.5rem; color: var(--muted); font-size: 12px; }
+      .item a.docs:hover { color: var(--fg); }
+      .links { color: var(--muted); font-size: 12px; padding: 1rem 2rem; border-top: 1px solid var(--line); }
+      .links a { color: var(--muted); margin-right: 1rem; }
+      .links a:hover { color: var(--fg); }
+      .loading { padding: 2rem; text-align: center; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Setup</h1>
+      <p>What Proxilion needs in order to start handling real traffic.</p>
+    </header>
+
+    <main id="root">
+      <div class="loading">checking configuration…</div>
+    </main>
+
+    <div class="links">
+      <a href="/admin/">← Back to admin</a>
+      <a href="https://proxilion.com/docs" target="_blank">Documentation</a>
+      <a href="https://github.com/clay-good/proxilion" target="_blank">GitHub</a>
+    </div>
+
+    <script>
+      async function load() {
+        const root = document.getElementById("root");
+        try {
+          const res = await fetch("/api/v1/setup/status", { cache: "no-store" });
+          if (!res.ok) throw new Error(`${res.status}`);
+          const data = await res.json();
+          render(data, root);
+        } catch (e) {
+          root.innerHTML = `<div class="banner red"><h2>Setup status unavailable</h2>
+            <p>${e}. Open the admin Health tab for the underlying check.</p></div>`;
+        }
+      }
+
+      function render(data, root) {
+        const banner = data.ready_for_traffic
+          ? `<div class="banner green"><h2>Ready for real traffic.</h2>
+              <p>All required pieces are in place. Point your managed agent at this proxy
+              and watch the live feed at <a href="/admin/">/admin/</a>.</p></div>`
+          : `<div class="banner amber"><h2>Almost there.</h2>
+              <p>One or more checks below are missing — follow each fix until everything's green.</p></div>`;
+
+        const items = data.items.map(it => {
+          const badge = it.ok
+            ? `<span class="badge ok">✓ ok</span>`
+            : `<span class="badge todo">needs setup</span>`;
+          const fix = it.fix
+            ? `<div class="fix">${escapeHtml(it.fix)}</div>`
+            : "";
+          const docs = it.docs ? `<a class="docs" href="${it.docs}" target="_blank">docs ↗</a>` : "";
+          return `
+            <div class="item">
+              <div class="head"><span class="title">${escapeHtml(it.title)}</span>${badge}</div>
+              <div class="detail">${escapeHtml(it.detail)}</div>
+              ${fix}
+              ${docs}
+            </div>
+          `;
+        }).join("");
+
+        root.innerHTML = banner + items;
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+      }
+
+      load();
+      // Auto-refresh every 5s so the operator sees the green checkmark
+      // immediately after they fix something.
+      setInterval(load, 5000);
+    </script>
+  </body>
+</html>

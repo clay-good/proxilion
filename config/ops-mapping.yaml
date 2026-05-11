@@ -1,0 +1,39 @@
+# IdP-groups → PIC ops mapping. Authority of this file: spec.md §7.2.
+#
+# Loaded by the federation bridge at PCA_0 issuance time. Until the bridge
+# service exists (deferred — see spec.md §0.4 Status), this file is consulted
+# by `scripts/smoke-pic.sh` to determine which ops to request from the Trust
+# Plane on Alice's behalf.
+#
+# Note on grammar: provenance-core's `Operation` type is { action, resource }.
+# The "scheme:action:resource" form used in spec.md examples is the proxilion
+# YAML surface; the bridge will translate it into the upstream form when it
+# calls Trust Plane.
+
+ops_mapping:
+  # Default — every authenticated user.
+  default:
+    - "drive:read:${user.email}/*"
+    - "gmail:read:${user.email}"
+    - "calendar:read:${user.email}/*"
+
+  groups:
+    - match: "engineering"
+      grant:
+        - "drive:read:engineering/*"
+        - "drive:write:engineering/scratch/*"
+
+    - match: "finance"
+      grant:
+        - "drive:read:finance/*"
+        - "drive:write:finance/*"
+        - "gmail:send:${user.email}"
+
+    - match: "executives"
+      grant:
+        - "drive:read:*"
+        - "calendar:write:*"
+
+  # Explicit denies always win, applied after the union of default + group grants.
+  deny:
+    - "drive:write:legal/*"

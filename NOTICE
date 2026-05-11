@@ -1,0 +1,31 @@
+Proxilion
+=========
+
+Proxilion is an MIT-licensed reverse proxy (and pre-flight advisor and audit
+ingester) for managed AI agents acting against SaaS APIs.
+
+Built on the PIC protocol.
+--------------------------
+
+The cryptography is not ours. Proxilion implements the **PIC protocol**
+(Principal-bound Capabilities), designed and specified by **Nicola Gallo**
+at https://pic-protocol.org/. PIC defines the PCA chain structure, the
+monotonic ops-shrinkage invariant, and the Trust Plane signing model that
+every guarantee in this repo depends on. If you find Proxilion useful,
+please read and cite Nicola's work first.
+
+Upstream Rust dependencies.
+---------------------------
+
+* `provenance-core` — federated trust framework implementing PIC.
+    Clay Good (MIT)
+    https://github.com/clay-good/provenance
+    Pinned to a specific SHA in proxilion's Cargo.toml.
+
+What Proxilion contributes on top of PIC.
+-----------------------------------------
+
+The deployable system *around* the protocol: the OAuth interception layer,
+the Google Drive / Gmail / Calendar adapters, the YAML policy engine, the
+audit and SIEM plumbing, the embedded admin UI, the operator CLI, and the
+Rust reverse proxy itself.

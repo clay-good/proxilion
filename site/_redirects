@@ -1,2 +1,4 @@
-# SPA fallback — serve index.html for unknown paths so deep-link anchors work.
-/*  /index.html  200
+# Intentionally empty. SPA fallback is handled by wrangler.toml's
+#   [assets] not_found_handling = "single-page-application"
+# Adding `/* /index.html 200` here as well triggers Cloudflare's loop
+# detector (error 10021), failing the build.

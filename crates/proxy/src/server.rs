@@ -128,6 +128,16 @@ pub async fn run(cfg: Config) -> Result<()> {
                     pca_cache: auth_state.pca_cache.clone(),
                 },
             ));
+            app = app.merge(crate::api::blocked::router(
+                crate::api::blocked::BlockedApiState {
+                    db: core.db.clone(),
+                    pca_cache: auth_state.pca_cache.clone(),
+                    pic: core.pic.clone(),
+                },
+            ));
+            app = app.merge(crate::api::killswitch::router(
+                crate::api::killswitch::KillswitchApiState { db: core.db.clone() },
+            ));
 
             // Setup-status checklist (powers /admin/setup). Always-on so the
             // operator can use it to figure out what's still missing.

@@ -6,6 +6,7 @@ use tracing::info;
 mod adapters;
 mod api;
 mod auth_middleware;
+mod blocked;
 mod config;
 mod crypto;
 mod demo;

@@ -32,7 +32,7 @@ use super::action_stream::ActionEvent;
 use super::error::AppError;
 use super::read_filter;
 use super::state::AdapterState;
-use crate::pic::{CachedPca, PcaCache};
+use crate::pic::{CachedPca, PcaCache, SuccessorOutcome};
 use crate::session::SessionCtx;
 use policy_engine::{Decision, Outcome, RequestContext, UserCtx};
 
@@ -179,32 +179,42 @@ async fn proxy_request(
     let request_id = Uuid::new_v4();
     let ctx = build_policy_ctx(state, session, &req);
 
-    // Layer B.
     let outcome = state.policy.evaluate(&ctx)?;
+    let requested_ops: Vec<String> = outcome
+        .required_ops
+        .required
+        .iter()
+        .map(|a| a.to_canonical())
+        .collect();
+    let method_str = req.method.to_string();
+
+    // Layer B.
     if let Err(e) = enforce_pre_request_decision(&outcome) {
-        if matches!(e, AppError::PolicyBlocked { .. }) {
-            persist_blocked_action(
+        let (layer_label, detail_str) = match &e {
+            AppError::PolicyBlocked { .. } => ("policy", format!("{e}")),
+            AppError::RequireConfirmation(_) => ("policy", "require_confirmation".to_string()),
+            _ => ("policy", format!("{e}")),
+        };
+        if matches!(
+            e,
+            AppError::PolicyBlocked { .. } | AppError::RequireConfirmation(_)
+        ) {
+            crate::blocked::persist(
                 &state.auth.db,
-                request_id,
-                session.agent_session_id,
-                "google",
-                &req.action,
-                "policy",
-                outcome.matched_policy_id.as_deref(),
-                Some(&format!("{e}")),
-            )
-            .await;
-        }
-        if matches!(e, AppError::RequireConfirmation(_)) {
-            persist_blocked_action(
-                &state.auth.db,
-                request_id,
-                session.agent_session_id,
-                "google",
-                &req.action,
-                "policy",
-                outcome.matched_policy_id.as_deref(),
-                Some("require_confirmation"),
+                crate::blocked::BlockedActionRecord {
+                    request_id,
+                    session_id: session.agent_session_id,
+                    p_0: Some(&session.p_0),
+                    vendor: "google",
+                    action: &req.action,
+                    method: &method_str,
+                    path: &req.upstream_path,
+                    layer: layer_label,
+                    policy_id: outcome.matched_policy_id.as_deref(),
+                    detail: Some(&detail_str),
+                    predecessor_pca_id: Some(session.leaf_pca_id),
+                    requested_ops: &requested_ops,
+                },
             )
             .await;
         }
@@ -212,16 +222,10 @@ async fn proxy_request(
     }
 
     // Layer A: narrowed PCA_2.
-    let requested_ops: Vec<String> = outcome
-        .required_ops
-        .required
-        .iter()
-        .map(|a| a.to_canonical())
-        .collect();
-    let leaf_ops = if requested_ops.is_empty() {
+    let leaf_ops: Vec<String> = if requested_ops.is_empty() {
         session.granted_ops.clone()
     } else {
-        requested_ops
+        requested_ops.clone()
     };
 
     let binding = ExecutorBinding::new()
@@ -229,22 +233,109 @@ async fn proxy_request(
         .with("action", req.action.as_str())
         .with("request_id", request_id.to_string().as_str());
 
-    let pca2 = match state
+    let (pca2_id, audit_violation_detail) = match state
         .pic
-        .mint_successor(session.leaf_pca_cbor.clone(), leaf_ops.clone(), binding)
+        .request_or_audit_successor(
+            session.leaf_pca_cbor.clone(),
+            leaf_ops.clone(),
+            binding,
+            outcome.pic_mode,
+        )
         .await
     {
-        Ok(p) => p,
-        Err(crate::pic::ExecutorError::Invariant(d)) => {
-            persist_blocked_action(
+        Ok(SuccessorOutcome::Issued(pca2)) => {
+            let pca2_cbor = B64
+                .decode(&pca2.pca)
+                .map_err(|e| AppError::Internal(format!("PCA_2 base64: {e}")))?;
+            let pca2_id = Uuid::new_v4();
+            let cache = PcaCache::new(state.auth.db.clone());
+            cache
+                .insert(&CachedPca {
+                    pca_id: pca2_id,
+                    cbor: pca2_cbor,
+                    p_0: pca2.p_0.clone(),
+                    ops: pca2.ops.clone(),
+                    hop: pca2.hop as i32,
+                    predecessor_id: Some(session.leaf_pca_id),
+                    signature: vec![],
+                })
+                .await
+                .map_err(|e| AppError::Internal(format!("pca_cache: {e}")))?;
+            (pca2_id, None)
+        }
+        Ok(SuccessorOutcome::AuditFallback { detail }) => {
+            let missing = crate::pic::violations::parse_missing_atoms(&detail);
+            crate::pic::violations::persist(
                 &state.auth.db,
-                request_id,
-                session.agent_session_id,
-                "google",
-                &req.action,
-                "pic_invariant",
-                outcome.matched_policy_id.as_deref(),
-                Some(&d),
+                crate::pic::PicViolationRecord {
+                    request_id,
+                    session_id: session.agent_session_id,
+                    p_0: Some(&session.p_0),
+                    vendor: "google",
+                    action: &req.action,
+                    method: &method_str,
+                    path: &req.upstream_path,
+                    policy_id: outcome.matched_policy_id.as_deref(),
+                    predecessor_pca_id: Some(session.leaf_pca_id),
+                    attempted_ops: &leaf_ops,
+                    missing_atoms: &missing,
+                    pic_mode: "audit",
+                    detail: Some(&detail),
+                },
+            )
+            .await;
+            metrics::counter!(
+                "proxilion_pic_violations_total",
+                "mode" => "audit",
+                "vendor" => "google",
+                "action" => req.action.clone(),
+            )
+            .increment(1);
+            (session.leaf_pca_id, Some(detail))
+        }
+        Err(crate::pic::ExecutorError::Invariant(d)) => {
+            crate::pic::violations::persist(
+                &state.auth.db,
+                crate::pic::PicViolationRecord {
+                    request_id,
+                    session_id: session.agent_session_id,
+                    p_0: Some(&session.p_0),
+                    vendor: "google",
+                    action: &req.action,
+                    method: &method_str,
+                    path: &req.upstream_path,
+                    policy_id: outcome.matched_policy_id.as_deref(),
+                    predecessor_pca_id: Some(session.leaf_pca_id),
+                    attempted_ops: &leaf_ops,
+                    missing_atoms: &crate::pic::violations::parse_missing_atoms(&d),
+                    pic_mode: "runtime_gate",
+                    detail: Some(&d),
+                },
+            )
+            .await;
+            metrics::counter!(
+                "proxilion_pic_violations_total",
+                "mode" => "runtime_gate",
+                "vendor" => "google",
+                "action" => req.action.clone(),
+            )
+            .increment(1);
+            crate::blocked::persist(
+                &state.auth.db,
+                crate::blocked::BlockedActionRecord {
+                    request_id,
+                    session_id: session.agent_session_id,
+                    p_0: Some(&session.p_0),
+                    vendor: "google",
+                    action: &req.action,
+                    method: &method_str,
+                    path: &req.upstream_path,
+                    layer: "pic_invariant",
+                    policy_id: outcome.matched_policy_id.as_deref(),
+                    detail: Some(&d),
+                    predecessor_pca_id: Some(session.leaf_pca_id),
+                    requested_ops: &leaf_ops,
+                },
             )
             .await;
             return Err(AppError::PicInvariantViolation(d));
@@ -256,24 +347,6 @@ async fn proxy_request(
         }
         Err(other) => return Err(AppError::Internal(other.to_string())),
     };
-
-    let pca2_cbor = B64
-        .decode(&pca2.pca)
-        .map_err(|e| AppError::Internal(format!("PCA_2 base64: {e}")))?;
-    let pca2_id = Uuid::new_v4();
-    let cache = PcaCache::new(state.auth.db.clone());
-    cache
-        .insert(&CachedPca {
-            pca_id: pca2_id,
-            cbor: pca2_cbor,
-            p_0: pca2.p_0.clone(),
-            ops: pca2.ops.clone(),
-            hop: pca2.hop as i32,
-            predecessor_id: Some(session.leaf_pca_id),
-            signature: vec![],
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("pca_cache: {e}")))?;
 
     // Upstream call.
     let upstream_url = format!("{}{}", state.google_api_base(), req.upstream_path);
@@ -311,15 +384,22 @@ async fn proxy_request(
             .map_err(|e| AppError::Internal(format!("read-filter regex: {e}")))?;
         let (b, o) = read_filter::apply(&body_bytes, &compiled, content_type.as_deref());
         if o.block {
-            persist_blocked_action(
+            crate::blocked::persist(
                 &state.auth.db,
-                request_id,
-                session.agent_session_id,
-                "google",
-                &req.action,
-                "read_filter",
-                outcome.matched_policy_id.as_deref(),
-                Some("BlockRequest pattern matched"),
+                crate::blocked::BlockedActionRecord {
+                    request_id,
+                    session_id: session.agent_session_id,
+                    p_0: Some(&session.p_0),
+                    vendor: "google",
+                    action: &req.action,
+                    method: &method_str,
+                    path: &req.upstream_path,
+                    layer: "read_filter",
+                    policy_id: outcome.matched_policy_id.as_deref(),
+                    detail: Some("BlockRequest pattern matched"),
+                    predecessor_pca_id: None,
+                    requested_ops: &[],
+                },
             )
             .await;
             return Err(AppError::ReadFilterBlocked);
@@ -368,6 +448,7 @@ async fn proxy_request(
                 "external_recipient": ctx.body.get("external_recipient"),
                 "recipient_count": ctx.body.get("recipient_count"),
                 "attachment_count": ctx.body.get("attachment_count"),
+                "pic_audit_violation": audit_violation_detail,
             }),
         })
         .await;
@@ -487,35 +568,6 @@ async fn persist_quarantine_samples(
         if let Err(e) = res {
             warn!(error = %e, "failed to persist quarantine sample");
         }
-    }
-}
-
-async fn persist_blocked_action(
-    db: &sqlx::PgPool,
-    request_id: Uuid,
-    session_id: Uuid,
-    vendor: &str,
-    action: &str,
-    layer: &str,
-    policy_id: Option<&str>,
-    detail: Option<&str>,
-) {
-    let res = sqlx::query(
-        "INSERT INTO blocked_actions
-            (request_id, session_id, vendor, action, layer, policy_id, detail)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(request_id)
-    .bind(session_id)
-    .bind(vendor)
-    .bind(action)
-    .bind(layer)
-    .bind(policy_id)
-    .bind(detail)
-    .execute(db)
-    .await;
-    if let Err(e) = res {
-        warn!(error = %e, "failed to persist blocked_action");
     }
 }
 

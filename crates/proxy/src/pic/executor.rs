@@ -31,6 +31,8 @@ use shared_types::provenance::{
     poc::PocBuilder,
 };
 
+use policy_engine::PicMode;
+
 #[derive(Debug, Error)]
 pub enum ExecutorError {
     #[error("Trust Plane returned {status}: {body}")]
@@ -225,6 +227,56 @@ impl PicExecutor {
     }
 }
 
+/// Outcome of an attempt to mint a successor PCA when the policy's
+/// `pic_mode` is consulted (see spec.md §2.4).
+///
+/// * `Issued` — Trust Plane minted a fresh successor; adapter chains on
+///   the new PCA.
+/// * `AuditFallback` — Trust Plane refused with a monotonicity violation
+///   and the policy was in `audit` mode. The adapter proceeds with the
+///   request against the predecessor PCA (no new leaf), and the proxy
+///   records a `pic_violations` row.
+#[derive(Debug)]
+pub enum SuccessorOutcome {
+    Issued(ProcessPocResponse),
+    AuditFallback { detail: String },
+}
+
+impl PicExecutor {
+    /// Audit-aware wrapper around `mint_successor` (spec.md §2.4).
+    ///
+    /// Audit-mode semantics: the upstream Trust Plane does not yet
+    /// expose an `audit-mode-successor` endpoint (open question #2 in
+    /// §15). v1 short-circuits per the spec's stated fallback — on
+    /// monotonicity violation in audit mode, the request proceeds with
+    /// the predecessor's PCA as the leaf. Confused-deputy semantics are
+    /// **not** preserved on that action's PCA; this is acceptable for
+    /// audit-only and is the documented trade-off.
+    #[instrument(skip(self, predecessor_pca_bytes))]
+    pub async fn request_or_audit_successor(
+        &self,
+        predecessor_pca_bytes: Vec<u8>,
+        requested_ops: Vec<String>,
+        binding: ExecutorBinding,
+        mode: PicMode,
+    ) -> Result<SuccessorOutcome, ExecutorError> {
+        match self
+            .mint_successor(predecessor_pca_bytes, requested_ops, binding)
+            .await
+        {
+            Ok(resp) => Ok(SuccessorOutcome::Issued(resp)),
+            Err(ExecutorError::Invariant(detail)) => match mode {
+                PicMode::RuntimeGate => Err(ExecutorError::Invariant(detail)),
+                PicMode::Audit => {
+                    info!(detail = %detail, "pic invariant violated in audit mode; passing through");
+                    Ok(SuccessorOutcome::AuditFallback { detail })
+                }
+            },
+            Err(other) => Err(other),
+        }
+    }
+}
+
 // Wire types mirroring upstream Trust Plane's JSON API. We re-declare rather
 // than importing from `provenance-plane` to keep the dependency surface
 // narrow (provenance-plane drags in storage backends, etc.).
@@ -276,3 +328,87 @@ struct RegisterExecutorRequest {
 // up calling anything else from the namespace in this module.
 #[allow(unused_imports)]
 use pc as _pc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn server_with_responses(
+        keys_status: u16,
+        poc_status: u16,
+        poc_body: &str,
+    ) -> MockServer {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/keys/executor"))
+            .respond_with(ResponseTemplate::new(keys_status).set_body_string("{}"))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/poc/process"))
+            .respond_with(
+                ResponseTemplate::new(poc_status)
+                    .set_body_string(poc_body)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&s)
+            .await;
+        s
+    }
+
+    #[tokio::test]
+    async fn audit_mode_returns_fallback_on_invariant() {
+        let server = server_with_responses(
+            200,
+            403,
+            "ops not subset of predecessor: missing [drive:read:bob/secret]",
+        )
+        .await;
+        let exec = PicExecutor::dev_ephemeral(server.uri()).unwrap();
+        let binding = ExecutorBinding::new().with("service", "test");
+        // predecessor_pca_bytes is opaque to the executor (PocBuilder copies it);
+        // an empty Vec is fine for the audit-fallback path since we never reach
+        // signing if Trust Plane refuses — but PoCBuilder requires a non-empty
+        // predecessor. Use a token byte.
+        let res = exec
+            .request_or_audit_successor(
+                vec![0u8; 16],
+                vec!["drive:read:bob/secret".into()],
+                binding,
+                PicMode::Audit,
+            )
+            .await
+            .unwrap();
+        match res {
+            SuccessorOutcome::AuditFallback { detail } => {
+                assert!(detail.contains("ops not subset"), "got: {detail}");
+            }
+            SuccessorOutcome::Issued(_) => panic!("expected audit fallback"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_gate_mode_propagates_invariant_error() {
+        let server = server_with_responses(
+            200,
+            422,
+            "ops not subset of predecessor: missing [gmail:send:external]",
+        )
+        .await;
+        let exec = PicExecutor::dev_ephemeral(server.uri()).unwrap();
+        let binding = ExecutorBinding::new().with("service", "test");
+        let err = exec
+            .request_or_audit_successor(
+                vec![0u8; 16],
+                vec!["gmail:send:external".into()],
+                binding,
+                PicMode::RuntimeGate,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExecutorError::Invariant(_)),
+            "got: {err:?}");
+    }
+}

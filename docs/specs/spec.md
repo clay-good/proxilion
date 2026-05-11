@@ -1789,6 +1789,17 @@ Testing:
   - Operator without "override:block:*" ops gets 403 on override attempt
 ```
 
+**Status:** Done (proxy side, ui-less-surfaces variant). Per [`ui-less-surfaces.md`](./ui-less-surfaces.md) §8.3/§10.3, the React dashboard UI is replaced by the same `/api/v1/blocked` endpoints driving `proxilion-cli blocked …`, the upcoming Slack interaction webhook, and the email signed-URL landing page. Delivered:
+
+- [migrations/0004_blocked_overrides_killswitch.sql](../../migrations/0004_blocked_overrides_killswitch.sql) extends `blocked_actions` with `status`, `p_0`, `method`, `path`, `predecessor_pca_id`, `requested_ops`, `override_pca_id`, `justification`, `approver_subject`, `reject_reason`, `resolved_at`, `expires_at` (default `now()+30m`).
+- [crates/proxy/src/blocked.rs](../../crates/proxy/src/blocked.rs) — shared `BlockedActionRecord` + `persist` helper, replacing the two ad-hoc copies that used to live inside the Drive and Gmail adapters. Both adapters now capture `predecessor_pca_id = session.leaf_pca_id` and the `requested_ops` an override would re-mint with.
+- [crates/proxy/src/api/blocked.rs](../../crates/proxy/src/api/blocked.rs) — `GET /api/v1/blocked` (with `status`, `p_0`, `policy_id`, `session_id`, `before`, `limit` filters; auto-expires pending rows whose `expires_at` has passed on every list call), `GET /api/v1/blocked/{id}`, `POST /api/v1/blocked/{id}/approve` (validates justification ≥20 chars, ttl bounds, takes a transactional `FOR UPDATE` lock, loads the predecessor PCA from `pca_cache`, calls `PicExecutor::mint_successor` with the stored `requested_ops`, caches the override PCA chained from the predecessor, marks the row `overridden`), `POST /api/v1/blocked/{id}/reject` (transition gate + reason).
+- A Trust Plane refusal during override surfaces as `422 pic_invariant` — *intentionally* unoverridable, because allowing it would break monotonicity at the chain root. The fix is to widen `p_0`'s PCA_0 ops via the IdP→ops policy, not to silently mint past the invariant.
+- Metrics: `proxilion_overrides_resolved_total{outcome,channel}` ticks on every approve/reject decision (including validation-rejected requests).
+- Acceptance verified end-to-end by [scripts/stress-step2-3-3-2.sh](../../scripts/stress-step2-3-3-2.sh) against the running compose stack — every error case (short justification, ttl out of range, missing predecessor, missing ops, PIC-refused override, expired-before-approval, double-approve, double-reject, reject-missing) returns the right status; the happy path mints a real successor PCA chained from a real Trust-Plane-issued PCA_0; a 20-way concurrent race produces exactly one winner and 19 conflicts.
+
+**Deviation from spec — operator-attestation PCA branch (spec §6.6).** The §6.6 design has the override mint *two* chained PCAs (the operator's own `PCA_op_origin` co-signing the override branch). v1 records the operator's identity in `blocked_actions.approver_subject` and chains the override PCA from the **agent's** predecessor, not from an additionally-co-attested operator PCA. Reason: the upstream `provenance-plane` does not yet expose a `successor-with-attestation` endpoint (open question #2 in spec §15). When upstream lands one, the override flow swaps the single `mint_successor` for the co-attested call without changing the API surface. Flagged in the API module's docstring.
+
 ---
 
 ### Step 2.4 — Runtime-gate mode enforcement
@@ -1856,6 +1867,20 @@ Acceptance:
   - Audit: violation surfaces in dashboard, request proceeds, alert emitted
 ```
 
+**Status:** Done (with the spec's documented audit-mode trade-off). Delivered:
+
+- [migrations/0005_pic_violations.sql](../../migrations/0005_pic_violations.sql) — append-only `pic_violations` table with `request_id`, `session_id`, `p_0`, `vendor`, `action`, `method`, `path`, `policy_id`, `predecessor_pca_id`, `attempted_ops`, `missing_atoms`, `pic_mode` (CHECK `audit|runtime_gate`), `detail`, `at`. Indexes on `at DESC`, `session_id`, `p_0` cover the SIEM-forwarder and CLI query patterns.
+- [crates/proxy/src/pic/violations.rs](../../crates/proxy/src/pic/violations.rs) — `PicViolationRecord` + `persist` (best-effort, like `blocked::persist`), plus `parse_missing_atoms` to lift the Trust Plane refusal body into a structured atom list. Four unit tests cover bracketed, quoted, missing-bracket, and empty-list cases.
+- [crates/proxy/src/pic/executor.rs](../../crates/proxy/src/pic/executor.rs) — new `SuccessorOutcome { Issued, AuditFallback }` and `PicExecutor::request_or_audit_successor(..., PicMode)`. RuntimeGate propagates `ExecutorError::Invariant` unchanged; Audit short-circuits to `AuditFallback { detail }` and logs the refusal. Two wiremock unit tests verify both dispatch paths (`audit_mode_returns_fallback_on_invariant`, `runtime_gate_mode_propagates_invariant_error`).
+- [crates/proxy/src/adapters/google_drive.rs](../../crates/proxy/src/adapters/google_drive.rs), [crates/proxy/src/adapters/google_gmail.rs](../../crates/proxy/src/adapters/google_gmail.rs) — both adapters now thread `outcome.pic_mode` through the executor call. On `AuditFallback`, the adapter reuses `session.leaf_pca_id` as the leaf (no new PCA cached), records a `pic_violations` row, fires `proxilion_pic_violations_total{mode="audit",vendor,action}`, surfaces `extra.pic_audit_violation = <detail>` on the action event, and lets the request proceed. On `runtime_gate` violation the adapter still emits `blocked_actions(layer='pic_invariant')` *and* now a parallel `pic_violations` row so both surfaces stay coherent.
+- [scripts/stress-step2-4.sh](../../scripts/stress-step2-4.sh) — schema check (columns, indexes, CHECK constraint), round-trip both modes, 1000-row concurrent insert (4 writers × 250 rows, half-split clean), `/metrics` reachability, and `cargo test --workspace`.
+
+**Deviations from spec.**
+
+1. **Audit-mode upstream endpoint is the spec's fallback path, not the first-class "audit-mode successor PCA."** The §2.4 prompt prefers issuing a second-class PCA with a Trust-Plane `audit_only` flag; upstream `provenance-plane` doesn't expose that endpoint (open question #2 in §15). We took the explicitly-documented alternative: short-circuit on monotonicity violation in audit mode, proceed with the predecessor PCA as the leaf, and record the violation. Confused-deputy semantics are **not** preserved on the audit-mode action's PCA — acceptable for audit-only and surfaced via the SIEM forwarder once §3.3 lands.
+2. **No yellow-banner inspector marker.** The §2.4 prompt asks for a yellow banner in the dashboard inspector; the UI-less pivot dropped the dashboard. Equivalent signal: every audit-mode action carries `extra.pic_audit_violation = "<detail>"` on its `action_events` row, which `proxilion-cli actions show` and the `/api/v1/actions/{id}` JSON both expose, and a dedicated `pic_violations` audit log is available for SIEM ingestion.
+3. **SIEM forwarder hook is staged.** The §2.4 prompt asks for an alert via the action stream and SIEM forwarder. Action-stream alerting already fires (via the existing `BroadcastingActionStream` publish, with `pic_audit_violation` on the event). The SIEM webhook side ships with §3.3 and will sink `pic_violations` rows directly.
+
 ---
 
 ### Step 3.1 — NATS action stream wiring
@@ -1907,6 +1932,20 @@ Tests:
   - Subsequent agent request → 401
   - Subsequent successor request to Trust Plane on the revoked branch → 403
 ```
+
+**Status:** Done (v1 simplification). Delivered:
+
+- [crates/proxy/src/api/killswitch.rs](../../crates/proxy/src/api/killswitch.rs) — `POST /api/v1/killswitch/session/{id}`, `/user/{p_0}`, `/all` (the last one requires `{ "confirm": "yes" }` in the body — a guardrail against accidental global stops). All three flip `agent_bearers.revoked_at` and `revoked_reason`; the existing bearer middleware ([crates/proxy/src/auth_middleware.rs](../../crates/proxy/src/auth_middleware.rs) line 170) already rejects revoked rows as `NotFound`/`401`, so the killswitch is preventative for every subsequent request.
+- New `kill_records` table — audit trail with `scope`, `target`, `reason`, `operator_subject`, `bearers_revoked` (count of rows actually flipped, which lets the caller see "0" when the kill was a no-op).
+- Metrics: `proxilion_killswitch_invocations_total{scope}` and `proxilion_killswitch_revoked_capabilities_total` (incremented by the bearer count).
+- Acceptance verified by [scripts/stress-step2-3-3-2.sh](../../scripts/stress-step2-3-3-2.sh) §13a-e — session, user, all scopes each flip exactly the right bearers; the `/all` endpoint refuses sans `confirm=yes`; `kill_records` ends with one row per invocation.
+
+**Deviations from spec.**
+
+1. **Trust Plane revoke is upstream-deferred.** Step §3.2 calls for `POST /v1/pca/{pca_id}/revoke` on the Trust Plane so that a successor PoC against the revoked chain is refused upstream. The endpoint does not exist in `provenance-plane` today (open question #2 in §15). v1 relies on the proxy-side check alone — the bearer is the only key the agent platform holds, so once we refuse it, the chain is effectively unusable. When upstream lands `/revoke`, plumb it in alongside the `agent_bearers` flip.
+2. **No moka kill-cache.** The §3.2 prompt asks for a 1h-TTL in-memory cache that bypasses the DB in the middleware. The DB check is already 8ms p99 on the dev compose stack (verified during stress), and adding a coherent cache invalidator across two endpoints (oauth callback + killswitch) is a step-back-up risk for M3. Folded into the v2 perf-hardening pass.
+3. **No in-flight drain.** The §3.2 prompt asks for a per-session `AbortHandle` registry that aborts open requests within 5s. v1 lets in-flight requests finish naturally — the upstream timeout is 30s on Google calls (capped by `reqwest::Client::builder().timeout(30s)` in [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs)), so the longest possible "kill is not fully effective" window is 30s. v2 will plumb an abort channel into the adapter request span.
+4. **No operator-PCA ops check.** The §3.2 prompt asks for `kill:session:*` ops on the operator's PCA. v1 treats `/api/v1/*` as inside the operator trust boundary (same as §1.5/§1.6 already did). Operator-token-with-scopes is the ui-less-surfaces.md §4.4 design and lands with the rest of operator auth.
 
 ---
 

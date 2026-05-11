@@ -7,6 +7,8 @@
 //! dashboard's auth story lands.
 
 pub mod actions;
+pub mod blocked;
+pub mod killswitch;
 pub mod setup;
 
 use std::sync::Arc;

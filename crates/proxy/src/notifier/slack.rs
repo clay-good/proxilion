@@ -15,13 +15,14 @@
 //! credential material and persist it only in `notifier_config.config`
 //! (redacted on GET), never in env.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use super::burst::{BurstSummary, BurstSuppressor};
 use super::BlockedNotification;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -86,6 +87,11 @@ pub struct SlackNotifier {
     signing_secret: SlackSigningSecret,
     proxy_public_url: String,
     http: reqwest::Client,
+    /// Optional burst suppressor (ui-less-surfaces.md §5.3 dev 5 / §5.6).
+    /// When set, `notify()` consults it before POSTing; suppressed
+    /// events are collapsed into a single summary message emitted by the
+    /// flush loop via `notify_summary`.
+    burst: Option<BurstSuppressor>,
 }
 
 impl SlackNotifier {
@@ -108,7 +114,15 @@ impl SlackNotifier {
             signing_secret,
             proxy_public_url,
             http,
+            burst: None,
         })
+    }
+
+    /// Attach a burst suppressor. Without it the notifier passes every
+    /// event through unconditionally.
+    pub fn with_burst(mut self, suppressor: BurstSuppressor) -> Self {
+        self.burst = Some(suppressor);
+        self
     }
 
     pub fn signing_secret(&self) -> &SlackSigningSecret {
@@ -121,6 +135,13 @@ impl SlackNotifier {
 
     /// POST a Block Kit message to the incoming webhook. Best-effort.
     pub async fn notify(&self, n: &BlockedNotification<'_>) {
+        if let Some(b) = &self.burst {
+            if !b.admit(n, Instant::now()).await {
+                // Suppressed — the flush loop will emit a thread-style
+                // summary message for this bucket.
+                return;
+            }
+        }
         let payload = block_kit_payload(n);
         match self
             .http
@@ -157,6 +178,94 @@ impl SlackNotifier {
             }
         }
     }
+
+    /// POST a single Slack message that summarizes a burst. Uses a
+    /// dedicated Block Kit layout so receivers can visually distinguish
+    /// summaries from per-event approvals — the summary has *no*
+    /// approve/reject buttons (clicking through to the full queue is
+    /// the operator's path).
+    pub async fn notify_summary(&self, s: &BurstSummary) {
+        let payload = summary_block_kit_payload(s);
+        match self
+            .http
+            .post(&self.incoming_webhook_url)
+            .header("content-type", "application/json")
+            .body(payload.to_string())
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                metrics::counter!(
+                    "proxilion_slack_summary_sent_total",
+                    "policy_id" => s.policy_id.clone()
+                )
+                .increment(1);
+                debug!(policy_id = %s.policy_id, suppressed = s.suppressed_count, "slack summary delivered");
+            }
+            Ok(r) => {
+                warn!(status = %r.status(), "slack summary: non-success");
+                metrics::counter!(
+                    "proxilion_slack_summary_failures_total",
+                    "reason" => "http_error"
+                )
+                .increment(1);
+            }
+            Err(e) => {
+                warn!(error = %e, "slack summary: transport error");
+                metrics::counter!(
+                    "proxilion_slack_summary_failures_total",
+                    "reason" => "transport"
+                )
+                .increment(1);
+            }
+        }
+    }
+}
+
+/// Build the Block Kit JSON for a burst summary message. ui-less-surfaces.md §5.6.
+fn summary_block_kit_payload(s: &BurstSummary) -> serde_json::Value {
+    let header = format!("📦 {} suppressed", plural(s.suppressed_count, "block"));
+    let p_0 = s.p_0.as_deref().unwrap_or("(any)");
+    let exemplar_line = match &s.exemplar {
+        Some(e) => format!(
+            "*Exemplar:* `{}.{}` (layer `{}`)",
+            e.vendor, e.action, e.layer
+        ),
+        None => "*Exemplar:* —".to_string(),
+    };
+    let mut blocks = vec![
+        serde_json::json!({
+            "type": "header",
+            "text": { "type": "plain_text", "text": header }
+        }),
+        serde_json::json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!(
+                    "*Policy:* `{}`  ·  *p_0:* `{}`\n*Window:* {}s  ·  *Suppressed:* {}\n{}",
+                    s.policy_id, p_0, s.window_seconds, s.suppressed_count, exemplar_line
+                )
+            }
+        }),
+    ];
+    if !s.details_url.is_empty() {
+        blocks.push(serde_json::json!({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Open full list" },
+                    "url": s.details_url,
+                }
+            ]
+        }));
+    }
+    serde_json::json!({ "blocks": blocks })
+}
+
+fn plural(n: u64, word: &str) -> String {
+    if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
 }
 
 /// Build the Block Kit JSON. Format mirrors ui-less-surfaces.md §5.3.
@@ -357,6 +466,55 @@ mod tests {
         }
         // Verify with a TAMPERED body.
         assert!(!secret.verify(&sig, &ts, b"action=reject"));
+    }
+
+    #[test]
+    fn summary_block_kit_has_header_and_open_full_list_button_when_url_present() {
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "gmail-x".into(),
+            p_0: Some("alice@acme.com".into()),
+            suppressed_count: 7,
+            window_seconds: 60,
+            exemplar: Some(super::super::burst::SuppressedEvent {
+                policy_id: "gmail-x".into(),
+                p_0: Some("alice@acme.com".into()),
+                vendor: "google".into(),
+                action: "gmail.messages.send".into(),
+                layer: "policy".into(),
+            }),
+            details_url: "https://proxy.local/api/v1/blocked?policy_id=gmail-x".into(),
+        };
+        let p = summary_block_kit_payload(&s);
+        let blocks = p["blocks"].as_array().unwrap();
+        // Header carries the count.
+        let header_text = blocks[0]["text"]["text"].as_str().unwrap();
+        assert!(header_text.contains("7"));
+        // The mrkdwn section mentions the policy_id and the exemplar.
+        let section_text = blocks[1]["text"]["text"].as_str().unwrap();
+        assert!(section_text.contains("gmail-x"));
+        assert!(section_text.contains("gmail.messages.send"));
+        // Action block with the "Open full list" button points at details_url.
+        let actions = blocks[2]["elements"].as_array().unwrap();
+        assert_eq!(actions[0]["text"]["text"], "Open full list");
+        assert_eq!(actions[0]["url"], "https://proxy.local/api/v1/blocked?policy_id=gmail-x");
+    }
+
+    #[test]
+    fn summary_block_kit_omits_button_when_url_empty() {
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 1,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        };
+        let p = summary_block_kit_payload(&s);
+        let blocks = p["blocks"].as_array().unwrap();
+        // Header + section, no action block.
+        assert_eq!(blocks.len(), 2);
     }
 
     #[test]

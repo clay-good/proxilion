@@ -19,6 +19,7 @@ use tracing::{debug, info_span, instrument, warn};
 use uuid::Uuid;
 
 use crate::crypto::{Bearer, BearerHash, Ciphertext, TokenCipher};
+use crate::kill_cache::KillCache;
 use crate::pic::{CatKeyRegistry, PcaCache};
 use crate::session::SessionContext;
 
@@ -35,6 +36,11 @@ pub struct AuthState {
     pub google_client_id: String,
     pub google_client_secret: String,
     pub http: reqwest::Client,
+    /// In-process kill-cache (spec.md §3.2 dev 2). Cache HIT short-circuits
+    /// the DB JOIN; cache MISS falls through to the DB (the source of
+    /// truth). Killswitch handlers populate this after the DB UPDATE
+    /// commits.
+    pub kill_cache: KillCache,
 }
 
 /// Per-bearer mutex so 50 concurrent requests with the same expired Google
@@ -128,6 +134,14 @@ async fn build_session(state: &AuthState, token: &str) -> Result<SessionContext,
     // 1+2. Format check.
     Bearer::parse(token).ok_or(AuthFail::BadFormat)?;
     let hash = BearerHash::of(token);
+
+    // 2a. Kill-cache fast path (spec.md §3.2 dev 2). A hit means a
+    // recent killswitch invocation already revoked this bearer; bypass
+    // the DB JOIN. The DB row is still the source of truth; a cache
+    // miss falls through to the existing JOIN below.
+    if state.kill_cache.is_killed(&hash.0).await {
+        return Err(AuthFail::NotFound);
+    }
 
     // 3. Look up bearer + join google_tokens.
     let row: Option<(

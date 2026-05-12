@@ -1,4 +1,19 @@
 //! Proxy configuration loaded from environment.
+//!
+//! ## Loading
+//!
+//! Production: [`Config::load`] (alias for [`Config::from_env`] today;
+//! becomes the file-then-env layered loader in phase 2 per
+//! qiuth-patterns.md §2). Programmatic / embed: [`ConfigBuilder`].
+//!
+//! ## Layering (phase 2, not yet enabled)
+//!
+//! ```text
+//! defaults  →  optional TOML/YAML file  →  env vars  →  programmatic overrides
+//! ```
+//!
+//! Phase 1 (shipped): `ConfigBuilder` exists, `Config::from_env` is a thin
+//! wrapper around it, no behavior change.
 
 use std::env;
 use std::net::SocketAddr;
@@ -42,6 +57,15 @@ pub struct Config {
     /// Hex-encoded HMAC secret for `X-Proxilion-Signature`. Required when
     /// `siem_webhook_url` is set.
     pub siem_hmac_key_hex: Option<String>,
+    /// Optional SIEM batch size — spec.md §3.3 dev 2. When `Some(n>1)`,
+    /// the forwarder collects up to `n` events into a single POST. When
+    /// `None` or `Some(1)`, per-event delivery (the original behavior).
+    /// Customers running low-volume keep the default; high-volume Splunk
+    /// HEC / Elastic clusters set this to amortize TLS overhead.
+    pub siem_batch_size: Option<usize>,
+    /// Maximum delay before a partially-filled batch is flushed.
+    /// Defaults to 5 seconds when `siem_batch_size > 1`.
+    pub siem_batch_max_age_secs: u64,
     /// Optional blocked-action webhook URL (ui-less-surfaces.md §10.3). When
     /// set, every persisted `blocked_actions` row fires a signed POST.
     pub blocked_webhook_url: Option<String>,
@@ -67,75 +91,381 @@ pub enum ConfigError {
     MissingCert(PathBuf),
     #[error("TLS key not found at {0}")]
     MissingKey(PathBuf),
+    #[error("invalid value for {field}: {reason}")]
+    InvalidValue { field: &'static str, reason: String },
 }
 
 impl Config {
+    /// Backward-compat entry. Delegates to [`ConfigBuilder::defaults`] +
+    /// [`ConfigBuilder::from_env_layer`] + [`ConfigBuilder::build`] —
+    /// behavior is byte-identical with the prior env-only loader.
     pub fn from_env() -> Result<Self, ConfigError> {
-        let bind_addr_raw =
-            env::var("PROXILION_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
-        let bind_addr = bind_addr_raw
-            .parse()
-            .map_err(|e| ConfigError::BindAddr(bind_addr_raw.clone(), e))?;
+        ConfigBuilder::defaults().from_env_layer()?.build()
+    }
 
-        let tls_cert_path = env::var("PROXILION_TLS_CERT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./certs/dev.crt"));
-        let tls_key_path = env::var("PROXILION_TLS_KEY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./certs/dev.key"));
+    /// Convenience entry point for callers who don't care about phase
+    /// distinctions. Today, identical to [`Config::from_env`]; phase 2
+    /// will add `PROXILION_CONFIG_FILE` as an intermediate layer.
+    #[allow(dead_code)] // alias for future-proofing the docs surface
+    pub fn load() -> Result<Self, ConfigError> {
+        Self::from_env()
+    }
+}
 
-        let dev_mode = matches!(env::var("PROXILION_DEV").as_deref(), Ok("1") | Ok("true"));
+// =====================================================================
+// ConfigBuilder — qiuth-patterns.md §2
+// =====================================================================
 
-        if !dev_mode {
-            if !tls_cert_path.exists() {
-                return Err(ConfigError::MissingCert(tls_cert_path));
+/// Fluent builder for [`Config`]. Validation runs in [`Self::build`] so
+/// callers get a single point to catch malformed inputs (token-encryption
+/// key length, URL shape, dev-mode-vs-cert).
+///
+/// Designed for two usage modes:
+///
+/// 1. **Production:** `ConfigBuilder::defaults().from_env_layer()?.build()` —
+///    same as `Config::from_env()`.
+/// 2. **Embed / test:** `ConfigBuilder::defaults().with_bind_addr(...).with_trust_plane_url(...).build()`.
+#[derive(Debug, Clone)]
+pub struct ConfigBuilder {
+    bind_addr: SocketAddr,
+    tls_cert_path: PathBuf,
+    tls_key_path: PathBuf,
+    database_url: Option<String>,
+    trust_plane_url: String,
+    federation_bridge_url: String,
+    log_format: LogFormat,
+    token_encryption_key_hex: Option<String>,
+    google_client_id: Option<String>,
+    google_client_secret: Option<String>,
+    proxy_base_url: String,
+    policy_path: Option<PathBuf>,
+    customer_domain: String,
+    dev_mode: bool,
+    nats_url: Option<String>,
+    nats_subject_prefix: String,
+    siem_webhook_url: Option<String>,
+    siem_hmac_key_hex: Option<String>,
+    siem_batch_size: Option<usize>,
+    siem_batch_max_age_secs: u64,
+    blocked_webhook_url: Option<String>,
+    blocked_webhook_hmac_key_hex: Option<String>,
+    operator_auth_enforced: bool,
+}
+
+impl Default for ConfigBuilder {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+impl ConfigBuilder {
+    /// Built-in defaults — equivalent to the prior env-only fallbacks.
+    pub fn defaults() -> Self {
+        Self {
+            bind_addr: "0.0.0.0:8443"
+                .parse()
+                .expect("compile-time default bind addr"),
+            tls_cert_path: PathBuf::from("./certs/dev.crt"),
+            tls_key_path: PathBuf::from("./certs/dev.key"),
+            database_url: None,
+            trust_plane_url: "http://trust-plane:8080".to_string(),
+            federation_bridge_url: "http://federation-bridge:8081".to_string(),
+            log_format: LogFormat::Json,
+            token_encryption_key_hex: None,
+            google_client_id: None,
+            google_client_secret: None,
+            proxy_base_url: "https://localhost:8443".to_string(),
+            policy_path: None,
+            customer_domain: "example.com".to_string(),
+            dev_mode: false,
+            nats_url: None,
+            nats_subject_prefix: "actions".to_string(),
+            siem_webhook_url: None,
+            siem_hmac_key_hex: None,
+            siem_batch_size: None,
+            siem_batch_max_age_secs: 5,
+            blocked_webhook_url: None,
+            blocked_webhook_hmac_key_hex: None,
+            operator_auth_enforced: true,
+        }
+    }
+
+    /// Layer environment variables on top of the current values. Empty
+    /// strings on optional vars are filtered like the prior loader did.
+    pub fn from_env_layer(mut self) -> Result<Self, ConfigError> {
+        if let Ok(raw) = env::var("PROXILION_BIND_ADDR") {
+            self.bind_addr = raw
+                .parse()
+                .map_err(|e| ConfigError::BindAddr(raw.clone(), e))?;
+        }
+        if let Ok(v) = env::var("PROXILION_TLS_CERT") {
+            self.tls_cert_path = PathBuf::from(v);
+        }
+        if let Ok(v) = env::var("PROXILION_TLS_KEY") {
+            self.tls_key_path = PathBuf::from(v);
+        }
+        if matches!(env::var("PROXILION_DEV").as_deref(), Ok("1") | Ok("true")) {
+            self.dev_mode = true;
+        }
+        if let Ok(v) = env::var("PROXILION_LOG_FORMAT") {
+            self.log_format = if v.eq_ignore_ascii_case("pretty") {
+                LogFormat::Pretty
+            } else {
+                LogFormat::Json
+            };
+        }
+        if let Ok(v) = env::var("DATABASE_URL") {
+            self.database_url = Some(v);
+        }
+        if let Ok(v) = env::var("PROXILION_TRUST_PLANE_URL") {
+            self.trust_plane_url = v;
+        }
+        if let Ok(v) = env::var("PROXILION_FEDERATION_BRIDGE_URL") {
+            self.federation_bridge_url = v;
+        }
+        if let Ok(v) = env::var("PROXILION_TOKEN_ENCRYPTION_KEY") {
+            self.token_encryption_key_hex = Some(v);
+        }
+        if let Ok(v) = env::var("GOOGLE_CLIENT_ID") {
+            self.google_client_id = Some(v);
+        }
+        if let Ok(v) = env::var("GOOGLE_CLIENT_SECRET") {
+            self.google_client_secret = Some(v);
+        }
+        if let Ok(v) = env::var("PROXILION_PUBLIC_URL") {
+            self.proxy_base_url = v;
+        }
+        if let Ok(v) = env::var("PROXILION_POLICY_PATH") {
+            self.policy_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = env::var("PROXILION_CUSTOMER_DOMAIN") {
+            self.customer_domain = v;
+        }
+        self.nats_url = env::var("PROXILION_NATS_URL").ok().filter(|s| !s.is_empty());
+        if let Ok(v) = env::var("PROXILION_NATS_SUBJECT_PREFIX") {
+            self.nats_subject_prefix = v;
+        }
+        self.siem_webhook_url = env::var("PROXILION_SIEM_WEBHOOK_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        self.siem_hmac_key_hex = env::var("PROXILION_SIEM_HMAC_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if let Ok(v) = env::var("PROXILION_SIEM_BATCH_SIZE") {
+            self.siem_batch_size = v.parse::<usize>().ok().filter(|n| *n > 1);
+        }
+        if let Ok(v) = env::var("PROXILION_SIEM_BATCH_MAX_AGE_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.siem_batch_max_age_secs = n.max(1);
             }
-            if !tls_key_path.exists() {
-                return Err(ConfigError::MissingKey(tls_key_path));
+        }
+        self.blocked_webhook_url = env::var("PROXILION_BLOCKED_WEBHOOK_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        self.blocked_webhook_hmac_key_hex = env::var("PROXILION_BLOCKED_WEBHOOK_HMAC_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if matches!(
+            env::var("PROXILION_DISABLE_OPERATOR_AUTH").as_deref(),
+            Ok("1") | Ok("true")
+        ) {
+            self.operator_auth_enforced = false;
+        }
+        Ok(self)
+    }
+
+    // --- chainable overrides (used by tests + future embed callers) ---
+
+    #[allow(dead_code)]
+    pub fn with_bind_addr(mut self, addr: SocketAddr) -> Self {
+        self.bind_addr = addr;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_trust_plane_url(mut self, url: impl Into<String>) -> Self {
+        self.trust_plane_url = url.into();
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_federation_bridge_url(mut self, url: impl Into<String>) -> Self {
+        self.federation_bridge_url = url.into();
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_database_url(mut self, url: impl Into<String>) -> Self {
+        self.database_url = Some(url.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_token_encryption_key_hex(mut self, hex: impl Into<String>) -> Self {
+        self.token_encryption_key_hex = Some(hex.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_policy_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.policy_path = Some(path.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_dev_mode(mut self, on: bool) -> Self {
+        self.dev_mode = on;
+        self
+    }
+
+    /// Finalize the builder. Runs semantic validation that env-only
+    /// loading can't easily express:
+    ///
+    /// - `token_encryption_key_hex` is exactly 64 hex chars when present.
+    /// - `trust_plane_url` / `federation_bridge_url` parse as
+    ///   `http(s)://`.
+    /// - `dev_mode == false` requires both cert and key paths to resolve.
+    pub fn build(self) -> Result<Config, ConfigError> {
+        // Token encryption key shape — defer key-material validation to
+        // crypto::TokenCipher, but reject early on the cheap check.
+        if let Some(hex) = self.token_encryption_key_hex.as_ref() {
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConfigError::InvalidValue {
+                    field: "PROXILION_TOKEN_ENCRYPTION_KEY",
+                    reason: format!(
+                        "expected 64 hex chars (32 bytes), got {} chars",
+                        hex.len()
+                    ),
+                });
             }
         }
 
-        let log_format = match env::var("PROXILION_LOG_FORMAT").as_deref() {
-            Ok(v) if v.eq_ignore_ascii_case("pretty") => LogFormat::Pretty,
-            _ => LogFormat::Json,
-        };
+        // URL shape — reject obvious typos. Allow either http:// or https://.
+        check_http_url("PROXILION_TRUST_PLANE_URL", &self.trust_plane_url)?;
+        check_http_url("PROXILION_FEDERATION_BRIDGE_URL", &self.federation_bridge_url)?;
 
-        Ok(Self {
-            bind_addr,
-            tls_cert_path,
-            tls_key_path,
-            database_url: env::var("DATABASE_URL").ok(),
-            trust_plane_url: env::var("PROXILION_TRUST_PLANE_URL")
-                .unwrap_or_else(|_| "http://trust-plane:8080".to_string()),
-            federation_bridge_url: env::var("PROXILION_FEDERATION_BRIDGE_URL")
-                .unwrap_or_else(|_| "http://federation-bridge:8081".to_string()),
-            log_format,
-            dev_mode,
-            token_encryption_key_hex: env::var("PROXILION_TOKEN_ENCRYPTION_KEY").ok(),
-            google_client_id: env::var("GOOGLE_CLIENT_ID").ok(),
-            google_client_secret: env::var("GOOGLE_CLIENT_SECRET").ok(),
-            proxy_base_url: env::var("PROXILION_PUBLIC_URL")
-                .unwrap_or_else(|_| "https://localhost:8443".to_string()),
-            policy_path: env::var("PROXILION_POLICY_PATH").ok().map(PathBuf::from),
-            customer_domain: env::var("PROXILION_CUSTOMER_DOMAIN")
-                .unwrap_or_else(|_| "example.com".to_string()),
-            nats_url: env::var("PROXILION_NATS_URL").ok().filter(|s| !s.is_empty()),
-            nats_subject_prefix: env::var("PROXILION_NATS_SUBJECT_PREFIX")
-                .unwrap_or_else(|_| "actions".to_string()),
-            siem_webhook_url: env::var("PROXILION_SIEM_WEBHOOK_URL")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            siem_hmac_key_hex: env::var("PROXILION_SIEM_HMAC_KEY").ok().filter(|s| !s.is_empty()),
-            blocked_webhook_url: env::var("PROXILION_BLOCKED_WEBHOOK_URL")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            blocked_webhook_hmac_key_hex: env::var("PROXILION_BLOCKED_WEBHOOK_HMAC_KEY")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            operator_auth_enforced: !matches!(
-                env::var("PROXILION_DISABLE_OPERATOR_AUTH").as_deref(),
-                Ok("1") | Ok("true")
-            ),
+        // dev_mode = false → cert + key must exist on disk now. This is
+        // the same behavior the prior `from_env` had inline.
+        if !self.dev_mode {
+            if !self.tls_cert_path.exists() {
+                return Err(ConfigError::MissingCert(self.tls_cert_path));
+            }
+            if !self.tls_key_path.exists() {
+                return Err(ConfigError::MissingKey(self.tls_key_path));
+            }
+        }
+
+        Ok(Config {
+            bind_addr: self.bind_addr,
+            tls_cert_path: self.tls_cert_path,
+            tls_key_path: self.tls_key_path,
+            database_url: self.database_url,
+            trust_plane_url: self.trust_plane_url,
+            federation_bridge_url: self.federation_bridge_url,
+            log_format: self.log_format,
+            token_encryption_key_hex: self.token_encryption_key_hex,
+            google_client_id: self.google_client_id,
+            google_client_secret: self.google_client_secret,
+            proxy_base_url: self.proxy_base_url,
+            policy_path: self.policy_path,
+            customer_domain: self.customer_domain,
+            dev_mode: self.dev_mode,
+            nats_url: self.nats_url,
+            nats_subject_prefix: self.nats_subject_prefix,
+            siem_webhook_url: self.siem_webhook_url,
+            siem_hmac_key_hex: self.siem_hmac_key_hex,
+            siem_batch_size: self.siem_batch_size,
+            siem_batch_max_age_secs: self.siem_batch_max_age_secs,
+            blocked_webhook_url: self.blocked_webhook_url,
+            blocked_webhook_hmac_key_hex: self.blocked_webhook_hmac_key_hex,
+            operator_auth_enforced: self.operator_auth_enforced,
         })
+    }
+}
+
+fn check_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(ConfigError::InvalidValue {
+            field,
+            reason: format!("expected http:// or https:// URL, got {url:?}"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_build_in_dev_mode() {
+        let c = ConfigBuilder::defaults().with_dev_mode(true).build().unwrap();
+        assert_eq!(c.bind_addr.to_string(), "0.0.0.0:8443");
+        assert_eq!(c.trust_plane_url, "http://trust-plane:8080");
+        assert!(c.operator_auth_enforced);
+        assert_eq!(c.customer_domain, "example.com");
+    }
+
+    #[test]
+    fn build_rejects_bad_token_encryption_key() {
+        let r = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .with_token_encryption_key_hex("deadbeef")
+            .build();
+        let err = r.unwrap_err();
+        match err {
+            ConfigError::InvalidValue { field, .. } => {
+                assert_eq!(field, "PROXILION_TOKEN_ENCRYPTION_KEY")
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_accepts_valid_token_encryption_key() {
+        let hex64 = "0".repeat(64);
+        let c = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .with_token_encryption_key_hex(&hex64)
+            .build()
+            .unwrap();
+        assert_eq!(c.token_encryption_key_hex.unwrap().len(), 64);
+    }
+
+    #[test]
+    fn build_rejects_non_http_trust_plane_url() {
+        let r = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .with_trust_plane_url("ftp://nope")
+            .build();
+        let err = r.unwrap_err();
+        match err {
+            ConfigError::InvalidValue { field, .. } => assert_eq!(field, "PROXILION_TRUST_PLANE_URL"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_requires_cert_when_not_dev_mode() {
+        let r = ConfigBuilder::defaults()
+            .with_dev_mode(false)
+            .build();
+        let err = r.unwrap_err();
+        assert!(matches!(err, ConfigError::MissingCert(_)));
+    }
+
+    #[test]
+    fn programmatic_overrides_compose() {
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let c = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .with_bind_addr(addr)
+            .with_database_url("postgres://localhost/test")
+            .with_policy_path("/tmp/p.yaml")
+            .build()
+            .unwrap();
+        assert_eq!(c.bind_addr, addr);
+        assert_eq!(c.database_url.as_deref(), Some("postgres://localhost/test"));
+        assert_eq!(c.policy_path.unwrap().to_string_lossy(), "/tmp/p.yaml");
     }
 }

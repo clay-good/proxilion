@@ -35,15 +35,39 @@ pub struct EmailNotifier {
     transport: AsyncSmtpTransport<Tokio1Executor>,
     from: Mailbox,
     to: Vec<Mailbox>,
+    /// Optional CC list (ui-less-surfaces.md §5.4 dev 4). Empty by default.
+    cc: Vec<Mailbox>,
+    /// Optional BCC list. Empty by default. Recipients here see neither
+    /// the To nor each other's BCC entries.
+    bcc: Vec<Mailbox>,
     proxy_public_url: String,
     db: PgPool,
+    /// Max SMTP retries on transient send failures (ui-less-surfaces.md
+    /// §5.4 dev 5). 0 disables retry; 3 is the production default,
+    /// chosen to match the webhook + SIEM forwarder's retry budget.
+    max_retries: u32,
 }
 
 impl EmailNotifier {
+    #[allow(dead_code)] // back-compat alias; new callers use `new_with_recipients`
     pub fn new(
         smtp_url: &str,
         from: &str,
         to: &[String],
+        proxy_public_url: String,
+        db: PgPool,
+    ) -> Result<Self, EmailBuildError> {
+        Self::new_with_recipients(smtp_url, from, to, &[], &[], proxy_public_url, db)
+    }
+
+    /// Build with optional cc + bcc lists. ui-less-surfaces.md §5.4 dev 4.
+    /// Empty `cc` / `bcc` slices are equivalent to [`Self::new`].
+    pub fn new_with_recipients(
+        smtp_url: &str,
+        from: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
         proxy_public_url: String,
         db: PgPool,
     ) -> Result<Self, EmailBuildError> {
@@ -65,13 +89,37 @@ impl EmailNotifier {
                     .map_err(|e| EmailBuildError(format!("to address `{s}`: {e}")))
             })
             .collect::<Result<_, _>>()?;
+        let cc: Vec<Mailbox> = cc
+            .iter()
+            .map(|s| {
+                s.parse::<Mailbox>()
+                    .map_err(|e| EmailBuildError(format!("cc address `{s}`: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+        let bcc: Vec<Mailbox> = bcc
+            .iter()
+            .map(|s| {
+                s.parse::<Mailbox>()
+                    .map_err(|e| EmailBuildError(format!("bcc address `{s}`: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             transport,
             from,
             to,
+            cc,
+            bcc,
             proxy_public_url,
             db,
+            max_retries: 3,
         })
+    }
+
+    /// Override the SMTP retry budget. Tests use 0 to keep them fast.
+    #[allow(dead_code)]
+    pub fn with_max_retries(mut self, n: u32) -> Self {
+        self.max_retries = n;
+        self
     }
 
     pub fn proxy_public_url(&self) -> &str {
@@ -156,6 +204,12 @@ impl EmailNotifier {
         for to in &self.to {
             builder = builder.to(to.clone());
         }
+        for cc in &self.cc {
+            builder = builder.cc(cc.clone());
+        }
+        for bcc in &self.bcc {
+            builder = builder.bcc(bcc.clone());
+        }
         let message = match builder.multipart(
             MultiPart::alternative()
                 .singlepart(
@@ -181,24 +235,53 @@ impl EmailNotifier {
             }
         };
 
-        match self.transport.send(message).await {
-            Ok(_) => {
-                metrics::counter!(
-                    "proxilion_email_send_total",
-                    "result" => "ok",
-                    "layer" => n.layer.to_string()
-                )
-                .increment(1);
-                debug!(blocked_id = %n.blocked_id, "email sent");
+        // ui-less-surfaces.md §5.4 dev 5 — SMTP retry on transient
+        // failures. lettre's `Error::is_permanent` lets us short-circuit
+        // 5xx-class SMTP responses (auth failure, bad recipient) instead
+        // of paying the full backoff budget for an error that will never
+        // recover. Anything else (timeout, network blip, server-busy
+        // 4xx) is retried with the same exp backoff shape as the webhook
+        // notifier.
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            // `Message` is Clone — send() consumes it, so we clone per
+            // attempt to keep the original around for retries.
+            let outcome = self.transport.send(message.clone()).await;
+            match outcome {
+                Ok(_) => {
+                    metrics::counter!(
+                        "proxilion_email_send_total",
+                        "result" => "ok",
+                        "layer" => n.layer.to_string()
+                    )
+                    .increment(1);
+                    debug!(blocked_id = %n.blocked_id, attempt, "email sent");
+                    return;
+                }
+                Err(e) if e.is_permanent() => {
+                    warn!(error = %e, "email: permanent SMTP failure; not retrying");
+                    metrics::counter!(
+                        "proxilion_email_send_failures_total",
+                        "reason" => "smtp_permanent"
+                    )
+                    .increment(1);
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, attempt, "email: transient SMTP failure");
+                    if attempt > self.max_retries {
+                        metrics::counter!(
+                            "proxilion_email_send_failures_total",
+                            "reason" => "smtp_transient_exhausted"
+                        )
+                        .increment(1);
+                        return;
+                    }
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "email: smtp send failed");
-                metrics::counter!(
-                    "proxilion_email_send_failures_total",
-                    "reason" => "smtp"
-                )
-                .increment(1);
-            }
+            let backoff_ms = 250u64 * 4u64.saturating_pow(attempt.saturating_sub(1));
+            tokio::time::sleep(Duration::from_millis(backoff_ms.min(10_000))).await;
         }
     }
 }

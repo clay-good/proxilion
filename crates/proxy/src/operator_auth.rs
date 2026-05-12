@@ -46,6 +46,11 @@ const TOKEN_LEN: usize = PREFIX.len() + BODY_LEN;
 /// token with this; everything else should be least-privilege.
 pub const WILDCARD: &str = "*";
 
+// The canonical catalogue lives in `shared_types::operator_scopes` so
+// the CLI + tests + future SCIM sync depend on the same source of truth.
+// The proxy itself doesn't render the catalogue (that's the CLI's job),
+// but tests can pull it from `shared_types::operator_scopes::SCOPE_CATALOGUE`.
+
 #[derive(Clone)]
 pub struct OperatorAuthState {
     pub db: PgPool,

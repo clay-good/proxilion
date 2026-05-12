@@ -101,6 +101,21 @@ The `LogFormat::Pretty | Json` field that's currently `#[allow(dead_code)]` ([co
 - Phase 2: add `from_file()` and `Config::load()`. Document the precedence order.
 - Phase 3: remove `Config::from_env()` once callers are migrated.
 
+### 2.5 Status (2026-05-12) — Phase 1 shipped.
+
+- [crates/proxy/src/config.rs](../../crates/proxy/src/config.rs) — new `ConfigBuilder` with `defaults()`, `from_env_layer()` (composes env vars on top), `with_*` overrides for every field, and `build()` (runs semantic validation, then constructs `Config`). `Config::from_env()` now delegates to `ConfigBuilder::defaults().from_env_layer()?.build()` — byte-identical with the prior loader, just refactored. `Config::load()` is the forward-looking convenience entry; today it aliases `from_env`, phase 2 will layer `PROXILION_CONFIG_FILE` underneath.
+- New `ConfigError::InvalidValue { field, reason }` variant carries the field name (e.g. `PROXILION_TOKEN_ENCRYPTION_KEY`) so the operator sees the env var that's wrong, not just "bad value somewhere."
+- Semantic validation now runs in `build()`:
+  - `token_encryption_key_hex` is exactly 64 hex characters when present (rejects truncated keys at boot rather than at first cipher use).
+  - `trust_plane_url` + `federation_bridge_url` must start with `http://` or `https://`.
+  - `dev_mode == false` still requires both cert + key paths to exist (unchanged behavior).
+- Tests: 6 new in `config::tests` covering defaults-in-dev-mode, key-too-short rejection, valid-key acceptance, non-http URL rejection, cert-required-when-not-dev-mode, and programmatic override composition (`with_bind_addr` + `with_database_url` + `with_policy_path` chain cleanly).
+
+**Deviations from §2.2 sketch.**
+
+1. **No `from_file()` yet.** That's phase 2 — needs a decision between TOML and YAML (TOML feels right for ops config, YAML keeps consistency with `policy.yaml`). Holding off until a customer asks for either.
+2. **No `Config::load()` precedence chain yet.** Today it's an alias for `from_env`. Adding the file layer is `defaults().from_file(path)?.from_env_layer()?.build()` — same builder, just an extra layer call.
+
 ---
 
 ## 3. Pattern 2 — `PolicyTrace` with per-layer outcomes
@@ -156,6 +171,19 @@ The policy engine's public eval function returns `PolicyTrace` instead of `Decis
 Qiuth is fail-fast — the array stops at the first failure. Proxilion should follow the same default for Layer A (PIC invariants are non-negotiable; no point evaluating Layer B if A denies) but **continue through Layer B even after the first Block** so operators see overlapping rules. This costs a few microseconds and pays for itself the first time someone debugs "why did THIS rule fire and not the one I expected."
 
 Implementation note: gate this with a `PolicyEvalMode::FailFast | Comprehensive` on the engine — `FailFast` for production hot path, `Comprehensive` for dashboard-driven "explain this denial" replays.
+
+### 3.4 Status (2026-05-12) — types + engine entry shipped; adapter wiring deferred.
+
+- [crates/policy-engine/src/trace.rs](../../crates/policy-engine/src/trace.rs) — new module with `PolicyTrace`, `LayerOutcome`, `PolicyLayer` (LayerA / LayerB / ReadFilter), `OpsAtomView`, `PolicyEvalMode`. `LayerOutcome::error_code` carries the canonical `shared_types::ErrorCode` from §4. `PolicyTrace::allowed()` is `true` only when every layer passed AND the final decision is `Allow`.
+- [crates/policy-engine/src/rego.rs](../../crates/policy-engine/src/rego.rs) — new `Engine::evaluate_with_trace(&ctx)` sibling to `evaluate(&ctx)`. Returns `(Outcome, PolicyTrace)` so callers that don't need the structured trace pay nothing. The trace fills in Layer A (engine-side, `passed: true`, records the required-ops count), Layer B (translates `Decision::{Allow, Block, RequireConfirmation, RateLimit}` to the matching `ErrorCode`), and an optional ReadFilter slot when a filter is configured (left as `passed: true; scan pending` for the adapter to mutate after the response body comes back).
+- [crates/policy-engine/Cargo.toml](../../crates/policy-engine/Cargo.toml) — adds `chrono`, `uuid` (already in the workspace).
+- Tests: 4 new in `trace::tests` + 3 integration tests in `crates/policy-engine/tests/policy_trace.rs` that exercise the engine with the live `config/policy.yaml`. Covers (a) Layer-B block via `gmail-external-send-gate` records `ErrorCode::PolicyBlocked` + the matched policy id, (b) no-policy-match path emits Layer A + Layer B both passed, (c) `drive-injection-filter` produces a ReadFilter slot with `passed: true` pending the adapter scan.
+
+**Deviations from §3.2/§3.3 sketch.**
+
+1. **Engine still exposes `evaluate(&ctx) -> Outcome` unchanged.** The spec sketch implies replacing the verdict-shaped return type; we ship the new typed path alongside the old one so the three adapters (Drive / Gmail / Calendar), the policy-handle, and ~12 existing tests don't have to change in one PR. Adapter migration to `evaluate_with_trace` is the natural next step — at that point the trace's Layer-A entry can be mutated to `failed` on Trust-Plane refusal, and the trace can be logged + surfaced via `X-Proxilion-Trace-Id`.
+2. **`PolicyEvalMode::{FailFast, Comprehensive}` defined but not yet observed.** The current engine evaluates fail-fast by structure (the YAML interpreter returns on the first match). `Comprehensive` mode that walks every later policy for "would also have matched" diagnostics is a follow-up tied to the dashboard's explain-this-denial replay path — file an issue when a customer asks.
+3. **Read-filter Layer outcome is `passed: true; scan pending` until the adapter runs.** Adapter-side mutation of the trace lands when the wiring happens; today the engine emits the slot so the trace's shape is stable.
 
 ---
 
@@ -223,6 +251,16 @@ Rules of the registry:
 
 The dashboard work (§1.6 of [spec.md](spec.md)) needs to render denials. Without `ErrorCode`, every dashboard improvement risks coupling to whatever string literal happened to be in `error.rs` that week.
 
+### 4.5 Status (2026-05-12) — shipped.
+
+- [crates/shared-types/src/error_code.rs](../../crates/shared-types/src/error_code.rs) — `ErrorCode` enum, `#[non_exhaustive]`, serde-derived `snake_case` wire form. `as_str()` returns `&'static str` (stable) and `default_status()` returns the recommended HTTP status. Variants in scope: `PicInvariantViolation`, `PolicyBlocked`, `RequireConfirmation`, `RateLimited`, `ReadFilterBlocked`, `UpstreamUnavailable`, `UpstreamTooLarge`, `PolicyEngineError`, `DatabaseError`, `InternalError`. Snapshot test `wire_strings_are_stable` pins the full mapping — renaming a string fails CI loudly.
+- [crates/shared-types/Cargo.toml](../../crates/shared-types/Cargo.toml) — adds `http` for `StatusCode` constants (already in the workspace).
+- [crates/proxy/src/adapters/error.rs](../../crates/proxy/src/adapters/error.rs) — `AppError::code()` now returns the canonical `ErrorCode`; `status()` is derived from `code().default_status()`; `body()` sources its `code` field from `self.code().as_str()`. No wire-format changes — all existing test assertions on body shapes (`policy_blocked_serializes_to_structured_403`, `pic_invariant_violation_serializes_to_403`) still pass.
+- [docs/error-codes.md](../error-codes.md) — operator-facing catalogue with default status + suggested action per code, plus the "adding a new code" runbook.
+- Tests: 2 new in `shared-types::error_code::tests` (`wire_strings_are_stable`, `serde_round_trip_snake_case`). All existing tests in the workspace green (123 proxy + 2 shared-types).
+
+**Deviations from §4.3 sketch.** None. The shipped enum lists every variant the spec sketch enumerated, plus `RequireConfirmation` and `RateLimited` (already in `AppError`; the spec sketch overlooked them).
+
 ---
 
 ## 5. Pattern 4 — `PolicyLoader` trait with compiled cache
@@ -289,6 +327,18 @@ Caching alone fixes the startup-parse problem. The trait fixes the bigger proble
 
 This mirrors qiuth's insight exactly: the auth core never knows whether your API key is in Postgres or in a YAML file. The policy core shouldn't know either.
 
+### 5.4 Status (2026-05-12) — shipped.
+
+- [crates/policy-engine/src/loader.rs](../../crates/policy-engine/src/loader.rs) — new `PolicyLoader` trait (`async fn load(&self) -> Result<PolicyBundle, PolicyLoadError>`, `fn source_label(&self) -> String`, async `changed_since(&self, version) -> Result<Option<String>>` with a default impl). `PolicyBundle { yaml, version }` is the snapshot; `version` is an opaque token (mtime for files, revision counter for static, future `xmin` for Postgres). Implementations: `FilePolicyLoader` (production path), `StaticPolicyLoader` (tests + embed; bumps an `AtomicU64` revision counter on `set_yaml`). `FilePolicyLoader::version_token_sync()` gives the bootstrap path a non-async way to compute the initial version when constructed outside a runtime.
+- [crates/proxy/src/policy_handle.rs](../../crates/proxy/src/policy_handle.rs) — `PolicyHandle::with_loader(initial, loader, raw_yaml, initial_version, source)` constructs a handle backed by a loader. New `reload_via_loader()` async method calls the loader, swaps the engine, and bumps `last_version`. `swap_from_yaml_with_version(...)` is the lower-level primitive that stamps the version atomically alongside the engine swap. `spawn_watcher` now branches: when a loader is attached, it polls `loader.changed_since(handle.last_version())` and reloads via the loader; the legacy mtime-on-`source` path is kept for back-compat (handles built with `PolicyHandle::new`, e.g. when no `PROXILION_POLICY_PATH` is set).
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) — `build_policy_handle` constructs `FilePolicyLoader` and feeds it to `with_loader` whenever `PROXILION_POLICY_PATH` is configured. The production reload path is now backend-pluggable; switching to a `DbPolicyLoader` is a one-line change at this call site, no adapters touched.
+- Tests: 4 new in `loader::tests` (file round-trip, mtime change detection, not-found, static-loader revision bump). 2 new in `policy_handle::tests` (`reload_via_loader_swaps_engine_and_bumps_version`, `reload_via_loader_keeps_prior_engine_on_bad_yaml`). All 131 proxy + 17 policy-engine tests green.
+
+**Deviations from §5.2 sketch.**
+
+1. **No `refresh_interval` on a wrapping `CachedPolicyEngine`.** The existing `PolicyHandle` already does the lock-free `ArcSwap<Engine>` + atomic version bump; introducing a parallel `CachedPolicyEngine` wrapper would duplicate that machinery. The loader trait slots into the existing handle. If a customer needs a different refresh cadence per backend (e.g. faster polling for `DbPolicyLoader`), that knob lands on `spawn_watcher` rather than as a wrapping struct.
+2. **`PolicyBundle` is `{yaml, version}`, not a pre-compiled tree.** Compilation stays at the engine boundary so a freshly-edited YAML with a syntax error doesn't kill the loader. The handle's "parse before swap" semantic carries through unchanged.
+
 ---
 
 ## 6. Pattern 5 — Coverage threshold gate in CI
@@ -328,17 +378,33 @@ Per-crate overrides are fine — `shared-types/` is mostly re-exports and can st
 
 A coverage gate ensures lines are *executed* in tests, not that the tests assert anything meaningful. Pair it with the existing integration test pattern in [policy-engine/tests/example_policies.rs](../../crates/policy-engine/tests/example_policies.rs) — that file is the model for "test what the policy actually decides," not just "the function returned."
 
+### 6.4 Status (2026-05-12) — Phase 1 floor pinned at 60% / 60%.
+
+- [.github/workflows/coverage.yml](../../.github/workflows/coverage.yml) — runs `cargo llvm-cov --workspace --lcov --output-path lcov.info` on every PR and push to `main`. Threshold: `--fail-under-lines 60 --fail-under-functions 60`. The rendered summary is logged for PR reviewers; the `lcov.info` artifact is always uploaded so downstream tools (Codecov, etc.) can consume it.
+- Uses `taiki-e/install-action` to install `cargo-llvm-cov` from a pre-built binary (saves ~3 minutes vs `cargo install`).
+- Caches `~/.cargo/registry`, `~/.cargo/git`, and `target` keyed on `Cargo.lock` — the SHA-pinned upstream `pic-protocol` + `provenance-*` deps make a cold build expensive (~6 min); a warm cache brings it under 90s.
+- Tests dir is excluded from the report (`--ignore-filename-regex '(^|/)tests/'`); coverage is measured against `src/`.
+
+**Ratchet plan.**
+
+The phase ladder in §6.2 (60 → 70 → 80) lives only in this YAML's `--fail-under-*` flags. Bump it in a single-line PR alongside the test backfill that earned the bump — never bump speculatively. The 3-month / 6-month targets in the table are aspirational, not calendar-bound.
+
+**Deviations from §6.2 sketch.**
+
+1. **No per-crate thresholds.** `cargo-llvm-cov`'s `--fail-under-*` is workspace-wide. Per-crate enforcement would need a `cargo llvm-cov report --output-format json` post-processing step. Holding off until the workspace floor is so high that the lowest-coverage crate is dragging it down.
+2. **No Codecov / coveralls integration.** The lcov artifact is uploaded; a downstream uploader can be wired in via a follow-up workflow without touching the gate itself.
+
 ---
 
 ## 7. Rollout order & dependencies
 
 Suggested sequence (each step is independently shippable):
 
-1. **§4 ErrorCode registry** — smallest, unblocks §3. ~1 day.
-2. **§3 PolicyTrace** — depends on §4. ~3 days incl. dashboard wiring.
-3. **§5 PolicyLoader trait + cache** — independent of §3/§4 but easier to test once trace exists. ~3 days.
-4. **§2 ConfigBuilder** — independent. Defer until embed API is on the roadmap; until then, env-only is fine. ~2 days.
-5. **§6 Coverage gate** — adopt at the *current* level immediately; ratchet over months.
+1. **§4 ErrorCode registry** — smallest, unblocks §3. ~1 day. ✅ shipped 2026-05-12.
+2. **§3 PolicyTrace** — depends on §4. ~3 days incl. dashboard wiring. ✅ shipped 2026-05-12 (types + engine entry; adapter wiring deferred).
+3. **§5 PolicyLoader trait + cache** — independent of §3/§4 but easier to test once trace exists. ~3 days. ✅ shipped 2026-05-12 (`FilePolicyLoader` is the production path; `DbPolicyLoader` is a one-line plug-in).
+4. **§2 ConfigBuilder** — independent. Defer until embed API is on the roadmap; until then, env-only is fine. ~2 days. ✅ Phase 1 shipped 2026-05-12 (`from_env` delegates to builder; semantic validation runs in `build()`).
+5. **§6 Coverage gate** — adopt at the *current* level immediately; ratchet over months. ✅ Phase 1 shipped 2026-05-12 (60% lines / 60% functions floor in [.github/workflows/coverage.yml](../../.github/workflows/coverage.yml)).
 
 §3 and §4 should land in the same PR if possible — `LayerOutcome` references `ErrorCode` directly.
 

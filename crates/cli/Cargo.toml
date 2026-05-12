@@ -27,3 +27,6 @@ sqlx = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
+shared-types = { path = "../shared-types" }
+policy-engine = { path = "../policy-engine" }
+serde_yaml = { workspace = true }

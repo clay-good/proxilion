@@ -394,10 +394,26 @@ async fn set_email(
             Json(json!({"error":"config.to must have at least one recipient"})),
         );
     }
-    let new_notifier = match EmailNotifier::new(
+    // cc / bcc — optional (ui-less-surfaces.md §5.4 dev 4). Same
+    // single-string-or-array shape as `to`, except empty is allowed.
+    let read_optional_list = |key: &str| -> Vec<String> {
+        match body.config.get(key) {
+            Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let cc = read_optional_list("cc");
+    let bcc = read_optional_list("bcc");
+    let new_notifier = match EmailNotifier::new_with_recipients(
         &smtp_url,
         &from,
         &to,
+        &cc,
+        &bcc,
         state.proxy_base_url.clone(),
         state.db.clone(),
     ) {
@@ -430,6 +446,8 @@ async fn set_email(
             "enabled": enabled,
             "from": from,
             "to": to,
+            "cc": cc,
+            "bcc": bcc,
             "smtp_url_redacted": redact_url(&smtp_url),
         })),
     )

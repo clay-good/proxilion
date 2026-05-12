@@ -4,16 +4,16 @@
   "tags": ["proxilion", "pic", "agent-security"],
   "timezone": "browser",
   "schemaVersion": 38,
-  "version": 1,
+  "version": 2,
   "refresh": "10s",
-  "time": { "from": "now-1h", "to": "now" },
+  "time": { "from": "now-6h", "to": "now" },
   "templating": {
     "list": [
       {
-        "name": "result",
+        "name": "policy_id",
         "type": "query",
         "datasource": { "type": "prometheus" },
-        "query": "label_values(proxilion_auth_attempts_total, result)",
+        "query": "label_values(proxilion_observe_would_have_blocked_total, policy_id)",
         "multi": true,
         "includeAll": true,
         "current": { "selected": true, "text": "All", "value": "$__all" }
@@ -22,60 +22,409 @@
   },
   "panels": [
     {
+      "id": 100,
+      "type": "row",
+      "title": "Are we secure?",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 }
+    },
+    {
       "id": 1,
       "type": "stat",
-      "title": "Auth attempts (1m rate)",
+      "title": "PIC invariant violations (5m)",
+      "description": "Layer-A breaks: continuity / monotonicity / p_0 drift / hop / signature. Should be 0 in steady state. Sustained non-zero == active attack or PIC drift.",
       "datasource": { "type": "prometheus" },
-      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "gridPos": { "x": 0, "y": 1, "w": 6, "h": 5 },
       "targets": [
-        { "expr": "sum(rate(proxilion_auth_attempts_total[1m]))", "legendFormat": "all" }
-      ]
+        {
+          "expr": "sum(increase(proxilion_pic_invariant_violations_total[5m]))",
+          "legendFormat": "5m"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 1, "color": "red" }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      }
     },
     {
       "id": 2,
       "type": "stat",
-      "title": "Auth rejected (5m share)",
+      "title": "Blocks rate (1m)",
+      "description": "Currently-enforced Layer-B blocks. Sudden spikes correlate with either a new attack pattern or a freshly promoted policy.",
       "datasource": { "type": "prometheus" },
-      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "gridPos": { "x": 6, "y": 1, "w": 6, "h": 5 },
       "targets": [
         {
-          "expr": "sum(rate(proxilion_auth_attempts_total{result=\"rejected\"}[5m])) / clamp_min(sum(rate(proxilion_auth_attempts_total[5m])), 1)",
-          "legendFormat": "rejection rate"
+          "expr": "sum(rate(proxilion_blocks_total[1m]))",
+          "legendFormat": "blocks/s"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "OAuth authorize denied (5m share)",
+      "description": "Anything > a few percent suggests a misconfigured agent or a brute-force probe.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 1, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "sum(rate(proxilion_oauth_authorize_total{result!=\"ok\"}[5m])) / clamp_min(sum(rate(proxilion_oauth_authorize_total[5m])), 1)",
+          "legendFormat": "denied"
         }
       ],
       "fieldConfig": { "defaults": { "unit": "percentunit" } }
     },
     {
-      "id": 3,
-      "type": "timeseries",
-      "title": "Token refreshes by result (1m rate)",
+      "id": 4,
+      "type": "stat",
+      "title": "Operator-auth rejected (5m)",
+      "description": "Bad / revoked / scope-denied operator-token attempts. Routine values are 0; sustained > 0 means a CI bot is misconfigured or an attacker is probing.",
       "datasource": { "type": "prometheus" },
-      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "gridPos": { "x": 18, "y": 1, "w": 6, "h": 5 },
       "targets": [
         {
-          "expr": "sum by (result) (rate(proxilion_token_refreshes_total[1m]))",
+          "expr": "sum(increase(proxilion_operator_auth_total{result=\"rejected\"}[5m]))",
+          "legendFormat": "rejected (5m)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 1, "color": "yellow" },
+              { "value": 5, "color": "red" }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "PIC invariant violations by kind",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "sum by (kind) (rate(proxilion_pic_invariant_violations_total[5m]))",
+          "legendFormat": "{{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Blocks by policy (5m rate)",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "sum by (policy_id) (rate(proxilion_blocks_total[5m]))",
+          "legendFormat": "{{policy_id}}"
+        }
+      ]
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Are we annoying people?",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 13, "w": 24, "h": 1 }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Overrides pending",
+      "description": "Current size of the blocked-action queue. Grows when approvers aren't responding; shrinks when the team is keeping up.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 14, "w": 6, "h": 5 },
+      "targets": [
+        { "expr": "proxilion_overrides_pending", "legendFormat": "pending" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 5, "color": "yellow" },
+              { "value": 20, "color": "red" }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Override latency p50 (5m)",
+      "description": "Median wall-clock time from block to approval. Target < 5 min in business hours.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 6, "y": 14, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(proxilion_override_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Notifier suppressed (5m)",
+      "description": "Events dropped because a burst would have flooded the channel. Each suppressed bucket produces one summary message instead.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 14, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "sum(increase(proxilion_notifier_suppressed_total[5m]))",
+          "legendFormat": "suppressed"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Overrides resolved (1h, by outcome)",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 18, "y": 14, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (increase(proxilion_overrides_resolved_total[1h]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Blocks vs would-have-blocks (5m rate)",
+      "description": "Solid = currently enforced; dashed = what observe-mode policies WOULD have blocked. A small ratio means promoting the observe policies is safe.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 19, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "sum(rate(proxilion_blocks_total[5m]))",
+          "legendFormat": "enforced blocks"
+        },
+        {
+          "expr": "sum(rate(proxilion_observe_would_have_blocked_total[5m]))",
+          "legendFormat": "would-have-blocked"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Override latency distribution",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 19, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(proxilion_override_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(proxilion_override_latency_seconds_bucket[5m])))",
+          "legendFormat": "p90"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(proxilion_override_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "What rolls out next? (observe-mode candidates)",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 1 }
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "Would-have-blocked totals by policy (1h)",
+      "description": "Policies currently in observe mode. Low counts = safe to promote to enforce. Sort high-to-low; the top of the list is what's still firing false positives.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 27, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (policy_id) (increase(proxilion_observe_would_have_blocked_total{policy_id=~\"$policy_id\"}[1h]))",
+          "legendFormat": "{{policy_id}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "organize", "options": {} }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Observe-mode would-have-block timeline",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 27, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (policy_id) (rate(proxilion_observe_would_have_blocked_total{policy_id=~\"$policy_id\"}[5m]))",
+          "legendFormat": "{{policy_id}}"
+        }
+      ]
+    },
+    {
+      "id": 400,
+      "type": "row",
+      "title": "Is the system healthy?",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 35, "w": 24, "h": 1 }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Trust Plane up",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 36, "w": 4, "h": 4 },
+      "targets": [{ "expr": "proxilion_trust_plane_up", "legendFormat": "up" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Federation bridge up",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 4, "y": 36, "w": 4, "h": 4 },
+      "targets": [{ "expr": "proxilion_federation_bridge_up", "legendFormat": "up" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Policy reload failures (1h)",
+      "description": "Should be 0 — a non-zero value means the file watcher rejected a malformed YAML. The previous engine stayed live; investigate the source diff.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 8, "y": 36, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(increase(proxilion_policy_reload_failures_total[1h]))",
+          "legendFormat": "fail"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 1, "color": "red" }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "PCA verify p99 (5m)",
+      "description": "Target < 5ms warm / < 20ms cold per ui-less §3.5.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 36, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(proxilion_pca_verify_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "Adapter request p99 (5m)",
+      "description": "Target < 50ms (minus upstream) per ui-less §3.5.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 18, "y": 36, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(proxilion_adapter_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Auth attempts by result (1m rate)",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 40, "w": 8, "h": 7 },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(proxilion_auth_attempts_total[1m]))",
           "legendFormat": "{{result}}"
         }
       ]
     },
     {
-      "id": 4,
+      "id": 21,
       "type": "timeseries",
-      "title": "PCA cache hits vs misses (1m rate)",
+      "title": "PCA cache hits / misses (1m rate)",
       "datasource": { "type": "prometheus" },
-      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "gridPos": { "x": 8, "y": 40, "w": 8, "h": 7 },
       "targets": [
         { "expr": "rate(proxilion_pca_cache_hits_total[1m])", "legendFormat": "hits" },
         { "expr": "rate(proxilion_pca_cache_misses_total[1m])", "legendFormat": "misses" }
       ]
     },
     {
-      "id": 5,
+      "id": 22,
       "type": "timeseries",
-      "title": "PCA verify failures (5m sum)",
-      "description": "Should be zero in steady state. Any non-zero value indicates a tampered PCA in cache or a CAT-key rotation that hasn't propagated.",
+      "title": "Adapter upstream errors by kind (5m rate)",
       "datasource": { "type": "prometheus" },
-      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 6 },
+      "gridPos": { "x": 16, "y": 40, "w": 8, "h": 7 },
+      "targets": [
+        {
+          "expr": "sum by (kind) (rate(proxilion_adapter_upstream_errors_total[5m]))",
+          "legendFormat": "{{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "PCA verify failures (5m increase)",
+      "description": "Should be 0. Any non-zero indicates a tampered PCA in cache or a CAT-key rotation that hasn't propagated.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 47, "w": 24, "h": 6 },
       "targets": [
         {
           "expr": "increase(proxilion_pca_verify_failures_total[5m])",

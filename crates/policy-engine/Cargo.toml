@@ -15,5 +15,11 @@ anyhow = { workspace = true }
 regex = { workspace = true }
 regorus = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
 
 shared-types = { path = "../shared-types" }
+
+[dev-dependencies]
+tokio = { workspace = true }

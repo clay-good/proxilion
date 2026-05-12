@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+http = { workspace = true }
 
 # Re-export surface so downstream crates depend on a stable internal API
 # rather than the upstream crate name directly. Swapping upstreams in the

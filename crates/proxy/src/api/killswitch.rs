@@ -33,6 +33,10 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct KillswitchApiState {
     pub db: PgPool,
+    /// In-process cache populated by every killswitch invocation so the
+    /// bearer middleware can short-circuit subsequent reads without
+    /// hitting the DB. spec.md §3.2 dev 2.
+    pub kill_cache: crate::kill_cache::KillCache,
 }
 
 pub fn router(state: KillswitchApiState) -> Router {
@@ -70,19 +74,21 @@ async fn kill_session(
 ) -> Result<Json<KillResponse>, ApiError> {
     let body = body.map(|j| j.0).unwrap_or_default();
     let reason = body.reason.clone().unwrap_or_else(|| "killswitch".into());
-    let res = sqlx::query(
+    let hashes: Vec<(Vec<u8>,)> = sqlx::query_as(
         "UPDATE agent_bearers
             SET revoked_at      = now(),
                 revoked_reason  = $2
           WHERE session_id      = $1
-            AND revoked_at IS NULL",
+            AND revoked_at IS NULL
+        RETURNING bearer_sha256",
     )
     .bind(id)
     .bind(&reason)
-    .execute(&state.db)
+    .fetch_all(&state.db)
     .await
     .map_err(ApiError::Db)?;
-    let n = res.rows_affected() as i64;
+    let n = hashes.len() as i64;
+    populate_kill_cache(&state.kill_cache, &hashes).await;
     Ok(Json(persist(&state.db, "session", &id.to_string(), &reason, body.operator_subject.as_deref(), n).await?))
 }
 
@@ -93,21 +99,23 @@ async fn kill_user(
 ) -> Result<Json<KillResponse>, ApiError> {
     let body = body.map(|j| j.0).unwrap_or_default();
     let reason = body.reason.clone().unwrap_or_else(|| "killswitch".into());
-    let res = sqlx::query(
+    let hashes: Vec<(Vec<u8>,)> = sqlx::query_as(
         "UPDATE agent_bearers ab
             SET revoked_at      = now(),
                 revoked_reason  = $2
           FROM oauth_sessions os
          WHERE ab.session_id = os.id
            AND os.p_0        = $1
-           AND ab.revoked_at IS NULL",
+           AND ab.revoked_at IS NULL
+        RETURNING ab.bearer_sha256",
     )
     .bind(&p0)
     .bind(&reason)
-    .execute(&state.db)
+    .fetch_all(&state.db)
     .await
     .map_err(ApiError::Db)?;
-    let n = res.rows_affected() as i64;
+    let n = hashes.len() as i64;
+    populate_kill_cache(&state.kill_cache, &hashes).await;
     Ok(Json(persist(&state.db, "user", &p0, &reason, body.operator_subject.as_deref(), n).await?))
 }
 
@@ -122,18 +130,35 @@ async fn kill_all(
         ));
     }
     let reason = body.reason.clone().unwrap_or_else(|| "killswitch:all".into());
-    let res = sqlx::query(
+    let hashes: Vec<(Vec<u8>,)> = sqlx::query_as(
         "UPDATE agent_bearers
             SET revoked_at      = now(),
                 revoked_reason  = $1
-          WHERE revoked_at IS NULL",
+          WHERE revoked_at IS NULL
+        RETURNING bearer_sha256",
     )
     .bind(&reason)
-    .execute(&state.db)
+    .fetch_all(&state.db)
     .await
     .map_err(ApiError::Db)?;
-    let n = res.rows_affected() as i64;
+    let n = hashes.len() as i64;
+    populate_kill_cache(&state.kill_cache, &hashes).await;
     Ok(Json(persist(&state.db, "all", "*", &reason, body.operator_subject.as_deref(), n).await?))
+}
+
+/// Push `bearer_sha256` BYTEA values from a RETURNING result into the
+/// in-process kill cache. Skips rows with the wrong length so a schema
+/// drift can't poison the cache.
+async fn populate_kill_cache(kc: &crate::kill_cache::KillCache, rows: &[(Vec<u8>,)]) {
+    let mut buf: [u8; 32] = [0; 32];
+    let mut out: Vec<[u8; 32]> = Vec::with_capacity(rows.len());
+    for (h,) in rows {
+        if h.len() == 32 {
+            buf.copy_from_slice(h);
+            out.push(buf);
+        }
+    }
+    kc.mark_many(out).await;
 }
 
 async fn persist(

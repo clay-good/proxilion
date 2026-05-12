@@ -163,6 +163,31 @@ enum PolicyCmd {
         /// Target mode: `enforce`, `observe`, or `disabled`.
         mode: String,
     },
+    /// Replay historical action_events against a candidate YAML and
+    /// report would-have-block deltas per policy. ui-less-surfaces.md §2.4.
+    Simulate {
+        /// Candidate YAML file.
+        file: String,
+        /// Window: `last-7d`, `last-24h`, `last-1h`, or an explicit
+        /// `--since` / `--until` pair via the standard CLI flags above.
+        #[arg(long, default_value = "last-7d")]
+        against: String,
+        /// Customer domain for `${customer_domain}` substitution. If
+        /// unset, falls back to `PROXILION_CUSTOMER_DOMAIN` then a
+        /// reasonable default.
+        #[arg(long)]
+        customer_domain: Option<String>,
+        /// Per-page fetch limit. Default 500 (the proxy max).
+        #[arg(long, default_value_t = 500)]
+        page_limit: u32,
+        /// Output format. `pretty` (default) | `json`.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+        /// Exit code 2 when any policy's delta exceeds this percentage
+        /// of replayed events. Useful in CI gates.
+        #[arg(long)]
+        fail_if_delta_exceeds: Option<f64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -238,6 +263,13 @@ enum TokensCmd {
         /// Reason (optional, recorded for audit).
         #[arg(long)]
         reason: Option<String>,
+    },
+    /// Print the operator-token scope catalogue (what each scope grants,
+    /// which endpoints require it). ui-less-surfaces.md §4.4.
+    Scopes {
+        /// Output format. `pretty` (default) | `json`.
+        #[arg(long, default_value = "pretty")]
+        format: String,
     },
 }
 
@@ -949,6 +981,12 @@ fn token_hash(token: &str) -> Vec<u8> {
 }
 
 async fn cmd_tokens(sub: TokensCmd) -> Result<()> {
+    // `Scopes` is a pure read of the catalogue — no DB connection needed,
+    // so handle it before opening the pool. That way the command works
+    // in environments without a DATABASE_URL (CI, container builds, etc).
+    if let TokensCmd::Scopes { format } = &sub {
+        return cmd_tokens_scopes(format);
+    }
     let db_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL must be set (proxilion-cli tokens writes directly to postgres)")?;
     let pool = sqlx::PgPool::connect(&db_url)
@@ -1035,7 +1073,42 @@ async fn cmd_tokens(sub: TokensCmd) -> Result<()> {
             }))?);
             Ok(())
         }
+        TokensCmd::Scopes { .. } => unreachable!("handled above before pool open"),
     }
+}
+
+fn cmd_tokens_scopes(format: &str) -> Result<()> {
+    let catalogue = shared_types::operator_scopes::SCOPE_CATALOGUE;
+    match format {
+        "json" => {
+            let arr: Vec<_> = catalogue
+                .iter()
+                .map(|(s, d, e)| json!({
+                    "scope": s,
+                    "description": d,
+                    "endpoints": e,
+                }))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+        }
+        _ => {
+            // Pretty: aligned columns, plus a header. Width of the scope
+            // column is the longest scope + 2.
+            let max = catalogue
+                .iter()
+                .map(|(s, _, _)| s.len())
+                .max()
+                .unwrap_or(0)
+                + 2;
+            println!("{:width$}{}", "scope", "description", width = max);
+            println!("{:width$}{}", "-----", "-----------", width = max);
+            for (s, d, e) in catalogue {
+                println!("{:width$}{}", s, d, width = max);
+                println!("{:width$}  endpoints: {}", "", e, width = max);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1120,7 +1193,321 @@ async fn cmd_policy(
             }
             Ok(())
         }
+        PolicyCmd::Simulate {
+            file,
+            against,
+            customer_domain,
+            page_limit,
+            format,
+            fail_if_delta_exceeds,
+        } => {
+            cmd_policy_simulate(
+                http,
+                url,
+                token,
+                &file,
+                &against,
+                customer_domain.as_deref(),
+                page_limit,
+                &format,
+                fail_if_delta_exceeds,
+            )
+            .await
+        }
     }
+}
+
+// Replay history against a candidate YAML and report would-have-block deltas.
+// ui-less-surfaces.md §2.4.
+async fn cmd_policy_simulate(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    file: &str,
+    against: &str,
+    customer_domain: Option<&str>,
+    page_limit: u32,
+    format: &str,
+    fail_if_delta_exceeds: Option<f64>,
+) -> Result<()> {
+    use policy_engine::{Decision, Engine, RequestContext, UserCtx};
+    use std::collections::HashMap;
+
+    // 1. Parse candidate YAML.
+    let candidate_yaml =
+        std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    let candidate = Engine::new(&candidate_yaml)
+        .map_err(|e| anyhow!("candidate policy YAML failed to parse: {e}"))?;
+
+    // 2. Resolve window.
+    let since = parse_window(against)?;
+    let domain = customer_domain
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("PROXILION_CUSTOMER_DOMAIN").ok())
+        .unwrap_or_else(|| "example.com".to_string());
+
+    // 3. Page through /api/v1/actions until exhausted or the rows pre-date `since`.
+    let mut before: Option<String> = None;
+    let mut total: usize = 0;
+    let mut would_now_block: HashMap<String, usize> = HashMap::new();
+    let mut would_now_allow: HashMap<String, usize> = HashMap::new();
+    let mut was_blocked_total: HashMap<String, usize> = HashMap::new();
+    let mut now_blocked_total: HashMap<String, usize> = HashMap::new();
+    let mut unreplayable: usize = 0;
+
+    let since_str = since.to_rfc3339();
+
+    loop {
+        let mut req = http
+            .get(format!("{url}/api/v1/actions"))
+            .query(&[("since", since_str.as_str()), ("limit", &page_limit.to_string())]);
+        if let Some(b) = before.as_deref() {
+            req = req.query(&[("before", b)]);
+        }
+        let resp = auth_header(req, token)
+            .send()
+            .await
+            .context("GET /api/v1/actions")?
+            .error_for_status()
+            .context("/api/v1/actions returned an error")?;
+        let envelope: Value = resp.json().await?;
+        let rows = envelope["rows"].as_array().cloned().unwrap_or_default();
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            total += 1;
+            let vendor = row["vendor"].as_str().unwrap_or("").to_string();
+            let action = row["action"].as_str().unwrap_or("").to_string();
+            let p_0 = row["p_0"].as_str().unwrap_or("").to_string();
+            let original_decision = row["decision"].as_str().unwrap_or("").to_string();
+            let was_blocked = original_decision == "block"
+                || original_decision == "observe_block"
+                || original_decision == "pic_invariant_violation"
+                || original_decision == "read_filter_blocked";
+
+            // Rehydrate body fields from `extra` where the adapter wrote them.
+            let extra = &row["extra"];
+            let mut body: HashMap<String, Value> = HashMap::new();
+            for k in &[
+                "to_domain",
+                "to_domains",
+                "external_recipient",
+                "recipient_count",
+                "attendee_domains",
+                "external_attendee",
+                "attendee_count",
+                "visibility",
+                "summary_present",
+            ] {
+                if let Some(v) = extra.get(*k) {
+                    if !v.is_null() {
+                        body.insert((*k).to_string(), v.clone());
+                    }
+                }
+            }
+            // request_path_params, if present.
+            let mut path = HashMap::new();
+            if let Some(p) = extra.get("request_path_params") {
+                if let Some(map) = p.as_object() {
+                    for (k, v) in map {
+                        if let Some(s) = v.as_str() {
+                            path.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Replayable iff vendor and action are present.
+            if vendor.is_empty() || action.is_empty() {
+                unreplayable += 1;
+                continue;
+            }
+
+            let ctx = RequestContext {
+                vendor,
+                action,
+                user: UserCtx {
+                    email: p_0,
+                    groups: vec![],
+                },
+                path,
+                body,
+                headers: HashMap::new(),
+                customer_domain: domain.clone(),
+            };
+
+            let simulated = match candidate.evaluate(&ctx) {
+                Ok(o) => o,
+                Err(_) => {
+                    unreplayable += 1;
+                    continue;
+                }
+            };
+            let simulated_blocked = matches!(simulated.decision, Decision::Block { .. })
+                || simulated.observe_would_have.as_deref() == Some("observe_block");
+            let policy_id = simulated
+                .matched_policy_id
+                .clone()
+                .unwrap_or_else(|| "(none)".to_string());
+
+            if was_blocked {
+                *was_blocked_total.entry(policy_id.clone()).or_default() += 1;
+            }
+            if simulated_blocked {
+                *now_blocked_total.entry(policy_id.clone()).or_default() += 1;
+            }
+            match (was_blocked, simulated_blocked) {
+                (false, true) => {
+                    *would_now_block.entry(policy_id).or_default() += 1;
+                }
+                (true, false) => {
+                    *would_now_allow.entry(policy_id).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+        // Cursor.
+        before = envelope["next_before"].as_str().map(|s| s.to_string());
+        if before.is_none() || rows.len() < page_limit as usize {
+            break;
+        }
+    }
+
+    // 4. Render report + compute max delta percentage.
+    let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    keys.extend(was_blocked_total.keys().cloned());
+    keys.extend(now_blocked_total.keys().cloned());
+    keys.extend(would_now_block.keys().cloned());
+    keys.extend(would_now_allow.keys().cloned());
+
+    let mut rows = Vec::new();
+    let mut max_pct_delta: f64 = 0.0;
+    for k in &keys {
+        let was = was_blocked_total.get(k).copied().unwrap_or(0);
+        let now = now_blocked_total.get(k).copied().unwrap_or(0);
+        let new_blocks = would_now_block.get(k).copied().unwrap_or(0);
+        let new_allows = would_now_allow.get(k).copied().unwrap_or(0);
+        let delta = now as i64 - was as i64;
+        let pct = if total > 0 {
+            (delta.unsigned_abs() as f64) * 100.0 / (total as f64)
+        } else {
+            0.0
+        };
+        if pct > max_pct_delta {
+            max_pct_delta = pct;
+        }
+        rows.push(json!({
+            "policy_id": k,
+            "was_blocked": was,
+            "now_blocked": now,
+            "would_now_block": new_blocks,
+            "would_now_allow": new_allows,
+            "delta": delta,
+            "delta_pct": pct,
+        }));
+    }
+
+    let report = json!({
+        "replayed": total,
+        "unreplayable": unreplayable,
+        "window": against,
+        "since": since_str,
+        "customer_domain": domain,
+        "policies": rows,
+        "max_pct_delta": max_pct_delta,
+    });
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Replayed {total} actions over `{against}` ({} unreplayable)", unreplayable);
+        if total == 0 {
+            println!("No history in the window.");
+        } else {
+            println!();
+            println!(
+                "{:<40} {:>8} {:>8} {:>12} {:>12}",
+                "policy_id", "was_blk", "now_blk", "+would_blk", "+would_allow"
+            );
+            println!("{}", "─".repeat(86));
+            for r in &report["policies"].as_array().unwrap().clone() {
+                println!(
+                    "{:<40} {:>8} {:>8} {:>12} {:>12}",
+                    r["policy_id"].as_str().unwrap_or(""),
+                    r["was_blocked"].as_u64().unwrap_or(0),
+                    r["now_blocked"].as_u64().unwrap_or(0),
+                    r["would_now_block"].as_u64().unwrap_or(0),
+                    r["would_now_allow"].as_u64().unwrap_or(0),
+                );
+            }
+            println!();
+            println!("Max delta: {:.2}% of replayed events.", max_pct_delta);
+        }
+    }
+
+    if let Some(threshold) = fail_if_delta_exceeds {
+        if max_pct_delta > threshold {
+            return Err(anyhow!(
+                "max delta {max_pct_delta:.2}% exceeds threshold {threshold:.2}% (--fail-if-delta-exceeds)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod simulate_tests {
+    use super::*;
+
+    #[test]
+    fn parse_window_days() {
+        let r = parse_window("last-7d").unwrap();
+        let now = chrono::Utc::now();
+        let diff = now.signed_duration_since(r);
+        assert!(diff.num_hours() >= 168 - 1 && diff.num_hours() <= 168 + 1);
+    }
+
+    #[test]
+    fn parse_window_hours_and_minutes_and_seconds() {
+        parse_window("last-24h").unwrap();
+        parse_window("last-15m").unwrap();
+        parse_window("last-30s").unwrap();
+    }
+
+    #[test]
+    fn parse_window_rejects_unknown_unit() {
+        assert!(parse_window("last-7y").is_err());
+    }
+
+    #[test]
+    fn parse_window_accepts_rfc3339() {
+        parse_window("2026-01-01T00:00:00Z").unwrap();
+    }
+}
+
+/// Window parser. Accepts `last-7d`, `last-24h`, `last-1h`, `last-15m`,
+/// or an RFC 3339 timestamp. Returns the UTC since-cutoff.
+fn parse_window(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    if let Some(rest) = s.strip_prefix("last-") {
+        // Accept "7d", "24h", "1h", "15m", "30s".
+        let (num, unit) = rest.split_at(rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len()));
+        let n: i64 = num
+            .parse()
+            .map_err(|e| anyhow!("invalid window number `{num}`: {e}"))?;
+        let dur = match unit {
+            "d" => chrono::Duration::days(n),
+            "h" => chrono::Duration::hours(n),
+            "m" => chrono::Duration::minutes(n),
+            "s" => chrono::Duration::seconds(n),
+            other => return Err(anyhow!("unknown window unit `{other}` (use d|h|m|s)")),
+        };
+        return Ok(chrono::Utc::now() - dur);
+    }
+    // Try as RFC 3339.
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| anyhow!("invalid --against value `{s}`: {e}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -86,10 +86,45 @@ pub struct BurstSummary {
     pub suppressed_count: u64,
     pub window_seconds: u64,
     pub exemplar: Option<SuppressedEvent>,
+    /// Deep link to the filtered blocked-queue view — ui-less-surfaces.md
+    /// §5.6 dev 2 "click for the full list." Populated by the caller from
+    /// `proxy_public_url + /api/v1/blocked?policy_id=...&p_0=...`. Empty
+    /// string when the notifier has no public URL (test fixtures).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub details_url: String,
 }
 
 impl BurstSummary {
     pub const SCHEMA: &'static str = "proxilion.blocked_action_burst.v1";
+
+    /// Fill `details_url` with `<base>/api/v1/blocked?policy_id=<id>[&p_0=<email>]`.
+    /// Both query values are URL-encoded; empty `base` is a no-op. Lets
+    /// each notifier produce the same deep link without duplicating the
+    /// URL-format logic.
+    pub fn with_details_url(mut self, base: &str) -> Self {
+        if base.is_empty() {
+            return self;
+        }
+        let trimmed = base.trim_end_matches('/');
+        let pid = urlencoding_encode(&self.policy_id);
+        let mut url = format!("{trimmed}/api/v1/blocked?policy_id={pid}");
+        if let Some(p_0) = &self.p_0 {
+            let e = urlencoding_encode(p_0);
+            url.push_str("&p_0=");
+            url.push_str(&e);
+        }
+        self.details_url = url;
+        self
+    }
+}
+
+/// Tiny URL-encoder for query values. The proxy already pulls
+/// `percent-encoding` for OAuth callback handling; we use it via a
+/// thin wrapper to keep call sites tidy. Kept here to avoid threading
+/// an extra dependency into `burst.rs`.
+fn urlencoding_encode(s: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
 }
 
 /// Per-policy override resolver. Returns `(threshold, window)` overrides
@@ -200,6 +235,7 @@ impl BurstSuppressor {
                 suppressed_count: b.suppressed,
                 window_seconds: cfg.window.as_secs(),
                 exemplar: b.first_suppressed.clone(),
+                details_url: String::new(),
             });
             b.suppressed = 0;
             b.first_suppressed = None;
@@ -401,6 +437,54 @@ mod tests {
         // With window=0, the previous timestamp is immediately pruned, so
         // this also passes.
         assert!(s.admit(&n, t1).await);
+    }
+
+    #[test]
+    fn details_url_round_trip() {
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "gmail-external".into(),
+            p_0: Some("alice@acme.com".into()),
+            suppressed_count: 5,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        }
+        .with_details_url("https://proxy.local/");
+        assert_eq!(
+            s.details_url,
+            "https://proxy.local/api/v1/blocked?policy_id=gmail%2Dexternal&p_0=alice%40acme%2Ecom"
+        );
+    }
+
+    #[test]
+    fn details_url_empty_base_is_noop() {
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 1,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        }
+        .with_details_url("");
+        assert!(s.details_url.is_empty());
+    }
+
+    #[test]
+    fn details_url_omits_p_0_when_absent() {
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 1,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        }
+        .with_details_url("https://proxy.local");
+        assert_eq!(s.details_url, "https://proxy.local/api/v1/blocked?policy_id=p");
     }
 
     #[tokio::test]

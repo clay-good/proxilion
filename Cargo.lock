@@ -2359,6 +2359,8 @@ name = "policy-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
  "regex",
  "regorus",
  "serde",
@@ -2366,7 +2368,9 @@ dependencies = [
  "serde_yaml",
  "shared-types",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2457,11 +2461,14 @@ dependencies = [
  "clap",
  "futures-util",
  "humantime",
+ "policy-engine",
  "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
+ "shared-types",
  "sqlx",
  "tokio",
  "tokio-stream",
@@ -3276,6 +3283,7 @@ name = "shared-types"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "http",
  "provenance-core",
  "serde",
  "serde_json",

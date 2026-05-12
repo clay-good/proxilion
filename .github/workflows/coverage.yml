@@ -1,0 +1,76 @@
+name: coverage
+
+# qiuth-patterns.md §6 — coverage threshold gate.
+#
+# Phase ladder (per §6.2):
+#   adoption | 60% lines / 60% functions  ← current floor
+#   3 months | 70% / 70%
+#   6 months | 80% / 80%
+#
+# Don't ratchet without expanding the test surface first.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Required for the SHA-pinned upstream git deps (pic-protocol, provenance-*).
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  llvm-cov:
+    name: cargo llvm-cov
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --component llvm-tools-preview --no-self-update
+          rustup default stable
+
+      - name: cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: coverage-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            coverage-${{ runner.os }}-
+
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: run coverage
+        # Skip the perf-test that's #[cfg_attr(debug_assertions, ignore)] —
+        # llvm-cov runs against the test profile (debug), so the perf test
+        # would no-op anyway.
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path lcov.info \
+            --ignore-filename-regex '(^|/)tests/' \
+            --no-fail-fast
+          # Render the summary so PR reviewers see numbers in the log.
+          cargo llvm-cov report --summary-only
+
+      - name: enforce coverage floor
+        # Phase 1: 60% lines / 60% functions. Bump via this file only —
+        # the threshold isn't read from anywhere else.
+        run: |
+          cargo llvm-cov report \
+            --fail-under-lines 60 \
+            --fail-under-functions 60
+
+      - name: upload lcov artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-report
+          path: lcov.info
+          if-no-files-found: error

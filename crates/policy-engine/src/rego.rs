@@ -7,6 +7,8 @@
 //! API later without changing the call sites.
 
 use serde_yaml::Value as Yaml;
+use shared_types::ErrorCode;
+use std::time::Instant;
 use thiserror::Error;
 use tracing::trace;
 
@@ -14,6 +16,7 @@ use crate::context::RequestContext;
 use crate::decision::{Decision, Pattern, QuarantineAction, ReadFilter};
 use crate::match_expr;
 use crate::ops::{OpsExpression, OpsParseError};
+use crate::trace::{LayerOutcome, OpsAtomView, PolicyLayer, PolicyTrace};
 use crate::yaml::{
     parse_policies, AuditBodyMode, Mode, PicMode, PolicyDoc, QuarantineActionCfg,
     QuarantinePatternCfg, ReadFilterCfg,
@@ -130,6 +133,93 @@ impl Engine {
             observe_would_have: None,
             audit_body: None,
         })
+    }
+
+    /// Evaluate and emit a structured per-layer [`PolicyTrace`] alongside
+    /// the [`Outcome`]. Adapters that don't need the trace continue to
+    /// call [`Engine::evaluate`]. Per qiuth-patterns.md §3.
+    ///
+    /// **Note:** Layer A (PIC ops) doesn't actually round-trip the Trust
+    /// Plane inside the engine; the returned trace's Layer-A entry records
+    /// the *required* ops set and `passed = true`. The adapter must
+    /// supplement the Layer-A outcome via [`PolicyTrace::layers`] after
+    /// the successor-PCA call resolves — failing back to
+    /// [`ErrorCode::PicInvariantViolation`] when the Trust Plane refuses.
+    pub fn evaluate_with_trace(
+        &self,
+        ctx: &RequestContext,
+    ) -> Result<(Outcome, PolicyTrace), Error> {
+        let started = Instant::now();
+        let outcome = self.evaluate(ctx)?;
+        let mut layers: Vec<LayerOutcome> = Vec::with_capacity(3);
+
+        // Layer A — required ops. The engine surfaces the expression; the
+        // adapter cross-checks it. Record as `passed` here; the adapter
+        // updates this entry to `failed` on Trust-Plane refusal.
+        layers.push(LayerOutcome {
+            layer: PolicyLayer::LayerA,
+            passed: true,
+            matched_rule_id: if outcome.required_ops.required.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{} required atom(s)",
+                    outcome.required_ops.required.len()
+                ))
+            },
+            error_code: None,
+            detail: None,
+        });
+
+        // Layer B — content rules.
+        let layer_b = match &outcome.decision {
+            Decision::Allow => LayerOutcome::passed(PolicyLayer::LayerB),
+            Decision::Block { reason, .. } => LayerOutcome::failed(
+                PolicyLayer::LayerB,
+                ErrorCode::PolicyBlocked,
+                outcome.matched_policy_id.clone(),
+                Some(reason.clone()),
+            ),
+            Decision::RequireConfirmation { reason } => LayerOutcome::failed(
+                PolicyLayer::LayerB,
+                ErrorCode::RequireConfirmation,
+                outcome.matched_policy_id.clone(),
+                Some(reason.clone()),
+            ),
+            Decision::RateLimit { burst, per_seconds } => LayerOutcome::failed(
+                PolicyLayer::LayerB,
+                ErrorCode::RateLimited,
+                outcome.matched_policy_id.clone(),
+                Some(format!("burst={burst} per_seconds={per_seconds}")),
+            ),
+        };
+        layers.push(layer_b);
+
+        // Read filter — engine only records that a filter is configured;
+        // the actual scan result lands on the adapter when the response
+        // body comes back. Recording the presence/absence here gives the
+        // trace a slot to mutate downstream.
+        if outcome.read_filter.is_some() {
+            layers.push(LayerOutcome {
+                layer: PolicyLayer::ReadFilter,
+                passed: true,
+                matched_rule_id: outcome.matched_policy_id.clone(),
+                error_code: None,
+                detail: Some("read_filter configured; scan pending".into()),
+            });
+        }
+
+        let required_ops: Vec<OpsAtomView> = outcome
+            .required_ops
+            .required
+            .iter()
+            .map(OpsAtomView::from)
+            .collect();
+
+        let mut trace = PolicyTrace::new(layers, outcome.decision.clone(), required_ops);
+        trace.duration_micros = started.elapsed().as_micros() as u64;
+
+        Ok((outcome, trace))
     }
 }
 

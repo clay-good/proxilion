@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use policy_engine::{Engine, Mode};
+use policy_engine::{Engine, Mode, PolicyLoader};
 use serde::Serialize;
 use tracing::{info, warn};
 
@@ -39,6 +39,14 @@ pub struct PolicyHandle {
     /// and used by `POST /api/v1/policy/{id}/mode` to round-trip mode
     /// flips back to disk in a future iteration.
     raw_yaml: Arc<ArcSwap<String>>,
+    /// Optional pluggable backend — `Some` when constructed via
+    /// `with_loader`. The file-watcher path uses this to short-circuit
+    /// identical reloads via `changed_since`, and a future `DbPolicyLoader`
+    /// drops in here without touching adapters. qiuth-patterns.md §5.
+    loader: Option<Arc<dyn PolicyLoader>>,
+    /// Last successful version token from the loader. Used by the
+    /// watcher to skip no-op reloads.
+    last_version: Arc<ArcSwap<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,7 +63,40 @@ impl PolicyHandle {
             engine: Arc::new(ArcSwap::from_pointee(initial)),
             source,
             raw_yaml: Arc::new(ArcSwap::from_pointee(raw_yaml)),
+            loader: None,
+            last_version: Arc::new(ArcSwap::from_pointee(String::new())),
         }
+    }
+
+    /// Build a handle backed by an arbitrary [`PolicyLoader`].
+    /// `initial_version` is the version token reported by the loader for
+    /// the YAML the handle was built with — passed through so the
+    /// watcher's first `changed_since` tick can short-circuit.
+    /// qiuth-patterns.md §5.
+    pub fn with_loader(
+        initial: Engine,
+        loader: Arc<dyn PolicyLoader>,
+        raw_yaml: String,
+        initial_version: String,
+        source: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            engine: Arc::new(ArcSwap::from_pointee(initial)),
+            source,
+            raw_yaml: Arc::new(ArcSwap::from_pointee(raw_yaml)),
+            loader: Some(loader),
+            last_version: Arc::new(ArcSwap::from_pointee(initial_version)),
+        }
+    }
+
+    pub fn loader(&self) -> Option<Arc<dyn PolicyLoader>> {
+        self.loader.clone()
+    }
+
+    /// Current version token from the most recent successful loader reload.
+    /// Empty string when no loader is attached.
+    pub fn last_version(&self) -> Arc<String> {
+        self.last_version.load_full()
     }
 
     /// Snapshot the current engine for evaluation. Cheap — bumps an
@@ -112,11 +153,26 @@ impl PolicyHandle {
     /// Swap the engine to a YAML string the caller already has in hand.
     /// Used by `set_mode` (round-trips mutated YAML) and the file watcher.
     pub fn swap_from_yaml(&self, yaml: String, source: String) -> ReloadReport {
+        self.swap_from_yaml_with_version(yaml, source, None)
+    }
+
+    /// Same as [`swap_from_yaml`], plus stores the loader's version token
+    /// so the watcher's next `changed_since` call short-circuits when the
+    /// source is unchanged. qiuth-patterns.md §5.
+    pub fn swap_from_yaml_with_version(
+        &self,
+        yaml: String,
+        source: String,
+        version: Option<String>,
+    ) -> ReloadReport {
         match Engine::new(&yaml) {
             Ok(engine) => {
                 let n = engine.policy_count();
                 self.engine.store(Arc::new(engine));
                 self.raw_yaml.store(Arc::new(yaml));
+                if let Some(v) = version {
+                    self.last_version.store(Arc::new(v));
+                }
                 info!(source = %source, policy_count = n, "policy reloaded");
                 metrics::counter!("proxilion_policy_reload_success_total").increment(1);
                 ReloadReport {
@@ -138,6 +194,38 @@ impl PolicyHandle {
                     source: Some(source),
                     policy_count: self.load().policy_count(),
                     error: Some(format!("parse failed: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Async reload via the attached [`PolicyLoader`]. Returns the report
+    /// + the loader's new version token. Used by the watcher when a
+    /// loader is attached; falls back to `reload_from_disk` otherwise.
+    /// qiuth-patterns.md §5.
+    pub async fn reload_via_loader(&self) -> ReloadReport {
+        let Some(loader) = self.loader.as_ref() else {
+            // No loader → keep prior behavior.
+            return self.reload_from_disk();
+        };
+        match loader.load().await {
+            Ok(bundle) => self.swap_from_yaml_with_version(
+                bundle.yaml,
+                loader.source_label(),
+                Some(bundle.version),
+            ),
+            Err(e) => {
+                warn!(error = %e, source = %loader.source_label(), "policy reload via loader failed");
+                metrics::counter!(
+                    "proxilion_policy_reload_failures_total",
+                    "reason" => "io_error"
+                )
+                .increment(1);
+                ReloadReport {
+                    ok: false,
+                    source: Some(loader.source_label()),
+                    policy_count: self.load().policy_count(),
+                    error: Some(format!("loader: {e}")),
                 }
             }
         }
@@ -209,6 +297,32 @@ pub enum SetModeError {
 /// else" (we cross-compile to Linux, macOS, and BSD targets, so
 /// platform-specific watchers add complexity without buying much).
 pub async fn spawn_watcher(handle: PolicyHandle) {
+    // Loader-aware path (qiuth-patterns.md §5): if a loader is attached,
+    // poll its `changed_since` and reload via the loader so backends like
+    // a future `DbPolicyLoader` plug in transparently.
+    if let Some(loader) = handle.loader() {
+        let label = loader.source_label();
+        info!(source = %label, interval_seconds = WATCH_INTERVAL.as_secs(), "policy loader watcher started");
+        loop {
+            tokio::time::sleep(WATCH_INTERVAL).await;
+            let current = handle.last_version();
+            match loader.changed_since(current.as_str()).await {
+                Ok(Some(_new_version)) => {
+                    info!(source = %label, "policy source changed; reloading via loader");
+                    let _ = handle.reload_via_loader().await;
+                    // Version is updated inside `swap_from_yaml_with_version`
+                    // on success; on failure we leave it so the next tick retries.
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(source = %label, error = %e, "policy loader version check failed");
+                }
+            }
+        }
+    }
+
+    // Legacy file-mtime path (no loader). Kept for back-compat with the
+    // existing construction path in `server.rs`.
     let Some(path) = handle.source().cloned() else {
         return;
     };
@@ -310,6 +424,44 @@ mod tests {
         let h = PolicyHandle::new(engine_with("[]"), None, "[]".into());
         let err = h.set_mode("nope", Mode::Observe).unwrap_err();
         assert!(matches!(err, SetModeError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn reload_via_loader_swaps_engine_and_bumps_version() {
+        use policy_engine::StaticPolicyLoader;
+        let yaml0 = "[]";
+        let loader = Arc::new(StaticPolicyLoader::new(yaml0).with_label("test-loader"));
+        let initial = engine_with(yaml0);
+        let v0 = loader.load().await.unwrap().version;
+        let h = PolicyHandle::with_loader(initial, loader.clone(), yaml0.into(), v0.clone(), None);
+
+        // Mutate the loader's YAML and reload through the handle.
+        loader.set_yaml(
+            "- id: viaLoader\n  vendor: google\n  action: drive.files.get\n  decision: allow\n  required_ops: []\n",
+        );
+        let report = h.reload_via_loader().await;
+        assert!(report.ok, "{report:?}");
+        assert_eq!(report.policy_count, 1);
+        assert_eq!(h.load().policy_count(), 1);
+
+        // Version token advanced.
+        assert_ne!(h.last_version().as_str(), v0.as_str());
+    }
+
+    #[tokio::test]
+    async fn reload_via_loader_keeps_prior_engine_on_bad_yaml() {
+        use policy_engine::StaticPolicyLoader;
+        let yaml0 = "[]";
+        let loader = Arc::new(StaticPolicyLoader::new(yaml0));
+        let initial = engine_with(yaml0);
+        let v0 = loader.load().await.unwrap().version;
+        let h = PolicyHandle::with_loader(initial, loader.clone(), yaml0.into(), v0, None);
+
+        loader.set_yaml("this is :: not yaml ::\n  - [");
+        let report = h.reload_via_loader().await;
+        assert!(!report.ok);
+        // Old engine still live.
+        assert_eq!(h.load().policy_count(), 0);
     }
 
     #[test]

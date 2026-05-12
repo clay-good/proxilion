@@ -134,6 +134,15 @@ pub async fn run(cfg: Config) -> Result<()> {
             let policy_handle = build_policy_handle(&cfg)?;
             tokio::spawn(crate::policy_handle::spawn_watcher(policy_handle.clone()));
 
+            // Blocked-action expiry sweeper (ui-less-surfaces.md §5.7).
+            // Flips `pending` rows whose `expires_at` has passed to
+            // `expired` once per minute. Operates independently of the
+            // notifier — no fan-out on expiry by design.
+            tokio::spawn(crate::blocked_expiry::spawn(
+                core.db.clone(),
+                crate::blocked_expiry::DEFAULT_TICK_INTERVAL,
+            ));
+
             // Setup-status checklist (powers /admin/setup). Always-on so the
             // operator can use it to figure out what's still missing. Mounted
             // OUTSIDE the operator_auth layer — it's a checklist for an
@@ -172,7 +181,10 @@ pub async fn run(cfg: Config) -> Result<()> {
                     pic: core.pic.clone(),
                 }))
                 .merge(crate::api::killswitch::router(
-                    crate::api::killswitch::KillswitchApiState { db: core.db.clone() },
+                    crate::api::killswitch::KillswitchApiState {
+                        db: core.db.clone(),
+                        kill_cache: auth_state.kill_cache.clone(),
+                    },
                 ))
                 .merge(crate::api::policy::router(crate::api::policy::PolicyApiState {
                     policy: policy_handle.clone(),
@@ -482,6 +494,7 @@ fn build_auth_state_from_core(cfg: &Config, core: &CoreState) -> AuthState {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .expect("reqwest client"),
+        kill_cache: crate::kill_cache::KillCache::new(),
     }
 }
 
@@ -530,17 +543,30 @@ async fn build_nats_sink(cfg: &Config, tee: TeeStream) -> TeeStream {
 }
 
 fn build_policy_handle(cfg: &Config) -> Result<crate::policy_handle::PolicyHandle> {
-    let (yaml, source) = match cfg.policy_path.as_ref() {
-        Some(p) => {
-            let yaml = std::fs::read_to_string(p)
-                .with_context(|| format!("reading policy file {}", p.display()))?;
-            (yaml, Some(p.clone()))
-        }
-        None => (String::from("[]"), None),
-    };
-    let engine = policy_engine::Engine::new(&yaml)
-        .map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
-    Ok(crate::policy_handle::PolicyHandle::new(engine, source, yaml))
+    use std::sync::Arc;
+    // Path configured → back the handle with a `FilePolicyLoader` so the
+    // watcher uses the pluggable backend (qiuth-patterns.md §5).
+    // Unconfigured → preserve the simple inline-empty-policy bootstrap.
+    if let Some(p) = cfg.policy_path.as_ref() {
+        let yaml = std::fs::read_to_string(p)
+            .with_context(|| format!("reading policy file {}", p.display()))?;
+        let engine = policy_engine::Engine::new(&yaml)
+            .map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
+        let loader = Arc::new(policy_engine::FilePolicyLoader::new(p));
+        let initial_version = loader.version_token_sync().unwrap_or_default();
+        Ok(crate::policy_handle::PolicyHandle::with_loader(
+            engine,
+            loader,
+            yaml,
+            initial_version,
+            Some(p.clone()),
+        ))
+    } else {
+        let yaml = String::from("[]");
+        let engine = policy_engine::Engine::new(&yaml)
+            .map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
+        Ok(crate::policy_handle::PolicyHandle::new(engine, None, yaml))
+    }
 }
 
 /// Resolve webhook URL + HMAC hex: DB row first (ui-less-surfaces.md §8.4),
@@ -598,11 +624,16 @@ async fn build_notifiers(
                     let wn = wn.with_burst(suppressor.clone());
                     let notifier = Arc::new(wn);
                     let nfor = notifier.clone();
+                    let proxy_url = cfg.proxy_base_url.clone();
                     tokio::spawn(crate::notifier::burst::spawn_flush_loop(
                         suppressor,
                         move |summary| {
                             let n = nfor.clone();
-                            async move { n.notify_summary(&summary).await }
+                            let url = proxy_url.clone();
+                            async move {
+                                let s = summary.with_details_url(&url);
+                                n.notify_summary(&s).await;
+                            }
                         },
                     ));
                     info!(
@@ -622,8 +653,30 @@ async fn build_notifiers(
         let secret = crate::notifier::SlackSigningSecret::new(secret_text);
         match crate::notifier::SlackNotifier::new(url.clone(), secret, cfg.proxy_base_url.clone()) {
             Ok(sn) => {
-                info!(url = %url, "blocked-action slack notifier installed");
-                n.slack.replace(Some(Arc::new(sn)));
+                let mut suppressor = BurstSuppressor::new(BurstConfig::default());
+                if let Some(handle) = policy {
+                    let handle: crate::policy_handle::PolicyHandle = handle.clone();
+                    let resolver: crate::notifier::burst::BurstResolver =
+                        Arc::new(move |policy_id| handle.load().burst_override_for(policy_id));
+                    suppressor = suppressor.with_resolver(resolver);
+                }
+                let sn = sn.with_burst(suppressor.clone());
+                let notifier = Arc::new(sn);
+                let nfor = notifier.clone();
+                let proxy_url = cfg.proxy_base_url.clone();
+                tokio::spawn(crate::notifier::burst::spawn_flush_loop(
+                    suppressor,
+                    move |summary| {
+                        let n = nfor.clone();
+                        let url = proxy_url.clone();
+                        async move {
+                            let s = summary.with_details_url(&url);
+                            n.notify_summary(&s).await;
+                        }
+                    },
+                ));
+                info!(url = %url, "blocked-action slack notifier installed (with burst suppression)");
+                n.slack.replace(Some(notifier));
             }
             Err(e) => warn!(error = %e, "SlackNotifier build failed; slack disabled"),
         }
@@ -631,10 +684,12 @@ async fn build_notifiers(
 
     // Email driver (ui-less-surfaces.md §5.4).
     if let Some(cfg_row) = resolve_email_config(db).await {
-        match crate::notifier::EmailNotifier::new(
+        match crate::notifier::EmailNotifier::new_with_recipients(
             &cfg_row.smtp_url,
             &cfg_row.from,
             &cfg_row.to,
+            &cfg_row.cc,
+            &cfg_row.bcc,
             cfg.proxy_base_url.clone(),
             db.clone(),
         ) {
@@ -653,6 +708,8 @@ struct EmailRowConfig {
     smtp_url: String,
     from: String,
     to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
 }
 
 /// Read the email driver row. No env fallback (SMTP credentials belong
@@ -682,7 +739,27 @@ async fn resolve_email_config(db: &sqlx::PgPool) -> Option<EmailRowConfig> {
     if to.is_empty() {
         return None;
     }
-    Some(EmailRowConfig { smtp_url, from, to })
+    // cc / bcc: optional, same single-string-or-array shape as `to`.
+    let read_list = |key: &str| -> Vec<String> {
+        match conf.get(key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let cc = read_list("cc");
+    let bcc = read_list("bcc");
+    Some(EmailRowConfig {
+        smtp_url,
+        from,
+        to,
+        cc,
+        bcc,
+    })
 }
 
 /// Read the Slack driver row. No env fallback (Slack tokens belong in DB
@@ -725,9 +802,24 @@ fn build_siem_sink(cfg: &Config, tee: TeeStream) -> TeeStream {
         }
     };
     match SiemForwarder::new(url.to_string(), key) {
-        Ok(fwd) => {
-            info!(url = %url, "SIEM forwarder installed");
-            tee.with_sink(Arc::new(fwd))
+        Ok(mut fwd) => {
+            if let Some(size) = cfg.siem_batch_size {
+                let interval = std::time::Duration::from_secs(cfg.siem_batch_max_age_secs);
+                fwd = fwd.with_batching(size, interval);
+                info!(
+                    url = %url,
+                    batch_size = size,
+                    flush_secs = cfg.siem_batch_max_age_secs,
+                    "SIEM forwarder installed (batched)"
+                );
+            } else {
+                info!(url = %url, "SIEM forwarder installed (per-event)");
+            }
+            let arc_fwd = Arc::new(fwd);
+            if arc_fwd.batching_enabled() {
+                tokio::spawn(crate::forwarder::siem::spawn_flush_loop(arc_fwd.clone()));
+            }
+            tee.with_sink(arc_fwd)
         }
         Err(e) => {
             warn!(error = %e, "SIEM forwarder build failed; continuing without it");

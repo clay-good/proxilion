@@ -2,6 +2,7 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use shared_types::ErrorCode;
 use thiserror::Error;
 use tracing::{error, warn};
 
@@ -48,23 +49,33 @@ pub enum AppError {
 }
 
 impl AppError {
-    pub fn status(&self) -> StatusCode {
+    /// Canonical [`ErrorCode`] for this variant. Stable wire contract — see
+    /// [`shared_types::error_code`] and `docs/error-codes.md`.
+    pub fn code(&self) -> ErrorCode {
         match self {
-            AppError::PolicyBlocked { .. } => StatusCode::FORBIDDEN,
-            AppError::RequireConfirmation(_) => StatusCode::PRECONDITION_REQUIRED,
-            AppError::RateLimit => StatusCode::TOO_MANY_REQUESTS,
-            AppError::PicInvariantViolation(_) => StatusCode::FORBIDDEN,
-            AppError::UpstreamTooLarge | AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
-            AppError::ReadFilterBlocked => StatusCode::FORBIDDEN,
-            AppError::Policy(_) | AppError::OpsTemplate(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            AppError::Db(_) | AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::PolicyBlocked { .. } => ErrorCode::PolicyBlocked,
+            AppError::RequireConfirmation(_) => ErrorCode::RequireConfirmation,
+            AppError::RateLimit => ErrorCode::RateLimited,
+            AppError::PicInvariantViolation(_) => ErrorCode::PicInvariantViolation,
+            AppError::UpstreamTooLarge => ErrorCode::UpstreamTooLarge,
+            AppError::Upstream(_) => ErrorCode::UpstreamUnavailable,
+            AppError::ReadFilterBlocked => ErrorCode::ReadFilterBlocked,
+            AppError::Policy(_) | AppError::OpsTemplate(_) => ErrorCode::PolicyEngineError,
+            AppError::Db(_) => ErrorCode::DatabaseError,
+            AppError::Internal(_) => ErrorCode::InternalError,
         }
     }
 
+    pub fn status(&self) -> StatusCode {
+        StatusCode::from_u16(self.code().default_status())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+
     fn body(&self) -> ErrorBody {
+        let code = self.code().as_str();
         match self {
             AppError::PolicyBlocked { policy_id, reason, override_allowed } => {
-                ErrorBody::new("blocked by policy", "policy_blocked")
+                ErrorBody::new("blocked by policy", code)
                     .with_detail(reason.clone())
                     .with_fix("If this block is incorrect, edit the matching policy in your policy YAML or grant a one-time override via `proxilion-cli override <request_id>` (planned, M3).")
                     .with_docs("https://proxilion.com/docs/policy/layer-b")
@@ -74,36 +85,36 @@ impl AppError {
                     }))
             }
             AppError::RequireConfirmation(reason) => {
-                ErrorBody::new("operation requires user confirmation", "require_confirmation")
+                ErrorBody::new("operation requires user confirmation", code)
                     .with_detail(reason.clone())
                     .with_fix("The agent must surface a confirmation prompt to the human, then resubmit with X-Proxilion-Confirmation: <token>.")
                     .with_docs("https://proxilion.com/docs/policy/confirmation")
             }
-            AppError::RateLimit => ErrorBody::new("rate limit exceeded", "rate_limited")
+            AppError::RateLimit => ErrorBody::new("rate limit exceeded", code)
                 .with_fix("Back off and retry; the rate-limit policy and per-user burst are configurable in your policy YAML.")
                 .with_docs("https://proxilion.com/docs/policy/rate-limit"),
             AppError::PicInvariantViolation(detail) => {
-                ErrorBody::new("operation exceeds session authority", "pic_invariant_violation")
+                ErrorBody::new("operation exceeds session authority", code)
                     .with_detail(detail.clone())
                     .with_fix("The action requires ops the predecessor PCA doesn't grant. Either widen the user's IdP group→ops mapping or restrict the agent's action to ops the user has.")
                     .with_docs("https://proxilion.com/docs/policy/ops")
             }
-            AppError::UpstreamTooLarge => ErrorBody::new("upstream response exceeded size cap", "upstream_too_large")
+            AppError::UpstreamTooLarge => ErrorBody::new("upstream response exceeded size cap", code)
                 .with_fix("Upstream returned >10MB. Restrict the agent's request (e.g. Drive `fields=`) or raise the cap if you have a real need — body inspection slows on large payloads.")
                 .with_docs("https://proxilion.com/docs/adapters/limits"),
-            AppError::Upstream(_) => ErrorBody::new("upstream temporarily unavailable", "upstream_unavailable")
+            AppError::Upstream(_) => ErrorBody::new("upstream temporarily unavailable", code)
                 .with_fix("Retry the request. If persistent, check the vendor status page and /healthz for downstream reachability.")
                 .with_docs("https://proxilion.com/docs/troubleshooting"),
-            AppError::ReadFilterBlocked => ErrorBody::new("blocked by read-filter policy", "read_filter_blocked")
+            AppError::ReadFilterBlocked => ErrorBody::new("blocked by read-filter policy", code)
                 .with_fix("A BlockRequest quarantine pattern matched in the response body. Open /admin/ → Live feed → click the row for the matched pattern.")
                 .with_docs("https://proxilion.com/docs/policy/read-filter"),
             AppError::Policy(_) | AppError::OpsTemplate(_) => {
-                ErrorBody::new("policy evaluation error", "policy_engine_error")
+                ErrorBody::new("policy evaluation error", code)
                     .with_fix("Policy YAML failed to evaluate. Validate it with `proxilion-cli policy check <file>` (planned, M3) or see the structured error in proxy logs.")
                     .with_docs("https://proxilion.com/docs/policy/authoring")
             }
             AppError::Db(_) | AppError::Internal(_) => {
-                ErrorBody::new("internal error", "internal_error")
+                ErrorBody::new("internal error", code)
                     .with_fix("This is a bug. Check proxy logs and file an issue at https://github.com/clay-good/proxilion/issues.")
                     .with_docs("https://proxilion.com/docs/troubleshooting")
             }

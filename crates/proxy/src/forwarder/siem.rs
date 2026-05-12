@@ -14,12 +14,14 @@
 //! pull from `/api/v1/actions` for any gaps. This matches the spec's
 //! "preventative chokepoint, audit log is the source of truth" model.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tracing::{debug, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 use crate::adapters::action_stream::{ActionEvent, ActionStream};
 
@@ -70,6 +72,20 @@ pub struct SiemForwarder {
     key: SiemHmacKey,
     http: reqwest::Client,
     max_retries: u32,
+    /// Optional batch mode (spec.md §3.3 dev 2). When set, `publish`
+    /// appends to an in-memory buffer and a single POST drains it once
+    /// the buffer reaches `max_batch_size` OR a background flush task
+    /// ticks at `flush_interval`. Mutually-exclusive with the per-event
+    /// path — when batching is configured, `publish` returns after the
+    /// append; the actual POST happens on flush.
+    batch: Option<BatchState>,
+}
+
+#[derive(Clone)]
+struct BatchState {
+    buffer: Arc<Mutex<Vec<ActionEvent>>>,
+    max_batch_size: usize,
+    flush_interval: Duration,
 }
 
 impl SiemForwarder {
@@ -88,6 +104,7 @@ impl SiemForwarder {
             key,
             http,
             max_retries: 3,
+            batch: None,
         })
     }
 
@@ -95,6 +112,145 @@ impl SiemForwarder {
     pub fn with_max_retries(mut self, n: u32) -> Self {
         self.max_retries = n;
         self
+    }
+
+    /// Enable batched delivery. spec.md §3.3 dev 2.
+    /// `max_batch_size` triggers a flush on size; `flush_interval` triggers
+    /// a flush on time (via the task spawned by [`SiemForwarder::spawn_flush_loop`]).
+    /// Skip this method to keep the per-event default.
+    pub fn with_batching(mut self, max_batch_size: usize, flush_interval: Duration) -> Self {
+        assert!(max_batch_size > 0, "max_batch_size must be > 0");
+        self.batch = Some(BatchState {
+            buffer: Arc::new(Mutex::new(Vec::with_capacity(max_batch_size))),
+            max_batch_size,
+            flush_interval,
+        });
+        self
+    }
+
+    /// Returns true when batching is enabled. Callers use this to decide
+    /// whether to spawn the flush loop.
+    pub fn batching_enabled(&self) -> bool {
+        self.batch.is_some()
+    }
+
+    /// Drain the batch buffer and POST whatever it contains as a single
+    /// batch envelope. No-op when batching is disabled or the buffer is
+    /// empty. Public so the `spawn_flush_loop` task can drive flushes.
+    pub async fn flush_batch(&self) {
+        let Some(b) = &self.batch else { return };
+        let drained: Vec<ActionEvent> = {
+            let mut buf = b.buffer.lock().await;
+            if buf.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *buf)
+        };
+        self.send_batch(drained).await;
+    }
+
+    async fn send_batch(&self, events: Vec<ActionEvent>) {
+        let envelope = serde_json::json!({
+            "schema": "proxilion.action_event_batch.v1",
+            "count": events.len(),
+            "events": events,
+        });
+        let body = match serde_json::to_vec(&envelope) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "siem batch: serialize failed");
+                metrics::counter!(
+                    "proxilion_siem_forward_failures_total",
+                    "reason" => "serialize"
+                )
+                .increment(1);
+                return;
+            }
+        };
+        let signature = self.key.sign(&body);
+        let schema = "proxilion.action_event_batch.v1";
+
+        let mut attempt: u32 = 0;
+        let count = events.len();
+        loop {
+            attempt += 1;
+            let send = self
+                .http
+                .post(&self.url)
+                .header("content-type", "application/json")
+                .header("x-proxilion-signature", &signature)
+                .header("x-proxilion-schema", schema)
+                .header("x-proxilion-batch-count", count.to_string())
+                .body(body.clone())
+                .send()
+                .await;
+            match send {
+                Ok(r) if r.status().is_success() => {
+                    metrics::counter!(
+                        "proxilion_siem_forward_total",
+                        "result" => "ok",
+                        "decision" => "(batch)"
+                    )
+                    .increment(count as u64);
+                    metrics::counter!("proxilion_siem_batches_sent_total").increment(1);
+                    metrics::histogram!("proxilion_siem_batch_size").record(count as f64);
+                    debug!(status = %r.status(), attempt, count, "siem batch ok");
+                    return;
+                }
+                Ok(r) if r.status().is_client_error() => {
+                    warn!(status = %r.status(), count, "siem batch: 4xx; not retrying");
+                    metrics::counter!(
+                        "proxilion_siem_forward_failures_total",
+                        "reason" => "client_error"
+                    )
+                    .increment(count as u64);
+                    return;
+                }
+                Ok(r) => {
+                    warn!(status = %r.status(), attempt, count, "siem batch: 5xx");
+                    if attempt > self.max_retries {
+                        metrics::counter!(
+                            "proxilion_siem_forward_failures_total",
+                            "reason" => "server_error_exhausted"
+                        )
+                        .increment(count as u64);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, attempt, count, "siem batch: transport error");
+                    if attempt > self.max_retries {
+                        metrics::counter!(
+                            "proxilion_siem_forward_failures_total",
+                            "reason" => "transport_exhausted"
+                        )
+                        .increment(count as u64);
+                        return;
+                    }
+                }
+            }
+            let backoff_ms = 100u64 * 4u64.saturating_pow(attempt.saturating_sub(1));
+            tokio::time::sleep(Duration::from_millis(backoff_ms.min(5_000))).await;
+        }
+    }
+}
+
+/// Background flush task. Spawns when [`SiemForwarder::batching_enabled`]
+/// is true. The task lives for the duration of the proxy process — the
+/// only failure mode is "DB-side receiver permanently down," which
+/// `send_batch` already metric's and drops.
+pub async fn spawn_flush_loop(forwarder: Arc<SiemForwarder>) {
+    let Some(batch) = forwarder.batch.as_ref().cloned() else {
+        return;
+    };
+    info!(
+        max_batch_size = batch.max_batch_size,
+        flush_interval_secs = batch.flush_interval.as_secs(),
+        "SIEM batch flush loop started"
+    );
+    loop {
+        tokio::time::sleep(batch.flush_interval).await;
+        forwarder.flush_batch().await;
     }
 }
 
@@ -105,6 +261,24 @@ pub struct BuildError(pub String);
 #[async_trait]
 impl ActionStream for SiemForwarder {
     async fn publish(&self, event: ActionEvent) {
+        // Batched path (spec.md §3.3 dev 2): append + size-flush. The
+        // time-based flush is driven by `spawn_flush_loop`.
+        if let Some(b) = &self.batch {
+            let drained = {
+                let mut buf = b.buffer.lock().await;
+                buf.push(event);
+                if buf.len() >= b.max_batch_size {
+                    Some(std::mem::take(&mut *buf))
+                } else {
+                    None
+                }
+            };
+            if let Some(events) = drained {
+                self.send_batch(events).await;
+            }
+            return;
+        }
+        // Per-event path (default).
         let body = match serde_json::to_vec(&event) {
             Ok(b) => b,
             Err(e) => {
@@ -285,5 +459,65 @@ mod tests {
             .unwrap()
             .with_max_retries(5);
         fwd.publish(sample()).await;
+    }
+
+    #[tokio::test]
+    async fn batch_mode_buffers_then_flushes_on_size() {
+        let server = MockServer::start().await;
+        // Match exactly one batched POST with the batch schema header.
+        // We assert `count` header matches the batch size (3).
+        Mock::given(method("POST"))
+            .and(path("/siem"))
+            .and(header("x-proxilion-schema", "proxilion.action_event_batch.v1"))
+            .and(header("x-proxilion-batch-count", "3"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let fwd = SiemForwarder::new(format!("{}/siem", server.uri()), key)
+            .unwrap()
+            .with_batching(3, Duration::from_secs(60));
+        assert!(fwd.batching_enabled());
+        // Two events: buffer holds them, no POST yet.
+        fwd.publish(sample()).await;
+        fwd.publish(sample()).await;
+        // Third triggers a size-flush.
+        fwd.publish(sample()).await;
+    }
+
+    #[tokio::test]
+    async fn batch_mode_flush_drains_partial_buffer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-proxilion-schema", "proxilion.action_event_batch.v1"))
+            .and(header("x-proxilion-batch-count", "2"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let fwd = SiemForwarder::new(server.uri(), key)
+            .unwrap()
+            .with_batching(10, Duration::from_secs(60));
+        fwd.publish(sample()).await;
+        fwd.publish(sample()).await;
+        // Manual drain — exercises the path the background flush task takes.
+        fwd.flush_batch().await;
+    }
+
+    #[tokio::test]
+    async fn flush_batch_is_noop_when_buffer_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let fwd = SiemForwarder::new(server.uri(), key)
+            .unwrap()
+            .with_batching(10, Duration::from_secs(60));
+        fwd.flush_batch().await;
     }
 }

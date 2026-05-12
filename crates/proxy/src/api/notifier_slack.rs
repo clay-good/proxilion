@@ -32,8 +32,71 @@ use crate::notifier::{parse_button_value, SlackAction, SlackHandle};
 pub struct SlackInteractState {
     pub slack: SlackHandle,
     pub blocked: Arc<BlockedApiState>,
-    #[allow(dead_code)] // future: write `slack_trigger_id` for replay protection
+    /// Direct DB handle for the trigger_id idempotency claim. The
+    /// approve/reject pipeline runs through `BlockedApiState` but the
+    /// pre-flight claim needs to UPDATE before either is called.
     pub db: PgPool,
+}
+
+/// Outcome of attempting to claim a `slack_trigger_id` on a blocked row.
+enum TriggerClaim {
+    /// First time we've seen this trigger_id; proceed.
+    Fresh,
+    /// Trigger_id already claimed this row — Slack retry of the same
+    /// click. Return the prior success without re-running approve/reject.
+    Retry,
+    /// Some other trigger_id already claimed the row. Reject.
+    Conflict,
+    /// DB unavailable / unexpected.
+    Error(String),
+}
+
+/// Atomically claim `slack_trigger_id` on a `pending` row. The unique
+/// partial index on `blocked_actions.slack_trigger_id` enforces
+/// "at most one trigger_id per row" at the database layer; this query
+/// surfaces the racing-trigger_id case as `Conflict` instead of a 500.
+async fn claim_trigger_id(
+    db: &PgPool,
+    blocked_id: uuid::Uuid,
+    trigger_id: &str,
+) -> TriggerClaim {
+    // Single-statement claim: only succeeds when the row is still pending
+    // AND no trigger_id is set. Returns the row's id so we can distinguish
+    // "claimed now" (1 row) from "couldn't claim" (0 rows).
+    let res = sqlx::query_scalar::<_, uuid::Uuid>(
+        "UPDATE blocked_actions
+            SET slack_trigger_id = $2
+          WHERE id = $1
+            AND status = 'pending'
+            AND slack_trigger_id IS NULL
+        RETURNING id",
+    )
+    .bind(blocked_id)
+    .bind(trigger_id)
+    .fetch_optional(db)
+    .await;
+
+    match res {
+        Ok(Some(_)) => TriggerClaim::Fresh,
+        Ok(None) => {
+            // Couldn't claim. Two reasons matter: same trigger_id already
+            // recorded (Slack retry → Retry), OR row is not pending /
+            // a different trigger_id is set (Conflict).
+            let existing: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
+                "SELECT slack_trigger_id FROM blocked_actions
+                  WHERE id = $1 AND slack_trigger_id IS NOT NULL",
+            )
+            .bind(blocked_id)
+            .fetch_optional(db)
+            .await;
+            match existing {
+                Ok(Some((existing_tid,))) if existing_tid == trigger_id => TriggerClaim::Retry,
+                Ok(_) => TriggerClaim::Conflict,
+                Err(e) => TriggerClaim::Error(e.to_string()),
+            }
+        }
+        Err(e) => TriggerClaim::Error(e.to_string()),
+    }
 }
 
 pub fn router(state: SlackInteractState) -> Router {
@@ -103,6 +166,48 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
         return slack_err(StatusCode::BAD_REQUEST, "unrecognized button value");
     };
 
+    // Trigger-id idempotency (ui-less-surfaces.md §5.3 deviation 3).
+    // Slack retries delivery on timeout/network failure; without this
+    // claim, a retry would attempt a second approve_inner call against
+    // an already-overridden row and return 409 to the Slack user.
+    let trigger_id = payload["trigger_id"].as_str().unwrap_or("").to_string();
+    if !trigger_id.is_empty() {
+        match claim_trigger_id(&state.db, blocked_id, &trigger_id).await {
+            TriggerClaim::Fresh => {}
+            TriggerClaim::Retry => {
+                metrics::counter!(
+                    "proxilion_slack_interact_total",
+                    "result" => "retry_idempotent",
+                )
+                .increment(1);
+                info!(blocked_id = %blocked_id, "slack interaction is a retry of a prior trigger_id; returning idempotent success");
+                return slack_ok_message("Already processed (retry).");
+            }
+            TriggerClaim::Conflict => {
+                metrics::counter!(
+                    "proxilion_slack_interact_total",
+                    "result" => "conflict_other_trigger",
+                )
+                .increment(1);
+                warn!(blocked_id = %blocked_id, "slack interaction conflicts with prior trigger_id");
+                return slack_err(
+                    StatusCode::CONFLICT,
+                    "this action was already approved or rejected",
+                );
+            }
+            TriggerClaim::Error(e) => {
+                metrics::counter!(
+                    "proxilion_slack_interact_total",
+                    "result" => "claim_error",
+                )
+                .increment(1);
+                warn!(blocked_id = %blocked_id, error = %e, "trigger_id claim failed; proceeding without idempotency");
+                // Continue — the FOR UPDATE inside approve_inner is still
+                // the canonical race protection.
+            }
+        }
+    }
+
     let approver_subject = format!("slack:{approver}");
     let outcome: Result<String, String> = match action {
         SlackAction::Approve => {
@@ -165,6 +270,23 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
     // Return a `response_type: ephemeral` message that replaces the
     // original (Block Kit). This shows immediate feedback in the channel
     // to the clicker.
+    let body = serde_json::json!({
+        "response_type": "in_channel",
+        "replace_original": true,
+        "text": text,
+    });
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// 200 OK with a Slack-shaped Block-Kit-ish text response. Used for the
+/// idempotent-retry path so the same Slack user sees the same kind of
+/// success message as a first-time approval.
+fn slack_ok_message(text: &str) -> Response {
     let body = serde_json::json!({
         "response_type": "in_channel",
         "replace_original": true,

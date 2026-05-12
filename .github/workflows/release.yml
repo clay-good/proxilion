@@ -1,0 +1,104 @@
+name: release
+
+# Tagged-release binary builds for `proxilion-cli`. Triggered on
+# `v*.*.*` tag push. Builds the operator CLI for the four targets we
+# expect operators to run on (Linux + macOS, x86_64 + aarch64), packs
+# each into a `.tar.gz` with the LICENSE + README + CHANGELOG, computes
+# sha256 checksums, and attaches everything to a GitHub Release.
+#
+# The proxy binary itself is deliberately *not* shipped here — it's
+# the kind of thing operators install via Docker (we ship the
+# Dockerfile + Helm chart) rather than as a raw binary. The CLI is
+# the local-laptop / CI-runner / on-call-laptop tool that benefits
+# from a one-line install.
+#
+# To cut a release:
+#
+#   git tag -a v0.1.0 -m "v0.1.0 — first public release"
+#   git push origin v0.1.0
+#
+# The workflow creates the GitHub Release and uploads the artifacts.
+# It does NOT publish to crates.io (we're not yet at that maturity);
+# add a `cargo publish` step here when the workspace is ready.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Manual trigger so a release can be re-run after a fix without
+  # re-tagging (re-runs are idempotent — `upload-rust-binary-action`
+  # replaces existing files on the same release).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist; e.g. v0.1.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+permissions:
+  # `softprops/action-gh-release` (used transitively by
+  # `upload-rust-binary-action`) needs `contents: write` to create
+  # the release and upload assets.
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # One arch failure doesn't cancel the others — operators on a
+      # working arch can still ship.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use the tag's commit, not the workflow_dispatch runner's
+          # default branch HEAD. For tag triggers this is implicit;
+          # for workflow_dispatch, `inputs.tag` is the ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup target add ${{ matrix.target }}
+          rustup default stable
+
+      # taiki-e/upload-rust-binary-action handles: cross-compile via
+      # `cross` when needed (aarch64-unknown-linux-gnu on x86_64
+      # runner), strip, archive into `.tar.gz`, compute sha256, and
+      # upload to the GitHub Release. Pinned to a tagged release so a
+      # silent action bump can't change the artifact shape.
+      - name: build + upload proxilion-cli
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: proxilion-cli
+          target: ${{ matrix.target }}
+          # Archive contents: the binary, the LICENSE for redistribution,
+          # the README so a one-step download includes the quickstart,
+          # the CHANGELOG so a downloader knows what changed since the
+          # last cut.
+          include: LICENSE,README.md,CHANGELOG.md
+          # GitHub will set the release name to the tag (e.g. `v0.1.0`)
+          # and auto-generate release notes from PRs since the last tag;
+          # we keep that default rather than re-render from CHANGELOG.md.
+          checksum: sha256
+          # Build with --locked so the release reproduces from
+          # Cargo.lock exactly. Same posture as ci.yml/build-release.
+          features: ""
+          tar: all
+          zip: none
+          token: ${{ secrets.GITHUB_TOKEN }}

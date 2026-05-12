@@ -23,6 +23,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
   [CONTRIBUTING.md](CONTRIBUTING.md) — spec-first contribution
   model, full CI gate matrix with local reproduction commands,
   style guidance, and the deliberate non-goals.
+- **Release workflow** (`.github/workflows/release.yml`) — on `v*.*.*`
+  tag push (or manual `workflow_dispatch`), builds `proxilion-cli`
+  for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `x86_64-apple-darwin`, and `aarch64-apple-darwin`, packs each
+  with `LICENSE` / `README.md` / `CHANGELOG.md` into a `.tar.gz`,
+  computes SHA-256 checksums, and uploads to the GitHub Release.
+  Proxy binary is intentionally not shipped — operators install
+  the proxy via Docker (Dockerfile + Helm chart) rather than raw
+  binary. `cargo publish` step deferred until the workspace is
+  crates.io-ready.
 - **CI gate** (`.github/workflows/ci.yml`) — `cargo fmt --check`,
   `cargo clippy -- -D warnings`, `cargo test --workspace --locked`,
   `cargo build --release` with `RUSTFLAGS="-D warnings"`. Three lint

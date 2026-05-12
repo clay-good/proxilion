@@ -69,6 +69,7 @@ Four workflows in `.github/workflows/`:
 | `coverage.yml` | `cargo llvm-cov` with a 60% / 60% floor | [.github/workflows/coverage.yml](.github/workflows/coverage.yml) |
 | `supply-chain.yml` | `cargo audit --deny warnings` + `cargo deny check` on PRs, push, weekly cron, manual | [.github/workflows/supply-chain.yml](.github/workflows/supply-chain.yml) |
 | `static-html-no-js.yml` | Lints the one server-rendered HTML page to keep it script-free | [.github/workflows/static-html-no-js.yml](.github/workflows/static-html-no-js.yml) |
+| `release.yml` | On `v*.*.*` tag: builds `proxilion-cli` for 4 targets, packs `.tar.gz`, uploads to GitHub Release | [.github/workflows/release.yml](.github/workflows/release.yml) |
 
 Run them locally before pushing:
 

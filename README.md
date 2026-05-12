@@ -154,7 +154,19 @@ attribution and detail.
 ## Contributing
 
 Issues and PRs welcome. There's no CLA; contributions land under the
-repository's MIT license. Run `cargo test --workspace` before pushing.
+repository's MIT license. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+dev setup, the CI gates you'll need to pass (`cargo fmt --check`,
+`cargo clippy -- -D warnings`, `cargo test --workspace --locked`,
+`cargo audit --deny warnings`), the per-spec contribution model, and
+the deliberate non-goals.
+
+## Security
+
+Found a vulnerability? **Do not open a public GitHub issue.** See
+[SECURITY.md](SECURITY.md) for the private disclosure address,
+response SLAs (72 hours to acknowledge, scaled by severity to patch),
+in-scope / out-of-scope surfaces, and what we already defend against
+so you can lead with where you got past it.
 
 ## The Skill Overreach problem
 

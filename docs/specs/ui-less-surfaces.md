@@ -881,7 +881,9 @@ The action_event JSON shape is a versioned contract:
 `{"schema": "proxilion.action_event.v1", ...}`. Field additions are
 non-breaking (consumers must ignore unknown fields). Field removals or
 type changes bump to `v2` and `v1` continues to be emitted for one minor
-release minimum. Documented in `docs/audit/schema-v1.md`.
+release minimum. Documented in [docs/audit/schema-v1.md](../audit/schema-v1.md).
+
+**Status (2026-05-12) — schema doc shipped.** [docs/audit/schema-v1.md](../audit/schema-v1.md) covers the full top-level field set, the adapter-specific `extra` keys (`request_path_params` / `to_domain` / `attendee_domains` / `pic_audit_violation`), the committed CSV column order, sibling schemas (`action_event_batch.v1`, `blocked_action.v1`, `blocked_action_burst.v1`), and the versioning policy (what counts as non-breaking vs. v2-bumping).
 
 ### 6.3 Retention
 
@@ -890,6 +892,14 @@ indefinitely by default; a cron-friendly `proxilion-cli actions purge
 --older-than 90d` exists for customers who don't tier to a SIEM. Most
 customers tier — the SIEM is the long-term system of record, the proxy is
 the queryable working set.
+
+**Status (2026-05-12) — purge shipped.** Delivered:
+
+- [crates/proxy/src/api/actions.rs](../../crates/proxy/src/api/actions.rs) — `POST /api/v1/actions/purge` (scope `actions:purge`) accepts `{ older_than: <rfc3339>, dry_run?: bool }`, refuses cutoffs in the future, and either counts (`dry_run=true`) or deletes (`DELETE FROM action_events WHERE at < $1`). Returns `{ older_than, dry_run, deleted }`. Joined-table rows in `action_event_bodies` / `quarantined_payloads` retain their own lifecycle (no FK cascade by design — body retention is independent per §6.4).
+- [crates/shared-types/src/operator_scopes.rs](../../crates/shared-types/src/operator_scopes.rs) — new `actions:purge` scope entry in the catalogue. Distinct from `actions:export` so an operator can have read/export rights without retention authority.
+- [crates/cli/src/main.rs](../../crates/cli/src/main.rs) — `proxilion-cli actions purge --older-than 90d [--dry-run] [--format json|pretty]`. Reuses the `parse_since` helper so the same window syntax works (`5m` / `24h` / `7d` / `90d` / RFC3339 absolute). Metrics: `proxilion_actions_purged_total{dry_run}`.
+
+Cron form: `proxilion-cli --token "$PROXILION_OPERATOR_TOKEN" actions purge --older-than 90d`.
 
 ### 6.4 Privacy / minimization
 

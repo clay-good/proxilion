@@ -345,6 +345,19 @@ enum ActionsCmd {
         #[arg(long, short = 'o')]
         output: Option<String>,
     },
+    /// Delete audit rows older than a window. Cron-friendly retention.
+    Purge {
+        /// Window like "90d", "30d", "7d", "24h", or an RFC3339 date. Rows
+        /// with `at < (now - window)` are deleted.
+        #[arg(long)]
+        older_than: String,
+        /// Count what would be deleted without deleting. Defaults to false.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output: pretty (default) | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
 }
 
 #[tokio::main]
@@ -361,7 +374,7 @@ async fn main() -> Result<()> {
         Cmd::Pca { id } => cmd_pca(&http, &cli.url, &id).await,
         Cmd::Verify { id } => cmd_verify(&http, &cli.url, &id).await,
         Cmd::Selftest => cmd_selftest(&http, &cli.url, &cli.trust_plane).await,
-        Cmd::Actions(sub) => cmd_actions(&http, &cli.url, sub).await,
+        Cmd::Actions(sub) => cmd_actions(&http, &cli.url, &cli.token, sub).await,
         Cmd::Tokens(sub) => cmd_tokens(sub).await,
         Cmd::Policy(sub) => cmd_policy(&http, &cli.url, &cli.token, sub).await,
         Cmd::Blocked(sub) => cmd_blocked(&http, &cli.url, &cli.token, sub).await,
@@ -377,7 +390,12 @@ fn auth_header<'a>(builder: reqwest::RequestBuilder, token: &'a str) -> reqwest:
     }
 }
 
-async fn cmd_actions(http: &reqwest::Client, url: &str, sub: ActionsCmd) -> Result<()> {
+async fn cmd_actions(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    sub: ActionsCmd,
+) -> Result<()> {
     match sub {
         ActionsCmd::Tail { decision, vendor, action, format } => {
             actions_tail(http, url, decision, vendor, action, &format).await
@@ -398,7 +416,48 @@ async fn cmd_actions(http: &reqwest::Client, url: &str, sub: ActionsCmd) -> Resu
             actions_export(http, url, &format, since, until, decision, vendor, action, p_0, output)
                 .await
         }
+        ActionsCmd::Purge { older_than, dry_run, format } => {
+            actions_purge(http, url, token, &older_than, dry_run, &format).await
+        }
     }
+}
+
+async fn actions_purge(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    older_than: &str,
+    dry_run: bool,
+    format: &str,
+) -> Result<()> {
+    let cutoff = parse_since(older_than)
+        .with_context(|| format!("invalid --older-than {older_than:?}"))?;
+    let body = serde_json::json!({
+        "older_than": cutoff.to_rfc3339(),
+        "dry_run": dry_run,
+    });
+    let req = http
+        .post(format!("{url}/api/v1/actions/purge"))
+        .json(&body);
+    let resp = auth_header(req, token).send().await?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        anyhow::bail!("purge failed ({status}): {payload}");
+    }
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&payload)?),
+        _ => {
+            let deleted = payload.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cutoff_str = payload
+                .get("older_than")
+                .and_then(|v| v.as_str())
+                .unwrap_or(older_than);
+            let verb = if dry_run { "would delete" } else { "deleted" };
+            println!("{verb} {deleted} action_event row(s) older than {cutoff_str}");
+        }
+    }
+    Ok(())
 }
 
 /// Parse "5m" / "24h" / "7d" / RFC3339 into a UTC timestamp.

@@ -32,10 +32,11 @@ pub struct ActionsApiState {
 
 pub fn router(state: ActionsApiState) -> Router {
     use axum::middleware::from_fn_with_state;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use crate::operator_auth::scope_check;
     let read = || from_fn_with_state("actions:read", scope_check);
     let export_scope = || from_fn_with_state("actions:export", scope_check);
+    let purge_scope = || from_fn_with_state("actions:purge", scope_check);
     Router::new()
         // /actions returns a paginated envelope { rows, next_before }.
         // /actions/recent stays as a raw array for the static-admin UI.
@@ -43,6 +44,7 @@ pub fn router(state: ActionsApiState) -> Router {
         .route("/api/v1/actions/recent", get(recent).route_layer(read()))
         .route("/api/v1/actions/stream", get(stream).route_layer(read()))
         .route("/api/v1/actions/export", get(export).route_layer(export_scope()))
+        .route("/api/v1/actions/purge", post(purge).route_layer(purge_scope()))
         .route("/api/v1/actions/{id}", get(get_action).route_layer(read()))
         .route(
             "/api/v1/sessions/{id}/chain",
@@ -259,6 +261,68 @@ async fn export(
         .header(axum::http::header::CACHE_CONTROL, "no-store")
         .body(body)
         .expect("export response builds")
+}
+
+// ===================================================================
+// Purge — retention. ui-less-surfaces.md §6.3.
+// ===================================================================
+
+#[derive(Debug, Deserialize)]
+struct PurgeRequest {
+    /// Cutoff timestamp; rows with `at < older_than` are deleted.
+    older_than: DateTime<Utc>,
+    /// If true, count what would be deleted without deleting.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PurgeResponse {
+    older_than: DateTime<Utc>,
+    dry_run: bool,
+    deleted: u64,
+}
+
+/// `POST /api/v1/actions/purge` — delete (or count) `action_events` rows
+/// older than the supplied cutoff. Joined-table rows in
+/// `action_event_bodies`, `quarantined_payloads`, etc. retain their own
+/// lifecycle (no FK cascade by design — body retention is independent of
+/// row retention per ui-less-surfaces.md §6.4).
+async fn purge(
+    State(state): State<ActionsApiState>,
+    Json(req): Json<PurgeRequest>,
+) -> Result<Json<PurgeResponse>, ActionsApiError> {
+    let now = Utc::now();
+    if req.older_than > now {
+        // Refuse to "delete the future" — almost always operator error.
+        return Err(ActionsApiError::BadRequest(
+            "older_than is in the future".into(),
+        ));
+    }
+    let deleted = if req.dry_run {
+        let row = sqlx::query("SELECT count(*)::bigint AS n FROM action_events WHERE at < $1")
+            .bind(req.older_than)
+            .fetch_one(&state.db)
+            .await?;
+        let n: i64 = row.try_get("n")?;
+        n.max(0) as u64
+    } else {
+        let r = sqlx::query("DELETE FROM action_events WHERE at < $1")
+            .bind(req.older_than)
+            .execute(&state.db)
+            .await?;
+        r.rows_affected()
+    };
+    metrics::counter!(
+        "proxilion_actions_purged_total",
+        "dry_run" => req.dry_run.to_string(),
+    )
+    .increment(deleted);
+    Ok(Json(PurgeResponse {
+        older_than: req.older_than,
+        dry_run: req.dry_run,
+        deleted,
+    }))
 }
 
 fn row_to_csv_line(r: &ListRow) -> String {
@@ -528,6 +592,8 @@ fn make_event(arc_event: Arc<ActionEvent>) -> Result<Event, Infallible> {
 enum ActionsApiError {
     #[error("not found")]
     NotFound,
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("database error")]
     Db(#[from] sqlx::Error),
     #[error(transparent)]
@@ -538,6 +604,9 @@ impl IntoResponse for ActionsApiError {
     fn into_response(self) -> Response {
         use crate::error_envelope::ErrorBody;
         match &self {
+            ActionsApiError::BadRequest(detail) => ErrorBody::new("bad request", "bad_request")
+                .with_detail(detail.clone())
+                .into_response(StatusCode::BAD_REQUEST),
             ActionsApiError::NotFound => ErrorBody::new("not found", "not_found")
                 .with_fix("No action_event with that id. The id you used may be wrong, or the row may have aged out.")
                 .with_docs("https://proxilion.com/docs/admin/actions")

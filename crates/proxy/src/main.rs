@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("metrics recorder install failed");
     server::set_metrics_handle(handle);
 
-    let cfg = match config::Config::from_env() {
+    let cfg = match config::Config::load() {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("config error: {e:#}");

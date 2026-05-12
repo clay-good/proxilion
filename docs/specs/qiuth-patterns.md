@@ -101,7 +101,7 @@ The `LogFormat::Pretty | Json` field that's currently `#[allow(dead_code)]` ([co
 - Phase 2: add `from_file()` and `Config::load()`. Document the precedence order.
 - Phase 3: remove `Config::from_env()` once callers are migrated.
 
-### 2.5 Status (2026-05-12) — Phase 1 shipped.
+### 2.5 Status (2026-05-12) — Phases 1 & 2 shipped.
 
 - [crates/proxy/src/config.rs](../../crates/proxy/src/config.rs) — new `ConfigBuilder` with `defaults()`, `from_env_layer()` (composes env vars on top), `with_*` overrides for every field, and `build()` (runs semantic validation, then constructs `Config`). `Config::from_env()` now delegates to `ConfigBuilder::defaults().from_env_layer()?.build()` — byte-identical with the prior loader, just refactored. `Config::load()` is the forward-looking convenience entry; today it aliases `from_env`, phase 2 will layer `PROXILION_CONFIG_FILE` underneath.
 - New `ConfigError::InvalidValue { field, reason }` variant carries the field name (e.g. `PROXILION_TOKEN_ENCRYPTION_KEY`) so the operator sees the env var that's wrong, not just "bad value somewhere."
@@ -111,10 +111,14 @@ The `LogFormat::Pretty | Json` field that's currently `#[allow(dead_code)]` ([co
   - `dev_mode == false` still requires both cert + key paths to exist (unchanged behavior).
 - Tests: 6 new in `config::tests` covering defaults-in-dev-mode, key-too-short rejection, valid-key acceptance, non-http URL rejection, cert-required-when-not-dev-mode, and programmatic override composition (`with_bind_addr` + `with_database_url` + `with_policy_path` chain cleanly).
 
-**Deviations from §2.2 sketch.**
+**Phase 2 additions (2026-05-12).**
 
-1. **No `from_file()` yet.** That's phase 2 — needs a decision between TOML and YAML (TOML feels right for ops config, YAML keeps consistency with `policy.yaml`). Holding off until a customer asks for either.
-2. **No `Config::load()` precedence chain yet.** Today it's an alias for `from_env`. Adding the file layer is `defaults().from_file(path)?.from_env_layer()?.build()` — same builder, just an extra layer call.
+- [crates/proxy/src/config.rs](../../crates/proxy/src/config.rs) — `ConfigBuilder::from_file(path)` parses a TOML file into a flat `FileConfig` struct (`#[serde(deny_unknown_fields)]` so typos fail loudly) and layers each set field on top of the builder's current values. Every field is optional; absent fields leave the prior value intact. Field names mirror the env-var conceptual model (snake_case, without the `PROXILION_` prefix) — `bind_addr = "..."` corresponds to `PROXILION_BIND_ADDR`.
+- [crates/proxy/src/config.rs](../../crates/proxy/src/config.rs) — `Config::load()` is now the production entry point: `defaults() → optional from_file($PROXILION_CONFIG_FILE) → from_env_layer() → build()`. Env vars layer on top of file values, so operators can override file-based config without editing the file. New `ConfigError::FileLoad { path, reason }` covers both read and parse failures.
+- [crates/proxy/src/main.rs](../../crates/proxy/src/main.rs) — boot path switched from `Config::from_env()` to `Config::load()`. `from_env` is kept for back-compat under `#[allow(dead_code)]` so existing callers in tests / embed paths don't break.
+- Tests: 3 new in `config::tests` covering file-overrides-defaults, unknown-field-rejection, and missing-path failure.
+
+**Deviation.** Chose TOML over YAML: ops config (small, flat, comments) reads cleanly in TOML; YAML's anchors / multi-line strings aren't load-bearing here and `policy.yaml` keeps its YAML stack. The `policy_path` field still points at a YAML file — just the proxy's own knobs are TOML.
 
 ---
 
@@ -172,18 +176,23 @@ Qiuth is fail-fast — the array stops at the first failure. Proxilion should fo
 
 Implementation note: gate this with a `PolicyEvalMode::FailFast | Comprehensive` on the engine — `FailFast` for production hot path, `Comprehensive` for dashboard-driven "explain this denial" replays.
 
-### 3.4 Status (2026-05-12) — types + engine entry shipped; adapter wiring deferred.
+### 3.4 Status (2026-05-12) — types + engine entry + adapter wiring shipped.
 
 - [crates/policy-engine/src/trace.rs](../../crates/policy-engine/src/trace.rs) — new module with `PolicyTrace`, `LayerOutcome`, `PolicyLayer` (LayerA / LayerB / ReadFilter), `OpsAtomView`, `PolicyEvalMode`. `LayerOutcome::error_code` carries the canonical `shared_types::ErrorCode` from §4. `PolicyTrace::allowed()` is `true` only when every layer passed AND the final decision is `Allow`.
 - [crates/policy-engine/src/rego.rs](../../crates/policy-engine/src/rego.rs) — new `Engine::evaluate_with_trace(&ctx)` sibling to `evaluate(&ctx)`. Returns `(Outcome, PolicyTrace)` so callers that don't need the structured trace pay nothing. The trace fills in Layer A (engine-side, `passed: true`, records the required-ops count), Layer B (translates `Decision::{Allow, Block, RequireConfirmation, RateLimit}` to the matching `ErrorCode`), and an optional ReadFilter slot when a filter is configured (left as `passed: true; scan pending` for the adapter to mutate after the response body comes back).
 - [crates/policy-engine/Cargo.toml](../../crates/policy-engine/Cargo.toml) — adds `chrono`, `uuid` (already in the workspace).
 - Tests: 4 new in `trace::tests` + 3 integration tests in `crates/policy-engine/tests/policy_trace.rs` that exercise the engine with the live `config/policy.yaml`. Covers (a) Layer-B block via `gmail-external-send-gate` records `ErrorCode::PolicyBlocked` + the matched policy id, (b) no-policy-match path emits Layer A + Layer B both passed, (c) `drive-injection-filter` produces a ReadFilter slot with `passed: true` pending the adapter scan.
 
-**Deviations from §3.2/§3.3 sketch.**
+**Adapter wiring additions (2026-05-12).**
 
-1. **Engine still exposes `evaluate(&ctx) -> Outcome` unchanged.** The spec sketch implies replacing the verdict-shaped return type; we ship the new typed path alongside the old one so the three adapters (Drive / Gmail / Calendar), the policy-handle, and ~12 existing tests don't have to change in one PR. Adapter migration to `evaluate_with_trace` is the natural next step — at that point the trace's Layer-A entry can be mutated to `failed` on Trust-Plane refusal, and the trace can be logged + surfaced via `X-Proxilion-Trace-Id`.
-2. **`PolicyEvalMode::{FailFast, Comprehensive}` defined but not yet observed.** The current engine evaluates fail-fast by structure (the YAML interpreter returns on the first match). `Comprehensive` mode that walks every later policy for "would also have matched" diagnostics is a follow-up tied to the dashboard's explain-this-denial replay path — file an issue when a customer asks.
-3. **Read-filter Layer outcome is `passed: true; scan pending` until the adapter runs.** Adapter-side mutation of the trace lands when the wiring happens; today the engine emits the slot so the trace's shape is stable.
+- [crates/proxy/src/adapters/policy_trace.rs](../../crates/proxy/src/adapters/policy_trace.rs) — new helper module. `mark_layer_a_failed(trace, detail)` rewrites the Layer-A slot on Trust-Plane refusal with `ErrorCode::PicInvariantViolation`. `mark_read_filter(trace, blocked, policy_id, detail)` rewrites the ReadFilter slot after the response body scan — `blocked=true` flips it to `failed` with `ErrorCode::ReadFilterBlocked`, otherwise it stays `passed` with a quarantine-sample count in `detail`. `emit(trace, request_id, vendor, action)` logs a single structured event per request — `tracing::info!` when allowed, `tracing::warn!` when denied — carrying `trace_id`, a one-line `summary` (`layer_a=ok,layer_b=policy_blocked,...`), and the serialized trace JSON. Replaces the prior scattered `warn!`/`error!` calls along the deny paths.
+- [crates/proxy/src/adapters/google_drive.rs](../../crates/proxy/src/adapters/google_drive.rs), [google_gmail.rs](../../crates/proxy/src/adapters/google_gmail.rs), [google_calendar.rs](../../crates/proxy/src/adapters/google_calendar.rs) — all three switched from `policy.evaluate(&ctx)` to `policy.evaluate_with_trace(&ctx)`. Each adapter now: (a) emits the trace on Layer-B deny, (b) mutates Layer A → failed + emits on Trust-Plane refusal, (c) mutates ReadFilter to `passed`/`failed` after the scan + emits on read-filter block, (d) on the happy path inserts `x-proxilion-trace-id: <uuid>` alongside the existing `x-proxilion-request-id` / `x-proxilion-pca-id` / `x-proxilion-policy` headers and emits an INFO trace at the end. The `trace_id` is the only piece surfaced to the caller — rule content stays inside the proxy.
+- Tests: 3 new in `adapters::policy_trace::tests` covering Layer-A replacement, ReadFilter append-when-absent, and the summary string.
+
+**Remaining deviations.**
+
+1. **Engine still exposes `evaluate(&ctx) -> Outcome` unchanged.** The trace-less entry point is still the public API for callers that don't need the structured trace; the three Google adapters now use `evaluate_with_trace` exclusively, but unit tests and any future embed callers can stay on the lighter path.
+2. **`PolicyEvalMode::{FailFast, Comprehensive}` defined but not yet observed.** The current engine evaluates fail-fast by structure (the YAML interpreter returns on the first match). `Comprehensive` mode that walks every later policy for "would also have matched" diagnostics is a follow-up tied to the explain-this-denial replay path — file an issue when a customer asks.
 
 ---
 
@@ -401,9 +410,9 @@ The phase ladder in §6.2 (60 → 70 → 80) lives only in this YAML's `--fail-u
 Suggested sequence (each step is independently shippable):
 
 1. **§4 ErrorCode registry** — smallest, unblocks §3. ~1 day. ✅ shipped 2026-05-12.
-2. **§3 PolicyTrace** — depends on §4. ~3 days incl. dashboard wiring. ✅ shipped 2026-05-12 (types + engine entry; adapter wiring deferred).
+2. **§3 PolicyTrace** — depends on §4. ~3 days incl. dashboard wiring. ✅ shipped 2026-05-12 (types + engine entry + adapter wiring; `X-Proxilion-Trace-Id` surfaced on responses).
 3. **§5 PolicyLoader trait + cache** — independent of §3/§4 but easier to test once trace exists. ~3 days. ✅ shipped 2026-05-12 (`FilePolicyLoader` is the production path; `DbPolicyLoader` is a one-line plug-in).
-4. **§2 ConfigBuilder** — independent. Defer until embed API is on the roadmap; until then, env-only is fine. ~2 days. ✅ Phase 1 shipped 2026-05-12 (`from_env` delegates to builder; semantic validation runs in `build()`).
+4. **§2 ConfigBuilder** — independent. Defer until embed API is on the roadmap; until then, env-only is fine. ~2 days. ✅ Phases 1 & 2 shipped 2026-05-12 (`from_env` delegates to builder + semantic validation in `build()`; `from_file` (TOML) + `Config::load()` precedence chain wired into `main.rs`).
 5. **§6 Coverage gate** — adopt at the *current* level immediately; ratchet over months. ✅ Phase 1 shipped 2026-05-12 (60% lines / 60% functions floor in [.github/workflows/coverage.yml](../../.github/workflows/coverage.yml)).
 
 §3 and §4 should land in the same PR if possible — `LayerOutcome` references `ErrorCode` directly.

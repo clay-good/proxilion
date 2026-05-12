@@ -1,23 +1,25 @@
-//! Proxy configuration loaded from environment.
+//! Proxy configuration loaded from environment and/or a TOML file.
 //!
 //! ## Loading
 //!
-//! Production: [`Config::load`] (alias for [`Config::from_env`] today;
-//! becomes the file-then-env layered loader in phase 2 per
-//! qiuth-patterns.md §2). Programmatic / embed: [`ConfigBuilder`].
+//! Production: [`Config::load`] — defaults → optional TOML file
+//! (`PROXILION_CONFIG_FILE`) → env vars. Programmatic / embed:
+//! [`ConfigBuilder`].
 //!
-//! ## Layering (phase 2, not yet enabled)
+//! ## Layering
 //!
 //! ```text
-//! defaults  →  optional TOML/YAML file  →  env vars  →  programmatic overrides
+//! defaults  →  optional TOML file  →  env vars  →  programmatic overrides
 //! ```
 //!
-//! Phase 1 (shipped): `ConfigBuilder` exists, `Config::from_env` is a thin
-//! wrapper around it, no behavior change.
+//! - Phase 1 (shipped 2026-05-12): `ConfigBuilder` exists, `Config::from_env`
+//!   is a thin wrapper around it.
+//! - Phase 2 (shipped 2026-05-12): `ConfigBuilder::from_file` (TOML),
+//!   `Config::load` honors `PROXILION_CONFIG_FILE` underneath env.
 
 use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -93,22 +95,30 @@ pub enum ConfigError {
     MissingKey(PathBuf),
     #[error("invalid value for {field}: {reason}")]
     InvalidValue { field: &'static str, reason: String },
+    #[error("config file {path}: {reason}")]
+    FileLoad { path: PathBuf, reason: String },
 }
 
 impl Config {
     /// Backward-compat entry. Delegates to [`ConfigBuilder::defaults`] +
     /// [`ConfigBuilder::from_env_layer`] + [`ConfigBuilder::build`] —
     /// behavior is byte-identical with the prior env-only loader.
+    #[allow(dead_code)]
     pub fn from_env() -> Result<Self, ConfigError> {
         ConfigBuilder::defaults().from_env_layer()?.build()
     }
 
-    /// Convenience entry point for callers who don't care about phase
-    /// distinctions. Today, identical to [`Config::from_env`]; phase 2
-    /// will add `PROXILION_CONFIG_FILE` as an intermediate layer.
-    #[allow(dead_code)] // alias for future-proofing the docs surface
+    /// Production entry point: defaults → optional TOML file (when
+    /// `PROXILION_CONFIG_FILE` is set) → env vars. Validates via
+    /// [`ConfigBuilder::build`].
     pub fn load() -> Result<Self, ConfigError> {
-        Self::from_env()
+        let mut builder = ConfigBuilder::defaults();
+        if let Ok(path) = env::var("PROXILION_CONFIG_FILE") {
+            if !path.is_empty() {
+                builder = builder.from_file(&path)?;
+            }
+        }
+        builder.from_env_layer()?.build()
     }
 }
 
@@ -274,6 +284,99 @@ impl ConfigBuilder {
         Ok(self)
     }
 
+    /// Layer a TOML file on top of the current values. Every field is
+    /// optional; absent fields leave the builder's prior value intact.
+    /// Per qiuth-patterns.md §2.2, this lives **between** defaults and
+    /// env so `PROXILION_*` env vars always win — operators can still
+    /// override file-based config without editing the file.
+    pub fn from_file(mut self, path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::FileLoad {
+            path: path.to_path_buf(),
+            reason: format!("read: {e}"),
+        })?;
+        let file: FileConfig = toml::from_str(&raw).map_err(|e| ConfigError::FileLoad {
+            path: path.to_path_buf(),
+            reason: format!("parse: {e}"),
+        })?;
+        if let Some(v) = file.bind_addr {
+            self.bind_addr = v
+                .parse()
+                .map_err(|e| ConfigError::BindAddr(v.clone(), e))?;
+        }
+        if let Some(v) = file.tls_cert_path {
+            self.tls_cert_path = v;
+        }
+        if let Some(v) = file.tls_key_path {
+            self.tls_key_path = v;
+        }
+        if let Some(v) = file.database_url {
+            self.database_url = Some(v);
+        }
+        if let Some(v) = file.trust_plane_url {
+            self.trust_plane_url = v;
+        }
+        if let Some(v) = file.federation_bridge_url {
+            self.federation_bridge_url = v;
+        }
+        if let Some(v) = file.log_format {
+            self.log_format = if v.eq_ignore_ascii_case("pretty") {
+                LogFormat::Pretty
+            } else {
+                LogFormat::Json
+            };
+        }
+        if let Some(v) = file.token_encryption_key_hex {
+            self.token_encryption_key_hex = Some(v);
+        }
+        if let Some(v) = file.google_client_id {
+            self.google_client_id = Some(v);
+        }
+        if let Some(v) = file.google_client_secret {
+            self.google_client_secret = Some(v);
+        }
+        if let Some(v) = file.proxy_base_url {
+            self.proxy_base_url = v;
+        }
+        if let Some(v) = file.policy_path {
+            self.policy_path = Some(v);
+        }
+        if let Some(v) = file.customer_domain {
+            self.customer_domain = v;
+        }
+        if let Some(v) = file.dev_mode {
+            self.dev_mode = v;
+        }
+        if let Some(v) = file.nats_url {
+            self.nats_url = Some(v);
+        }
+        if let Some(v) = file.nats_subject_prefix {
+            self.nats_subject_prefix = v;
+        }
+        if let Some(v) = file.siem_webhook_url {
+            self.siem_webhook_url = Some(v);
+        }
+        if let Some(v) = file.siem_hmac_key_hex {
+            self.siem_hmac_key_hex = Some(v);
+        }
+        if let Some(v) = file.siem_batch_size {
+            self.siem_batch_size = Some(v).filter(|n| *n > 1);
+        }
+        if let Some(v) = file.siem_batch_max_age_secs {
+            self.siem_batch_max_age_secs = v.max(1);
+        }
+        if let Some(v) = file.blocked_webhook_url {
+            self.blocked_webhook_url = Some(v);
+        }
+        if let Some(v) = file.blocked_webhook_hmac_key_hex {
+            self.blocked_webhook_hmac_key_hex = Some(v);
+        }
+        if let Some(v) = file.operator_auth_enforced {
+            self.operator_auth_enforced = v;
+        }
+        Ok(self)
+    }
+
     // --- chainable overrides (used by tests + future embed callers) ---
 
     #[allow(dead_code)]
@@ -383,6 +486,38 @@ impl ConfigBuilder {
     }
 }
 
+/// On-disk TOML schema. Every field is optional — operators only set
+/// what they want to override. Field names match the env-var conceptual
+/// model (without the `PROXILION_` prefix and in snake_case) so a
+/// `bind_addr = "..."` line corresponds to `PROXILION_BIND_ADDR`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    bind_addr: Option<String>,
+    tls_cert_path: Option<PathBuf>,
+    tls_key_path: Option<PathBuf>,
+    database_url: Option<String>,
+    trust_plane_url: Option<String>,
+    federation_bridge_url: Option<String>,
+    log_format: Option<String>,
+    token_encryption_key_hex: Option<String>,
+    google_client_id: Option<String>,
+    google_client_secret: Option<String>,
+    proxy_base_url: Option<String>,
+    policy_path: Option<PathBuf>,
+    customer_domain: Option<String>,
+    dev_mode: Option<bool>,
+    nats_url: Option<String>,
+    nats_subject_prefix: Option<String>,
+    siem_webhook_url: Option<String>,
+    siem_hmac_key_hex: Option<String>,
+    siem_batch_size: Option<usize>,
+    siem_batch_max_age_secs: Option<u64>,
+    blocked_webhook_url: Option<String>,
+    blocked_webhook_hmac_key_hex: Option<String>,
+    operator_auth_enforced: Option<bool>,
+}
+
 fn check_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(ConfigError::InvalidValue {
@@ -452,6 +587,52 @@ mod tests {
             .build();
         let err = r.unwrap_err();
         assert!(matches!(err, ConfigError::MissingCert(_)));
+    }
+
+    #[test]
+    fn from_file_overrides_defaults() {
+        let dir = std::env::temp_dir().join(format!("proxilion-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxilion.toml");
+        std::fs::write(
+            &path,
+            r#"
+bind_addr = "127.0.0.1:7777"
+trust_plane_url = "https://tp.internal:9000"
+customer_domain = "acme.example"
+dev_mode = true
+operator_auth_enforced = false
+"#,
+        )
+        .unwrap();
+        let c = ConfigBuilder::defaults()
+            .from_file(&path)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(c.bind_addr.to_string(), "127.0.0.1:7777");
+        assert_eq!(c.trust_plane_url, "https://tp.internal:9000");
+        assert_eq!(c.customer_domain, "acme.example");
+        assert!(c.dev_mode);
+        assert!(!c.operator_auth_enforced);
+    }
+
+    #[test]
+    fn from_file_rejects_unknown_field() {
+        let dir = std::env::temp_dir().join(format!("proxilion-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, "totally_unknown_key = \"x\"\n").unwrap();
+        let err = ConfigBuilder::defaults().from_file(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::FileLoad { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn from_file_missing_path() {
+        let err = ConfigBuilder::defaults()
+            .from_file("/no/such/path/proxilion.toml")
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::FileLoad { .. }), "got {err:?}");
     }
 
     #[test]

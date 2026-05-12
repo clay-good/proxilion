@@ -51,6 +51,11 @@ pub const SCOPE_CATALOGUE: &[(&str, &str, &str)] = &[
         "GET /api/v1/actions/export",
     ),
     (
+        "actions:purge",
+        "delete rows from the audit log older than a cutoff (retention)",
+        "POST /api/v1/actions/purge",
+    ),
+    (
         "pca:read",
         "fetch + verify PCAs",
         "GET /api/v1/pca/{id}, GET /api/v1/pca/{id}/verify",

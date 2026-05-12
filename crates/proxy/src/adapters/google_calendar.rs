@@ -247,7 +247,7 @@ async fn proxy_request(
     let request_id = Uuid::new_v4();
     let ctx = build_policy_ctx(state, session, &req);
 
-    let outcome = state.policy.load().evaluate(&ctx)?;
+    let (outcome, mut policy_trace) = state.policy.load().evaluate_with_trace(&ctx)?;
     let requested_ops: Vec<String> = outcome
         .required_ops
         .required
@@ -258,6 +258,7 @@ async fn proxy_request(
 
     // Layer B.
     if let Err(e) = enforce_pre_request_decision(&outcome) {
+        super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
         if matches!(
             e,
             AppError::PolicyBlocked { .. } | AppError::RequireConfirmation(_)
@@ -360,6 +361,8 @@ async fn proxy_request(
             (session.leaf_pca_id, Some(detail))
         }
         Err(crate::pic::ExecutorError::Invariant(d)) => {
+            super::policy_trace::mark_layer_a_failed(&mut policy_trace, d.clone());
+            super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
             crate::pic::violations::persist(
                 &state.auth.db,
                 crate::pic::PicViolationRecord {
@@ -446,6 +449,13 @@ async fn proxy_request(
                 .map_err(|e| AppError::Internal(format!("read-filter regex: {e}")))?;
             let (b, o) = read_filter::apply(&body_bytes, &compiled, content_type.as_deref());
             if o.block {
+                super::policy_trace::mark_read_filter(
+                    &mut policy_trace,
+                    true,
+                    outcome.matched_policy_id.clone(),
+                    format!("BlockRequest pattern matched ({} hits)", o.matches),
+                );
+                super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
                 crate::blocked::persist_and_notify(
                     &state.auth.db,
                     &state.notifier,
@@ -475,6 +485,12 @@ async fn proxy_request(
                 &o.samples,
             )
             .await;
+            super::policy_trace::mark_read_filter(
+                &mut policy_trace,
+                false,
+                outcome.matched_policy_id.clone(),
+                format!("{} matches, {} samples", o.matches, o.samples.len()),
+            );
             (b, o)
         } else {
             (body_bytes, Default::default())
@@ -557,6 +573,10 @@ async fn proxy_request(
         }
     }
     insert_proxy_headers(resp_headers, request_id, &outcome, pca2_id);
+    if let Ok(v) = HeaderValue::from_str(&policy_trace.trace_id.to_string()) {
+        resp_headers.insert(HeaderName::from_static("x-proxilion-trace-id"), v);
+    }
+    super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
     Ok(builder
         .body(axum::body::Body::from(final_body))
         .map_err(|e| AppError::Internal(e.to_string()))?)

@@ -29,10 +29,14 @@ Until v0.1.0, the canonical reference is the most recent commit on
   families are allowed in the command line with documented rationale
   (`type_complexity`, `too_many_arguments`, `result_large_err`); all
   other warnings are errors.
-- **cargo-audit CI** (`.github/workflows/cargo-audit.yml`) — runs
-  `cargo audit --deny warnings` on PRs, pushes to `main`, a weekly
-  cron, and manual dispatch. `.cargo/audit.toml` documents two
-  ignored advisories with unblock conditions.
+- **Supply-chain CI** (`.github/workflows/supply-chain.yml`) — runs
+  `cargo audit --deny warnings` *and* `cargo deny check` (advisories,
+  bans, licenses, sources) on PRs, pushes to `main`, a weekly cron,
+  and manual dispatch. `.cargo/audit.toml` + `deny.toml` document two
+  ignored advisories with unblock conditions. `deny.toml` adds an
+  MIT-compatible license allow-list, source restrictions (crates.io
+  + the SHA-pinned `clay-good/provenance` git URL only), and
+  duplicate-version warnings.
 - **Asciinema demo recorder** (`demo/scripts/record-demo.sh`) —
   wraps `./run.sh` or any subset of scenario scripts into a
   `.cast` file under `demo/recordings/`. Closes `spec.md §4.4 dev 2`.

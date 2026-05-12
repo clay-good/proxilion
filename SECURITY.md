@@ -72,9 +72,9 @@ that. Disclosure stays free.
 - Vulnerabilities in transitive dependencies that are already tracked
   in `.cargo/audit.toml` with documented unblock conditions, unless
   you have a reproducer demonstrating exploitability in Proxilion's
-  code paths. (We do scan via [cargo-audit](.github/workflows/cargo-audit.yml)
-  weekly; a report there is a "no, we know" not a "you missed
-  something.")
+  code paths. (We scan via [cargo-audit + cargo-deny](.github/workflows/supply-chain.yml)
+  on every PR + weekly cron; a report there is a "no, we know" not a
+  "you missed something.")
 - Operator misconfiguration (a Proxilion deployment running with
   `PROXILION_DISABLE_OPERATOR_AUTH=1` in production, a `policy.yaml`
   with `decision: allow` everywhere). Documented loud-failure modes

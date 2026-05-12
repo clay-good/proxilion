@@ -1,11 +1,11 @@
 # Dependabot configuration.
 #
-# Pairs with .github/workflows/cargo-audit.yml — that workflow scans
+# Pairs with .github/workflows/supply-chain.yml — that workflow scans
 # RustSec's advisory DB on every PR + weekly cron, this config opens
 # weekly version-bump PRs so we *also* catch routine non-security
 # updates before they pile up into a six-month chore. The two together:
-#   - cargo-audit: "is anything currently insecure?"
-#   - dependabot:  "is anything routinely behind?"
+#   - supply-chain: "is anything currently insecure / non-compliant?"
+#   - dependabot:   "is anything routinely behind?"
 #
 # History: this config was added after commit 0b7da70 (4 rustls-webpki
 # alerts via async-nats 0.38, all fixable by one bump to async-nats 0.48

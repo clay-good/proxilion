@@ -1,6 +1,9 @@
-name: cargo-audit
+name: supply-chain
 
-# Proactive vulnerability detection against the RustSec advisory DB.
+# Two-pronged supply-chain hygiene: vulnerability detection
+# (cargo-audit) and policy enforcement (cargo-deny — licenses,
+# allowed sources, duplicate-version warnings, advisory mirror).
+#
 # Same data source Dependabot scans against; running it in CI surfaces
 # new advisories on PRs (and the weekly cron) instead of after a vuln
 # lands on `main` and Dependabot opens an alert.
@@ -10,10 +13,11 @@ name: cargo-audit
 # fixable in one bump (`async-nats 0.48`); we'd rather catch the next
 # one before it merges.
 #
-# Failure mode: this workflow fails the PR on any unfiltered advisory.
+# Failure mode: each job fails the PR on any unfiltered finding.
 # To temporarily allow an advisory while a fix is in flight, add it to
-# `.cargo/audit.toml` under `[advisories].ignore = [...]` with a comment
-# pointing at the tracking PR.
+# `.cargo/audit.toml` AND `deny.toml` `[advisories].ignore` with a
+# comment pointing at the tracking PR. To allow a new license, add it
+# to `deny.toml` `[licenses].allow` with a PR-level rationale.
 
 on:
   pull_request:
@@ -53,3 +57,20 @@ jobs:
         # crates, deprecated APIs) into failures alongside genuine
         # vulnerabilities. Yanked-crate detection is on by default.
         run: cargo audit --deny warnings
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: run cargo deny
+        # All four checks (advisories, bans, licenses, sources) must
+        # pass. Config lives in deny.toml at the repo root.
+        run: cargo deny check

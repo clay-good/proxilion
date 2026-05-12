@@ -1,0 +1,120 @@
+# cargo-deny — supply-chain hygiene config.
+#
+# Pairs with .cargo/audit.toml + .github/workflows/cargo-audit.yml.
+# `cargo audit` answers "any vulns?"; `cargo deny` adds:
+#   - licence policy (MIT-compatible only — we're MIT-licensed and we
+#     don't want a GPL transitive dep slipping in)
+#   - duplicate-version detection (multiple major versions of the same
+#     crate inflate the binary and the supply-chain surface)
+#   - source restrictions (only crates.io + the SHA-pinned git deps we
+#     explicitly allow)
+#   - advisory checks (same advisory DB, configured to match
+#     .cargo/audit.toml's ignore list so the two tools agree)
+#
+# Local: `cargo deny check`. CI: `.github/workflows/cargo-audit.yml`
+# runs it on every PR + push + weekly cron.
+
+[graph]
+# Check the dep graph for every target the proxy actually builds on.
+# Default skips many targets; here we keep the macOS + Linux x86_64 +
+# aarch64 quartet that covers what we ship.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+all-features = false
+no-default-features = false
+
+# --- Advisories -------------------------------------------------------
+#
+# Mirrors `.cargo/audit.toml` so `cargo audit` and `cargo deny` agree.
+# Anything we ignore in one must have the same rationale in the other.
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+
+ignore = [
+    # RUSTSEC-2023-0071 — `rsa 0.9.x` Marvin attack timing side-channel.
+    # Present via `sqlx-macros-core → sqlx-mysql → rsa`. We use the
+    # postgres backend only; MySQL code paths are never reached.
+    # No upstream fix available; tracked at RustCrypto/RSA#19.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via sqlx-mysql; we use postgres backend only; no upstream fix yet" },
+
+    # RUSTSEC-2025-0134 — `rustls-pemfile` unmaintained.
+    # Warning, not a vulnerability. Used directly + via axum-server's
+    # TLS. Migration to rustls-pki-types' PemObject trait is non-
+    # trivial and tracked alongside future axum-server upgrades.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained warning; functional; tracked with axum-server upgrades" },
+]
+
+# --- Licenses ---------------------------------------------------------
+#
+# Permissive licenses compatible with MIT distribution. The list is
+# narrow on purpose — every entry is one a security-conscious enterprise
+# legal team will accept without a follow-up question. New entries
+# require a PR with rationale.
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",               # MIT No Attribution — strictly more permissive than MIT.
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "MPL-2.0",             # weak copyleft (file-level); used by some webpki crates.
+    "Unicode-3.0",         # ICU + unicode-data crates.
+    "Unicode-DFS-2016",    # older form, still in some crates.
+    "CDLA-Permissive-2.0", # used by some webpki cert bundles.
+    "OpenSSL",             # ring; ISC-shape with extra notice clauses.
+]
+confidence-threshold = 0.93
+
+# --- Bans / version policy --------------------------------------------
+#
+# Detects duplicate major-version copies of the same crate (one of the
+# top contributors to binary bloat + supply-chain confusion).
+
+[bans]
+multiple-versions = "warn"     # tighten to "deny" after we've cleaned the obvious dupes
+wildcards = "deny"             # `*` version specs from crates.io are a no-no
+# Intra-workspace `path = "../foo"` deps have no explicit version and
+# cargo-deny treats them as wildcards. Allow these specifically —
+# they're not a supply-chain concern (the source is in this same git
+# tree). Wildcards from crates.io are still blocked.
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    # Known-bad crates we don't want pulled in transitively. Empty for
+    # now; the list is here so future findings have a home.
+]
+skip = [
+    # Duplicate-version exemptions. cargo-deny will count duplicates of
+    # these crates as expected. Keep this list short and revisit
+    # quarterly.
+]
+skip-tree = []
+
+# --- Sources ----------------------------------------------------------
+#
+# Only crates.io and the SHA-pinned upstream git deps are allowed.
+# Anything from a random git URL gets flagged.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    # SHA-pinned in workspace Cargo.toml; review-before-bump policy
+    # documented in CONTRIBUTING.md.
+    "https://github.com/clay-good/provenance",
+]

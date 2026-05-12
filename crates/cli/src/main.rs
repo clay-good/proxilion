@@ -230,8 +230,14 @@ enum NotifierCmd {
         #[arg(long, default_value = "pretty")]
         format: String,
     },
-    /// Send a synthetic test notification through the configured webhook.
-    Test,
+    /// Send a synthetic test notification. Default fans out to every
+    /// configured driver; `--driver <name>` targets one and 412s if
+    /// that driver isn't configured. ui-less-surfaces.md §4.1.
+    Test {
+        /// One of `all` (default) | `webhook` | `slack` | `email`.
+        #[arg(long, default_value = "all")]
+        driver: String,
+    },
     /// Read the persisted notifier_config row.
     Config,
     /// Set / update the webhook driver config (DB-stored, hot-swapped on
@@ -2793,8 +2799,14 @@ async fn cmd_notifier(
             }
             Ok(())
         }
-        NotifierCmd::Test => {
+        NotifierCmd::Test { driver } => {
+            if !matches!(driver.as_str(), "all" | "webhook" | "slack" | "email") {
+                return Err(anyhow!(
+                    "driver must be one of: all | webhook | slack | email (got `{driver}`)"
+                ));
+            }
             let resp = auth_header(http.post(format!("{url}/api/v1/notifier/test")), token)
+                .json(&json!({ "driver": driver }))
                 .send()
                 .await
                 .context("POST /api/v1/notifier/test")?;

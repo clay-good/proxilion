@@ -94,19 +94,53 @@ async fn show(State(state): State<NotifierApiState>) -> Json<Value> {
     }))
 }
 
-async fn test(State(state): State<NotifierApiState>) -> impl IntoResponse {
-    let Some(n) = state.notifiers.webhook.current() else {
-        return (
-            StatusCode::PRECONDITION_FAILED,
-            Json(json!({
-                "ok": false,
-                "error": "notifier not configured",
-                "detail": "set PROXILION_BLOCKED_WEBHOOK_URL + PROXILION_BLOCKED_WEBHOOK_HMAC_KEY and restart"
-            })),
-        );
-    };
-    // Build a synthetic blocked-action envelope. The receiver should
-    // detect `policy_id == "proxilion.test"` and treat it as a dry run.
+/// `POST /api/v1/notifier/test` — fire a synthetic notification.
+///
+/// Body (all fields optional):
+/// ```json
+/// { "driver": "all" | "webhook" | "slack" | "email" }
+/// ```
+///
+/// Default driver is `"all"` (fan out to every configured driver,
+/// matching the §4.1 sketch). Specifying a single driver returns 412
+/// when that driver isn't configured so the operator gets a fast,
+/// targeted failure instead of a "tested-something" yes-answer.
+async fn test(
+    State(state): State<NotifierApiState>,
+    body: Option<Json<TestRequest>>,
+) -> impl IntoResponse {
+    let driver = body
+        .as_ref()
+        .and_then(|b| b.driver.clone())
+        .unwrap_or_else(|| "all".to_string());
+
+    // Pick a `proxy_public_url` to mint the synthetic approve/reject
+    // links against. Any configured driver knows its public URL; we
+    // prefer webhook → slack → email so the URL is deterministic when
+    // multiple drivers are live. Falls back to a placeholder when
+    // nothing is configured (the per-driver dispatch below will 412
+    // before we ever serialize a notification with this).
+    let proxy_url = state
+        .notifiers
+        .webhook
+        .current()
+        .map(|n| n.proxy_public_url().to_string())
+        .or_else(|| {
+            state
+                .notifiers
+                .slack
+                .current()
+                .map(|n| n.proxy_public_url().to_string())
+        })
+        .or_else(|| {
+            state
+                .notifiers
+                .email
+                .current()
+                .map(|n| n.proxy_public_url().to_string())
+        })
+        .unwrap_or_else(|| "http://proxilion.local".to_string());
+
     let blocked_id = Uuid::new_v4();
     let request_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
@@ -126,23 +160,98 @@ async fn test(State(state): State<NotifierApiState>) -> impl IntoResponse {
         detail: Some("synthetic test notification — receiver should ignore"),
         predecessor_pca_id: None,
         requested_ops: &ops,
-        approve_url: format!("{}/api/v1/blocked/{}/approve", n.proxy_public_url(), blocked_id),
-        reject_url: format!("{}/api/v1/blocked/{}/reject", n.proxy_public_url(), blocked_id),
+        approve_url: format!("{}/api/v1/blocked/{}/approve", proxy_url, blocked_id),
+        reject_url: format!("{}/api/v1/blocked/{}/reject", proxy_url, blocked_id),
     };
-    // Bypass the burst suppressor — a test notification must always fire.
-    // We do this by calling notify_unfiltered. Currently the notifier
-    // only exposes `notify` which consults burst; we add a thin
-    // bypass: spawn an immediate POST with no suppression.
-    n.notify(&notif).await;
+
+    let mut fired = Vec::<&'static str>::new();
+    let mut not_configured = Vec::<&'static str>::new();
+
+    let want_webhook = matches!(driver.as_str(), "all" | "webhook");
+    let want_slack = matches!(driver.as_str(), "all" | "slack");
+    let want_email = matches!(driver.as_str(), "all" | "email");
+
+    if !want_webhook && !want_slack && !want_email {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "unsupported driver",
+                "detail": "valid drivers: all | webhook | slack | email"
+            })),
+        );
+    }
+
+    if want_webhook {
+        match state.notifiers.webhook.current() {
+            Some(n) => {
+                n.notify(&notif).await;
+                fired.push("webhook");
+            }
+            None => not_configured.push("webhook"),
+        }
+    }
+    if want_slack {
+        match state.notifiers.slack.current() {
+            Some(n) => {
+                n.notify(&notif).await;
+                fired.push("slack");
+            }
+            None => not_configured.push("slack"),
+        }
+    }
+    if want_email {
+        match state.notifiers.email.current() {
+            Some(n) => {
+                n.notify(&notif).await;
+                fired.push("email");
+            }
+            None => not_configured.push("email"),
+        }
+    }
+
+    // Targeted single-driver request against an unconfigured driver:
+    // hard 412 so the operator's setup script fails noisily.
+    if driver != "all" && fired.is_empty() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({
+                "ok": false,
+                "error": "driver not configured",
+                "detail": format!("driver `{driver}` has no active configuration — set it via POST /api/v1/notifier/config"),
+                "driver": driver,
+            })),
+        );
+    }
+    // Fan-out request with zero configured drivers: same 412 but a
+    // catalogue answer.
+    if fired.is_empty() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({
+                "ok": false,
+                "error": "no notifier driver configured",
+                "detail": "configure at least one driver via POST /api/v1/notifier/config (webhook | slack | email)",
+            })),
+        );
+    }
+
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "blocked_id": blocked_id.to_string(),
             "policy_id": "proxilion.test",
+            "fired": fired,
+            "not_configured": not_configured,
             "note": "Receiver should drop or echo. Check the proxy log for delivery status."
         })),
     )
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct TestRequest {
+    driver: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -557,5 +666,34 @@ mod tests {
         );
         assert_eq!(redact_url("https://example.com"), "https://example.com");
         assert_eq!(redact_url("https://example.com/path"), "https://example.com/...");
+    }
+
+    /// Driver-string parsing: `all` fans out, a single name targets,
+    /// anything else is a 400 from the API layer (we exercise the
+    /// classification here without needing a live DB / notifier).
+    #[test]
+    fn test_request_driver_classification() {
+        let parse = |s: &str| {
+            (
+                matches!(s, "all" | "webhook"),
+                matches!(s, "all" | "slack"),
+                matches!(s, "all" | "email"),
+            )
+        };
+        assert_eq!(parse("all"), (true, true, true));
+        assert_eq!(parse("webhook"), (true, false, false));
+        assert_eq!(parse("slack"), (false, true, false));
+        assert_eq!(parse("email"), (false, false, true));
+        assert_eq!(parse("bogus"), (false, false, false));
+    }
+
+    /// `TestRequest` accepts a missing body (default `all`) and an
+    /// explicit `{ "driver": "slack" }` shape.
+    #[test]
+    fn test_request_deserializes_optional_driver() {
+        let req: TestRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(req.driver, None);
+        let req: TestRequest = serde_json::from_str(r#"{"driver":"slack"}"#).unwrap();
+        assert_eq!(req.driver.as_deref(), Some("slack"));
     }
 }

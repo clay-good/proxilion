@@ -509,6 +509,10 @@ COMMANDS
 - `proxilion-cli policy validate <file>` — local-only YAML parse via `policy_engine::yaml::parse_policies`. Prints one-line summary per policy on success; exits 1 with the serde_yaml error on failure. Safe to run in CI without proxy or DB access — fits `lint + validate + simulate` in a single pre-merge pipeline.
 - `proxilion-cli policy diff <before> <after> [--format pretty|json]` — local-only diff between two policy YAML files. Reports `added` / `removed` / `modified` policy ids; modified rows list which fields changed (`vendor / action / mode / pic_mode / required_ops / match / decision`). Comparison of structural fields (`match`, `decision`) is YAML-serialization-equality rather than recursive walk — surfaces "this changed" without false-positive deltas from key ordering. ~~**Deviation:** `policy edit` (opens `$EDITOR` on `policy.yaml` + validates + hot-reloads) is still unimplemented — operators can edit the file manually and `proxilion-cli policy reload` to apply. The CST-preservation blocker that gated `policy edit` is now resolved (§11.1 — `policy_handle::edit_mode_in_yaml` does a comment-safe line-oriented edit); shipping the `$EDITOR` wrapper is now purely an ergonomic add and is the next CLI piece to land.~~ **Resolved 2026-05-12.** `proxilion-cli policy edit [--file <path>] [--editor "code --wait"] [--no-reload]` ships in [crates/cli/src/main.rs::cmd_policy_edit](../../crates/cli/src/main.rs). The flow: resolve the file path (`--file` wins; otherwise `GET /api/v1/policy` returns the live `source`), drop a `<path>.bak` backup, spawn `$EDITOR` / `$VISUAL` / `vi` via `sh -c` with the path POSIX-shell-quoted, wait for clean exit, short-circuit on no-change, parse the result through `policy_engine::yaml::parse_policies` (the same parse the proxy will run), roll back from the in-memory original on validation failure, then `POST /api/v1/policy/reload` and roll back on a proxy-side parse failure too. The backup is removed only after a successful reload — the operator's `git diff` is the canonical history from there. `--no-reload` skips the reload and keeps the backup. 5 new unit tests pin the POSIX shell-quote behavior (spaces, embedded `'`, `$`/backtick neutralization) and the local-validation contract. **Deviation from the §4.1 sketch:** the command writes the *whole file* — there's no field-level merge logic. The operator's editor session is the source of truth; the proxy only validates + reloads. This sidesteps the entire class of "what if two operators edit at once?" race questions (last-write-wins via `git`, same as every other policy-as-code workflow). The `set_mode` field-level edit path remains for the API-driven mode-flip flow.
 
+**Status (2026-05-12) — per-driver `notifier test` shipped.**
+
+- `proxilion-cli notifier test [--driver all|webhook|slack|email]` ([crates/cli/src/main.rs](../../crates/cli/src/main.rs)) — was webhook-only; now fans out to every configured driver by default (`--driver all`) and targets a single driver when asked. The server endpoint ([`crates/proxy/src/api/notifier.rs::test`](../../crates/proxy/src/api/notifier.rs)) accepts `{ "driver": "..." }` JSON, fires the synthetic blocked-action envelope (`policy_id="proxilion.test"`, `vendor="proxilion"`, `action="notifier.test"` so receivers can detect+ignore it), and returns `{ ok, fired: [drivers], not_configured: [drivers] }`. Single-driver requests against an unconfigured driver return 412 with a `driver`-keyed envelope so setup scripts fail noisily on the right line. Closes the §4.1 sketch's `test slack | test email | test webhook` rows.
+
 **Status (2026-05-12) — `metrics sample` and `trust-plane info` shipped.**
 
 - `proxilion-cli metrics sample [--filter <substr>] [--raw]` — `GET /metrics` on the proxy, parses the Prometheus exposition format inline (no extra dependency), groups by metric *family* (name before `{`), prints one row per family with `SERIES` (count of label-set permutations) + `MIN` + `MAX` value seen. `--filter foo` restricts to families whose name contains `foo` (cheap O(n) substring), `--raw` falls through to the original `name{labels} value` lines for `grep` / `awk` pipelines. The `--raw` mode also honors `--filter`. Integer-valued samples (counters, gauges held at integer values) render without decimals; histogram bucket totals keep 6 significant digits.
@@ -834,7 +838,7 @@ endpoints + landing page are live. Delivered:
 
 **Spec deviations to flag.**
 
-1. ~~**No outbound email composer.** §5.4 promises Plain-text + HTML mail bodies, DMARC/SPF/DKIM alignment, signed mailto reject links. We ship the *chokepoint* (signed URL + landing page); the email body composition + SMTP delivery is the next layer. The notifier driver model (Slack / Email / Webhook trait) lives in §10.3 as a separate deferred item.~~ **Resolved 2026-05-12.** [crates/proxy/src/notifier/email.rs](../../crates/proxy/src/notifier/email.rs) — `EmailNotifier` ships the full SMTP delivery path via `lettre`: plain-text composition with the signed approve / reject URLs, configurable `from` / cc / bcc, transient-vs-permanent error classification on send (retried with exponential backoff for transient, recorded permanent for the audit row), per-policy recipient overrides via `notifier_recipients:` in `policy.yaml`, and a `notify_escalation` variant that re-fires with a `REMINDER:` subject prefix for the §5.7 dev 2 escalation sweep. Counters: `proxilion_email_send_total{kind="initial|escalation",result}`, `proxilion_email_send_failures_total{reason}`. DMARC / SPF / DKIM alignment lives at the customer's SMTP relay rather than proxy-side — three known-good configurations documented in [docs/install/email.md](../install/email.md) (resolves §11 open question #3). Signed-URL approve/reject links are clickable in any HTML-capable mail client; a follow-on HTML body shape (for prettier rendering in Outlook / Gmail) is the only piece of §5.4 we deliberately haven't shipped — the plain-text version round-trips cleanly through every relay we've tested.
+1. ~~**No outbound email composer.** §5.4 promises Plain-text + HTML mail bodies, DMARC/SPF/DKIM alignment, signed mailto reject links. We ship the *chokepoint* (signed URL + landing page); the email body composition + SMTP delivery is the next layer. The notifier driver model (Slack / Email / Webhook trait) lives in §10.3 as a separate deferred item.~~ **Resolved 2026-05-12.** [crates/proxy/src/notifier/email.rs](../../crates/proxy/src/notifier/email.rs) — `EmailNotifier` ships the full SMTP delivery path via `lettre`: **`multipart/alternative` with both plain-text and styled HTML bodies** (color-coded approve / reject buttons, identification table, single-use-link disclaimer), configurable `from` / cc / bcc, transient-vs-permanent error classification on send (retried with exponential backoff for transient, recorded permanent for the audit row), per-policy recipient overrides via `notifier_recipients:` in `policy.yaml`, and a `notify_escalation` variant that re-fires with a `REMINDER:` subject prefix for the §5.7 dev 2 escalation sweep. Counters: `proxilion_email_send_total{kind="initial|escalation",result}`, `proxilion_email_send_failures_total{reason}`. DMARC / SPF / DKIM alignment lives at the customer's SMTP relay rather than proxy-side — three known-good configurations documented in [docs/install/email.md](../install/email.md) (resolves §11 open question #3).
 2. **Single signed URL — not HMAC-signed query string.** §5.4 specifies a URL with an HMAC token. We use a UUID-keyed `notifier_tokens` row (essentially a single-use bearer in DB rather than a self-contained signed JWT). Both shapes are equivalent for one-time-use links; the DB-keyed shape is replay-resistant by construction (single-use enforced by `consumed_at` UPDATE inside the locking transaction) and doesn't require key rotation. A future iteration can layer HMAC-signed URLs on top for stateless verification if a customer's email infrastructure needs that.
 3. ~~Metric `_total` counters coalesce to 1.~~ **Resolved 2026-05-11.** Root-caused to a `get_or_create_counter` non-idempotency bug in `metrics-util 0.19.1` (used by `metrics-exporter-prometheus 0.16.2`): each `metrics::counter!("name")` call site was inserting a *fresh* `Arc<AtomicU64>` into the registry's sharded hashmap, so increments split across N counters with the LAST-inserted one rendered. Confirmed via a minimal repro that printed Arc addresses — two `registry.get_or_create_counter(&same_key, |c| c.clone())` calls returned different Arc pointers. Bumping `metrics-exporter-prometheus = "0.17"` (pulls `metrics-util 0.20.3`) makes `get_or_create_counter` idempotent and counters accumulate correctly. Live verification: 5 unauth probes → `proxilion_auth_attempts_total{result="rejected"} 5`; signed-link stress's `proxilion_overrides_requested_total{channel="email_link"} = 3` after 3 issue-link calls.
 
@@ -1110,7 +1114,7 @@ Datadog, Snowflake).
 
 **Spec deviations to flag.**
 
-1. **Only the `webhook` driver is exposed today.** The migration's CHECK accepts `slack` and `email` for forward-compat, but `set_config` returns 400 for those drivers until §5.3 / §5.4 ship.
+1. ~~**Only the `webhook` driver is exposed today.** The migration's CHECK accepts `slack` and `email` for forward-compat, but `set_config` returns 400 for those drivers until §5.3 / §5.4 ship.~~ **Resolved 2026-05-12.** [`api/notifier.rs::set_config`](../../crates/proxy/src/api/notifier.rs) dispatches `webhook` → `set_webhook`, `slack` → `set_slack`, `email` → `set_email`; all three drivers ship per §5.3 / §5.4 deviations above. The 400 branch is reserved for genuinely unknown drivers.
 2. ~~Flush loop captures the initial notifier instance.~~ **Resolved 2026-05-12.** [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) — both the webhook and Slack `spawn_flush_loop` call sites now clone the corresponding `Handle<T>` (`Notifiers::webhook` / `Notifiers::slack`) and resolve `handle.current()` *inside* the per-tick closure, so a subsequent `webhook.replace(...)` / `slack.replace(...)` via `POST /api/v1/notifier/config` directs the next flush to the live notifier rather than the one captured at spawn time. `current().is_none()` (driver disabled mid-flight) cleanly skips the tick. ~~One caveat that remains by design: the `BurstSuppressor` instance is still the one created at boot — a new notifier built from a config change doesn't carry burst suppression unless paired with the boot-time suppressor.~~ **Caveat resolved 2026-05-12.** [`Notifiers`](../../crates/proxy/src/notifier/handle.rs) now carries optional `webhook_burst: Option<BurstSuppressor>` and `slack_burst: Option<BurstSuppressor>` fields. `build_notifiers` constructs both suppressors at function entry (even when no driver is configured at boot, so first-time-via-API drivers still get suppression) and parks them on the bundle; the flush loops are spawned unconditionally and become no-ops when the corresponding `Handle::current()` is `None`. `set_webhook` / `set_slack` in [api/notifier.rs](../../crates/proxy/src/api/notifier.rs) re-attach `state.notifiers.{webhook,slack}_burst.clone()` to every freshly-built notifier before storing it on the handle. Because `BurstSuppressor::buckets` is `Arc<Mutex<…>>`, cloning shares state — bucket counters and exemplars now survive config swaps. The flush-tick closures still resolve `Handle::current()` inside the closure, so hot-swap routing of summaries is unchanged.
 
 ```sql
@@ -1320,11 +1324,24 @@ attested override PCA branch.
    guarantee. `proxilion-cli policy edit` is the natural follow-on
    ergonomic — the `$EDITOR` wrapper called out in §4.1 dev "policy
    edit" — and is now unblocked.
-2. **Slack workspace vs Slack app distribution.** Customers self-host
+2. ~~**Slack workspace vs Slack app distribution.** Customers self-host
    Proxilion; do they each install a per-workspace Slack app, or do we
    ship a public Slack app they install once with workspace-scoped
    tokens? Latter is friendlier; depends on Slack's review process for a
-   security app. Open.
+   security app. Open.~~
+   **Resolved 2026-05-12 (decision: per-workspace install for v1).**
+   The shipped Slack driver
+   ([`crates/proxy/src/notifier/slack.rs`](../../crates/proxy/src/notifier/slack.rs))
+   uses an *incoming webhook URL* + *signing secret*, both
+   workspace-scoped — customers self-install a Slack app in their own
+   workspace and feed the proxy the two strings via
+   `proxilion-cli notifier set-slack`. No public Slack-app listing is
+   needed and no Slack-app-review process gates customer onboarding.
+   A future public Slack-app distribution remains a fine v2 option
+   *if* we ever ship a hosted Proxilion offering — at which point
+   workspace-scoped bot tokens (`xoxb-…`) via OAuth replace the
+   incoming-webhook URL. Until then the per-workspace install is the
+   right shape for the self-hosted-only product.
 3. ~~**Email DMARC alignment.** Customers' SMTP relays vary wildly.
    Document the three known-good configurations (Postmark, SES, internal
    relay) in `docs/install/email.md` rather than try to be smart.~~
@@ -1362,9 +1379,23 @@ attested override PCA branch.
    single-line scripts pass; SPA-shaped drift fails loudly. (The
    directory name diverged from the spec sketch — `static-html` vs
    `static-approval` — the workflow tracks the actual path.)
-6. **OTLP push vs scrape.** Default is `/metrics` scrape. Some customers
+6. ~~**OTLP push vs scrape.** Default is `/metrics` scrape. Some customers
    (Datadog Agent, Grafana Cloud) prefer push. The exporter facade
-   supports both; defaulting to scrape avoids egress firewall conversations.
+   supports both; defaulting to scrape avoids egress firewall conversations.~~
+   **Resolved 2026-05-12 (decision: scrape-only for v1).**
+   [`crates/proxy/src/main.rs`](../../crates/proxy/src/main.rs)
+   installs `metrics_exporter_prometheus::PrometheusBuilder` and the
+   proxy exposes `/metrics` on the same listener as `/healthz` — no
+   OTLP push, no separate egress conversation, no extra port. The
+   customer's Grafana / Datadog / VictoriaMetrics scrapes the
+   endpoint via their existing service-discovery story (one of the
+   shipped Grafana dashboard imports in
+   [`ops/grafana/proxilion.json`](../../ops/grafana/proxilion.json)
+   is the canonical scrape target). OTLP push lands when a real
+   customer asks for it: trivial to add behind a config flag
+   (the `metrics` facade is exporter-agnostic), but until then
+   shipping unused egress code violates the §0 "no speculative
+   features" rule.
 7. ~~**CLI vs API auth tokens — same or different?** Likely same scheme
    (`pxl_operator_*`), different scopes. Confirm in the M0 implementation.~~
    **Resolved 2026-05-12.** Same scheme, scopes-per-route. The CLI sends

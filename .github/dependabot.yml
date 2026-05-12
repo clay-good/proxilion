@@ -1,0 +1,71 @@
+# Dependabot configuration.
+#
+# Pairs with .github/workflows/cargo-audit.yml — that workflow scans
+# RustSec's advisory DB on every PR + weekly cron, this config opens
+# weekly version-bump PRs so we *also* catch routine non-security
+# updates before they pile up into a six-month chore. The two together:
+#   - cargo-audit: "is anything currently insecure?"
+#   - dependabot:  "is anything routinely behind?"
+#
+# History: this config was added after commit 0b7da70 (4 rustls-webpki
+# alerts via async-nats 0.38, all fixable by one bump to async-nats 0.48
+# that we'd missed by ~6 months of routine bumps not happening).
+
+version: 2
+
+updates:
+  # Rust crates.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: "Etc/UTC"
+    # Cap concurrent PRs so we don't drown the reviewer in 30 bumps
+    # the first time Dependabot wakes up against a stale lockfile.
+    open-pull-requests-limit: 5
+    # Group routine patch + minor bumps into one PR per ecosystem;
+    # major bumps stay separate (they're more likely to need
+    # code changes).
+    groups:
+      cargo-patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - patch
+          - minor
+      cargo-security:
+        applies-to: security-updates
+        # Security updates always get their own PR shape regardless of
+        # semver delta — patch / minor / major all bundle here.
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: "deps"
+      include: scope
+    # Don't touch SHA-pinned git deps automatically. The `provenance-*`
+    # crates are pinned to specific upstream commits in Cargo.toml
+    # because we deliberately review upstream changes before bumping;
+    # Dependabot can't see that semantic. The `git` source-type also
+    # isn't well-supported by `cargo update --precise` against a SHA.
+    ignore:
+      - dependency-name: "provenance-core"
+      - dependency-name: "pic-protocol"
+      - dependency-name: "provenance-bridge"
+
+  # GitHub Actions used by the workflows themselves.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:30"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "ci"
+      include: scope

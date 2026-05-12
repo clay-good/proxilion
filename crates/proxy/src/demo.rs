@@ -19,7 +19,8 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::adapters::action_stream::{ActionEvent, ActionStream, BroadcastingActionStream};
+use crate::adapters::action_stream::{ActionEvent, ActionStream};
+use std::sync::Arc;
 
 /// True when demo mode should run.
 ///
@@ -49,11 +50,11 @@ pub async fn should_run(db: &PgPool) -> bool {
 /// Returns the join handle so callers can keep it alive for the program's
 /// lifetime; we never need to abort it explicitly because tokio's runtime
 /// shutdown will drop it cleanly.
-pub fn start(stream: BroadcastingActionStream) -> tokio::task::JoinHandle<()> {
+pub fn start(stream: Arc<dyn ActionStream>) -> tokio::task::JoinHandle<()> {
     info!("PROXILION_DEMO active — seeding synthetic action events");
     tokio::spawn(async move {
-        seed_history(&stream).await;
-        ticker(&stream).await;
+        seed_history(stream.as_ref()).await;
+        ticker(stream.as_ref()).await;
     })
 }
 
@@ -165,7 +166,7 @@ fn synth_event(scenario: &Scenario, now: chrono::DateTime<Utc>) -> ActionEvent {
     }
 }
 
-async fn seed_history(stream: &BroadcastingActionStream) {
+async fn seed_history(stream: &dyn ActionStream) {
     // 20 historical rows spread over the last 2 hours.
     let now = Utc::now();
     for i in 0..20 {
@@ -176,7 +177,7 @@ async fn seed_history(stream: &BroadcastingActionStream) {
     }
 }
 
-async fn ticker(stream: &BroadcastingActionStream) {
+async fn ticker(stream: &dyn ActionStream) {
     loop {
         // Random 6–12s between synthetic events. ThreadRng isn't Send across
         // await boundaries, so re-acquire it inside a tight scope each tick.

@@ -30,6 +30,27 @@ pub struct Config {
     /// If true, generate a self-signed cert at `tls_cert_path` / `tls_key_path`
     /// when they don't exist. Set via `PROXILION_DEV=1`.
     pub dev_mode: bool,
+    /// Optional NATS server URL (e.g. `nats://nats:4222`). When set, every
+    /// persisted action event is also published to NATS on subject
+    /// `<prefix>.<vendor>.<action>`. Spec.md §3.1.
+    pub nats_url: Option<String>,
+    /// NATS subject prefix (default "actions").
+    pub nats_subject_prefix: String,
+    /// Optional SIEM webhook URL. When set, every persisted action event is
+    /// POSTed to this URL with an HMAC-signed body. Spec.md §3.3.
+    pub siem_webhook_url: Option<String>,
+    /// Hex-encoded HMAC secret for `X-Proxilion-Signature`. Required when
+    /// `siem_webhook_url` is set.
+    pub siem_hmac_key_hex: Option<String>,
+    /// Optional blocked-action webhook URL (ui-less-surfaces.md §10.3). When
+    /// set, every persisted `blocked_actions` row fires a signed POST.
+    pub blocked_webhook_url: Option<String>,
+    /// Hex-encoded HMAC key for the blocked-action webhook.
+    pub blocked_webhook_hmac_key_hex: Option<String>,
+    /// When true (default), `/api/v1/*` requires a valid `pxl_operator_*`
+    /// bearer. Set `PROXILION_DISABLE_OPERATOR_AUTH=1` to bypass for local
+    /// dev. ui-less-surfaces.md §4.4.
+    pub operator_auth_enforced: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +119,23 @@ impl Config {
             policy_path: env::var("PROXILION_POLICY_PATH").ok().map(PathBuf::from),
             customer_domain: env::var("PROXILION_CUSTOMER_DOMAIN")
                 .unwrap_or_else(|_| "example.com".to_string()),
+            nats_url: env::var("PROXILION_NATS_URL").ok().filter(|s| !s.is_empty()),
+            nats_subject_prefix: env::var("PROXILION_NATS_SUBJECT_PREFIX")
+                .unwrap_or_else(|_| "actions".to_string()),
+            siem_webhook_url: env::var("PROXILION_SIEM_WEBHOOK_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            siem_hmac_key_hex: env::var("PROXILION_SIEM_HMAC_KEY").ok().filter(|s| !s.is_empty()),
+            blocked_webhook_url: env::var("PROXILION_BLOCKED_WEBHOOK_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            blocked_webhook_hmac_key_hex: env::var("PROXILION_BLOCKED_WEBHOOK_HMAC_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            operator_auth_enforced: !matches!(
+                env::var("PROXILION_DISABLE_OPERATOR_AUTH").as_deref(),
+                Ok("1") | Ok("true")
+            ),
         })
     }
 }

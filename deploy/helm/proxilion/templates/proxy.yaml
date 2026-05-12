@@ -1,0 +1,181 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "proxilion.proxy.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: {{ .Values.proxy.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "proxilion.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      labels:
+        {{- include "proxilion.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: proxy
+        {{- with .Values.global.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        # Roll pods on policy/config change.
+        checksum/policy: {{ include (print $.Template.BasePath "/policy-configmap.yaml") . | sha256sum }}
+        {{- with .Values.global.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{ toYaml .Values.proxy.podSecurityContext | nindent 8 }}
+      containers:
+        - name: proxy
+          image: "{{ .Values.proxy.image.repository }}:{{ .Values.proxy.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
+          securityContext: {{ toYaml .Values.proxy.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          env:
+            - name: PROXILION_BIND_ADDR
+              value: "0.0.0.0:8443"
+            - name: PROXILION_LOG_FORMAT
+              value: {{ .Values.proxy.env.logFormat | quote }}
+            - name: PROXILION_CUSTOMER_DOMAIN
+              value: {{ .Values.proxy.env.customerDomain | quote }}
+            - name: PROXILION_POLICY_PATH
+              value: "/config/policy.yaml"
+            - name: PROXILION_TRUST_PLANE_URL
+              value: "http://{{ include "proxilion.trustPlane.fullname" . }}:{{ .Values.trustPlane.service.port }}"
+            {{- if .Values.proxy.env.publicUrl }}
+            - name: PROXILION_PUBLIC_URL
+              value: {{ .Values.proxy.env.publicUrl | quote }}
+            {{- end }}
+            {{- if .Values.proxy.env.nats.enabled }}
+            - name: PROXILION_NATS_URL
+              value: {{ include "proxilion.natsUrl" . | quote }}
+            - name: PROXILION_NATS_SUBJECT_PREFIX
+              value: {{ .Values.proxy.env.nats.subjectPrefix | quote }}
+            {{- end }}
+            {{- if .Values.proxy.env.siem.enabled }}
+            - name: PROXILION_SIEM_WEBHOOK_URL
+              value: {{ .Values.proxy.env.siem.webhookUrl | quote }}
+            - name: PROXILION_SIEM_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: siem-hmac-key
+            {{- end }}
+            - name: PROXILION_TLS_CERT
+              value: /tls/tls.crt
+            - name: PROXILION_TLS_KEY
+              value: /tls/tls.key
+            {{- if .Values.proxy.devCert }}
+            - name: PROXILION_DEV
+              value: "1"
+            {{- end }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: database-url
+            - name: PROXILION_TOKEN_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: token-encryption-key
+            - name: GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: google-client-id
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: google-client-secret
+          volumeMounts:
+            - name: policy
+              mountPath: /config
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: {{ not .Values.proxy.devCert }}
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.proxy.probes.readinessPath }}
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: {{ .Values.proxy.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.proxy.probes.periodSeconds }}
+            failureThreshold: {{ .Values.proxy.probes.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.proxy.probes.livenessPath }}
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources: {{ toYaml .Values.proxy.resources | nindent 12 }}
+      volumes:
+        - name: policy
+          configMap:
+            name: {{ include "proxilion.policyConfigMapName" . }}
+        - name: tls
+          {{- if .Values.proxy.devCert }}
+          emptyDir: {}
+          {{- else if .Values.proxy.tls.existingSecret }}
+          secret:
+            secretName: {{ .Values.proxy.tls.existingSecret }}
+          {{- else }}
+          # Falls back to the ingress-managed Secret name (cert-manager etc.)
+          secret:
+            secretName: {{ (index .Values.proxy.ingress.tls 0).secretName | default "proxilion-proxy-tls" }}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "proxilion.proxy.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+  {{- with .Values.proxy.service.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.proxy.service.type }}
+  ports:
+    - name: https
+      port: {{ .Values.proxy.service.port }}
+      targetPort: https
+      protocol: TCP
+  selector:
+    {{- include "proxilion.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+{{- if .Values.proxy.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "proxilion.proxy.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "proxilion.proxy.fullname" . }}
+  minReplicas: {{ .Values.proxy.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.proxy.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.proxy.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

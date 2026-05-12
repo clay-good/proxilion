@@ -1,0 +1,250 @@
+# Proxilion Helm chart — production-shaped defaults. Authority: spec.md §4.2.
+#
+# This chart deploys three first-class workloads: the proxy itself, the
+# upstream Trust Plane (provenance-plane), and an optional NATS event bus
+# for action-stream fan-out. Postgres is intentionally NOT bundled — every
+# customer already has a managed Postgres they trust; we connect to it via
+# `postgres.externalUrl`.
+#
+# All secret material (OAuth client credentials, CAT signing key, token
+# encryption key, SIEM HMAC) is consumed from a single Kubernetes Secret,
+# `proxilion-secrets`, which the operator creates out-of-band (or via
+# external-secrets-operator / sealed-secrets / Vault). The chart never
+# generates secret material at install time — the customer's KMS is the
+# trust root for PIC, not Helm.
+
+global:
+  # Override across every workload in the chart.
+  imagePullSecrets: []
+  podAnnotations: {}
+  podLabels: {}
+
+# ─────────────────────────────────────────────────────────────────────────
+# Proxy
+# ─────────────────────────────────────────────────────────────────────────
+proxy:
+  image:
+    repository: ghcr.io/clay-good/proxilion-proxy
+    tag: ""                              # default: chart appVersion
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1
+      memory: 1Gi
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    fsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  # Persistent volume for the auto-generated TLS cert (when devCert=true).
+  # In production, leave devCert=false and mount real material via
+  # tls.existingSecret (see below).
+  devCert: false
+  service:
+    type: ClusterIP
+    port: 8443
+    annotations: {}
+  ingress:
+    enabled: false
+    className: ""
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts:
+      - host: proxy.proxilion.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: proxilion-proxy-tls
+        hosts:
+          - proxy.proxilion.example.com
+  tls:
+    # When set, mount cert/key from this existing Secret instead of using
+    # `devCert`. The Secret must contain keys `tls.crt` and `tls.key`.
+    existingSecret: ""
+  env:
+    # Customer's primary domain — drives `${customer_domain}` in policy.
+    customerDomain: "example.com"
+    logFormat: "json"
+    publicUrl: ""                         # used to construct the OAuth redirect_uri
+    nats:
+      enabled: true                       # turn off to skip the NATS sink
+      url: ""                             # defaults to in-cluster NATS service
+      subjectPrefix: "actions"
+    siem:
+      enabled: false
+      webhookUrl: ""
+      # The HMAC key comes from the secret (siem.hmacKey).
+  # Liveness/readiness — /healthz returns 200 when ready, 503 otherwise.
+  probes:
+    livenessPath: /healthz
+    readinessPath: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 6
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# ─────────────────────────────────────────────────────────────────────────
+# Trust Plane (upstream provenance-plane, by clay-good/provenance)
+# ─────────────────────────────────────────────────────────────────────────
+trustPlane:
+  enabled: true
+  image:
+    repository: ghcr.io/clay-good/provenance-plane
+    # Pin to a known-good SHA-tagged image. The Cargo.toml in this repo
+    # already SHA-pins `provenance-core`; this image tag should match.
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1                        # raise once we federate
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  service:
+    type: ClusterIP
+    port: 8080
+  env:
+    name: "proxilion-prod"
+    catKid: "prod-cat-key-1"
+    logLevel: "info"
+    publicUrl: ""
+
+# ─────────────────────────────────────────────────────────────────────────
+# NATS (optional — action-stream fan-out)
+# ─────────────────────────────────────────────────────────────────────────
+nats:
+  enabled: true
+  image:
+    repository: nats
+    tag: "2.10-alpine"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    clientPort: 4222
+    monitorPort: 8222
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# ─────────────────────────────────────────────────────────────────────────
+# Postgres
+# ─────────────────────────────────────────────────────────────────────────
+# Proxilion does NOT bundle Postgres — production deploys connect to a
+# managed Postgres (RDS, Cloud SQL, Crunchy, etc.). Set externalUrl to a
+# DSN that resolves from inside the cluster. The corresponding password
+# component must ALSO be set in the `proxilion-secrets` secret under the
+# `database-url` key; templates prefer the secret value when present.
+postgres:
+  externalUrl: ""                        # e.g. postgres://proxilion@host:5432/proxilion
+  database: "proxilion"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Secrets
+# ─────────────────────────────────────────────────────────────────────────
+# Two ways to provide secret material:
+#   1. (preferred) Create `proxilion-secrets` out-of-band, then set
+#      `secrets.existingSecret: proxilion-secrets`. The chart will NOT
+#      attempt to render any secret manifest.
+#   2. (dev only) Set `secrets.existingSecret: ""` and inline the values
+#      below. They will be rendered into a Secret manifest in this chart.
+#      DO NOT commit `values.yaml` with real secrets — use --set or a
+#      separate `values-secrets.yaml` git-ignored.
+#
+# Required keys (whether inlined or pre-created):
+#   database-url            full DSN with password (overrides postgres.externalUrl)
+#   token-encryption-key    64 hex chars (32-byte AES-256-GCM key for OAuth tokens)
+#   google-client-id        Google OAuth client_id
+#   google-client-secret    Google OAuth client_secret
+#   trust-plane-cat-key     64 hex chars (32-byte Ed25519 seed for CAT signing)
+#   siem-hmac-key           >=32 hex chars (optional; only when siem.enabled)
+secrets:
+  existingSecret: "proxilion-secrets"
+  # Inline values — IGNORED when `existingSecret` is set.
+  inline:
+    databaseUrl: ""
+    tokenEncryptionKey: ""
+    googleClientId: ""
+    googleClientSecret: ""
+    trustPlaneCatKey: ""
+    siemHmacKey: ""
+
+# ─────────────────────────────────────────────────────────────────────────
+# Policy bundle (Layer-B YAML — spec.md §9)
+# ─────────────────────────────────────────────────────────────────────────
+# Mounted into the proxy at /config/policy.yaml. The chart renders a
+# ConfigMap; for GitOps workflows replace this with a reference to an
+# existing ConfigMap via `policy.existingConfigMap`.
+policy:
+  existingConfigMap: ""
+  # When `existingConfigMap` is empty, this block is rendered into a new
+  # ConfigMap named `<release>-proxilion-policy`. The shape is the same as
+  # `config/policy.yaml` in the repo root.
+  bundle:
+    - id: drive-injection-filter
+      vendor: google
+      action: drive.files.get
+      decision: allow
+      read_filter:
+        quarantine_patterns:
+          - "ignore previous instructions"
+          - "system prompt:"
+          - regex: '<\|.*?\|>'
+        quarantine_action: replace_with_marker
+      required_ops:
+        - "drive:read:file/${path.id}"
+      pic_mode: audit
+
+    - id: gmail-external-send-gate
+      vendor: google
+      action: gmail.messages.send
+      match:
+        body.external_recipient:
+          equals: true
+      decision: block
+      override: requires_justification
+      required_ops:
+        - "gmail:send:${user.email}:to:${body.to_domains}"
+      pic_mode: runtime-gate
+
+    - id: calendar-external-attendee-gate
+      vendor: google
+      action: calendar.events.insert
+      match:
+        body.external_attendee:
+          equals: true
+      decision: block
+      override: requires_justification
+      required_ops:
+        - "calendar:write:${user.email}/event:to:${body.attendee_domains}"
+      pic_mode: runtime-gate
+
+# ─────────────────────────────────────────────────────────────────────────
+# Prometheus ServiceMonitor (optional — turn on if prometheus-operator
+# is installed in-cluster)
+# ─────────────────────────────────────────────────────────────────────────
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}

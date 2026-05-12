@@ -15,7 +15,8 @@ use crate::decision::{Decision, Pattern, QuarantineAction, ReadFilter};
 use crate::match_expr;
 use crate::ops::{OpsExpression, OpsParseError};
 use crate::yaml::{
-    parse_policies, PicMode, PolicyDoc, QuarantineActionCfg, QuarantinePatternCfg, ReadFilterCfg,
+    parse_policies, AuditBodyMode, Mode, PicMode, PolicyDoc, QuarantineActionCfg,
+    QuarantinePatternCfg, ReadFilterCfg,
 };
 
 #[derive(Debug, Error)]
@@ -47,6 +48,16 @@ impl Engine {
     pub fn policy_count(&self) -> usize {
         self.policies.len()
     }
+
+    /// Look up a policy's `notifier_burst:` override by id. Returns
+    /// `(threshold, window_seconds)` if either is set; `None` if the
+    /// policy doesn't exist or doesn't carry a burst override.
+    /// ui-less-surfaces.md §5.6.
+    pub fn burst_override_for(&self, policy_id: &str) -> Option<(Option<usize>, Option<u64>)> {
+        let p = self.policies.iter().find(|p| p.id == policy_id)?;
+        let b = p.notifier_burst.as_ref()?;
+        Some((b.threshold, b.window_seconds))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +67,19 @@ pub struct Outcome {
     pub required_ops: OpsExpression,
     pub read_filter: Option<ReadFilter>,
     pub pic_mode: PicMode,
+    /// Per-policy enforcement mode (ui-less-surfaces.md §2). `Enforce` is
+    /// the production posture; `Observe` records what *would* have happened
+    /// and lets the adapter let the request through.
+    pub mode: Mode,
+    /// When `mode == Observe` and `decision` would have been non-Allow,
+    /// this carries the "would have been" decision the adapter records on
+    /// the action event (`observe_block`, `observe_require_confirmation`,
+    /// `observe_rate_limit`). `None` when not in observe mode or when the
+    /// underlying decision was Allow.
+    pub observe_would_have: Option<String>,
+    /// Per-policy body audit directive (ui-less-surfaces.md §6.4). `None`
+    /// → adapter skips the audit-body table entirely (privacy default).
+    pub audit_body: Option<AuditBodyMode>,
 }
 
 impl Engine {
@@ -69,16 +93,31 @@ impl Engine {
             if p.vendor != ctx.vendor || p.action != ctx.action {
                 continue;
             }
+            // `disabled` policies are skipped entirely — useful as an
+            // emergency kill-switch without deleting the YAML. The loop
+            // continues so a later policy can still match.
+            if p.mode == Mode::Disabled {
+                continue;
+            }
             if !match_expr::evaluate(&p.match_, ctx)? {
                 continue;
             }
-            trace!(policy = %p.id, "matched");
+            trace!(policy = %p.id, mode = ?p.mode, "matched");
+            let real_decision = parse_decision(p)?;
+            let (decision, observe_would_have) = match p.mode {
+                Mode::Enforce => (real_decision, None),
+                Mode::Observe => observe_demote(real_decision),
+                Mode::Disabled => unreachable!("filtered above"),
+            };
             return Ok(Outcome {
                 matched_policy_id: Some(p.id.clone()),
-                decision: parse_decision(p)?,
+                decision,
                 required_ops: OpsExpression::resolve(&p.required_ops, ctx)?,
                 read_filter: p.read_filter.as_ref().map(compile_read_filter).transpose()?,
                 pic_mode: p.pic_mode,
+                mode: p.mode,
+                observe_would_have,
+                audit_body: p.audit_body,
             });
         }
         Ok(Outcome {
@@ -87,7 +126,25 @@ impl Engine {
             required_ops: OpsExpression::default(),
             read_filter: None,
             pic_mode: PicMode::Audit,
+            mode: Mode::Enforce,
+            observe_would_have: None,
+            audit_body: None,
         })
+    }
+}
+
+/// In `observe` mode the adapter receives `Decision::Allow` (so the
+/// request proceeds untouched) plus a `would_have` label so the action
+/// event records `observe_block` / `observe_require_confirmation` /
+/// `observe_rate_limit`. ui-less-surfaces.md §2.5.
+fn observe_demote(d: Decision) -> (Decision, Option<String>) {
+    match d {
+        Decision::Allow => (Decision::Allow, None),
+        Decision::Block { .. } => (Decision::Allow, Some("observe_block".into())),
+        Decision::RequireConfirmation { .. } => {
+            (Decision::Allow, Some("observe_require_confirmation".into()))
+        }
+        Decision::RateLimit { .. } => (Decision::Allow, Some("observe_rate_limit".into())),
     }
 }
 

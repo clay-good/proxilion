@@ -36,10 +36,13 @@ pub struct KillswitchApiState {
 }
 
 pub fn router(state: KillswitchApiState) -> Router {
+    use axum::middleware::from_fn_with_state;
+    use crate::operator_auth::scope_check;
+    let kill = || from_fn_with_state("killswitch:revoke", scope_check);
     Router::new()
-        .route("/api/v1/killswitch/session/{id}", post(kill_session))
-        .route("/api/v1/killswitch/user/{p0}", post(kill_user))
-        .route("/api/v1/killswitch/all", post(kill_all))
+        .route("/api/v1/killswitch/session/{id}", post(kill_session).route_layer(kill()))
+        .route("/api/v1/killswitch/user/{p0}", post(kill_user).route_layer(kill()))
+        .route("/api/v1/killswitch/all", post(kill_all).route_layer(kill()))
         .with_state(Arc::new(state))
 }
 

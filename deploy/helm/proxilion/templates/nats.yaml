@@ -1,0 +1,62 @@
+{{- if .Values.nats.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "proxilion.nats.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+spec:
+  replicas: {{ .Values.nats.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "proxilion.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: nats
+  template:
+    metadata:
+      labels:
+        {{- include "proxilion.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: nats
+    spec:
+      containers:
+        - name: nats
+          image: "{{ .Values.nats.image.repository }}:{{ .Values.nats.image.tag }}"
+          imagePullPolicy: {{ .Values.nats.image.pullPolicy }}
+          args: ["-js", "-m", "{{ .Values.nats.service.monitorPort }}"]
+          ports:
+            - name: client
+              containerPort: {{ .Values.nats.service.clientPort }}
+            - name: monitor
+              containerPort: {{ .Values.nats.service.monitorPort }}
+          resources: {{ toYaml .Values.nats.resources | nindent 12 }}
+          readinessProbe:
+            tcpSocket:
+              port: client
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: client
+            initialDelaySeconds: 10
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "proxilion.nats.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+spec:
+  type: ClusterIP
+  ports:
+    - name: client
+      port: {{ .Values.nats.service.clientPort }}
+      targetPort: client
+    - name: monitor
+      port: {{ .Values.nats.service.monitorPort }}
+      targetPort: monitor
+  selector:
+    {{- include "proxilion.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+{{- end }}

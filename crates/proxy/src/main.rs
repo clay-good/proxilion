@@ -5,14 +5,19 @@ use tracing::info;
 
 mod adapters;
 mod api;
+mod audit_body;
 mod auth_middleware;
 mod blocked;
 mod config;
 mod crypto;
 mod demo;
 mod error_envelope;
+mod forwarder;
+mod notifier;
 mod oauth;
+mod operator_auth;
 mod pic;
+mod policy_handle;
 mod server;
 mod session;
 
@@ -28,10 +33,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Install the global Prometheus metrics recorder. `/metrics` mounted in
     // server.rs renders this recorder's snapshot on each scrape.
-    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .build_recorder();
-    let handle = recorder.handle();
-    metrics::set_global_recorder(recorder).expect("metrics recorder already installed");
+    //
+    // We use `install_recorder()` (returns just the handle + installs the
+    // recorder globally) rather than `build_recorder()` + manual
+    // `set_global_recorder()` — the latter pattern is documented in
+    // metrics-exporter-prometheus 0.16 but in practice the recency-tracking
+    // wrapper around the recorder reaps counters between scrapes when
+    // ownership crosses the manual-set boundary. `install_recorder` keeps
+    // the recorder + the upkeep thread it spawns colocated, which is what
+    // accumulates counter values across calls in steady state.
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("metrics recorder install failed");
     server::set_metrics_handle(handle);
 
     let cfg = match config::Config::from_env() {

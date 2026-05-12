@@ -14,4 +14,4 @@ pub use context::{RequestContext, UserCtx};
 pub use decision::{Decision, Pattern, QuarantineAction, ReadFilter};
 pub use ops::{MissingOps, OpsAtom, OpsExpression};
 pub use rego::{Engine, Outcome};
-pub use yaml::PicMode;
+pub use yaml::{AuditBodyMode, Mode, PicMode};

@@ -34,6 +34,12 @@ struct Cli {
     #[arg(long)]
     insecure: bool,
 
+    /// Operator token (sent as `Authorization: Bearer <token>` on
+    /// `/api/v1/*` requests). When the proxy runs with
+    /// `PROXILION_DISABLE_OPERATOR_AUTH=1` this can be empty.
+    #[arg(long, env = "PROXILION_OPERATOR_TOKEN", default_value = "")]
+    token: String,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -64,6 +70,175 @@ enum Cmd {
     /// Live tail / list / show / export of the action log.
     #[command(subcommand)]
     Actions(ActionsCmd),
+    /// Operator-token management (ui-less-surfaces.md §4.4). Writes
+    /// directly to postgres via `DATABASE_URL` — no token required (this
+    /// is how the bootstrap token is minted).
+    #[command(subcommand)]
+    Tokens(TokensCmd),
+    /// Policy hot-reload + mode flips (ui-less-surfaces.md §2 + §4).
+    #[command(subcommand)]
+    Policy(PolicyCmd),
+    /// Blocked-action queue: list / show / approve / reject.
+    #[command(subcommand)]
+    Blocked(BlockedCmd),
+    /// Notifier diagnostics (ui-less-surfaces.md §4.1).
+    #[command(subcommand)]
+    Notifier(NotifierCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum NotifierCmd {
+    /// Display the current webhook + burst-suppressor config.
+    Show {
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
+    /// Send a synthetic test notification through the configured webhook.
+    Test,
+    /// Read the persisted notifier_config row.
+    Config,
+    /// Set / update the webhook driver config (DB-stored, hot-swapped on
+    /// the proxy without restart). ui-less-surfaces.md §8.4.
+    SetWebhook {
+        /// Webhook URL the proxy POSTs to.
+        #[arg(long)]
+        url: String,
+        /// HMAC secret (hex, ≥32 chars).
+        #[arg(long)]
+        hmac_hex: String,
+        /// Disable the webhook without removing the row.
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Set / update the Slack driver config (ui-less-surfaces.md §5.3).
+    /// Outbound: posts Block Kit message to the incoming-webhook URL.
+    /// Inbound: verifies button-click POSTs via the signing-secret.
+    SetSlack {
+        /// Slack incoming-webhook URL (Slack workspace admin > Apps > your app).
+        #[arg(long)]
+        incoming_webhook_url: String,
+        /// Slack signing secret (32-char hex from "Basic Information").
+        #[arg(long)]
+        signing_secret: String,
+        /// Disable without removing the row.
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Set / update the Email driver config (ui-less-surfaces.md §5.4).
+    /// Sends plain-text + HTML email with single-use signed approve/reject
+    /// URLs on every blocked action.
+    SetEmail {
+        /// SMTP relay URL: smtps://user:pass@host:465 or smtp://host:25.
+        #[arg(long)]
+        smtp_url: String,
+        /// RFC 5322 from address (e.g. "Proxilion <secops@org.com>").
+        #[arg(long)]
+        from: String,
+        /// Recipient(s). Repeat for multiple addresses.
+        #[arg(long = "to", required = true)]
+        to: Vec<String>,
+        /// Disable without removing the row.
+        #[arg(long)]
+        disabled: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCmd {
+    /// List current policies + modes.
+    List {
+        /// Optional mode filter: enforce | observe | disabled.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Output: pretty | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
+    /// Force a re-read from disk.
+    Reload,
+    /// Flip a single policy between observe / enforce / disabled.
+    SetMode {
+        /// Policy id.
+        id: String,
+        /// Target mode: `enforce`, `observe`, or `disabled`.
+        mode: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BlockedCmd {
+    /// List blocked actions, default filter pending.
+    List {
+        /// `pending` (default) | `approved` | `overridden` | `rejected` | `expired` | `all`.
+        #[arg(long, default_value = "pending")]
+        status: String,
+        /// Filter by p_0.
+        #[arg(long)]
+        p_0: Option<String>,
+        /// Filter by policy_id.
+        #[arg(long)]
+        policy_id: Option<String>,
+        /// Per-page limit (1..=200, default 50).
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Output: pretty | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
+    /// Show one blocked-action record (full envelope).
+    Show {
+        id: String,
+        /// Output: pretty | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
+    /// Approve a blocked action with a justification.
+    Approve {
+        id: String,
+        #[arg(long)]
+        justification: String,
+        /// Approver subject (defaults to $USER@cli).
+        #[arg(long)]
+        approver: Option<String>,
+        /// TTL in minutes for the override (1..=1440).
+        #[arg(long)]
+        ttl: Option<u32>,
+    },
+    /// Reject a blocked action.
+    Reject {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TokensCmd {
+    /// Mint a new operator token. Prints once to stdout; only the SHA-256
+    /// hash is persisted.
+    Issue {
+        /// Human-readable name (e.g. "alice (on-call)" or "ci-bot").
+        #[arg(long)]
+        name: String,
+        /// Comma-separated scopes. Use `*` for an admin/bootstrap token.
+        /// See `--help-scopes` for the full catalogue.
+        #[arg(long, value_delimiter = ',')]
+        scope: Vec<String>,
+    },
+    /// List active (non-revoked) tokens.
+    List {
+        /// Include revoked tokens.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Revoke a token by id.
+    Revoke {
+        /// Token id (UUID).
+        id: String,
+        /// Reason (optional, recorded for audit).
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -155,6 +330,18 @@ async fn main() -> Result<()> {
         Cmd::Verify { id } => cmd_verify(&http, &cli.url, &id).await,
         Cmd::Selftest => cmd_selftest(&http, &cli.url, &cli.trust_plane).await,
         Cmd::Actions(sub) => cmd_actions(&http, &cli.url, sub).await,
+        Cmd::Tokens(sub) => cmd_tokens(sub).await,
+        Cmd::Policy(sub) => cmd_policy(&http, &cli.url, &cli.token, sub).await,
+        Cmd::Blocked(sub) => cmd_blocked(&http, &cli.url, &cli.token, sub).await,
+        Cmd::Notifier(sub) => cmd_notifier(&http, &cli.url, &cli.token, sub).await,
+    }
+}
+
+fn auth_header<'a>(builder: reqwest::RequestBuilder, token: &'a str) -> reqwest::RequestBuilder {
+    if token.is_empty() {
+        builder
+    } else {
+        builder.bearer_auth(token)
     }
 }
 
@@ -735,4 +922,518 @@ fn urlencode(s: &str) -> String {
             }
         })
         .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Operator-token management (ui-less-surfaces.md §4.4)
+// ─────────────────────────────────────────────────────────────────────────
+
+const TOKEN_PREFIX: &str = "pxl_operator_";
+const TOKEN_BODY_LEN: usize = 52;
+
+fn generate_token() -> String {
+    use rand::RngCore;
+    const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut bytes = [0u8; TOKEN_BODY_LEN];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let body: String = bytes
+        .iter()
+        .map(|b| ALPH[(*b as usize) % ALPH.len()] as char)
+        .collect();
+    format!("{TOKEN_PREFIX}{body}")
+}
+
+fn token_hash(token: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
+async fn cmd_tokens(sub: TokensCmd) -> Result<()> {
+    let db_url = std::env::var("DATABASE_URL")
+        .context("DATABASE_URL must be set (proxilion-cli tokens writes directly to postgres)")?;
+    let pool = sqlx::PgPool::connect(&db_url)
+        .await
+        .context("connecting to postgres")?;
+    match sub {
+        TokensCmd::Issue { name, scope } => {
+            if scope.is_empty() {
+                return Err(anyhow!(
+                    "--scope is required (at least one; use `*` for a bootstrap admin token)"
+                ));
+            }
+            let plaintext = generate_token();
+            let hash = token_hash(&plaintext);
+            let row: (uuid::Uuid,) = sqlx::query_as(
+                "INSERT INTO operator_tokens (token_hash, name, scopes)
+                 VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(&hash[..])
+            .bind(&name)
+            .bind(&scope)
+            .fetch_one(&pool)
+            .await
+            .context("inserting operator_tokens")?;
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "id": row.0.to_string(),
+                "name": name,
+                "scopes": scope,
+                "token": plaintext,
+                "note": "This token is shown ONCE. Store it in a secrets manager."
+            }))?);
+            Ok(())
+        }
+        TokensCmd::List { all } => {
+            let rows: Vec<(uuid::Uuid, String, Vec<String>, chrono::DateTime<chrono::Utc>,
+                           Option<chrono::DateTime<chrono::Utc>>,
+                           Option<chrono::DateTime<chrono::Utc>>,
+                           Option<String>)> = sqlx::query_as(
+                "SELECT id, name, scopes, created_at, last_used_at, revoked_at, revoked_reason
+                 FROM operator_tokens
+                 WHERE ($1 OR revoked_at IS NULL)
+                 ORDER BY created_at DESC",
+            )
+            .bind(all)
+            .fetch_all(&pool)
+            .await
+            .context("selecting operator_tokens")?;
+            let arr: Vec<_> = rows.into_iter().map(|r| {
+                json!({
+                    "id": r.0.to_string(),
+                    "name": r.1,
+                    "scopes": r.2,
+                    "created_at": r.3.to_rfc3339(),
+                    "last_used_at": r.4.map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
+                    "revoked_at": r.5.map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
+                    "revoked_reason": r.6,
+                })
+            }).collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+            Ok(())
+        }
+        TokensCmd::Revoke { id, reason } => {
+            let uuid = uuid::Uuid::parse_str(&id)
+                .map_err(|e| anyhow!("invalid UUID `{id}`: {e}"))?;
+            let res = sqlx::query(
+                "UPDATE operator_tokens
+                 SET revoked_at = now(), revoked_reason = $2
+                 WHERE id = $1 AND revoked_at IS NULL",
+            )
+            .bind(uuid)
+            .bind(reason.as_deref())
+            .execute(&pool)
+            .await
+            .context("updating operator_tokens")?;
+            let n = res.rows_affected();
+            if n == 0 {
+                return Err(anyhow!("no active token with id {id} (already revoked?)"));
+            }
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "id": id,
+                "revoked": n,
+            }))?);
+            Ok(())
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Policy management (ui-less-surfaces.md §4)
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn cmd_policy(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    sub: PolicyCmd,
+) -> Result<()> {
+    match sub {
+        PolicyCmd::List { mode, format } => {
+            let resp = auth_header(http.get(format!("{url}/api/v1/policy")), token)
+                .send()
+                .await
+                .context("GET /api/v1/policy")?
+                .error_for_status()
+                .context("/api/v1/policy returned an error")?;
+            let envelope: Value = resp.json().await?;
+            let policies = envelope["policies"].as_array().cloned().unwrap_or_default();
+            let filtered: Vec<Value> = policies
+                .into_iter()
+                .filter(|p| match &mode {
+                    Some(m) => p["mode"].as_str() == Some(m.as_str()),
+                    None => true,
+                })
+                .collect();
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&filtered)?);
+            } else {
+                let source = envelope["source"].as_str().unwrap_or("(unset)");
+                println!("source: {source}");
+                println!("{:<40} {:<10} {:<10} {}", "id", "mode", "pic_mode", "vendor/action");
+                println!("{}", "─".repeat(78));
+                for p in &filtered {
+                    println!(
+                        "{:<40} {:<10} {:<10} {}/{}",
+                        p["id"].as_str().unwrap_or(""),
+                        p["mode"].as_str().unwrap_or(""),
+                        p["pic_mode"].as_str().unwrap_or(""),
+                        p["vendor"].as_str().unwrap_or(""),
+                        p["action"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            Ok(())
+        }
+        PolicyCmd::Reload => {
+            let resp = auth_header(http.post(format!("{url}/api/v1/policy/reload")), token)
+                .send()
+                .await
+                .context("POST /api/v1/policy/reload")?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if !status.is_success() {
+                return Err(anyhow!("reload failed (HTTP {status})"));
+            }
+            Ok(())
+        }
+        PolicyCmd::SetMode { id, mode } => {
+            if !matches!(mode.as_str(), "enforce" | "observe" | "disabled") {
+                return Err(anyhow!(
+                    "mode must be one of: enforce | observe | disabled (got `{mode}`)"
+                ));
+            }
+            let resp = auth_header(
+                http.post(format!("{url}/api/v1/policy/{id}/mode")),
+                token,
+            )
+            .json(&json!({"mode": mode}))
+            .send()
+            .await
+            .context("POST /api/v1/policy/{id}/mode")?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if !status.is_success() {
+                return Err(anyhow!("set-mode failed (HTTP {status})"));
+            }
+            Ok(())
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Blocked-action queue
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn cmd_blocked(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    sub: BlockedCmd,
+) -> Result<()> {
+    match sub {
+        BlockedCmd::List {
+            status,
+            p_0,
+            policy_id,
+            limit,
+            format,
+        } => {
+            let mut q = vec![("status", status), ("limit", limit.to_string())];
+            if let Some(v) = p_0 { q.push(("p_0", v)); }
+            if let Some(v) = policy_id { q.push(("policy_id", v)); }
+            let resp = auth_header(http.get(format!("{url}/api/v1/blocked")), token)
+                .query(&q)
+                .send()
+                .await
+                .context("GET /api/v1/blocked")?
+                .error_for_status()
+                .context("/api/v1/blocked returned an error")?;
+            let envelope: Value = resp.json().await?;
+            let rows = envelope["rows"].as_array().cloned().unwrap_or_default();
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!(
+                    "{:<38} {:<11} {:<22} {:<22} {}",
+                    "id", "status", "p_0", "action", "policy_id"
+                );
+                println!("{}", "─".repeat(120));
+                for r in &rows {
+                    let id = r["id"].as_str().unwrap_or("");
+                    let id_short = format!("{}…", &id[..id.len().min(36)]);
+                    println!(
+                        "{:<38} {:<11} {:<22} {:<22} {}",
+                        id_short,
+                        r["status"].as_str().unwrap_or(""),
+                        truncate(r["p_0"].as_str().unwrap_or(""), 22),
+                        truncate(r["action"].as_str().unwrap_or(""), 22),
+                        r["policy_id"].as_str().unwrap_or(""),
+                    );
+                }
+                println!("\n{} row(s)", rows.len());
+            }
+            Ok(())
+        }
+        BlockedCmd::Show { id, format } => {
+            let resp = auth_header(http.get(format!("{url}/api/v1/blocked/{id}")), token)
+                .send()
+                .await
+                .context("GET /api/v1/blocked/{id}")?
+                .error_for_status()
+                .context("/api/v1/blocked/{id} returned an error")?;
+            let body: Value = resp.json().await?;
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            } else {
+                pretty_blocked_record(&body);
+            }
+            Ok(())
+        }
+        BlockedCmd::Approve {
+            id,
+            justification,
+            approver,
+            ttl,
+        } => {
+            let user = std::env::var("USER").unwrap_or_else(|_| "cli".into());
+            let approver = approver.unwrap_or_else(|| format!("{user}@cli"));
+            let mut body = json!({
+                "justification": justification,
+                "approver_subject": approver,
+            });
+            if let Some(t) = ttl {
+                body["ttl_minutes"] = json!(t);
+            }
+            let resp = auth_header(
+                http.post(format!("{url}/api/v1/blocked/{id}/approve")),
+                token,
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("POST /api/v1/blocked/{id}/approve")?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if !status.is_success() {
+                return Err(anyhow!("approve failed (HTTP {status})"));
+            }
+            Ok(())
+        }
+        BlockedCmd::Reject { id, reason } => {
+            let body = match reason {
+                Some(r) => json!({"reason": r}),
+                None => json!({}),
+            };
+            let resp = auth_header(
+                http.post(format!("{url}/api/v1/blocked/{id}/reject")),
+                token,
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("POST /api/v1/blocked/{id}/reject")?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if !status.is_success() {
+                return Err(anyhow!("reject failed (HTTP {status})"));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn pretty_blocked_record(v: &Value) {
+    let bold = |s: &str| format!("\x1b[1m{s}\x1b[0m");
+    println!("{}", bold("blocked action"));
+    for k in [
+        "id",
+        "request_id",
+        "session_id",
+        "p_0",
+        "vendor",
+        "action",
+        "method",
+        "path",
+        "layer",
+        "policy_id",
+        "detail",
+        "predecessor_pca_id",
+        "status",
+        "created_at",
+        "expires_at",
+        "approver_subject",
+        "override_pca_id",
+        "justification",
+        "reject_reason",
+    ] {
+        if let Some(val) = v.get(k) {
+            if !val.is_null() {
+                println!("  {:<22} {}", k, val);
+            }
+        }
+    }
+    if let Some(ops) = v.get("requested_ops").and_then(|v| v.as_array()) {
+        if !ops.is_empty() {
+            println!("  {}", bold("requested_ops:"));
+            for o in ops {
+                if let Some(s) = o.as_str() {
+                    println!("    {s}");
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Notifier (ui-less-surfaces.md §4.1)
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn cmd_notifier(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    sub: NotifierCmd,
+) -> Result<()> {
+    match sub {
+        NotifierCmd::Show { format } => {
+            let resp = auth_header(http.get(format!("{url}/api/v1/notifier/show")), token)
+                .send()
+                .await
+                .context("GET /api/v1/notifier/show")?
+                .error_for_status()
+                .context("/api/v1/notifier/show returned an error")?;
+            let body: Value = resp.json().await?;
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            } else {
+                let webhook = &body["webhook"];
+                let configured = webhook["configured"].as_bool().unwrap_or(false);
+                if !configured {
+                    println!("webhook: \x1b[33mnot configured\x1b[0m");
+                    println!("  set PROXILION_BLOCKED_WEBHOOK_URL + PROXILION_BLOCKED_WEBHOOK_HMAC_KEY to enable");
+                } else {
+                    println!(
+                        "webhook: \x1b[32mconfigured\x1b[0m  ({})",
+                        webhook["proxy_public_url_redacted"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                    );
+                }
+                let burst = &body["burst"];
+                if burst.is_null() {
+                    println!("burst:   disabled");
+                } else {
+                    println!(
+                        "burst:   threshold={} window={}s flush={}s",
+                        burst["threshold"].as_u64().unwrap_or(0),
+                        burst["window_seconds"].as_u64().unwrap_or(0),
+                        burst["flush_interval_seconds"].as_u64().unwrap_or(0),
+                    );
+                }
+            }
+            Ok(())
+        }
+        NotifierCmd::Test => {
+            let resp = auth_header(http.post(format!("{url}/api/v1/notifier/test")), token)
+                .send()
+                .await
+                .context("POST /api/v1/notifier/test")?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if !status.is_success() {
+                return Err(anyhow!("notifier test failed (HTTP {status})"));
+            }
+            Ok(())
+        }
+        NotifierCmd::Config => {
+            let resp = auth_header(http.get(format!("{url}/api/v1/notifier/config")), token)
+                .send()
+                .await
+                .context("GET /api/v1/notifier/config")?
+                .error_for_status()?;
+            let body: Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        NotifierCmd::SetWebhook { url: hook_url, hmac_hex, disabled } => {
+            let body = json!({
+                "driver": "webhook",
+                "enabled": !disabled,
+                "config": { "url": hook_url, "hmac_key": hmac_hex },
+            });
+            let resp = auth_header(http.post(format!("{url}/api/v1/notifier/config")), token)
+                .json(&body)
+                .send()
+                .await
+                .context("POST /api/v1/notifier/config")?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if !status.is_success() {
+                return Err(anyhow!("notifier set-webhook failed (HTTP {status})"));
+            }
+            Ok(())
+        }
+        NotifierCmd::SetEmail { smtp_url, from, to, disabled } => {
+            let body = json!({
+                "driver": "email",
+                "enabled": !disabled,
+                "config": {
+                    "smtp_url": smtp_url,
+                    "from": from,
+                    "to": to,
+                },
+            });
+            let resp = auth_header(http.post(format!("{url}/api/v1/notifier/config")), token)
+                .json(&body)
+                .send()
+                .await
+                .context("POST /api/v1/notifier/config")?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if !status.is_success() {
+                return Err(anyhow!("notifier set-email failed (HTTP {status})"));
+            }
+            Ok(())
+        }
+        NotifierCmd::SetSlack { incoming_webhook_url, signing_secret, disabled } => {
+            let body = json!({
+                "driver": "slack",
+                "enabled": !disabled,
+                "config": {
+                    "incoming_webhook_url": incoming_webhook_url,
+                    "signing_secret": signing_secret,
+                },
+            });
+            let resp = auth_header(http.post(format!("{url}/api/v1/notifier/config")), token)
+                .json(&body)
+                .send()
+                .await
+                .context("POST /api/v1/notifier/config")?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if !status.is_success() {
+                return Err(anyhow!("notifier set-slack failed (HTTP {status})"));
+            }
+            Ok(())
+        }
+    }
 }

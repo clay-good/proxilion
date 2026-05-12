@@ -1,0 +1,89 @@
+{{- if .Values.trustPlane.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "proxilion.trustPlane.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trust-plane
+spec:
+  replicas: {{ .Values.trustPlane.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "proxilion.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: trust-plane
+  template:
+    metadata:
+      labels:
+        {{- include "proxilion.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: trust-plane
+        {{- with .Values.global.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      {{- with .Values.global.podAnnotations }}
+      annotations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: trust-plane
+          image: "{{ .Values.trustPlane.image.repository }}:{{ .Values.trustPlane.image.tag }}"
+          imagePullPolicy: {{ .Values.trustPlane.image.pullPolicy }}
+          env:
+            - name: TRUST_PLANE_PORT
+              value: "8080"
+            - name: TRUST_PLANE_NAME
+              value: {{ .Values.trustPlane.env.name | quote }}
+            - name: TRUST_PLANE_CAT_KID
+              value: {{ .Values.trustPlane.env.catKid | quote }}
+            - name: TRUST_PLANE_LOG_LEVEL
+              value: {{ .Values.trustPlane.env.logLevel | quote }}
+            {{- if .Values.trustPlane.env.publicUrl }}
+            - name: TRUST_PLANE_PUBLIC_URL
+              value: {{ .Values.trustPlane.env.publicUrl | quote }}
+            {{- end }}
+            - name: TRUST_PLANE_CAT_KEY_HEX
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: trust-plane-cat-key
+            - name: TRUST_PLANE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: database-url
+          ports:
+            - name: http
+              containerPort: 8080
+          resources: {{ toYaml .Values.trustPlane.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "proxilion.trustPlane.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trust-plane
+spec:
+  type: {{ .Values.trustPlane.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.trustPlane.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "proxilion.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: trust-plane
+{{- end }}

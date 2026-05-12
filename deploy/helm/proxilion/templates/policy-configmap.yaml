@@ -1,0 +1,11 @@
+{{- if not .Values.policy.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "proxilion.policyConfigMapName" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+data:
+  policy.yaml: |
+{{ toYaml .Values.policy.bundle | indent 4 }}
+{{- end }}

@@ -1,0 +1,23 @@
+apiVersion: v2
+name: proxilion
+description: |
+  Self-hosted reverse proxy that sits in the OAuth path between managed AI
+  agents and the SaaS systems they touch — filtering reads, gating writes,
+  streaming actions in real time, and binding every call to a PIC authority
+  chain. See spec.md §12 / §4.2.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://proxilion.com
+sources:
+  - https://github.com/clay-good/proxilion
+keywords:
+  - oauth
+  - ai-security
+  - managed-agents
+  - pic
+  - reverse-proxy
+maintainers:
+  - name: Proxilion contributors
+    email: hi@proxilion.com
+icon: https://proxilion.com/favicon.svg

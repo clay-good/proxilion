@@ -1,0 +1,22 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "proxilion.proxy.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}{{ toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "proxilion.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: proxy
+  endpoints:
+    - port: https
+      path: /metrics
+      scheme: https
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      tlsConfig:
+        insecureSkipVerify: true
+{{- end }}

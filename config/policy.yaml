@@ -37,3 +37,41 @@
   required_ops:
     - "gmail:send:${user.email}:to:${body.to_domains}"
   pic_mode: runtime-gate
+
+# Calendar event reads — surface in audit only, no read-filter (Calendar
+# events don't carry free-form document content the way Drive does).
+- id: calendar-read-audit
+  vendor: google
+  action: calendar.events.get
+  decision: allow
+  required_ops:
+    - "calendar:read:${user.email}/event/${path.eid}"
+  pic_mode: audit
+
+# External-attendee gate on calendar writes. Blocks `events.insert` and
+# `events.update` whenever the agent tries to add at least one attendee
+# whose domain doesn't match `customer_domain`. Override allowed (the
+# meeting may be legitimate; an approver decides).
+- id: calendar-external-attendee-gate
+  vendor: google
+  action: calendar.events.insert
+  match:
+    body.external_attendee:
+      equals: true
+  decision: block
+  override: requires_justification
+  required_ops:
+    - "calendar:write:${user.email}/event:to:${body.attendee_domains}"
+  pic_mode: runtime-gate
+
+- id: calendar-external-attendee-update-gate
+  vendor: google
+  action: calendar.events.update
+  match:
+    body.external_attendee:
+      equals: true
+  decision: block
+  override: requires_justification
+  required_ops:
+    - "calendar:write:${user.email}/event/${path.eid}:to:${body.attendee_domains}"
+  pic_mode: runtime-gate

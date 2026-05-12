@@ -31,15 +31,23 @@ pub struct ActionsApiState {
 }
 
 pub fn router(state: ActionsApiState) -> Router {
+    use axum::middleware::from_fn_with_state;
+    use axum::routing::get;
+    use crate::operator_auth::scope_check;
+    let read = || from_fn_with_state("actions:read", scope_check);
+    let export_scope = || from_fn_with_state("actions:export", scope_check);
     Router::new()
         // /actions returns a paginated envelope { rows, next_before }.
         // /actions/recent stays as a raw array for the static-admin UI.
-        .route("/api/v1/actions", axum::routing::get(list))
-        .route("/api/v1/actions/recent", axum::routing::get(recent))
-        .route("/api/v1/actions/stream", axum::routing::get(stream))
-        .route("/api/v1/actions/export", axum::routing::get(export))
-        .route("/api/v1/actions/{id}", axum::routing::get(get_action))
-        .route("/api/v1/sessions/{id}/chain", axum::routing::get(session_chain))
+        .route("/api/v1/actions", get(list).route_layer(read()))
+        .route("/api/v1/actions/recent", get(recent).route_layer(read()))
+        .route("/api/v1/actions/stream", get(stream).route_layer(read()))
+        .route("/api/v1/actions/export", get(export).route_layer(export_scope()))
+        .route("/api/v1/actions/{id}", get(get_action).route_layer(read()))
+        .route(
+            "/api/v1/sessions/{id}/chain",
+            get(session_chain).route_layer(read()),
+        )
         .with_state(state)
 }
 
@@ -318,6 +326,17 @@ struct PcaLink {
 }
 
 #[derive(Debug, Serialize)]
+struct AuditBody {
+    mode: String,
+    request_hash: Option<String>,
+    response_hash: Option<String>,
+    request_body_b64: Option<String>,
+    response_body_b64: Option<String>,
+    request_bytes: i32,
+    response_bytes: i32,
+}
+
+#[derive(Debug, Serialize)]
 struct ActionDetail {
     #[serde(flatten)]
     row: ListRow,
@@ -325,6 +344,8 @@ struct ActionDetail {
     /// links; in the latter case `chain_broken_at` names the first missing id.
     chain: Vec<PcaLink>,
     chain_broken_at: Option<Uuid>,
+    /// Audit-body row, when the policy opted in via `audit_body:`.
+    audit_body: Option<AuditBody>,
 }
 
 async fn get_action(
@@ -349,7 +370,33 @@ async fn get_action(
         Some(leaf) => walk_chain(&state.pca_cache, leaf).await?,
         None => (Vec::new(), None),
     };
-    Ok(Json(ActionDetail { row: list_row, chain, chain_broken_at: broken_at }))
+    // Audit-body row, if any. Joined by request_id (the audit_body table
+    // uses request_id as its PK so the adapter can insert without
+    // awaiting the action_events row's generated UUID).
+    let audit_body: Option<AuditBody> = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>, i32, i32)>(
+        "SELECT mode, request_hash, response_hash,
+                request_body_b64, response_body_b64,
+                request_bytes, response_bytes
+           FROM action_event_bodies WHERE request_id = $1",
+    )
+    .bind(list_row.request_id)
+    .fetch_optional(&state.db)
+    .await?
+    .map(|(mode, rh, sh, rb, rbb, rs, ss)| AuditBody {
+        mode,
+        request_hash: rh,
+        response_hash: sh,
+        request_body_b64: rb,
+        response_body_b64: rbb,
+        request_bytes: rs,
+        response_bytes: ss,
+    });
+    Ok(Json(ActionDetail {
+        row: list_row,
+        chain,
+        chain_broken_at: broken_at,
+        audit_body,
+    }))
 }
 
 #[derive(Debug, Serialize)]

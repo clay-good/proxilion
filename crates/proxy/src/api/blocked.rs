@@ -51,12 +51,116 @@ pub struct BlockedApiState {
 }
 
 pub fn router(state: BlockedApiState) -> Router {
+    use axum::middleware::from_fn_with_state;
+    use crate::operator_auth::scope_check;
+    let read = || from_fn_with_state("blocks:read", scope_check);
+    let approve_scope = || from_fn_with_state("blocks:approve", scope_check);
     Router::new()
-        .route("/api/v1/blocked", get(list))
-        .route("/api/v1/blocked/{id}", get(show))
-        .route("/api/v1/blocked/{id}/approve", post(approve))
-        .route("/api/v1/blocked/{id}/reject", post(reject))
+        .route("/api/v1/blocked", get(list).route_layer(read()))
+        .route("/api/v1/blocked/{id}", get(show).route_layer(read()))
+        .route(
+            "/api/v1/blocked/{id}/approve",
+            post(approve).route_layer(approve_scope()),
+        )
+        .route(
+            "/api/v1/blocked/{id}/reject",
+            post(reject).route_layer(approve_scope()),
+        )
+        .route(
+            "/api/v1/blocked/{id}/issue-link",
+            post(issue_link).route_layer(approve_scope()),
+        )
         .with_state(Arc::new(state))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Signed-URL approve link (ui-less-surfaces.md §5.4)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct IssueLinkBody {
+    /// "approve" or "reject".
+    action: String,
+    /// Link TTL in minutes. Default 30, max 1440.
+    ttl_minutes: Option<i64>,
+    /// Optional approver hint (email of the recipient — surfaced on the
+    /// landing page and recorded if they actually click through).
+    approver_hint: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct IssueLinkResponse {
+    token_id: Uuid,
+    url: String,
+    action: String,
+    expires_at: DateTime<Utc>,
+}
+
+async fn issue_link(
+    State(state): State<Arc<BlockedApiState>>,
+    Path(blocked_id): Path<Uuid>,
+    axum::extract::Extension(principal): axum::extract::Extension<
+        crate::operator_auth::OperatorPrincipal,
+    >,
+    Json(body): Json<IssueLinkBody>,
+) -> Result<Json<IssueLinkResponse>, ApiError> {
+    let action = body.action.trim().to_ascii_lowercase();
+    if action != "approve" && action != "reject" {
+        return Err(ApiError::BadRequest(
+            "action must be `approve` or `reject`".into(),
+        ));
+    }
+    let ttl = body.ttl_minutes.unwrap_or(30);
+    if !(1..=1440).contains(&ttl) {
+        return Err(ApiError::BadRequest("ttl_minutes must be 1..=1440".into()));
+    }
+
+    // Confirm the blocked row exists + is pending — minting a link for a
+    // resolved row is a no-op and confusing for the receiver.
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM blocked_actions WHERE id = $1")
+            .bind(blocked_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(ApiError::Db)?;
+    let Some((status,)) = exists else {
+        return Err(ApiError::NotFound);
+    };
+    if status != "pending" {
+        return Err(ApiError::Conflict(format!(
+            "blocked row is {status} — only pending rows accept signed links"
+        )));
+    }
+
+    let row: (Uuid, DateTime<Utc>) = sqlx::query_as(
+        "INSERT INTO notifier_tokens (blocked_id, action, approver_hint, issued_by, expires_at)
+         VALUES ($1, $2, $3, $4, now() + ($5::int || ' minutes')::interval)
+         RETURNING token_id, expires_at",
+    )
+    .bind(blocked_id)
+    .bind(&action)
+    .bind(body.approver_hint.as_deref())
+    .bind(&principal.name)
+    .bind(ttl as i32)
+    .fetch_one(&state.db)
+    .await
+    .map_err(ApiError::Db)?;
+
+    let url = format!(
+        "/notifier/approve?t={token}",
+        token = row.0
+    );
+    metrics::counter!(
+        "proxilion_overrides_requested_total",
+        "channel" => "email_link"
+    )
+    .increment(1);
+    Ok(Json(IssueLinkResponse {
+        token_id: row.0,
+        url,
+        action,
+        expires_at: row.1,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,25 +277,25 @@ async fn show(
 }
 
 #[derive(Debug, Deserialize)]
-struct ApproveBody {
-    justification: String,
+pub struct ApproveBody {
+    pub justification: String,
     /// Optional override; default 30m from now. Caps at 24h.
-    ttl_minutes: Option<i64>,
+    pub ttl_minutes: Option<i64>,
     /// Approver identity (in v1: free-text; in v2: extracted from operator
     /// token / Slack user id mapping). For now we record whatever the caller
     /// provides — the same field the Slack interaction webhook will fill.
-    approver_subject: Option<String>,
+    pub approver_subject: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct ApproveResponse {
-    blocked_id: Uuid,
-    override_pca_id: Uuid,
-    p_0: String,
-    granted_ops: Vec<String>,
-    hop: u32,
-    predecessor_pca_id: Uuid,
-    status: &'static str,
+pub struct ApproveResponse {
+    pub blocked_id: Uuid,
+    pub override_pca_id: Uuid,
+    pub p_0: String,
+    pub granted_ops: Vec<String>,
+    pub hop: u32,
+    pub predecessor_pca_id: Uuid,
+    pub status: &'static str,
 }
 
 async fn approve(
@@ -199,10 +303,22 @@ async fn approve(
     Path(id): Path<Uuid>,
     Json(body): Json<ApproveBody>,
 ) -> Result<Json<ApproveResponse>, ApiError> {
+    Ok(Json(approve_inner(&state, id, body, "api").await?))
+}
+
+/// Inner approve implementation, reusable from non-operator-auth code
+/// paths (the signed-URL landing page). `channel` is the metric label
+/// (`api`, `email`, etc.).
+pub async fn approve_inner(
+    state: &BlockedApiState,
+    id: Uuid,
+    body: ApproveBody,
+    channel: &'static str,
+) -> Result<ApproveResponse, ApiError> {
     if body.justification.trim().len() < 20 {
         metrics::counter!(
             "proxilion_overrides_resolved_total",
-            "outcome" => "rejected_validation", "channel" => "api"
+            "outcome" => "rejected_validation", "channel" => channel
         )
         .increment(1);
         return Err(ApiError::BadRequest(
@@ -288,7 +404,7 @@ async fn approve(
             // construction beats operator override.
             metrics::counter!(
                 "proxilion_overrides_resolved_total",
-                "outcome" => "rejected_invariant", "channel" => "api"
+                "outcome" => "rejected_invariant", "channel" => channel
             )
             .increment(1);
             return Err(ApiError::PicRefused(d));
@@ -310,6 +426,7 @@ async fn approve(
             hop: pca.hop as i32,
             predecessor_id: Some(pred_id),
             signature: vec![],
+                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
         })
         .await
         .map_err(|e| ApiError::Internal(format!("pca_cache insert: {e}")))?;
@@ -340,11 +457,11 @@ async fn approve(
 
     metrics::counter!(
         "proxilion_overrides_resolved_total",
-        "outcome" => "approved", "channel" => "api"
+        "outcome" => "approved", "channel" => channel
     )
     .increment(1);
 
-    Ok(Json(ApproveResponse {
+    Ok(ApproveResponse {
         blocked_id: id,
         override_pca_id,
         p_0: pca.p_0,
@@ -352,19 +469,19 @@ async fn approve(
         hop: pca.hop,
         predecessor_pca_id: pred_id,
         status: "overridden",
-    }))
+    })
 }
 
 #[derive(Debug, Deserialize)]
-struct RejectBody {
-    reason: String,
-    approver_subject: Option<String>,
+pub struct RejectBody {
+    pub reason: String,
+    pub approver_subject: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct RejectResponse {
-    blocked_id: Uuid,
-    status: &'static str,
+pub struct RejectResponse {
+    pub blocked_id: Uuid,
+    pub status: &'static str,
 }
 
 async fn reject(
@@ -372,6 +489,14 @@ async fn reject(
     Path(id): Path<Uuid>,
     Json(body): Json<RejectBody>,
 ) -> Result<Json<RejectResponse>, ApiError> {
+    Ok(Json(reject_inner(&state, id, body).await?))
+}
+
+pub async fn reject_inner(
+    state: &BlockedApiState,
+    id: Uuid,
+    body: RejectBody,
+) -> Result<RejectResponse, ApiError> {
     if body.reason.trim().is_empty() {
         return Err(ApiError::BadRequest("reason must be non-empty".into()));
     }
@@ -411,7 +536,7 @@ async fn reject(
         "outcome" => "rejected", "channel" => "api"
     )
     .increment(1);
-    Ok(Json(RejectResponse { blocked_id: id, status: "rejected" }))
+    Ok(RejectResponse { blocked_id: id, status: "rejected" })
 }
 
 fn row_to_blocked(r: &sqlx::postgres::PgRow) -> Result<BlockedRow, ApiError> {
@@ -443,7 +568,7 @@ fn row_to_blocked(r: &sqlx::postgres::PgRow) -> Result<BlockedRow, ApiError> {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ApiError {
+pub enum ApiError {
     #[error("not found")]
     NotFound,
     #[error("{0}")]

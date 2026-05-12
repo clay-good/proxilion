@@ -3,6 +3,7 @@
 
 pub mod action_stream;
 pub mod error;
+pub mod google_calendar;
 pub mod google_drive;
 pub mod google_gmail;
 pub mod read_filter;

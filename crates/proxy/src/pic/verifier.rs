@@ -61,6 +61,14 @@ pub struct VerificationResult {
     pub p_0: Option<String>,
     pub broken_at: Option<Uuid>,
     pub reason: Option<String>,
+    /// PIC profile pinned on every link in the chain (spec.md §15 #11).
+    /// `None` only when the chain is broken before any link was loaded.
+    /// `mismatch_at` is set when a chain mixes profiles — strict
+    /// enforcement of "all links share one profile" is a v2 hardening;
+    /// today the verifier surfaces the field so dashboards / audits can
+    /// detect drift without us bumping the rejection-rate on day one.
+    pub pic_profile: Option<String>,
+    pub pic_profile_mismatch_at: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -110,6 +118,8 @@ impl PicVerifier {
         let mut current_id = leaf_pca_id;
         let mut links_verified = 0usize;
         let mut p_0: Option<String> = None;
+        let mut chain_profile: Option<String> = None;
+        let mut profile_mismatch_at: Option<Uuid> = None;
 
         loop {
             let cached = self
@@ -124,6 +134,16 @@ impl PicVerifier {
                 .map_err(|_| VerifierError::BadCatSignature(current_id))?;
             links_verified += 1;
             p_0.get_or_insert_with(|| pca_current.p_0.value.clone());
+            // Track the chain's PIC profile. First link sets it; subsequent
+            // links that disagree get recorded as a mismatch (not yet a
+            // hard error — surfaces the drift in API output for audit).
+            match chain_profile.as_deref() {
+                None => chain_profile = Some(cached.pic_profile.clone()),
+                Some(prev) if prev == cached.pic_profile => {}
+                Some(_) => {
+                    profile_mismatch_at.get_or_insert(current_id);
+                }
+            }
 
             match cached.predecessor_id {
                 None => {
@@ -162,6 +182,8 @@ impl PicVerifier {
             p_0,
             broken_at: None,
             reason: None,
+            pic_profile: chain_profile,
+            pic_profile_mismatch_at: profile_mismatch_at,
         })
     }
 }
@@ -235,6 +257,8 @@ fn err_to_result(leaf_id: Uuid, e: &VerifierError) -> VerificationResult {
         p_0: None,
         broken_at,
         reason: Some(e.to_string()),
+        pic_profile: None,
+        pic_profile_mismatch_at: None,
     }
 }
 
@@ -289,6 +313,7 @@ mod tests {
             hop: pca.hop as i32,
             predecessor_id: predecessor,
             signature: vec![],
+                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
         }
     }
 

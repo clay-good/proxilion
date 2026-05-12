@@ -125,7 +125,7 @@ async fn proxy_request(
     let request_id = Uuid::new_v4();
     let ctx = build_policy_ctx(state, session, &req);
 
-    let outcome = state.policy.evaluate(&ctx)?;
+    let outcome = state.policy.load().evaluate(&ctx)?;
     // Compute the ops the next-hop PCA would carry. Hoisted above the Layer-B
     // gate so the block record (if we end up blocking) carries the same
     // `requested_ops` an override would re-mint with.
@@ -139,8 +139,9 @@ async fn proxy_request(
     // Layer B: policy.
     if let Err(e) = enforce_pre_request_decision(&outcome) {
         if matches!(e, AppError::PolicyBlocked { .. }) {
-            crate::blocked::persist(
+            crate::blocked::persist_and_notify(
                 &state.auth.db,
+                &state.notifier,
                 crate::blocked::BlockedActionRecord {
                     request_id,
                     session_id: session.agent_session_id,
@@ -199,6 +200,7 @@ async fn proxy_request(
                     hop: pca2.hop as i32,
                     predecessor_id: Some(session.leaf_pca_id),
                     signature: vec![],
+                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
                 })
                 .await
                 .map_err(|e| AppError::Internal(format!("pca_cache: {e}")))?;
@@ -264,8 +266,9 @@ async fn proxy_request(
                 "action" => req.action.clone(),
             )
             .increment(1);
-            crate::blocked::persist(
+            crate::blocked::persist_and_notify(
                 &state.auth.db,
+                &state.notifier,
                 crate::blocked::BlockedActionRecord {
                     request_id,
                     session_id: session.agent_session_id,
@@ -322,8 +325,9 @@ async fn proxy_request(
             .map_err(|e| AppError::Internal(format!("read-filter regex: {e}")))?;
         let (b, o) = read_filter::apply(&body_bytes, &compiled, content_type.as_deref());
         if o.block {
-            crate::blocked::persist(
+            crate::blocked::persist_and_notify(
                 &state.auth.db,
+                &state.notifier,
                 crate::blocked::BlockedActionRecord {
                     request_id,
                     session_id: session.agent_session_id,
@@ -358,12 +362,38 @@ async fn proxy_request(
     };
 
     // Action event.
+    // Observe mode (ui-less-surfaces.md §2.5): if the policy would have
+    // blocked / required_confirmation / rate_limited but is in observe
+    // mode, the engine returns Decision::Allow + an `observe_would_have`
+    // label. The action event records the "would have" outcome so the
+    // operator can promote the policy to enforce later.
     let decision_label = match &outcome.decision {
-        Decision::Allow => "allow",
+        Decision::Allow => outcome
+            .observe_would_have
+            .as_deref()
+            .unwrap_or("allow"),
         Decision::Block { .. } => "block",
         Decision::RequireConfirmation { .. } => "require_confirmation",
         Decision::RateLimit { .. } => "rate_limit",
     };
+    if let Some(woulda) = outcome.observe_would_have.as_deref() {
+        // Strip the `observe_` prefix to keep the metric label bounded.
+        let reason = woulda.strip_prefix("observe_").unwrap_or(woulda);
+        metrics::counter!(
+            "proxilion_observe_would_have_blocked_total",
+            "policy_id" => outcome
+                .matched_policy_id
+                .clone()
+                .unwrap_or_else(|| "unknown".into()),
+            "reason" => reason.to_string(),
+        )
+        .increment(1);
+    }
+    // Per-policy audit-body capture (ui-less-surfaces.md §6.4). Skipped
+    // entirely when `outcome.audit_body` is None — privacy default.
+    if let Some(mode) = outcome.audit_body {
+        crate::audit_body::persist(&state.auth.db, request_id, mode, &[], &final_body).await;
+    }
     state
         .stream
         .publish(ActionEvent {
@@ -531,6 +561,9 @@ mod tests {
             required_ops: OpsExpression::default(),
             read_filter: None,
             pic_mode: PicMode::Audit,
+            mode: policy_engine::Mode::Enforce,
+            observe_would_have: None,
+            audit_body: None,
         }
     }
 

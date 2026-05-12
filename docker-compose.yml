@@ -82,10 +82,26 @@ services:
       PROXILION_BASE_URL: "${PROXILION_BASE_URL:-https://localhost:8443}"
       PROXILION_POLICY_PATH: "${PROXILION_POLICY_PATH:-/config/policy.yaml}"
       PROXILION_CUSTOMER_DOMAIN: "${PROXILION_CUSTOMER_DOMAIN:-acme.com}"
+      # M3 §3.1 / §3.3: NATS bridge + SIEM webhook. Both are optional; the
+      # proxy degrades gracefully when either is unset.
+      PROXILION_DEMO: "${PROXILION_DEMO:-1}"
+      PROXILION_NATS_URL: "${PROXILION_NATS_URL:-nats://nats:4222}"
+      PROXILION_NATS_SUBJECT_PREFIX: "${PROXILION_NATS_SUBJECT_PREFIX:-actions}"
+      PROXILION_SIEM_WEBHOOK_URL: "${PROXILION_SIEM_WEBHOOK_URL:-}"
+      PROXILION_SIEM_HMAC_KEY: "${PROXILION_SIEM_HMAC_KEY:-}"
+      # ui-less-surfaces.md §10.3 — blocked-action webhook notifier.
+      PROXILION_BLOCKED_WEBHOOK_URL: "${PROXILION_BLOCKED_WEBHOOK_URL:-}"
+      PROXILION_BLOCKED_WEBHOOK_HMAC_KEY: "${PROXILION_BLOCKED_WEBHOOK_HMAC_KEY:-}"
+      # ui-less-surfaces.md §4.4 operator tokens. Compose stack defaults
+      # to DISABLED so existing demo/stress scripts run unauthenticated.
+      # Production deployments leave this unset (default = enforced).
+      PROXILION_DISABLE_OPERATOR_AUTH: "${PROXILION_DISABLE_OPERATOR_AUTH:-1}"
     depends_on:
       postgres:
         condition: service_healthy
       trust-plane:
+        condition: service_started
+      nats:
         condition: service_started
     volumes:
       - proxy-certs:/certs

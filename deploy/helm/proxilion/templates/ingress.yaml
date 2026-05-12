@@ -1,0 +1,33 @@
+{{- if .Values.proxy.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "proxilion.proxy.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+  {{- with .Values.proxy.ingress.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.proxy.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.proxy.ingress.tls }}
+  tls: {{ toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.proxy.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "proxilion.proxy.fullname" $ }}
+                port:
+                  name: https
+          {{- end }}
+    {{- end }}
+{{- end }}

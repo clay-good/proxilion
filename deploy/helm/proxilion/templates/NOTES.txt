@@ -1,0 +1,46 @@
+Proxilion {{ .Chart.AppVersion }} installed in namespace "{{ .Release.Namespace }}".
+
+Components:
+  proxy:        {{ include "proxilion.proxy.fullname" . }} (replicas: {{ .Values.proxy.replicaCount }})
+  trust-plane:  {{ if .Values.trustPlane.enabled }}{{ include "proxilion.trustPlane.fullname" . }}{{ else }}DISABLED{{ end }}
+  nats:         {{ if .Values.nats.enabled }}{{ include "proxilion.nats.fullname" . }}{{ else }}DISABLED{{ end }}
+
+Quick checks:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "proxilion.proxy.fullname" . }} 8443:{{ .Values.proxy.service.port }}
+  curl -k https://localhost:8443/healthz
+
+Required Secret keys (in `{{ include "proxilion.secretsName" . }}`):
+  database-url            Postgres DSN (the proxy and trust-plane share this)
+  token-encryption-key    64 hex chars (AES-256-GCM key for OAuth tokens at rest)
+  google-client-id        Google OAuth client_id
+  google-client-secret    Google OAuth client_secret
+  trust-plane-cat-key     64 hex chars (Ed25519 seed for CAT signing)
+{{- if .Values.proxy.env.siem.enabled }}
+  siem-hmac-key           >=32 hex chars (SIEM webhook signing)
+{{- end }}
+
+Generate the Postgres and crypto secrets out-of-band, e.g.:
+
+  kubectl -n {{ .Release.Namespace }} create secret generic {{ include "proxilion.secretsName" . }} \
+    --from-literal=database-url='postgres://USER:PASS@HOST:5432/DB' \
+    --from-literal=token-encryption-key=$(openssl rand -hex 32) \
+    --from-literal=trust-plane-cat-key=$(openssl rand -hex 32) \
+    --from-literal=google-client-id='YOUR_GOOGLE_CLIENT_ID' \
+    --from-literal=google-client-secret='YOUR_GOOGLE_CLIENT_SECRET'
+
+Once Secrets and the database exist, run `helm upgrade --install` again
+to reconcile.
+
+{{- if .Values.proxy.ingress.enabled }}
+
+Ingress configured for:
+{{- range .Values.proxy.ingress.hosts }}
+  https://{{ .host }}
+{{- end }}
+
+Wire your Anthropic Managed Claude OAuth client to:
+  Authorization URL:  https://<host>/oauth/google/authorize
+  Token URL:          https://<host>/oauth/google/token
+  API base URL:       https://<host>/google
+{{- end }}

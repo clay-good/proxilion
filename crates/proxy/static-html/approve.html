@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Proxilion · {{ACTION_TITLE}}</title>
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { font: 15px/1.5 -apple-system, system-ui, "Segoe UI", sans-serif; max-width: 640px; margin: 4vh auto; padding: 0 16px; color: #1a1a1a; }
+@media (prefers-color-scheme: dark) { body { background: #0d1117; color: #e6edf3; } a, summary { color: #4fb3ff; } code, pre { background: #161b22; } }
+h1 { font-size: 18px; margin: 0 0 4px; }
+.muted { color: #6a737d; }
+.envelope { border: 1px solid #d1d5db; border-radius: 6px; padding: 16px; margin: 16px 0; }
+@media (prefers-color-scheme: dark) { .envelope { border-color: #30363d; } }
+.row { display: flex; justify-content: space-between; padding: 4px 0; border-top: 1px dashed #e1e4e8; gap: 12px; }
+.row:first-child { border-top: none; }
+.row .k { color: #6a737d; font-size: 13px; min-width: 8em; }
+.row .v { font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace; font-size: 13px; word-break: break-all; }
+form { margin-top: 16px; }
+label { display: block; font-size: 13px; color: #6a737d; margin: 8px 0 4px; }
+textarea { width: 100%; min-height: 84px; padding: 8px; font: inherit; border: 1px solid #d1d5db; border-radius: 4px; background: transparent; color: inherit; }
+@media (prefers-color-scheme: dark) { textarea { border-color: #30363d; } }
+button { font: inherit; padding: 8px 14px; border: 1px solid; border-radius: 4px; cursor: pointer; background: transparent; color: inherit; }
+button.primary { background: #00e5a8; color: #0d1117; border-color: #00e5a8; font-weight: 600; }
+button.reject { background: #f85149; color: white; border-color: #f85149; font-weight: 600; }
+.note { font-size: 12px; color: #6a737d; margin-top: 12px; }
+code { padding: 1px 4px; border-radius: 3px; }
+.banner-ok { padding: 12px; border-left: 4px solid #00b386; background: rgba(0,229,168,0.08); border-radius: 0 4px 4px 0; margin: 16px 0; }
+.banner-err { padding: 12px; border-left: 4px solid #f85149; background: rgba(248,81,73,0.08); border-radius: 0 4px 4px 0; margin: 16px 0; }
+.banner-warn { padding: 12px; border-left: 4px solid #d29922; background: rgba(210,153,34,0.08); border-radius: 0 4px 4px 0; margin: 16px 0; }
+</style>
+</head>
+<body>
+
+<h1>Proxilion · {{ACTION_TITLE}}</h1>
+<div class="muted">Single-use approval link · expires {{EXPIRES_AT}}</div>
+
+<div class="envelope">
+  <div class="row"><div class="k">action</div><div class="v">{{ACTION}}</div></div>
+  <div class="row"><div class="k">p_0</div><div class="v">{{P_0}}</div></div>
+  <div class="row"><div class="k">vendor / verb</div><div class="v">{{VENDOR}} / {{VERB}}</div></div>
+  <div class="row"><div class="k">path</div><div class="v">{{PATH}}</div></div>
+  <div class="row"><div class="k">policy</div><div class="v">{{POLICY_ID}}</div></div>
+  <div class="row"><div class="k">detail</div><div class="v">{{DETAIL}}</div></div>
+  <div class="row"><div class="k">blocked at</div><div class="v">{{CREATED_AT}}</div></div>
+  <div class="row"><div class="k">requested ops</div><div class="v">{{REQUESTED_OPS}}</div></div>
+</div>
+
+{{FORM_OR_RESULT}}
+
+<p class="note">
+  This link uses a single-use token bound to this specific blocked action.
+  After you submit, the token is consumed — refreshing will show
+  "already used." Audit trail records the action with timestamp + the
+  approver hint embedded in this link.
+</p>
+
+</body>
+</html>

@@ -163,6 +163,33 @@ The CLI edits the YAML file in place (preserving comments via `yq` semantics
 or a hand-rolled CST-preserving editor — see §11) and triggers the same
 hot-reload path as a manual edit.
 
+**Status (2026-05-11) — observe mode + hot reload shipped.** Delivered:
+
+- [crates/policy-engine/src/yaml.rs](../../crates/policy-engine/src/yaml.rs) — new top-level `mode: enforce | observe | disabled` field on `PolicyDoc` (default `enforce`). The `pic_invariants.mode` knob the spec sketches at the file level isn't a YAML field; PIC enforcement remains controlled by the existing per-policy `pic_mode: audit | runtime-gate`, which already mirrors the observe/enforce shape for Layer A.
+- [crates/policy-engine/src/rego.rs](../../crates/policy-engine/src/rego.rs) — `Engine::evaluate` now demotes `Block` / `RequireConfirmation` / `RateLimit` to `Decision::Allow` in observe mode and surfaces an `observe_would_have: Option<String>` ("observe_block" / "observe_require_confirmation" / "observe_rate_limit") on the `Outcome`. `disabled` policies are skipped entirely without consuming the match slot, so a later policy can still fire.
+- [crates/proxy/src/adapters/google_{drive,gmail,calendar}.rs](../../crates/proxy/src/adapters/) — all three adapters now record the would-have label on the `action_events.decision` column and emit `proxilion_observe_would_have_blocked_total{policy_id,reason}` per match.
+- [crates/proxy/src/policy_handle.rs](../../crates/proxy/src/policy_handle.rs) — `PolicyHandle` wraps `ArcSwap<Engine>` for lock-free atomic swaps. Three reload paths: API (`POST /api/v1/policy/reload`), file watcher background task (5s mtime poll, ui-less-surfaces.md §2.3 fallback semantics), and in-memory mode flip (`POST /api/v1/policy/{id}/mode`, round-trips the mutated YAML back into the cached buffer). **Parse failures leave the previous engine live** — load-bearing for production safety, verified end-to-end below.
+- [crates/proxy/src/api/policy.rs](../../crates/proxy/src/api/policy.rs) — three new endpoints: `GET /api/v1/policy` (lists `{id, vendor, action, mode, pic_mode}` for every loaded policy plus `source` path), `POST /api/v1/policy/reload`, `POST /api/v1/policy/{id}/mode` (body `{"mode":"enforce|observe|disabled"}`). 400 on unknown mode, 404 on unknown policy, 409 on reload-after-parse-failure.
+- Metrics: `proxilion_policy_reload_success_total`, `proxilion_policy_reload_failures_total{reason="io_error|parse_error|no_source"}`, `proxilion_observe_would_have_blocked_total{policy_id,reason}`.
+
+**Unit tests** (4 new in `policy-engine/tests/observe_mode.rs`, 5 new in `policy_handle::tests`): observe demotes block→allow with label, enforce passes decision through, disabled skips evaluation, default mode is enforce; swap atomicity, bad YAML keeps previous engine, set_mode round-trips through the YAML cache, set_mode 404 on unknown id, reload-without-source returns error. `cargo test --workspace` is green at **84 passing** (was 74).
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-observe-reload.sh](../../scripts/stress-observe-reload.sh) against the live compose stack:
+- `GET /api/v1/policy` returns all 5 policies with current modes + source path.
+- `POST /api/v1/policy/drive-injection-filter/mode {"mode":"observe"}` round-trips: subsequent `GET` shows `mode: observe`.
+- Invalid mode → 400; unknown policy → 404.
+- File watcher: append a 6th policy on disk → watcher detects within 3s (well under the 12s budget), `GET` reflects 6 policies.
+- Write garbage YAML to disk → watcher reads it, fails to parse, leaves the previous 6-policy engine live; `proxilion_policy_reload_failures_total{reason="parse_error"}=1` ticks.
+- Restore file → watcher reloads cleanly, `proxilion_policy_reload_success_total` ticks.
+
+**Spec deviations to flag.**
+
+1. **No `pic_invariants.mode` top-level field.** §2.2 sketches a `defaults: { pic_invariants: { mode: enforce } }` block. PIC invariant enforcement is already per-policy via the existing `pic_mode: audit | runtime-gate`, which gives the same observability story without adding a defaults pre-processor. If a customer asks for global PIC observe-mode (e.g. for a migration), it's a one-line `for_each_policy` over the loaded set.
+2. **CST-preserving editor not used.** §11.1 flags `yq` vs hand-rolled CST. We use `serde_yaml` round-trip on `set_mode` — comments and key ordering ARE NOT preserved across writes. The mutation lives in memory; the file watcher picks up the operator's manual edits independently. A CST-preserving editor is a follow-up when a customer reports a real comment-mangling regression.
+3. **`policy simulate` not yet shipped.** §4.1 lists `proxilion-cli policy simulate <file> --against last-7d`. Out of scope for this PR; the underlying eval path is now hot-reload-aware so adding the replay loop is straightforward.
+
+---
+
 ### 2.5 What `observe` mode actually does on the wire
 
 In `observe` mode, the decision pipeline runs identically:
@@ -384,15 +411,14 @@ COMMANDS
     revoke agent <agent_session_id>
     revoke all --confirm              global stop, must type yes
 
-  notifier                            Slack / email / webhook config
-    test slack
-    test email
-    test webhook
-    show
-    set slack.bot_token <token>
-    set slack.channel <#channel>
-    set email.smtp.url smtp://... --from sec-ops@org.com
-    set webhook.url https://... --hmac-secret <hex>
+  notifier                            Slack / email / webhook diagnostics
+    show                                webhook + burst-suppressor state
+    test                                fire a synthetic notification
+    # Coming in a future iteration when the `notifier_config` table lands:
+    #   test slack | test email | test webhook
+    #   set slack.bot_token <token> / channel <#channel>
+    #   set email.smtp.url smtp://... --from sec-ops@org.com
+    #   set webhook.url https://... --hmac-secret <hex>
 
   clients                             OAuth client registry (replaces SQL editing)
     list
@@ -463,6 +489,56 @@ WebAuthn / passkey login is **not** a v1 requirement because the CLI
 is the only UI — operators authenticate to the CLI, not to a browser.
 Passkeys land if and only if we add a notifier-served HTML page for
 approve-from-mobile use cases (§5.4).
+
+**Status (2026-05-11) — operator tokens shipped.** Delivered:
+
+- [migrations/0006_operator_tokens.sql](../../migrations/0006_operator_tokens.sql) — `operator_tokens` table: `id`, `token_hash` (SHA-256 of plaintext, raw bytes), `name`, `scopes TEXT[]`, `created_at`, `last_used_at`, `revoked_at`, `revoked_reason`. Partial index on `revoked_at` for fast active-token lookup.
+- [crates/proxy/src/operator_auth.rs](../../crates/proxy/src/operator_auth.rs) — token format (`pxl_operator_<52 base32 chars>`, same shape as agent bearer), SHA-256 hashing, `OperatorPrincipal` extension, `middleware()` extracts `Authorization: Bearer pxl_operator_*`, looks up hash, rejects revoked/missing/malformed with `401 unauthorized` (fixed body, no info leak). Successful auth attaches `OperatorPrincipal` to request extensions for downstream handlers + fires a `tokio::spawn`-ed best-effort `last_used_at` update. The `require_scope(...)` helper exists and is unit-tested but per-endpoint scope checks are a follow-up (see deviation 1).
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) — all five `/api/v1/*` routers (`pca`, `actions`, `blocked`, `killswitch`, `policy`) are merged and wrapped in a single `operator_auth::middleware` layer. `/healthz`, `/metrics`, `/admin`, `/admin/setup`, `/oauth/*`, and the adapter routes (`/google/*`) remain outside the operator-auth boundary — those have their own auth model (the agent's `pxl_live_*` bearer).
+- [crates/cli/src/main.rs](../../crates/cli/src/main.rs) — three new subcommands: `tokens issue --name <n> --scope <scopes>` (mints + prints once, hashes + persists), `tokens list [--all]` (active or full history), `tokens revoke <id> --reason <r>`. Writes directly to postgres via `DATABASE_URL` — that's the bootstrap path the spec describes ("proxilion-cli init mints it, prints once").
+- Metrics: `proxilion_operator_auth_total{result="ok|rejected",reason}`. Reason buckets are bounded (`missing`, `malformed`, `unknown_or_revoked`, `no_principal`, `scope_denied`).
+- Default posture: **enforced**. Set `PROXILION_DISABLE_OPERATOR_AUTH=1` to bypass for local dev — emits a loud `WARN` on every startup so it's visible in CI/prod logs. The docker compose file flips this on for the dev stack so the existing demo and stress scripts continue to work; production deployments leave it unset.
+
+**Unit tests** (7 new in `operator_auth::tests`): token-format validation (correct shape; rejected: wrong prefix, lowercase, wrong length), wildcard scope acceptance, exact-scope acceptance + rejection on miss, SHA-256 hash stability. `cargo test --workspace` is green at **87 passing** (was 80).
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-operator-tokens.sh](../../scripts/stress-operator-tokens.sh):
+- `proxilion-cli tokens issue` mints an admin (`*` scope) token and a narrow `policy:read,actions:read` ci-bot token. `tokens list` returns 2 rows.
+- Toggle proxy to enforced (`PROXILION_DISABLE_OPERATOR_AUTH=0` + restart). Unauthed `/api/v1/policy` → 401, bogus token → 401, valid admin → 200, valid ci-bot → 200.
+- `tokens revoke <id>` flips `revoked_at`. Subsequent request with the revoked token → 401; admin token unaffected.
+- `proxilion_operator_auth_total{result="ok"}` and `{result="rejected"}` both tick. `last_used_at` is updated within ~1s of a successful request.
+- Restore disabled mode → unauthed requests succeed again, preserving the dev-compose default.
+
+**Update (2026-05-11) — per-endpoint scope enforcement shipped + `proxilion-cli policy / blocked` subcommands wired.** Delivered:
+
+- [crates/proxy/src/operator_auth.rs](../../crates/proxy/src/operator_auth.rs) — `scope_check` middleware function used via `axum::middleware::from_fn_with_state("scope:name", scope_check)`. When the outer operator-auth middleware is disabled (`PROXILION_DISABLE_OPERATOR_AUTH=1`) it attaches a synthetic wildcard principal so the per-route checks are no-ops; in enforced mode an absent principal would have already 401'd at the outer layer. Wrong scope → `403 scope_denied` with a structured body `{ "code": "scope_denied", "required": "<scope>", "have": [...], "error": "insufficient scope" }`.
+- [crates/proxy/src/api/{mod,actions,blocked,killswitch,policy}.rs](../../crates/proxy/src/api/) — every route layered with its specific scope:
+
+| Method + path | Scope |
+|---|---|
+| `GET /api/v1/pca/{id}` + `/verify` | `pca:read` |
+| `GET /api/v1/actions*` (list, recent, stream, {id}, sessions chain) | `actions:read` |
+| `GET /api/v1/actions/export` | `actions:export` |
+| `GET /api/v1/blocked` + `/{id}` | `blocks:read` |
+| `POST /api/v1/blocked/{id}/{approve,reject}` | `blocks:approve` |
+| `POST /api/v1/killswitch/{session,user,all}/...` | `killswitch:revoke` |
+| `GET /api/v1/policy` | `policy:read` |
+| `POST /api/v1/policy/reload` + `…/{id}/mode` | `policy:write` |
+- [crates/cli/src/main.rs](../../crates/cli/src/main.rs) — new global `--token / $PROXILION_OPERATOR_TOKEN` flag; new subcommands `policy {list,reload,set-mode}` and `blocked {list,show,approve,reject}` (covers ui-less-surfaces.md §4.1's `policy` and `blocked` blocks). Each command builds the request via a small `auth_header()` helper so absent tokens (dev mode) still produce a clean request.
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-scope-and-cli.sh](../../scripts/stress-scope-and-cli.sh) — 21 assertions, all passing:
+- Mint three tokens (policy-read-only, blocks-approve, wildcard admin).
+- `policy:read` token → `GET /policy = 200`, `POST /policy/reload = 403`, `POST /killswitch/all = 403`, body carries `required` + `have`.
+- `blocks:approve` token → `GET /blocked = 200`, `GET /policy = 403`.
+- CLI happy-path: `policy list / set-mode / reload`, then seed a blocked-action with a real Trust-Plane-minted PCA_0, `blocked list / show / approve`, then re-seed and exercise `reject`.
+- CLI fail-path: `proxilion-cli blocked approve` with the `policy:read` token surfaces the 403 to the operator.
+- Metric `proxilion_operator_auth_total{result="rejected",reason="scope_denied"}` ticks.
+
+**Spec deviations to flag.**
+
+1. **`POST /api/v1/policy/{id}/mode` round-trips through serde_yaml.** Same caveat as the original notice: comments / key ordering are not preserved across writes. Still tracked alongside §11.1 (CST-preserving editor).
+2. **No `proxilion-cli init` wrapper.** §4.4 sketches `proxilion-cli init` as the bootstrap command. We ship the same functionality split into the three explicit verbs (`issue`/`list`/`revoke`) — that fits better with operator scripting (`set -e`-friendly, JSON output to `jq`) than a one-shot `init` that prints a token to a TTY. A thin `init` alias can be added when an installer needs it.
+3. **No `proxilion-cli tokens scopes` listing.** The scope catalogue lives in the operator_auth.rs module docstring. Adding a `tokens scopes` subcommand that prints the catalogue + per-route requirements lands with the per-endpoint scope enforcement above.
+4. **`last_used_at` writes are fire-and-forget.** Under sustained load every request triggers one `UPDATE`. If write amplification shows up in profiles, the natural mitigation is to debounce (only update when stale > 60s) — moka-cache the in-memory timestamp the same way the bearer refresh coordinator caches mutexes. Not yet a real bottleneck on the dev stack.
 
 ### 4.5 Distribution
 
@@ -575,6 +651,34 @@ identity via `notifier_config.slack.user_map` (an IdP-group lookup is the
 production path; manual map is fine for v1). The mapped operator
 identity is what attests the override PCA — same as a CLI `blocked approve`.
 
+**Status (2026-05-11) — shipped.** Delivered:
+
+- [crates/proxy/src/notifier/slack.rs](../../crates/proxy/src/notifier/slack.rs) — `SlackNotifier { incoming_webhook_url, signing_secret, proxy_public_url }`. `notify(&BlockedNotification)` POSTs a Block Kit JSON envelope (header / context section / detail context / actions buttons / footer). Button `value` carries `approve:<uuid>` / `reject:<uuid>` — the interaction webhook parses these to route. `SlackSigningSecret::verify(signature, timestamp, body)` implements Slack's `v0:<ts>:<body>` scheme with constant-time compare + 5-minute skew window.
+- [crates/proxy/src/api/notifier_slack.rs](../../crates/proxy/src/api/notifier_slack.rs) — `POST /api/v1/notifier/slack/interact` lives **outside** the operator-auth boundary; the signed request IS the credential. Reads the raw request body (so signature verification matches Slack's byte-exact computation), verifies via the configured `signing_secret`, parses the form-encoded JSON `payload`, and routes the button via `parse_button_value` → `approve_inner` / `reject_inner` with `channel="slack"` and `approver_subject="slack:<username>"`.
+- [crates/proxy/src/notifier/handle.rs](../../crates/proxy/src/notifier/handle.rs) — generalized to `Handle<T>` with per-driver `NotifierHandle` (webhook) and `SlackHandle` aliases. New `Notifiers` bundle holds both; `AdapterState.notifier: Notifiers` and `blocked::persist_and_notify` fan out to **both** drivers in parallel when both are configured.
+- [crates/proxy/src/api/notifier.rs](../../crates/proxy/src/api/notifier.rs) — `POST /api/v1/notifier/config` now accepts `driver: "slack"` with `config: { incoming_webhook_url, signing_secret }`. `GET` redacts both the signing_secret and the URL.
+- [crates/cli/src/main.rs](../../crates/cli/src/main.rs) — `proxilion-cli notifier set-slack --incoming-webhook-url <u> --signing-secret <s> [--disabled]`.
+- Metrics: `proxilion_slack_post_total{result,layer}`, `proxilion_slack_post_failures_total{reason}`, `proxilion_slack_interact_total{result}`, `proxilion_notifier_config_changes_total{driver="slack"}`.
+
+**Unit tests** (5 new in `notifier::slack::tests`): Block Kit payload shape (header + approve/reject buttons with `style: primary|danger`), button value round-trip + rejection of bad shapes, signed-request verify happy path + rejection of stale timestamp + rejection of tampered body + rejection of missing `v0=` prefix. `cargo test --workspace` is green at **119 proxy tests** (was 110).
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-slack-driver.sh](../../scripts/stress-slack-driver.sh) — 12 assertions, all passing:
+- `proxilion-cli notifier set-slack` persists row + hot-swaps notifier.
+- `/api/v1/notifier/show` reports `slack: configured: true`.
+- `/api/v1/notifier/config` redacts `signing_secret` (echoes `signing_secret_set: true`) and the URL.
+- Seeded blocked-action row + valid Slack-signed POST → approval succeeds, blocked row → `overridden`, approver = `slack:<username>`.
+- Missing signature → 401. Bad signature → 401. 10-minute-old timestamp → 401 (replay rejected even with valid HMAC).
+- Reject button → row → `rejected`.
+- Metrics: `proxilion_slack_interact_total{result="ok"}=2`, `{result="rejected_signature"}=2`.
+
+**Spec deviations to flag.**
+
+1. **No `[Approve once]` vs `[Approve + add to policy exception]` distinction.** The Block Kit message ships two buttons: Approve and Reject. The "add to policy exception" path requires a YAML editor that we'd plumb back into the policy hot-reload — a follow-up when a customer asks for it. For v1 the single-use approve covers the operational case.
+2. **No `[Why?]` button.** Hover-context with full request_canonical_json was a v1.5 ergonomics nicety. The blocked-action row carries all the same fields; an operator who wants forensic context calls `proxilion-cli blocked show <id>`.
+3. **No `slack_trigger_id` idempotency check.** Spec §5.3 wants `blocked_actions.slack_trigger_id` to prevent double-click double-approve. The current implementation relies on the `blocked_actions.status = 'pending'` precondition inside `approve_inner` (also FOR UPDATE locked) — a double-click on the same row will see `status != 'pending'` on the second attempt and return 409. Trigger_id-keyed dedup is strictly stronger (rejects the second click even when it arrived while the first was still in flight); tracked.
+4. **No `user_map` from Slack user to Proxilion operator.** The approver_subject is recorded as `slack:<username>`. An IdP-group lookup that maps Slack users to operator tokens is a v2 piece tied to operator-token-with-scopes (ui-less-surfaces.md §4.4 deviation 1). Today: every Slack user in the channel can approve (the customer controls who's in the channel).
+5. **No burst-suppression / thread folding.** The webhook driver supports burst suppression; the Slack driver currently fires every blocked action as a top-level message. Wiring the suppressor into the Slack path is mostly cosmetic (same `BurstSuppressor::admit` call) but requires the summary envelope to render as a Slack thread reply instead of a JSON payload — that's the spec's "folded into a thread" requirement and lands when the customer ships volume.
+
 ### 5.4 Email approvals (for orgs that don't live in Slack)
 
 Configurable per-policy; can coexist with Slack. The email contains:
@@ -599,6 +703,64 @@ This is the **one** server-rendered HTML page Proxilion ships. It's
 ~80 lines of HTML, no JS framework. It exists because most security
 people read email on a phone.
 
+**Update (2026-05-11) — outbound email composer + SMTP delivery shipped.** Builds on the signed-URL plumbing below: every blocked-action persist mints two single-use `notifier_tokens` (approve + reject) and emails plain-text + HTML bodies with both one-click links. Delivered:
+
+- [crates/proxy/src/notifier/email.rs](../../crates/proxy/src/notifier/email.rs) — `EmailNotifier` wraps a lettre `AsyncSmtpTransport<Tokio1Executor>` with a 10s timeout. `notify(&BlockedNotification)` issues two tokens (one per action), composes a multipart alternative (text/plain + text/html), and sends via SMTP. HTML body has Approve (green) + Reject (red) buttons; plain-text mirrors the same two links. HTML-escapes every field that goes into the body.
+- [Cargo.toml](../../Cargo.toml) + [crates/proxy/Cargo.toml](../../crates/proxy/Cargo.toml) — `lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "rustls-platform-verifier", "builder", "tokio1"] }`. Pulls in TLS support; no native-tls dep.
+- [crates/proxy/src/notifier/handle.rs](../../crates/proxy/src/notifier/handle.rs) — `EmailHandle = Handle<EmailNotifier>` joins `NotifierHandle` (webhook) and `SlackHandle` in the `Notifiers` bundle.
+- [crates/proxy/src/blocked.rs](../../crates/proxy/src/blocked.rs) — `persist_and_notify` fans out to **all three** drivers in parallel (`tokio::spawn` per driver). The owned-notification snapshot is cloned per branch.
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) — `build_notifiers` consults `notifier_config` for the `email` row at startup. Config shape: `{ smtp_url: "smtps://user:pass@host:465", from: "RFC 5322 mailbox", to: <string|array> }`. No env fallback — SMTP credentials live in DB only.
+- [crates/proxy/src/api/notifier.rs](../../crates/proxy/src/api/notifier.rs) — `POST /api/v1/notifier/config { driver: "email", config: { smtp_url, from, to } }` validates + builds + persists + hot-swaps. `to` accepts either a single string or an array of strings. `GET` redacts `smtp_url` (since the URL may contain `user:pass`) to `smtp_url_redacted = scheme://host/...`; `from` and `to` echo plaintext.
+- [crates/cli/src/main.rs](../../crates/cli/src/main.rs) — `proxilion-cli notifier set-email --smtp-url <u> --from <addr> --to <addr1> [--to <addr2>] [--disabled]`.
+- Metrics: `proxilion_email_send_total{result,layer}`, `proxilion_email_send_failures_total{reason="token_issue|build|smtp"}`, `proxilion_notifier_config_changes_total{driver="email"}`.
+
+**Unit tests** (4 new in `notifier::email::tests`): HTML-escape sanitization, invalid `smtp_url` rejection, empty `to` rejection, malformed `from` rejection. `cargo test --workspace` is green at **123 proxy tests** (was 119).
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-email-driver.sh](../../scripts/stress-email-driver.sh) — 13 assertions, all passing, exercised against a live `axllent/mailpit:v1.27` SMTP-test container inside the compose network:
+- `proxilion-cli notifier set-email` persists + hot-swaps.
+- `/api/v1/notifier/show` reports `email: configured: true`.
+- `/api/v1/notifier/config` redacts `smtp_url` (echoes `smtp_url_redacted`), preserves `from` + `to`.
+- Bad SMTP URL → 400. Missing `to` → 400. Empty `to` array → 400. Malformed `from` → 400.
+- DB row survives env-less proxy restart; email notifier is rebuilt at boot from `notifier_config`.
+- `--disabled` hot-swaps the notifier to None; `/show` flips to `email: configured: false`.
+- Metric increments per config change.
+
+**Spec deviations to flag.**
+
+1. **No DKIM signing on the proxy side.** §5.4 calls out DMARC / SPF / DKIM alignment "via the customer's SMTP relay." We accept whatever relay the customer configures; if the relay handles DKIM (most do, e.g. SES, SendGrid, Mailgun, Postmark), alignment works. The proxy itself doesn't sign — it's a customer-relay concern.
+2. **`mailto:` reject link not generated.** §5.4 sketches a `mailto:` rejection link that pre-fills the reason text and lets the approver hit Send. We use the same HTTP signed-URL flow as the approve path (both go through `/notifier/approve` with `action=reject`). The signed-URL approach is friendlier on mobile mail clients that show preview cards for HTTP URLs but not for `mailto:`.
+3. **Single global `to` recipient list.** Spec implies per-policy routing (different recipients for different policies). v1 sends to the same list for every blocked action. A `body.audit_body_routing` extension to the policy YAML would route per-policy in v2.
+4. **No bcc / cc.** Add when a customer asks.
+5. **No retry on transient SMTP failures.** lettre's `send` returns the SMTP server's response verbatim. Tempfail (4xx) currently increments `proxilion_email_send_failures_total{reason="smtp"}` and drops the event — same fan-out posture as the webhook driver. The audit-log path (`blocked_actions` + `notifier_tokens`) is the source of truth; a customer who wants retries can pull from `/api/v1/blocked?status=pending`.
+
+
+endpoints + landing page are live. Delivered:
+
+- [migrations/0007_notifier_tokens.sql](../../migrations/0007_notifier_tokens.sql) — `notifier_tokens(token_id, blocked_id, action CHECK approve|reject, approver_hint, issued_by, expires_at, consumed_at)` with a partial index on unconsumed tokens for cheap lookup.
+- [crates/proxy/src/api/blocked.rs](../../crates/proxy/src/api/blocked.rs) — `POST /api/v1/blocked/{id}/issue-link` (scope `blocks:approve`) accepts `{ action, ttl_minutes?, approver_hint? }`, validates `action ∈ {approve, reject}` + `ttl_minutes ∈ 1..=1440`, checks the row is still `pending`, inserts the token row, and returns `{ token_id, url: "/notifier/approve?t=<uuid>", action, expires_at }`. The `approve_inner` + `reject_inner` were refactored from the operator-facing handlers into reusable inner functions that take a `channel` label.
+- [crates/proxy/src/api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs) — `GET /notifier/approve?t=<uuid>` renders a single HTML page with a confirm form; `POST /notifier/approve` (urlencoded body `t=<uuid> & justification=... | reason=...`) calls `approve_inner`/`reject_inner` with `channel="email"` and marks the token consumed inside the same transaction that locked it `FOR UPDATE`. Replay-safe by construction: a second click on the same link sees `consumed_at IS NOT NULL` and renders the "already used" page.
+- [crates/proxy/static-html/approve.html](../../crates/proxy/static-html/approve.html) — single-file template, no JS framework, embeds via `include_str!`. Light/dark color scheme via `prefers-color-scheme`. ~80 lines of HTML + CSS. **All user-supplied fields are HTML-escaped via `html_escape()`** before substitution — the `<script>alert(1)</script>` payload in the `detail` column is rendered as `&lt;script&gt;`.
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) — `notifier_public::router(...)` is merged into the app **outside** the operator-auth boundary. The single-use token IS the credential.
+- Metrics: `proxilion_overrides_requested_total{channel="email_link"}` ticks on every issued link; `proxilion_overrides_resolved_total{outcome="approved|rejected",channel="email"}` ticks on every consumed link.
+
+**Unit tests** (2 new in `notifier_public::tests`): `html_escape_handles_payload_attacks` (XSS sanitization on `<` `>` `&` `"` `'`) and `template_substitutions_fill_all_placeholders` (no unfilled `{{...}}` placeholders, real fields propagate).
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-signed-link-approve.sh](../../scripts/stress-signed-link-approve.sh) — 14 assertions, all passing:
+- Real `PCA_0` minted via mock-okta → Trust Plane, seeded into `pca_cache` + a pending `blocked_actions` row.
+- `POST /api/v1/blocked/{id}/issue-link {"action":"approve"}` returns `{token_id, url, action, expires_at}`.
+- `GET /notifier/approve?t=...` renders without an operator token, carries `p_0`, escapes the `<script>` payload in the `detail` field.
+- `POST` with short justification → validation error, token still unconsumed.
+- `POST` with valid justification → success banner with the freshly-minted override PCA id + hop; blocked row flips to `overridden` with `approver_subject = "on-call@acme.com"` (taken from the link's `approver_hint`).
+- Re-clicking the consumed link → "already used."
+- Reject path: same shape, blocked row → `rejected`.
+- Negative paths: invalid `action` → 400; resolved row → 409; expired token surfaced in HTML; unknown UUID → friendly error page.
+
+**Spec deviations to flag.**
+
+1. **No outbound email composer.** §5.4 promises Plain-text + HTML mail bodies, DMARC/SPF/DKIM alignment, signed mailto reject links. We ship the *chokepoint* (signed URL + landing page); the email body composition + SMTP delivery is the next layer. The notifier driver model (Slack / Email / Webhook trait) lives in §10.3 as a separate deferred item.
+2. **Single signed URL — not HMAC-signed query string.** §5.4 specifies a URL with an HMAC token. We use a UUID-keyed `notifier_tokens` row (essentially a single-use bearer in DB rather than a self-contained signed JWT). Both shapes are equivalent for one-time-use links; the DB-keyed shape is replay-resistant by construction (single-use enforced by `consumed_at` UPDATE inside the locking transaction) and doesn't require key rotation. A future iteration can layer HMAC-signed URLs on top for stateless verification if a customer's email infrastructure needs that.
+3. ~~Metric `_total` counters coalesce to 1.~~ **Resolved 2026-05-11.** Root-caused to a `get_or_create_counter` non-idempotency bug in `metrics-util 0.19.1` (used by `metrics-exporter-prometheus 0.16.2`): each `metrics::counter!("name")` call site was inserting a *fresh* `Arc<AtomicU64>` into the registry's sharded hashmap, so increments split across N counters with the LAST-inserted one rendered. Confirmed via a minimal repro that printed Arc addresses — two `registry.get_or_create_counter(&same_key, |c| c.clone())` calls returned different Arc pointers. Bumping `metrics-exporter-prometheus = "0.17"` (pulls `metrics-util 0.20.3`) makes `get_or_create_counter` idempotent and counters accumulate correctly. Live verification: 5 unauth probes → `proxilion_auth_attempts_total{result="rejected"} 5`; signed-link stress's `proxilion_overrides_requested_total{channel="email_link"} = 3` after 3 issue-link calls.
+
 ### 5.5 Generic webhook (for everyone else)
 
 For PagerDuty / Opsgenie / Teams / Jira / custom:
@@ -614,6 +776,28 @@ For PagerDuty / Opsgenie / Teams / Jira / custom:
 This makes Proxilion notifier-agnostic without writing a Teams plugin and
 a Jira plugin and an Opsgenie plugin.
 
+**Status (2026-05-11) — outbound webhook driver shipped.** Delivered:
+
+- [crates/proxy/src/notifier/mod.rs](../../crates/proxy/src/notifier/mod.rs) — `BlockedNotification` envelope (`schema: "proxilion.blocked_action.v1"`, `blocked_id`, `p_0`, `vendor`, `action`, `method`, `path`, `layer`, `policy_id`, `detail`, `predecessor_pca_id`, `requested_ops`, plus `approve_url` and `reject_url` for one-click operator landing).
+- [crates/proxy/src/notifier/webhook.rs](../../crates/proxy/src/notifier/webhook.rs) — `WebhookNotifier` POSTs JSON with `x-proxilion-signature: sha256=<hmac>`, `x-proxilion-schema: proxilion.blocked_action.v1`, `x-proxilion-blocked-id: <uuid>`. Retry policy mirrors the SIEM forwarder (no retry on 4xx; exp-backoff on 5xx/transport up to 3 attempts).
+- [crates/proxy/src/blocked.rs](../../crates/proxy/src/blocked.rs) — `persist_and_notify(db, notifier, record)` is the new adapter call. Persistence runs first (synchronous, durable); the webhook is spawned on tokio so a slow receiver never slows the request response. The three Google adapters (Drive / Gmail / Calendar) all switched to this signature.
+- Config: `PROXILION_BLOCKED_WEBHOOK_URL` + `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY`. Empty URL → notifier disabled. URL set without key → refuse-to-sign-without-a-key (warn + disable). Invalid hex / too-short key → same.
+- Metrics: `proxilion_notifier_send_total{result,layer}` and `proxilion_notifier_send_failures_total{reason="serialize|client_error|server_error_exhausted|transport_exhausted"}`.
+
+**Unit tests** (`notifier::webhook::tests`, 5 new): HMAC round-trip, hex-validation rejection paths, wiremock'd POST asserting signature + schema + blocked-id headers and body content, no-retry-on-4xx, retry-on-5xx-then-success. `cargo test --workspace` is green at **74 passing**.
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-notifier.sh](../../scripts/stress-notifier.sh) against the live compose stack:
+- Proxy log confirms `blocked-action webhook notifier installed url=http://…`.
+- Negative paths: empty `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY` → warn + run without the notifier (refuse to sign with no key). Too-short hex (`dead`) → warn + run without. Both verified in CI-friendly assertions.
+- Restore path: setting both env vars again brings the notifier back to nominal state.
+- Live POST to a `mendhak/http-https-echo` receiver inside the compose network is unit-tested via wiremock; full adapter→notifier→receiver round-trip requires a seeded signed-PCA in cache (CI harness gap shared with §1.1 / §1.3).
+
+**Spec deviations to flag.**
+
+1. **Driver model elided.** §10.3 sketches a `Notifier` trait with `slack` / `email` / `webhook` implementations and a `Vec<Box<dyn Notifier>>` fan-out. We ship one driver (`WebhookNotifier`) and one optional field (`AdapterState.notifier: Option<Arc<WebhookNotifier>>`). Slack interactive Block Kit + email signed-URL landing are bigger pieces and intentionally deferred to a follow-up that adds the trait, the burst-suppression layer (§5.6), and the per-policy channel routing.
+2. **No inbound Slack interaction webhook.** §8.3 lists `POST /api/v1/notifier/slack/interact` and `GET /api/v1/notifier/approve` as new endpoints. Outbound notifications work today via the customer's webhook handler calling `POST /api/v1/blocked/{id}/approve` directly (the same endpoint the CLI hits). Adding signed approve/reject URLs that bypass the operator-token requirement lands with the email/HTML-landing-page work.
+3. **No burst suppression yet.** §5.6 promises that 50 blocks/minute in the same `(policy_id, p_0)` collapse to one threaded message. The current implementation fires one webhook per block. Tracked alongside the Slack driver.
+
 ### 5.6 Block-burst suppression
 
 If 50 blocks fire in a minute from the same `(policy_id, p_0)`, Slack
@@ -621,6 +805,28 @@ gets one message with a counter, not 50 messages — "57 more blocks of
 this kind suppressed; click for the full list." Threshold and window
 configurable per-policy. This is the difference between "approval flow
 helps" and "approval flow has been muted by the team."
+
+**Status (2026-05-11) — shipped.** Delivered:
+
+- [crates/proxy/src/notifier/burst.rs](../../crates/proxy/src/notifier/burst.rs) — `BurstSuppressor` keyed by `(policy_id, p_0)`. Each bucket holds a sliding window of recent timestamps; once the window count hits `threshold`, subsequent events are dropped and a per-bucket `suppressed` counter accrues with an `exemplar` snapshot of the first dropped event. Defaults: `threshold=50`, `window=60s`, `flush_interval=30s`. Events with no `policy_id` (Layer-A invariant breaks, read-filter blocks) bypass the suppressor — they're rare enough that collapsing distinct attack signals would lose information.
+- [crates/proxy/src/notifier/webhook.rs](../../crates/proxy/src/notifier/webhook.rs) — `WebhookNotifier::with_burst(...)` attaches the suppressor; `notify(...)` consults it before each POST. New `notify_summary(...)` method delivers `BurstSummary` envelopes on a separate schema (`proxilion.blocked_action_burst.v1`) so receivers can route differently.
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) — `build_blocked_notifier` now attaches the suppressor by default and spawns a flush loop that drains every 30s. Startup log line confirms `with burst suppression`.
+- Metrics: `proxilion_notifier_suppressed_total{policy_id}` (counter, increments per dropped event); `proxilion_notifier_summary_sent_total{policy_id}` (counter, increments per delivered summary).
+
+**Unit tests** (6 new in `notifier::burst::tests`): passes-through below threshold, suppresses above threshold + drain returns the right summary, separate `(policy_id, p_0)` keys stay independent, window expiry resets the bucket, missing `policy_id` bypasses, summary carries exemplar.
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-burst-and-notifier-cli.sh](../../scripts/stress-burst-and-notifier-cli.sh) — 13 assertions, all passing:
+- `notifier show` reports `not-configured` when env-less, then `configured` with default burst block (threshold=50 / window=60s / flush=30s) after restart with `PROXILION_BLOCKED_WEBHOOK_URL` set.
+- `notifier test` POSTs a synthetic envelope to the receiver — receiver echoes `"action": "notifier.test"` with `policy_id == "proxilion.test"`.
+- 60 synthetic notifications on the same bucket → receiver sees exactly 50 raw events; `proxilion_notifier_suppressed_total` ticks.
+- After 18s the burst-summary envelope arrives. The body contains `"schema": "proxilion.blocked_action_burst.v1"`, `"suppressed_count": 11`, and a full `exemplar` block with vendor/action/layer.
+- `proxilion_notifier_summary_sent_total` ticks once per delivered summary.
+
+**Spec deviations to flag.**
+
+1. ~~Per-policy threshold/window not yet honored.~~ **Resolved 2026-05-11.** `PolicyDoc` now carries an optional `notifier_burst: { threshold, window_seconds }` block (`crates/policy-engine/src/yaml.rs`). `Engine::burst_override_for(policy_id)` returns the override pair; the proxy wires a resolver closure into `BurstSuppressor::with_resolver(...)` that consults the live policy engine on every `admit()` call, so a `policy.yaml` hot-reload immediately changes threshold/window for in-flight buckets. Both fields are individually optional — `threshold: 5` alone keeps the default window, `window_seconds: 10` alone keeps the default threshold. Policies without a `notifier_burst:` block fall through to `BurstConfig::default()` (threshold=50, window=60s). Verified by 4 policy-engine tests + 2 burst-suppressor resolver tests + live stress.
+2. **No "click for the full list" deep link.** The exemplar in the summary identifies the policy + p_0; an operator clicking through to `/api/v1/blocked?policy_id=<id>&p_0=<email>` does the rest. A pre-resolved URL field on the envelope is a minor follow-up.
+3. **Suppression state is in-process.** A proxy restart wipes the buckets. For a multi-replica deployment, suppression is per-pod — bursts get collapsed at each pod rather than across the fleet. Spec.md §13's design partner won't notice; a Redis-backed shared suppressor is the v2 path if we add multi-region.
 
 ### 5.7 Expiry & escalation
 
@@ -680,6 +886,31 @@ hashes go into `action_events`. The full body is held in the
 (i.e., the customer specifically asked us to). This is a privacy default,
 not a feature — opt-in to fuller body persistence is per-policy:
 `then.audit_body: hash | redact_pii | full`.
+
+**Status (2026-05-11) — shipped.** Delivered:
+
+- [migrations/0009_action_event_bodies.sql](../../migrations/0009_action_event_bodies.sql) — `action_event_bodies (request_id PK, mode CHECK in (hash, redact_pii, full), request_hash, response_hash, request_body_b64, response_body_b64, request_bytes, response_bytes, created_at)`. Joined by `request_id` (not the `action_events.id` UUID) so the adapter can insert without awaiting the action_events row's generated id; intentionally NO foreign key so deletes from `action_events` don't cascade — body retention has its own lifecycle (customers will tier audit-body rows to cold storage on a different cadence than the action_events row count).
+- [crates/policy-engine/src/yaml.rs](../../crates/policy-engine/src/yaml.rs) — `PolicyDoc.audit_body: Option<AuditBodyMode>` with `Hash | RedactPii | Full` variants (kebab/snake-case YAML). `Outcome.audit_body` surfaces the directive to the adapter.
+- [crates/proxy/src/audit_body.rs](../../crates/proxy/src/audit_body.rs) — `persist(db, request_id, mode, request, response)` writes the row. `redact_pii_bytes()` runs the regex set; binary content (first 256 bytes contain a null) is left intact since pattern-matching binary data is noisy. Redactor patterns: email, US SSN, US phone (10-digit + parens / dots / dashes), credit-card-shaped 13–19-digit runs (no Luhn check — false positives acceptable for redaction; false negatives are not), `Bearer <token>`, `pxl_live_*` / `pxl_operator_*` / `sk-*` / `ghp_*` / `xox?-*` API-key shapes. Order matters: known-token shapes redact BEFORE the digit-pattern redactors so a Slack token's leading 10-digit workspace id isn't pre-redacted by the phone regex (regression caught + fixed during the build-out).
+- Adapter call sites (Drive / Gmail / Calendar): `if let Some(mode) = outcome.audit_body { crate::audit_body::persist(..., request_id, mode, req_bytes, &final_body).await; }`. Skipped entirely when the policy doesn't opt in — the privacy default is unchanged.
+- [crates/proxy/src/api/actions.rs](../../crates/proxy/src/api/actions.rs) — `GET /api/v1/actions/{id}` now includes an `audit_body: { mode, request_hash, response_hash, request_body_b64, response_body_b64, request_bytes, response_bytes }` field when a row exists in `action_event_bodies` for the request_id. Null when the policy didn't opt in.
+- Metrics: `proxilion_audit_body_persisted_total{mode}` and `proxilion_audit_body_persist_failures_total{mode}`. Both cardinality-bounded by the enum.
+
+**Unit tests** (9 new in `audit_body::tests`): email / SSN / phone (four format variations) / credit-card-shaped / `Bearer <token>` / API-key shapes (4 patterns) / binary input unchanged / text input redacted / SHA-256 hex matches the known vector for "hello".
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-audit-body.sh](../../scripts/stress-audit-body.sh) — 10 assertions, all passing:
+- Schema + CHECK constraint enforced (`mode='leak_all'` rejected by Postgres).
+- Three rows (one per mode) round-trip through INSERT + SELECT.
+- Hot reload picks up `audit_body: full` and `audit_body: redact_pii` policies.
+- `GET /api/v1/actions/{id}` surfaces the audit_body object with correct mode + body_b64 + hash; returns `audit_body: null` when no row exists.
+- Decoupled lifecycle: deleting an `action_events` row leaves the `action_event_bodies` row intact (no FK, no cascade).
+
+**Spec deviations to flag.**
+
+1. **Adapter call sites pre-Layer-B and post-Layer-A.** The body capture fires AFTER the upstream call completes and ONLY when a policy matched (no policy → skipped). Layer-A blocks (PIC invariant violations) never reach the publish path, so they never get an audit_body row even on a policy with `audit_body: full`. This is the right shape: a request that was refused at the chain layer didn't produce a meaningful body to capture, only the predecessor PCA + the refused-ops-set, both already stored in `pca_cache` + `blocked_actions`.
+2. **No streaming-body support.** Bodies are buffered up to `MAX_BODY` (10 MB) before capture. Streaming-body redaction is in scope for §15 #6 in `spec.md`, not this PR.
+3. **PII redactor is regex-only.** No NER, no PII detection model, no per-customer pattern override. The customer can disable redact_pii and use `full` + their own downstream redactor if their threat model demands one. Pattern catalogue lives in `audit_body.rs::redactors()` — adding a new shape is a one-line PR.
+4. **`hash` mode persists SHA-256 only.** Spec sketch hints at storing per-field hashes (e.g. hash of subject, hash of body). We store request-body and response-body hashes, not field-level. Sufficient for tamper-detection + audit; field-level would be a follow-up if a customer needs to grep audits by `subject_hash`.
 
 ---
 
@@ -750,13 +981,39 @@ Datadog, Snowflake).
 
 ### 8.4 New tables (postgres)
 
+**Status (2026-05-11) — `notifier_config` shipped (webhook driver).** Delivered:
+
+- [migrations/0010_notifier_config.sql](../../migrations/0010_notifier_config.sql) — `notifier_config (id PK CHECK in (webhook,slack,email), enabled, config JSONB, updated_at, updated_by)`. v1 ships only the `webhook` driver row; `slack` / `email` rows are reserved for §5.3 / §5.4.
+- [crates/proxy/src/notifier/handle.rs](../../crates/proxy/src/notifier/handle.rs) — `NotifierHandle` wraps `Arc<ArcSwap<Option<Arc<WebhookNotifier>>>>`. All consumers (adapters via `AdapterState.notifier`, public approve flow via `NotifierApiState.notifier`, blocked-action notify via `persist_and_notify`) call `current()` per use; `replace()` atomically hot-swaps.
+- [crates/proxy/src/api/notifier.rs](../../crates/proxy/src/api/notifier.rs) — `GET /api/v1/notifier/config` (scope `notifier:read`) reads the row + redacts `hmac_key` (echoes `hmac_key_set: bool` instead) and the URL (`url_redacted`). `POST /api/v1/notifier/config` (scope `notifier:write`) validates `{ driver: "webhook", config: { url, hmac_key } }`, builds a new `WebhookNotifier`, persists to DB, then calls `NotifierHandle::replace(...)`. Returns 400 on missing url / missing hmac / invalid hex / unknown driver.
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) — startup calls `build_notifier_handle(&cfg, &core.db, ...)`. The handle's initial value is resolved by `resolve_webhook_config`: DB row wins (when `enabled=true` AND both `url` + `hmac_key` are present); env vars are the fallback for the no-DB bootstrap path.
+- [crates/cli/src/main.rs](../../crates/cli/src/main.rs) — `proxilion-cli notifier set-webhook --url <u> --hmac-hex <h> [--disabled]` POSTs to `/api/v1/notifier/config`. `proxilion-cli notifier config` GETs the redacted view.
+- Metric: `proxilion_notifier_config_changes_total{driver}` per successful set.
+
+**Unit tests** (3 new in `notifier::handle::tests`): starts-none, replace swaps in new (clones see the same swap), replace-to-none clears.
+
+**End-to-end verification (2026-05-11)** via [scripts/stress-notifier-config-hotswap.sh](../../scripts/stress-notifier-config-hotswap.sh) — 14 assertions, all passing:
+- Schema + CHECK constraint enforced.
+- `proxilion-cli notifier set-webhook` persists + hot-swaps without restart.
+- After setting URL=A, `notifier test` POSTs to A. After setting URL=B, the next `notifier test` POSTs to B; receiver A's POST count is unchanged.
+- `notifier config` GET redacts `hmac_key` (shows `hmac_key_set: true`) and the URL.
+- `set-webhook --disabled` clears the active notifier; `notifier test` → 412.
+- Four negative paths (unknown driver / missing url / missing hmac / short hmac) → 400.
+- After full proxy restart with env vars cleared, the DB-stored row is loaded and the notifier is operational — confirms DB-first bootstrap.
+
+**Spec deviations to flag.**
+
+1. **Only the `webhook` driver is exposed today.** The migration's CHECK accepts `slack` and `email` for forward-compat, but `set_config` returns 400 for those drivers until §5.3 / §5.4 ship.
+2. **Flush loop captures the initial notifier instance.** Burst-summary delivery uses the notifier that was alive when `spawn_flush_loop` started. A subsequent `replace()` swaps the live `notify` path; the next flush tick still drains accumulated buckets to the OLD notifier. For v1 this is the right shape — pending buckets get delivered one last time. A future improvement would route flushes through the handle on each tick.
+
 ```sql
--- 0004_notifier.sql
+-- 0010_notifier_config.sql (shipped)
 CREATE TABLE notifier_config (
-    id          TEXT PRIMARY KEY,             -- "slack", "email", "webhook"
-    enabled     BOOLEAN NOT NULL DEFAULT false,
-    config      JSONB NOT NULL,               -- per-driver structured config
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id          TEXT PRIMARY KEY CHECK (id IN ('webhook','slack','email')),
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    config      JSONB NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by  TEXT
 );
 
 CREATE TABLE notifier_tokens (

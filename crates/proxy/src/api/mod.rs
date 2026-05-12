@@ -9,6 +9,10 @@
 pub mod actions;
 pub mod blocked;
 pub mod killswitch;
+pub mod notifier;
+pub mod notifier_public;
+pub mod notifier_slack;
+pub mod policy;
 pub mod setup;
 
 use std::sync::Arc;
@@ -32,9 +36,17 @@ pub struct ApiState {
 }
 
 pub fn router(state: ApiState) -> Router {
+    use axum::middleware::from_fn_with_state;
+    use crate::operator_auth::scope_check;
     Router::new()
-        .route("/api/v1/pca/{id}", get(get_pca))
-        .route("/api/v1/pca/{id}/verify", get(verify_pca))
+        .route(
+            "/api/v1/pca/{id}",
+            get(get_pca).route_layer(from_fn_with_state("pca:read", scope_check)),
+        )
+        .route(
+            "/api/v1/pca/{id}/verify",
+            get(verify_pca).route_layer(from_fn_with_state("pca:read", scope_check)),
+        )
         .with_state(state)
 }
 
@@ -45,6 +57,8 @@ struct PcaView {
     ops: Vec<String>,
     hop: i32,
     predecessor_id: Option<Uuid>,
+    /// PIC profile pinned at insert time (spec.md §15 #11).
+    pic_profile: String,
     /// CBOR bytes, hex-encoded (small enough to inline for inspection).
     cbor_hex: String,
 }
@@ -62,6 +76,7 @@ async fn get_pca(
         ops: row.ops,
         hop: row.hop,
         predecessor_id: row.predecessor_id,
+        pic_profile: row.pic_profile,
         cbor_hex: hex_encode(&row.cbor),
     }))
 }
@@ -77,6 +92,8 @@ async fn verify_pca(
         "p_0": result.p_0,
         "broken_at": result.broken_at,
         "reason": result.reason,
+        "pic_profile": result.pic_profile,
+        "pic_profile_mismatch_at": result.pic_profile_mismatch_at,
     })))
 }
 

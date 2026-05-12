@@ -6,6 +6,8 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::notifier::{BlockedNotification, Notifiers};
+
 /// Everything the adapter knows at the moment of denial. The API in
 /// `crate::api::blocked` joins this with `pca_cache` to load the
 /// predecessor CBOR when an operator approves.
@@ -32,12 +34,77 @@ pub struct BlockedActionRecord<'a> {
     pub requested_ops: &'a [String],
 }
 
+#[allow(dead_code)]
 pub async fn persist(db: &PgPool, r: BlockedActionRecord<'_>) {
-    let res = sqlx::query(
+    let _ = persist_returning_id(db, &r).await;
+}
+
+/// Persist + optionally notify (ui-less-surfaces.md §10.3). Adapters use
+/// this variant so the human-approval channel fires as soon as the row
+/// commits. Notification is fire-and-forget — the request response and
+/// the durable row never wait on the webhook receiver.
+pub async fn persist_and_notify(
+    db: &PgPool,
+    notifiers: &Notifiers,
+    r: BlockedActionRecord<'_>,
+) {
+    let id = match persist_returning_id(db, &r).await {
+        Some(id) => id,
+        None => return,
+    };
+    // Build the canonical notification once. proxy_public_url defaults to
+    // whichever driver is configured first; all drivers use the same
+    // approve/reject URLs.
+    let proxy_url = notifiers
+        .webhook
+        .current()
+        .map(|n| n.proxy_public_url().to_string())
+        .or_else(|| {
+            notifiers
+                .slack
+                .current()
+                .map(|n| n.proxy_public_url().to_string())
+        })
+        .or_else(|| {
+            notifiers
+                .email
+                .current()
+                .map(|n| n.proxy_public_url().to_string())
+        });
+    let Some(proxy_url) = proxy_url else { return };
+    let payload = BlockedNotification::from_record(id, &r, &proxy_url);
+    let owned = OwnedBlockedNotification::from(&payload);
+
+    // Webhook fan-out.
+    if let Some(n) = notifiers.webhook.current() {
+        let owned = owned.clone();
+        tokio::spawn(async move {
+            n.notify(&owned.as_borrowed()).await;
+        });
+    }
+    // Slack fan-out.
+    if let Some(s) = notifiers.slack.current() {
+        let owned = owned.clone();
+        tokio::spawn(async move {
+            s.notify(&owned.as_borrowed()).await;
+        });
+    }
+    // Email fan-out.
+    if let Some(e) = notifiers.email.current() {
+        let owned = owned.clone();
+        tokio::spawn(async move {
+            e.notify(&owned.as_borrowed()).await;
+        });
+    }
+}
+
+async fn persist_returning_id(db: &PgPool, r: &BlockedActionRecord<'_>) -> Option<Uuid> {
+    let res: Result<(Uuid,), _> = sqlx::query_as(
         "INSERT INTO blocked_actions
             (request_id, session_id, p_0, vendor, action, method, path,
              layer, policy_id, detail, predecessor_pca_id, requested_ops)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         RETURNING id",
     )
     .bind(r.request_id)
     .bind(r.session_id)
@@ -51,9 +118,79 @@ pub async fn persist(db: &PgPool, r: BlockedActionRecord<'_>) {
     .bind(r.detail)
     .bind(r.predecessor_pca_id)
     .bind(r.requested_ops)
-    .execute(db)
+    .fetch_one(db)
     .await;
-    if let Err(e) = res {
-        tracing::warn!(error = %e, "failed to persist blocked_action");
+    match res {
+        Ok((id,)) => Some(id),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to persist blocked_action");
+            None
+        }
+    }
+}
+
+/// `BlockedNotification` borrows from the adapter's `BlockedActionRecord`.
+/// To send it on a `tokio::spawn` we need owned strings. This struct is
+/// the materialized snapshot; `as_borrowed()` reconstructs the borrowed
+/// view the notifier expects.
+#[derive(Clone)]
+struct OwnedBlockedNotification {
+    blocked_id: Uuid,
+    request_id: Uuid,
+    session_id: Uuid,
+    p_0: Option<String>,
+    vendor: String,
+    action: String,
+    method: String,
+    path: String,
+    layer: String,
+    policy_id: Option<String>,
+    detail: Option<String>,
+    predecessor_pca_id: Option<Uuid>,
+    requested_ops: Vec<String>,
+    approve_url: String,
+    reject_url: String,
+}
+
+impl OwnedBlockedNotification {
+    fn from(n: &BlockedNotification<'_>) -> Self {
+        Self {
+            blocked_id: n.blocked_id,
+            request_id: n.request_id,
+            session_id: n.session_id,
+            p_0: n.p_0.map(|s| s.to_string()),
+            vendor: n.vendor.to_string(),
+            action: n.action.to_string(),
+            method: n.method.to_string(),
+            path: n.path.to_string(),
+            layer: n.layer.to_string(),
+            policy_id: n.policy_id.map(|s| s.to_string()),
+            detail: n.detail.map(|s| s.to_string()),
+            predecessor_pca_id: n.predecessor_pca_id,
+            requested_ops: n.requested_ops.to_vec(),
+            approve_url: n.approve_url.clone(),
+            reject_url: n.reject_url.clone(),
+        }
+    }
+
+    fn as_borrowed(&self) -> BlockedNotification<'_> {
+        BlockedNotification {
+            schema: BlockedNotification::SCHEMA,
+            blocked_id: self.blocked_id,
+            request_id: self.request_id,
+            session_id: self.session_id,
+            p_0: self.p_0.as_deref(),
+            vendor: &self.vendor,
+            action: &self.action,
+            method: &self.method,
+            path: &self.path,
+            layer: &self.layer,
+            policy_id: self.policy_id.as_deref(),
+            detail: self.detail.as_deref(),
+            predecessor_pca_id: self.predecessor_pca_id,
+            requested_ops: &self.requested_ops,
+            approve_url: self.approve_url.clone(),
+            reject_url: self.reject_url.clone(),
+        }
     }
 }

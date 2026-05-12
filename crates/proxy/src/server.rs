@@ -19,8 +19,10 @@ use tokio::signal;
 use tracing::{Instrument, info, info_span, warn};
 use uuid::Uuid;
 
-use crate::adapters::action_stream::BroadcastingActionStream;
-use crate::adapters::{AdapterState, google_drive, google_gmail};
+use crate::adapters::action_stream::{ActionStream, BroadcastingActionStream};
+use crate::adapters::{AdapterState, google_calendar, google_drive, google_gmail};
+use crate::forwarder::{NatsBridge, SiemForwarder, SiemHmacKey, TeeStream};
+use crate::notifier::{BurstConfig, BurstSuppressor, WebhookNotifier, WebhookSecret};
 use crate::api::{self, ApiState};
 use crate::auth_middleware::{AuthState, RefreshCoordinator, auth_middleware};
 use crate::config::Config;
@@ -105,51 +107,38 @@ pub async fn run(cfg: Config) -> Result<()> {
                 cat_keys: auth_state.cat_keys.clone(),
             });
 
+            // Build the action-stream tee early: primary =
+            // BroadcastingActionStream (DB + SSE); optional secondary sinks =
+            // NATS (§3.1) + SIEM webhook (§3.3). Demo + every adapter publish
+            // through the same Arc<dyn ActionStream>.
+            let primary: Arc<dyn ActionStream> = Arc::new(action_stream.clone());
+            let mut tee = TeeStream::new(primary);
+            tee = build_nats_sink(&cfg, tee).await;
+            tee = build_siem_sink(&cfg, tee);
+            if tee.sink_count() == 0 {
+                info!("action-stream sinks: primary only (DB + SSE)");
+            } else {
+                info!(sinks = tee.sink_count(), "action-stream sinks installed");
+            }
+            let adapter_stream: Arc<dyn ActionStream> = Arc::new(tee);
+
             // Demo mode: if PROXILION_DEMO=1 (or DB is empty), seed synthetic
-            // history and start a slow ticker. Gives first-time visitors a
-            // populated, alive UI without needing a real agent.
+            // history and start a slow ticker.
             if crate::demo::should_run(&core.db).await {
-                let _ = crate::demo::start(action_stream.clone());
+                let _ = crate::demo::start(adapter_stream.clone());
             }
 
-            // PCA management API + actions feed — always available with a DB.
-            let api_state = ApiState {
-                verifier: Arc::new(PicVerifier::new(
-                    auth_state.pca_cache.clone(),
-                    auth_state.cat_keys.clone(),
-                )),
-                pca_cache: auth_state.pca_cache.clone(),
-            };
-            app = app.merge(api::router(api_state));
-            app = app.merge(crate::api::actions::router(
-                crate::api::actions::ActionsApiState {
-                    db: core.db.clone(),
-                    stream: action_stream.clone(),
-                    pca_cache: auth_state.pca_cache.clone(),
-                },
-            ));
-            app = app.merge(crate::api::blocked::router(
-                crate::api::blocked::BlockedApiState {
-                    db: core.db.clone(),
-                    pca_cache: auth_state.pca_cache.clone(),
-                    pic: core.pic.clone(),
-                },
-            ));
-            app = app.merge(crate::api::killswitch::router(
-                crate::api::killswitch::KillswitchApiState { db: core.db.clone() },
-            ));
+            // Build the hot-reloadable policy handle. Initial load + watcher
+            // spawn happen here so admin endpoints can talk to the same
+            // ArcSwap the adapters do.
+            let policy_handle = build_policy_handle(&cfg)?;
+            tokio::spawn(crate::policy_handle::spawn_watcher(policy_handle.clone()));
 
             // Setup-status checklist (powers /admin/setup). Always-on so the
-            // operator can use it to figure out what's still missing.
-            let policy_count = match cfg.policy_path.as_ref() {
-                Some(p) => match std::fs::read_to_string(p) {
-                    Ok(yaml) => policy_engine::Engine::new(&yaml)
-                        .map(|e| e.policy_count())
-                        .unwrap_or(0),
-                    Err(_) => 0,
-                },
-                None => 0,
-            };
+            // operator can use it to figure out what's still missing. Mounted
+            // OUTSIDE the operator_auth layer — it's a checklist for an
+            // operator who hasn't issued a token yet.
+            let policy_count = policy_handle.load().policy_count();
             app = app.merge(crate::api::setup::router(crate::api::setup::SetupApiState {
                 db: core.db.clone(),
                 google_configured: cfg.google_client_id.is_some()
@@ -159,11 +148,86 @@ pub async fn run(cfg: Config) -> Result<()> {
                 policy_count,
             }));
 
+            // Build the /api/v1/* router behind the operator_auth middleware.
+            let api_state = ApiState {
+                verifier: Arc::new(PicVerifier::new(
+                    auth_state.pca_cache.clone(),
+                    auth_state.cat_keys.clone(),
+                )),
+                pca_cache: auth_state.pca_cache.clone(),
+            };
+            // Build the notifier bundle (webhook + slack). Each driver is
+            // independently hot-swappable via `/api/v1/notifier/config`.
+            // DB-stored config wins; env vars are the bootstrap fallback.
+            let notifiers = build_notifiers(&cfg, &core.db, Some(&policy_handle)).await;
+            let protected_api = api::router(api_state)
+                .merge(crate::api::actions::router(crate::api::actions::ActionsApiState {
+                    db: core.db.clone(),
+                    stream: action_stream.clone(),
+                    pca_cache: auth_state.pca_cache.clone(),
+                }))
+                .merge(crate::api::blocked::router(crate::api::blocked::BlockedApiState {
+                    db: core.db.clone(),
+                    pca_cache: auth_state.pca_cache.clone(),
+                    pic: core.pic.clone(),
+                }))
+                .merge(crate::api::killswitch::router(
+                    crate::api::killswitch::KillswitchApiState { db: core.db.clone() },
+                ))
+                .merge(crate::api::policy::router(crate::api::policy::PolicyApiState {
+                    policy: policy_handle.clone(),
+                }))
+                .merge(crate::api::notifier::router(crate::api::notifier::NotifierApiState {
+                    notifiers: notifiers.clone(),
+                    db: core.db.clone(),
+                    proxy_base_url: cfg.proxy_base_url.clone(),
+                }));
+            let operator_state = crate::operator_auth::OperatorAuthState {
+                db: core.db.clone(),
+                enforced: cfg.operator_auth_enforced,
+            };
+            if !cfg.operator_auth_enforced {
+                warn!(
+                    "PROXILION_DISABLE_OPERATOR_AUTH=1 — /api/v1/* is unauthenticated. \
+                     Dev only; never use in production."
+                );
+            }
+            app = app.merge(protected_api.route_layer(middleware::from_fn_with_state(
+                operator_state,
+                crate::operator_auth::middleware,
+            )));
+
+            // Public-facing approval landing page (ui-less-surfaces.md §5.4).
+            // The single-use `notifier_tokens` row IS the credential, so this
+            // router lives OUTSIDE the operator_auth layer.
+            let blocked_state = Arc::new(crate::api::blocked::BlockedApiState {
+                db: core.db.clone(),
+                pca_cache: auth_state.pca_cache.clone(),
+                pic: core.pic.clone(),
+            });
+            app = app.merge(crate::api::notifier_public::router(
+                crate::api::notifier_public::NotifierPublicState {
+                    db: core.db.clone(),
+                    blocked: blocked_state.clone(),
+                },
+            ));
+
+            // Slack interaction webhook (ui-less-surfaces.md §5.3). Signed
+            // request IS the credential; lives outside operator_auth.
+            app = app.merge(crate::api::notifier_slack::router(
+                crate::api::notifier_slack::SlackInteractState {
+                    slack: notifiers.slack.clone(),
+                    blocked: blocked_state,
+                    db: core.db.clone(),
+                },
+            ));
+
             // OAuth + adapter routes layer on top, gated separately on
             // Google creds.
             if let Some(oauth_state) = build_oauth_state(&cfg, &core) {
                 let adapter_state = build_adapter_state(
-                    &cfg, &auth_state, &oauth_state, action_stream,
+                    &cfg, &auth_state, &oauth_state, adapter_stream,
+                    policy_handle, notifiers,
                 )?;
                 app = app.merge(oauth::router(oauth_state));
                 app = app.merge(protected_router(auth_state.clone()));
@@ -425,18 +489,13 @@ fn build_adapter_state(
     cfg: &Config,
     auth: &AuthState,
     oauth: &OAuthState,
-    stream: BroadcastingActionStream,
+    stream: Arc<dyn ActionStream>,
+    policy: crate::policy_handle::PolicyHandle,
+    notifier: crate::notifier::Notifiers,
 ) -> Result<AdapterState> {
-    let policy_yaml = match cfg.policy_path.as_ref() {
-        Some(p) => std::fs::read_to_string(p)
-            .with_context(|| format!("reading policy file {}", p.display()))?,
-        None => String::from("[]"),
-    };
-    let engine = policy_engine::Engine::new(&policy_yaml)
-        .map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
     Ok(AdapterState {
         auth: auth.clone(),
-        policy: Arc::new(engine),
+        policy,
         pic: oauth.pic.clone(),
         upstream: reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -447,17 +506,243 @@ fn build_adapter_state(
             ))
             .build()
             .context("upstream reqwest client")?,
-        stream: Arc::new(stream),
+        stream,
         google_api_base: std::env::var("GOOGLE_API_BASE").ok(),
         customer_domain: cfg.customer_domain.clone(),
+        notifier,
     })
+}
+
+async fn build_nats_sink(cfg: &Config, tee: TeeStream) -> TeeStream {
+    let Some(url) = cfg.nats_url.as_deref() else {
+        return tee;
+    };
+    match NatsBridge::connect(url, cfg.nats_subject_prefix.clone()).await {
+        Ok(bridge) => {
+            info!(url = %url, prefix = %cfg.nats_subject_prefix, "NATS bridge connected");
+            tee.with_sink(Arc::new(bridge))
+        }
+        Err(e) => {
+            warn!(url = %url, error = %e, "NATS bridge: connect failed; continuing without it");
+            tee
+        }
+    }
+}
+
+fn build_policy_handle(cfg: &Config) -> Result<crate::policy_handle::PolicyHandle> {
+    let (yaml, source) = match cfg.policy_path.as_ref() {
+        Some(p) => {
+            let yaml = std::fs::read_to_string(p)
+                .with_context(|| format!("reading policy file {}", p.display()))?;
+            (yaml, Some(p.clone()))
+        }
+        None => (String::from("[]"), None),
+    };
+    let engine = policy_engine::Engine::new(&yaml)
+        .map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
+    Ok(crate::policy_handle::PolicyHandle::new(engine, source, yaml))
+}
+
+/// Resolve webhook URL + HMAC hex: DB row first (ui-less-surfaces.md §8.4),
+/// env vars second. Returns `(url, hex)` or `None` when neither source has
+/// a complete config.
+async fn resolve_webhook_config(cfg: &Config, db: &sqlx::PgPool) -> Option<(String, String)> {
+    // 1. DB (preferred).
+    let row: Option<(bool, serde_json::Value)> =
+        sqlx::query_as("SELECT enabled, config FROM notifier_config WHERE id = 'webhook'")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    if let Some((enabled, conf)) = row {
+        if !enabled {
+            info!("notifier_config: webhook row exists but enabled=false — notifier disabled");
+            return None;
+        }
+        let url = conf.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let hex = conf.get("hmac_key").and_then(|v| v.as_str()).map(|s| s.to_string());
+        if let (Some(u), Some(h)) = (url, hex) {
+            return Some((u, h));
+        }
+        warn!("notifier_config: webhook row missing url or hmac_key — falling back to env");
+    }
+    // 2. Env fallback.
+    let url = cfg.blocked_webhook_url.as_deref()?.to_string();
+    let hex = cfg.blocked_webhook_hmac_key_hex.as_deref()?.to_string();
+    Some((url, hex))
+}
+
+async fn build_notifiers(
+    cfg: &Config,
+    db: &sqlx::PgPool,
+    policy: Option<&crate::policy_handle::PolicyHandle>,
+) -> crate::notifier::Notifiers {
+    let n = crate::notifier::Notifiers::empty();
+
+    // Webhook driver (ui-less-surfaces.md §10.3 + §8.4).
+    if let Some((url, hex)) = resolve_webhook_config(cfg, db).await {
+        match WebhookSecret::from_hex(&hex) {
+            Ok(secret) => match WebhookNotifier::new(
+                url.clone(),
+                secret,
+                cfg.proxy_base_url.clone(),
+            ) {
+                Ok(wn) => {
+                    let mut suppressor = BurstSuppressor::new(BurstConfig::default());
+                    if let Some(handle) = policy {
+                        let handle: crate::policy_handle::PolicyHandle = handle.clone();
+                        let resolver: crate::notifier::burst::BurstResolver =
+                            Arc::new(move |policy_id| handle.load().burst_override_for(policy_id));
+                        suppressor = suppressor.with_resolver(resolver);
+                    }
+                    let wn = wn.with_burst(suppressor.clone());
+                    let notifier = Arc::new(wn);
+                    let nfor = notifier.clone();
+                    tokio::spawn(crate::notifier::burst::spawn_flush_loop(
+                        suppressor,
+                        move |summary| {
+                            let n = nfor.clone();
+                            async move { n.notify_summary(&summary).await }
+                        },
+                    ));
+                    info!(
+                        url = %url,
+                        "blocked-action webhook notifier installed (with burst suppression)"
+                    );
+                    n.webhook.replace(Some(notifier));
+                }
+                Err(e) => warn!(error = %e, "WebhookNotifier build failed; webhook disabled"),
+            },
+            Err(e) => warn!(error = %e, "webhook HMAC key invalid; webhook disabled"),
+        }
+    }
+
+    // Slack driver (ui-less-surfaces.md §5.3).
+    if let Some((url, secret_text)) = resolve_slack_config(db).await {
+        let secret = crate::notifier::SlackSigningSecret::new(secret_text);
+        match crate::notifier::SlackNotifier::new(url.clone(), secret, cfg.proxy_base_url.clone()) {
+            Ok(sn) => {
+                info!(url = %url, "blocked-action slack notifier installed");
+                n.slack.replace(Some(Arc::new(sn)));
+            }
+            Err(e) => warn!(error = %e, "SlackNotifier build failed; slack disabled"),
+        }
+    }
+
+    // Email driver (ui-less-surfaces.md §5.4).
+    if let Some(cfg_row) = resolve_email_config(db).await {
+        match crate::notifier::EmailNotifier::new(
+            &cfg_row.smtp_url,
+            &cfg_row.from,
+            &cfg_row.to,
+            cfg.proxy_base_url.clone(),
+            db.clone(),
+        ) {
+            Ok(en) => {
+                info!(from = %cfg_row.from, "blocked-action email notifier installed");
+                n.email.replace(Some(Arc::new(en)));
+            }
+            Err(e) => warn!(error = %e, "EmailNotifier build failed; email disabled"),
+        }
+    }
+
+    n
+}
+
+struct EmailRowConfig {
+    smtp_url: String,
+    from: String,
+    to: Vec<String>,
+}
+
+/// Read the email driver row. No env fallback (SMTP credentials belong
+/// in DB only).
+async fn resolve_email_config(db: &sqlx::PgPool) -> Option<EmailRowConfig> {
+    let row: Option<(bool, serde_json::Value)> =
+        sqlx::query_as("SELECT enabled, config FROM notifier_config WHERE id = 'email'")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let (enabled, conf) = row?;
+    if !enabled {
+        return None;
+    }
+    let smtp_url = conf.get("smtp_url").and_then(|v| v.as_str()).map(String::from)?;
+    let from = conf.get("from").and_then(|v| v.as_str()).map(String::from)?;
+    // `to` may be a single string OR an array of strings.
+    let to: Vec<String> = match conf.get("to") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => return None,
+    };
+    if to.is_empty() {
+        return None;
+    }
+    Some(EmailRowConfig { smtp_url, from, to })
+}
+
+/// Read the Slack driver row. No env fallback (Slack tokens belong in DB
+/// only; environment variables are too easy to leak).
+async fn resolve_slack_config(db: &sqlx::PgPool) -> Option<(String, String)> {
+    let row: Option<(bool, serde_json::Value)> =
+        sqlx::query_as("SELECT enabled, config FROM notifier_config WHERE id = 'slack'")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let (enabled, conf) = row?;
+    if !enabled {
+        return None;
+    }
+    let url = conf
+        .get("incoming_webhook_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())?;
+    let secret = conf
+        .get("signing_secret")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())?;
+    Some((url, secret))
+}
+
+fn build_siem_sink(cfg: &Config, tee: TeeStream) -> TeeStream {
+    let Some(url) = cfg.siem_webhook_url.as_deref() else {
+        return tee;
+    };
+    let Some(hex) = cfg.siem_hmac_key_hex.as_deref() else {
+        warn!("PROXILION_SIEM_WEBHOOK_URL set but PROXILION_SIEM_HMAC_KEY missing — SIEM forwarder disabled");
+        return tee;
+    };
+    let key = match SiemHmacKey::from_hex(hex) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(error = %e, "PROXILION_SIEM_HMAC_KEY invalid — SIEM forwarder disabled");
+            return tee;
+        }
+    };
+    match SiemForwarder::new(url.to_string(), key) {
+        Ok(fwd) => {
+            info!(url = %url, "SIEM forwarder installed");
+            tee.with_sink(Arc::new(fwd))
+        }
+        Err(e) => {
+            warn!(error = %e, "SIEM forwarder build failed; continuing without it");
+            tee
+        }
+    }
 }
 
 fn adapter_router(adapter: AdapterState, auth: AuthState) -> Router {
     let drive = google_drive::router(adapter.clone());
-    let gmail = google_gmail::router(adapter);
+    let gmail = google_gmail::router(adapter.clone());
+    let calendar = google_calendar::router(adapter);
     drive
         .merge(gmail)
+        .merge(calendar)
         .route_layer(middleware::from_fn_with_state(auth, auth_middleware))
 }
 

@@ -129,6 +129,7 @@ async fn bridge_callback(
                 hop: 0,
                 predecessor_id: None,
                 signature: vec![],
+                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
             })
             .await
             .map_err(|e| OAuthError::Internal(e.to_string()))?;
@@ -305,6 +306,7 @@ async fn google_callback(
             hop: resp.hop as i32,
             predecessor_id: Some(pca_0_id),
             signature: vec![],
+                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
         })
         .await
         .map_err(|e| OAuthError::Internal(e.to_string()))?;

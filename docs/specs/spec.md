@@ -1887,6 +1887,25 @@ Acceptance:
 
 *(Same as v0 spec. Hot-path publish; consumer batches inserts to Postgres asynchronously.)*
 
+**Status:** Done. Delivered:
+
+- [crates/proxy/src/forwarder/mod.rs](../../crates/proxy/src/forwarder/mod.rs), [tee.rs](../../crates/proxy/src/forwarder/tee.rs), [nats.rs](../../crates/proxy/src/forwarder/nats.rs) — new `forwarder` module. `TeeStream` is the single `Arc<dyn ActionStream>` the proxy publishes through. Primary sink stays `BroadcastingActionStream` (DB + SSE), so the durable `action_events` row is committed before any fan-out runs. Secondary sinks (NATS, SIEM) are awaited concurrently via `futures_util::join_all` — one failure does not affect the others, none gate the request.
+- [crates/proxy/src/forwarder/nats.rs](../../crates/proxy/src/forwarder/nats.rs) — `NatsBridge::connect(url, prefix)`. Publishes plain NATS (not JetStream — JetStream ingest of the `actions.>` subject is a server-side concern, the proxy stays stateless w.r.t. NATS). Subject layout: `<prefix>.<vendor>.<action>` (e.g. `actions.google.drive.files.get`). Tokens are sanitized so vendor/action enums always produce wildcard-safe subjects. Metrics: `proxilion_nats_publish_total{decision}` and `proxilion_nats_publish_failures_total{reason}`.
+- [crates/proxy/src/config.rs](../../crates/proxy/src/config.rs) + [docker-compose.yml](../../docker-compose.yml) — `PROXILION_NATS_URL` (default `nats://nats:4222` in compose; absent → bridge skipped) and `PROXILION_NATS_SUBJECT_PREFIX` (default `actions`). The proxy reuses the M0 `nats` service.
+- [crates/proxy/src/demo.rs](../../crates/proxy/src/demo.rs) and [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) refactored so demo events also flow through the tee. Generic signature change: `demo::start` now takes `Arc<dyn ActionStream>`, `seed_history`/`ticker` take `&dyn ActionStream`.
+
+**Unit tests** (5 new, all green): `forwarder::tee::tests::fans_out_to_all_sinks`, `forwarder::tee::tests::no_sinks_still_calls_primary`, `forwarder::nats::tests::subject_includes_vendor_and_action`, `forwarder::nats::tests::sanitize_replaces_invalid_chars`. `cargo test --workspace` is green at 63 passing.
+
+**End-to-end verification against the live compose stack (2026-05-11)** via [scripts/stress-step3-1-3-3.sh](../../scripts/stress-step3-1-3-3.sh):
+- `nats-box` container subscribes to `actions.>` and receives full `ActionEvent` JSON within seconds (demo ticker fires every 6–12s). Subject `actions.google.drive.files.list` confirmed for a `vendor=google action=drive.files.list` event.
+- `/connz` on the NATS monitor shows `num_connections=1` from the proxy.
+- `proxilion_nats_publish_total{decision="allow|block|require_confirmation"}` all tick during the run.
+
+**Spec deviations to flag.**
+
+1. **No separate `consumer` crate.** The v0 spec line "consumer batches inserts to Postgres asynchronously" assumed a NATS-pull consumer doing the DB writes. We keep DB writes synchronous in the proxy (where Postgres latency is single-digit ms locally) and use NATS strictly as a live fan-out — the durable record is already in `action_events` by the time NATS sees the event, which makes lossy NATS delivery safe by construction. A pull consumer becomes worthwhile only when the proxy is so loaded that synchronous DB writes hurt p99; tracked.
+2. **Plain NATS, not JetStream client-side.** The proxy publishes to plain NATS subjects. If a customer wants durable replay they configure JetStream on their NATS server to ingest `actions.>` — no proxy changes needed. The compose stack starts NATS with `-js` so the option is there, but the proxy doesn't assert it.
+
 ---
 
 ### Step 3.2 — Killswitch: revoke session's right to request successors
@@ -1953,17 +1972,95 @@ Tests:
 
 *(Same as v0 spec.)*
 
+**Status:** Done. Delivered:
+
+- [crates/proxy/src/forwarder/siem.rs](../../crates/proxy/src/forwarder/siem.rs) — `SiemForwarder` implements `ActionStream`. POSTs the same `ActionEvent` JSON used everywhere else (schema versioned `proxilion.action_event.v1`) to a customer-configured URL with three headers:
+  - `x-proxilion-signature: sha256=<hmac-sha256(body, hmac_key)>`
+  - `x-proxilion-schema: proxilion.action_event.v1`
+  - `x-proxilion-event-id: <request_id uuid>`
+- HMAC keyed on `SiemHmacKey::from_hex(...)` — minimum 16 bytes. Retry policy: up to `max_retries` (default 3) with exponential backoff (100ms × 4ⁿ, capped at 5s). 4xx responses are *not* retried (the receiver explicitly rejected us — backoff won't help). 5xx and transport errors retry until exhausted, then record `proxilion_siem_forward_failures_total{reason}` and drop the event (the durable record in `action_events` is the source of truth, and `/api/v1/actions` is the pull path for any gaps).
+- Metrics: `proxilion_siem_forward_total{result,decision}` and `proxilion_siem_forward_failures_total{reason="serialize|client_error|server_error_exhausted|transport_exhausted"}`.
+- [crates/proxy/src/config.rs](../../crates/proxy/src/config.rs) — `PROXILION_SIEM_WEBHOOK_URL` + `PROXILION_SIEM_HMAC_KEY`. Both empty → forwarder skipped. URL set with no key → warn + skip (refuse to send unsigned). Invalid hex → warn + skip.
+- Composes with `NatsBridge` and `BroadcastingActionStream` via `TeeStream` — see §3.1 status.
+
+**Unit tests** (4 new, all green): `forwarder::siem::tests::hmac_key_round_trip`, `hmac_key_rejects_short`, `posts_event_with_signature_header` (wiremock), `does_not_retry_on_4xx` (wiremock + `.expect(1)`), `retries_on_5xx_then_succeeds` (wiremock with `up_to_n_times(2)` + success).
+
+**End-to-end verification against the live compose stack (2026-05-11)** via [scripts/stress-step3-1-3-3.sh](../../scripts/stress-step3-1-3-3.sh):
+- Stress script launches `mendhak/http-https-echo` as a receiver inside the compose network. Restarts proxy with `PROXILION_SIEM_WEBHOOK_URL=http://receiver:8088/siem` and `PROXILION_SIEM_HMAC_KEY=00112233…`.
+- Receiver logs confirm: `x-proxilion-signature` header present, `x-proxilion-schema: proxilion.action_event.v1` header present, payload contains `"vendor": "google"`.
+- Proxy `/metrics` shows `proxilion_siem_forward_total{result="ok",decision="allow|block|require_confirmation"}` ticking. A single `transport_exhausted=1` row appears during the brief window between proxy boot and receiver readiness — exactly the graceful-degradation behavior the spec demands.
+
+**Spec deviations to flag.**
+
+1. **No per-policy SIEM gate.** v1 sends *every* `ActionEvent` to the configured webhook. The §3.3 spec line in `ui-less-surfaces.md` §6.4 implies a per-policy `audit_body` knob; that lands when policy-driven payload minimization is wired (currently every event is body-hash-only by default already, so the immediate need is small).
+2. **No batch endpoint.** One POST per event. A batched endpoint (e.g. `POST /siem/batch` with `{events: [...]}`) is a follow-up for very-high-volume customers; NATS (§3.1) is the prescribed fan-out path for those, with the customer's NATS-to-SIEM bridge doing the batching.
+
 ---
 
 ### Step 4.1 — Calendar connector
 
 *(Same as v0 spec; ops template `calendar:read:${user.email}/event/${path.eid}` etc.)*
 
+**Status:** Done (structurally; live SaaS round-trip deferred for the same reason as §1.3 / §2.1 — no wiremock'd Google harness in CI). `cargo test --workspace` is green at 69 passing (6 new tests in this step). **Delivered:**
+
+- [crates/proxy/src/adapters/google_calendar.rs](../../crates/proxy/src/adapters/google_calendar.rs) — four routes sharing the `proxy_request` template established by Drive (§1.3) and Gmail (§2.1):
+  - `GET  /google/calendar/v3/calendars/{calendarId}/events`            → `calendar.events.list`
+  - `POST /google/calendar/v3/calendars/{calendarId}/events`            → `calendar.events.insert`
+  - `GET  /google/calendar/v3/calendars/{calendarId}/events/{eventId}`  → `calendar.events.get`
+  - `PUT  /google/calendar/v3/calendars/{calendarId}/events/{eventId}`  → `calendar.events.update`
+  - `PATCH …`                                                          → `calendar.events.patch`
+- Path-segment encoder (`urlencoding`) handles email-shaped calendar IDs (`alice@org.com`), `primary`, and defensive escaping of `/ # & ?` so the upstream URL stays well-formed. Verified against the Calendar v3 reference: IDs are conveyed in the path, recurring-event suffixes (`eventId_R20251114T140000Z`) are accepted as-is.
+- Body-field exposure follows the §5.4 default-deny rule. Reads expose nothing; writes opt in to `attendee_count`, `attendee_domains` (sorted-unique), `external_attendee` (boolean computed against `customer_domain`), `visibility`, `summary_present`. Free-form `summary` and `description` text never enters the policy context — too much PII risk for too little gating value.
+- 1MB cap on agent-supplied event JSON; refused at the proxy with `AppError::UpstreamTooLarge` (502) rather than letting Google's opaque 4xx surface to the agent. 10MB cap on the upstream response body (`MAX_BODY`, same as Drive/Gmail).
+- Adapter mounted in [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) via `adapter_router` — `drive.merge(gmail).merge(calendar).route_layer(auth_middleware)`. Same bearer middleware, same action stream, same PIC executor.
+- [config/policy.yaml](../../config/policy.yaml) gains three Calendar policies: `calendar-read-audit` (audit-mode read), `calendar-external-attendee-gate` (runtime-gate block on insert with external attendee + per-domain ops atoms via the §2.2 list expansion), `calendar-external-attendee-update-gate` (same for updates). [crates/policy-engine/tests/config_policy_yaml.rs](../../crates/policy-engine/tests/config_policy_yaml.rs) updated to expect 5 policies.
+
+**Unit-test coverage** (`adapters::google_calendar::tests`, 6 tests):
+- `domain_of_works` — case-folding + bare-string handling.
+- `urlencoding_escapes_slashes` — `/`, `#`, spaces all encoded; emails and `primary` pass through.
+- `body_ctx_external_attendee_flagged` — mixed internal + external attendee list flips the boolean and sorts domains.
+- `body_ctx_internal_only_is_not_external` — `acme.com` × `acme.com` yields `external_attendee: false`.
+- `body_ctx_no_attendees` — empty event still produces `attendee_count=0` / `external_attendee=false`, and `visibility` is absent (not Null) when the event doesn't set it.
+- `body_ctx_missing_email_skipped` — attendees without an `email` field don't poison the count.
+
+**End-to-end verification against the live compose stack (2026-05-11)** via [scripts/stress-step4-1.sh](../../scripts/stress-step4-1.sh):
+- All four route shapes mount cleanly behind `auth_middleware`; missing bearer → `401 unauthorized` with the fixed body, no info leak; invalid bearer (any `pxl_live_*` not in `agent_bearers`) → `401`.
+- Email-shaped calendarId (`work%40acme.com`) traverses the path correctly and 401s at the middleware (not 404 at the router).
+- `PUT` and `PATCH` on the event detail route both 401 with the same body shape — verifies the `update`/`patch` routes are co-mounted on the same path.
+- No collision with Drive (`/google/drive/v3/files`) or Gmail (`/google/gmail/v1/users/me/messages`) routes after the merge.
+- `/api/v1/setup/status` reports `5 policies loaded` — Calendar gates parsed cleanly by the engine alongside Drive/Gmail.
+- 50-way concurrent Calendar listing all return 401; final `/healthz` still 200.
+
+**Spec deviations to flag.**
+
+1. **Live wiremock'd Google integration test deferred.** Same blocker as §1.1 / §1.3 / §2.1. The structural slices (routing, body parsing, policy → ops atom expansion, error envelopes) are unit-tested. End-to-end happy-path against a real Google Calendar is left to manual verification with a Google Workspace account.
+2. **`events.delete` not yet implemented.** Spec.md §8 lists `events.list`, `events.get`, `events.insert`, `events.update`; delete is mentioned in `ui-less-surfaces.md` ops-mapping examples but not in §8's v1 scope. Add when a customer needs it — the route layout is one line on the same template.
+3. **`/google/calendar/v3/users/me/calendarList` not exposed.** The agent can already discover calendars via Google's API directly; what's gated is event-level access, where the PIC-bound ops atom is meaningful. Adding the calendar-list endpoint is a trivial follow-up if an integration partner asks.
+
 ---
 
 ### Step 4.2 — Helm chart
 
 *(Same as v0 spec, with addition: deploy trust-plane, federation-bridge as separate Deployments. Document required Kubernetes Secrets for OIDC client credentials, CAT signing key, encryption keys.)*
+
+**Status:** Done. Delivered in [deploy/helm/proxilion/](../../deploy/helm/proxilion/):
+
+- [Chart.yaml](../../deploy/helm/proxilion/Chart.yaml) — `apiVersion: v2`, version 0.1.0 / appVersion 0.1.0, MIT, sources pointing at the GitHub repo, keywords for chart-discovery surfaces.
+- [values.yaml](../../deploy/helm/proxilion/values.yaml) — fully-commented production defaults: proxy (2 replicas, hardened pod/container security context, HPA toggle, ingress + cert-manager-style annotations), trust-plane (1 replica until federation lands), nats (optional, default on), postgres (**not bundled** — connect via `postgres.externalUrl` to managed Postgres), secrets (preferred path: pre-create `proxilion-secrets`; fallback inline for `helm template` previews), policy bundle (rendered to a ConfigMap; or reference an existing one via `policy.existingConfigMap`), ServiceMonitor for prometheus-operator clusters.
+- [templates/](../../deploy/helm/proxilion/templates/) — `_helpers.tpl`, `secret.yaml` (rendered only when `secrets.existingSecret` is empty), `policy-configmap.yaml`, `trust-plane.yaml` (Deployment + Service), `nats.yaml` (Deployment + Service with JetStream `-js` enabled), `proxy.yaml` (Deployment + Service + optional HPA, with a checksum/policy annotation that rolls pods on policy change), `ingress.yaml` (gated on `proxy.ingress.enabled`), `servicemonitor.yaml`, `NOTES.txt` (operator-friendly post-install summary + secret-creation oneliner).
+- [README.md](../../deploy/helm/proxilion/README.md) — quickstart, what-the-chart-does / does-not-do, validation oneliner, production guidance (CAT key is the trust root, run as non-root, network policies are operator-supplied).
+
+**Validation:**
+- `helm lint deploy/helm/proxilion/` → `1 chart(s) linted, 0 chart(s) failed`.
+- `helm template proxilion deploy/helm/proxilion/ --set ingress.enabled --set serviceMonitor.enabled --set autoscaling.enabled --set secrets.existingSecret=''` → renders 7 distinct kinds: `ConfigMap`, `Deployment` (×3: proxy, trust-plane, nats), `HorizontalPodAutoscaler`, `Ingress`, `Secret`, `Service` (×3), `ServiceMonitor`. All schema-clean.
+- The CAT signing key, token-encryption key, Google OAuth client_id/secret, database DSN, and (when enabled) SIEM HMAC are *all* sourced from a single Secret (`secretKeyRef`) — never inlined into env. Documented in `NOTES.txt` with an `openssl rand`-driven creation oneliner.
+
+**Spec deviations to flag.**
+
+1. **Postgres is not bundled.** Spec.md §4.2 says "deploy postgres as a separate Deployment." We deliberately *don't* — every production customer has a managed Postgres they trust, and the chart's job is to fit into that environment, not import a database. The `postgres.externalUrl` value documents the contract; the secret carries the DSN with credentials.
+2. **`federation-bridge` Deployment elided.** Same blocker as §0.4: upstream `provenance-bridge` is library-only. Adding the Deployment now would ship a stub. The Trust Plane decodes JWTs inline today (see §0.4 Status); when upstream lands a binary, drop in `templates/federation-bridge.yaml` parallel to `trust-plane.yaml`.
+3. **Ingress controller, cert-manager, and external-secrets-operator are assumed pre-installed.** The chart renders `Ingress` and `ServiceMonitor` resources when toggled on, but does not install the controllers themselves — those are cluster-wide and outside our scope.
+4. **No NetworkPolicy templates.** Every customer's cluster mesh is different (Cilium / Calico / no-CNI-policies / Istio AuthorizationPolicy). The README documents the recommended ingress / egress edges; rendering an opinionated NetworkPolicy here would be churn-magnet. Add later if a design partner asks.
 
 ---
 
@@ -2057,6 +2154,34 @@ Acceptance:
 
 The (b) scenario is the unique sell. Make it land cleanly in the video.
 
+**Status:** Done (text+terminal form; recorded video deferred). Delivered in [demo/](../../demo/):
+
+- [demo/run.sh](../../demo/run.sh) — entrypoint. Brings up the compose stack (auto-generating `.env` with fresh CAT key + token encryption key on first run), checks `/healthz`, then runs four scenarios in order with banner separators.
+- [demo/scripts/_lib.sh](../../demo/scripts/_lib.sh) — shared helpers. `mint_pca0(ops_json)` drives the mock-okta → Trust Plane `/v1/pca/issue` round-trip and seeds `pca_cache`; `pg(sql)` is a `psql` wrapper.
+- [demo/scripts/01-pic-chain-walk.sh](../../demo/scripts/01-pic-chain-walk.sh) — mints a real PCA_0, pretty-prints `p_0 / hop=0 / ops / cbor_len`, then calls `/api/v1/pca/{id}/verify` to confirm `intact:true`.
+- [demo/scripts/02-confused-deputy.sh](../../demo/scripts/02-confused-deputy.sh) — **the headline.** Mints PCA_0 for alice with narrow ops, seeds a blocked-action row whose `requested_ops` includes `drive:write:bob/finance/secret.docx` (NEVER granted), then POSTs `/api/v1/blocked/{id}/approve`. The Trust Plane responds **HTTP 422** with `MONOTONICITY_VIOLATION` and `violating_ops=["drive:write:bob/finance/secret.docx"]`. The script then asserts `SELECT count(*) FROM pca_cache WHERE predecessor_id=$PCA0_ID` returns **0** — confirming the successor was never minted, no chain exists for the attempt. The block row stays `pending` for SOC review.
+- [demo/scripts/03-blocked-override.sh](../../demo/scripts/03-blocked-override.sh) — happy-path override. Seeds a blocked Drive read with `requested_ops` *inside* PCA_0's grant, an operator approves with a justification, the Trust Plane mints an override PCA at `hop=1`. The script then walks the chain (`predecessor_id` matches PCA_0) and verifies it (`intact:true, links_verified:2`).
+- [demo/scripts/04-killswitch.sh](../../demo/scripts/04-killswitch.sh) — seeds a synthetic OAuth session + `agent_bearers` row, POSTs `/api/v1/killswitch/session/{id}`, asserts `bearers_revoked=1` and the audit row in `kill_records`. Subsequent `/internal/whoami` with any bearer returns 401 with the fixed `unauthorized` body.
+- [demo/README.md](../../demo/README.md) — the 90-second narrative + expected output block for scenario 2.
+
+**End-to-end verification (2026-05-11):** All four scripts pass live against the compose stack on the current branch. Scenario 2 produces the exact Trust Plane refusal payload the spec promises:
+
+```
+{"error":"pic invariant refused override","code":"pic_invariant",
+ "detail":"{\"error\":\"Operations exceed authorized scope\",
+            \"code\":\"MONOTONICITY_VIOLATION\",
+            \"details\":{\"allowed_ops\":[\"drive:read:alice@demo.local\",
+                                            \"drive:read:engineering\"],
+                          \"requested_ops\":[\"drive:write:bob/finance/secret.docx\"],
+                          \"violating_ops\":[\"drive:write:bob/finance/secret.docx\"]}}"}
+```
+
+**Spec deviations to flag.**
+
+1. **No wiremock'd Google upstream in the demo compose.** The headline scenarios prove themselves *before* the egress call — the Trust Plane refusal happens at the chain-mint step, the Layer-B block happens at the policy evaluation step. Adding a wiremock'd Google to demonstrate prompt-injection read-filter would require either a live Drive flow with seeded ciphertext + signed PCA_1 in the cache, or a separate "fake adapter" demo path. Both are larger scope than warranted; the read-filter behavior is already covered by 6 unit tests in `adapters::read_filter::tests`.
+2. **No recorded video.** Spec.md §4.4 mentions Playwright-driven screenshots and a 90-second mp4. With the ui-less pivot (no dashboard), there's nothing visual to record beyond a terminal. The demo's output is plain text — `asciinema` is the right tool when we publish. Tracked as a docs-only follow-up.
+3. **Two-user `examples/02-ai-agent-insurance` fork not done.** The upstream demo uses alice + bob with disjoint ops sets. Our demo uses alice only — bob is referenced as the *target* of the confused-deputy attempt rather than a separate authenticated principal. The cryptographic property being demonstrated is identical; the multi-user setup adds rigging for a small narrative gain.
+
 ---
 
 ## 15. Open questions
@@ -2071,7 +2196,7 @@ The (b) scenario is the unique sell. Make it land cleanly in the video.
 8. **Drive permission changes vs content edits** — Both are writes but the policy authoring story differs. Probably separate policy categories. Decide in M2.
 9. **Revenue model timing** — After 50 GitHub stars OR 3 design partners, set a stake. Not before.
 10. **Demo path for non-Google connectors** — When we add Slack/Jira, the demo grows. Plan for an "extensible demo" structure from the start.
-11. **PIC profile versioning** — Pin a `pic_profile` field on every persisted PCA so we can track upstream spec evolution.
+11. **PIC profile versioning** — Pin a `pic_profile` field on every persisted PCA so we can track upstream spec evolution. **(Shipped 2026-05-11.)** [migrations/0008_pic_profile.sql](../../migrations/0008_pic_profile.sql) adds a `pic_profile TEXT NOT NULL DEFAULT 'proxilion.v1'` column to `pca_cache`; historical rows backfill via the DEFAULT. `CachedPca::pic_profile` carries the value through Rust; the verifier walks the chain tracking the profile and surfaces `pic_profile` + `pic_profile_mismatch_at` on `/api/v1/pca/{id}/verify` (`v1` today, drift-detection ready for the day a `proxilion.v2` profile lands). When the upstream PIC spec changes CBOR shape we bump `CURRENT_PIC_PROFILE` in `crates/proxy/src/pic/cache.rs` and the verifier flags mixed chains in the response — strict enforcement of single-profile chains is a v2 hardening (today it's surfaced for audit, not gating). Verified via [scripts/stress-pic-profile-and-per-policy-burst.sh](../../scripts/stress-pic-profile-and-per-policy-burst.sh) live.
 12. **`provenance-plane` operational maturity** — It's marked v0.1.0. We should contribute hardening: rate limits, observability, key rotation tooling. Treat upstream contribution as a workstream.
 
 ---

@@ -19,7 +19,7 @@
 //! `pca_verification_results` is the dashboard's job (§1.6).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use moka::future::Cache;
 use serde::Serialize;
@@ -97,13 +97,41 @@ impl PicVerifier {
         leaf_pca_id: Uuid,
     ) -> Result<Arc<VerificationResult>, VerifierError> {
         if let Some(hit) = self.cache.get(&leaf_pca_id).await {
+            // Cache hits don't tick the verify counter — they're free
+            // re-fetches of a prior verification, not new verifications.
             return Ok(hit);
         }
+        // spec.md §3.2 — `proxilion_pca_verify_total{result="intact|broken"}`
+        // + `proxilion_pca_verify_duration_seconds` histogram. Measured on
+        // the cold path only (cache misses); §1.5's p99 budget is "<5ms
+        // warm / <20ms cold," and warm is by-construction free here.
+        let started = Instant::now();
         let result = self.walk(leaf_pca_id).await;
-        let arc = Arc::new(match result {
-            Ok(r) => r,
-            Err(e) => err_to_result(leaf_pca_id, &e),
-        });
+        let (arc, violation_kind) = match result {
+            Ok(r) => (Arc::new(r), None),
+            Err(ref e) => (Arc::new(err_to_result(leaf_pca_id, e)), Some(invariant_kind(e))),
+        };
+        let result_label = if arc.intact { "intact" } else { "broken" };
+        metrics::counter!(
+            "proxilion_pca_verify_total",
+            "result" => result_label,
+        )
+        .increment(1);
+        if let Some(kind) = violation_kind {
+            // spec.md §3.2 — `proxilion_pic_invariant_violations_total{kind}`.
+            // Mirrors the verifier-detected break to the Prometheus contract.
+            // Layer-A runtime-gate refusals (Trust-Plane-side) already tick
+            // `proxilion_pic_violations_total` with `mode=runtime_gate` from
+            // pic/executor.rs; this counter is the chain-verifier's view of
+            // *historical* chain tampering, which is a distinct signal.
+            metrics::counter!(
+                "proxilion_pic_invariant_violations_total",
+                "kind" => kind,
+            )
+            .increment(1);
+        }
+        metrics::histogram!("proxilion_pca_verify_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
         self.cache.insert(leaf_pca_id, arc.clone()).await;
         Ok(arc)
     }
@@ -242,6 +270,24 @@ fn decode(cached: &CachedPca, id: Uuid) -> Result<(SignedPca, Pca), VerifierErro
         .extract_pca()
         .map_err(|e| VerifierError::Decode(format!("pca {id}: {e}")))?;
     Ok((signed, pca))
+}
+
+/// Map a `VerifierError` to the spec.md §3.2 `kind` label set
+/// (`continuity | monotonicity | p0 | hop | signature`) — plus three
+/// out-of-contract buckets (`missing | decode | cat_key`) for the
+/// "could not even walk the chain" failures that the spec's enum doesn't
+/// directly name. Bounded label cardinality.
+fn invariant_kind(e: &VerifierError) -> &'static str {
+    match e {
+        VerifierError::ContinuityBroken { .. } => "continuity",
+        VerifierError::Monotonicity { .. } => "monotonicity",
+        VerifierError::P0Mismatch { .. } => "p0",
+        VerifierError::HopOrder { .. } => "hop",
+        VerifierError::BadCatSignature(_) => "signature",
+        VerifierError::Missing(_) => "missing",
+        VerifierError::Decode(_) => "decode",
+        VerifierError::CatKey(_) => "cat_key",
+    }
 }
 
 fn err_to_result(leaf_id: Uuid, e: &VerifierError) -> VerificationResult {
@@ -391,12 +437,43 @@ mod tests {
     fn tampered_payload_caught_by_cat_signature() {
         let (cat, mut chain) = build_three_deep();
         let pk = cat.public_key();
-        // Tamper the middle PCA's payload.
+        // Tamper the middle PCA's payload. The midpoint byte happens to
+        // land in different CBOR regions across chain rebuilds (uuid
+        // randomness shifts the layout): sometimes it's in the payload
+        // (signature verify catches it), sometimes it's a length / map
+        // header byte (decode catches it earlier). EITHER outcome is a
+        // successful "tampering rejected" — what we're asserting is that
+        // an XOR'd byte never sails through to a valid SignedPca whose
+        // signature still verifies. Loop the tamper byte across the
+        // middle quartile so we exercise both paths in a single run.
         let idx = 1;
-        let mid = chain[idx].cbor.len() / 2;
+        let len = chain[idx].cbor.len();
+        let start = len / 4;
+        let stop = (3 * len) / 4;
+        for pos in start..stop {
+            let mut tampered = chain[idx].cbor.clone();
+            tampered[pos] ^= 0x01;
+            let cached = super::CachedPca {
+                cbor: tampered,
+                ..chain[idx].clone()
+            };
+            match decode(&cached, cached.pca_id) {
+                Err(_) => { /* CBOR rejected — tampering caught */ }
+                Ok((signed, _)) => assert!(
+                    pk.verify_pca(&signed).is_err(),
+                    "tampered byte at pos {pos} passed both decode AND signature verify",
+                ),
+            }
+        }
+        // Also exercise the original "midpoint byte" scenario explicitly
+        // so this stays a regression test for the spec-cited "tampered
+        // payload caught" path (spec.md §1.5).
+        let mid = len / 2;
         chain[idx].cbor[mid] ^= 0x01;
-        let (signed, _) = decode(&chain[idx], chain[idx].pca_id).unwrap();
-        assert!(pk.verify_pca(&signed).is_err());
+        match decode(&chain[idx], chain[idx].pca_id) {
+            Err(_) => { /* ok — tampering caught at decode */ }
+            Ok((signed, _)) => assert!(pk.verify_pca(&signed).is_err()),
+        }
     }
 
     #[test]

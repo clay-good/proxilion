@@ -155,13 +155,19 @@ impl PicExecutor {
             .send()
             .await?;
         match resp.status() {
-            s if s.is_success() => Ok(resp.json().await?),
+            s if s.is_success() => {
+                let parsed: IssuePcaResponse = resp.json().await?;
+                record_pca_issue("ok", parsed.hop);
+                Ok(parsed)
+            }
             StatusCode::UNPROCESSABLE_ENTITY | StatusCode::FORBIDDEN => {
                 let body = resp.text().await.unwrap_or_default();
+                record_pca_issue("invariant", 0);
                 Err(ExecutorError::Invariant(body))
             }
             status => {
                 let body = resp.text().await.unwrap_or_default();
+                record_pca_issue("upstream_error", 0);
                 Err(ExecutorError::Upstream {
                     status: status.as_u16(),
                     body,
@@ -211,13 +217,19 @@ impl PicExecutor {
             .send()
             .await?;
         match resp.status() {
-            s if s.is_success() => Ok(resp.json().await?),
+            s if s.is_success() => {
+                let parsed: ProcessPocResponse = resp.json().await?;
+                record_pca_issue("ok", parsed.hop);
+                Ok(parsed)
+            }
             StatusCode::UNPROCESSABLE_ENTITY | StatusCode::FORBIDDEN => {
                 let body = resp.text().await.unwrap_or_default();
+                record_pca_issue("invariant", 0);
                 Err(ExecutorError::Invariant(body))
             }
             status => {
                 let body = resp.text().await.unwrap_or_default();
+                record_pca_issue("upstream_error", 0);
                 Err(ExecutorError::Upstream {
                     status: status.as_u16(),
                     body,
@@ -225,6 +237,30 @@ impl PicExecutor {
             }
         }
     }
+}
+
+/// spec.md §3.2 — `proxilion_pca_issue_total{result,hop_class}`. `hop_class`
+/// is `0 | 1 | 2 | n` per the spec's curated label set so cardinality stays
+/// bounded regardless of how deep a customer's chains get. `0` only fires
+/// on the `mint_pca_0` path; `1` is a typical first agent action; `2` is
+/// the post-override branch; everything ≥3 collapses into `n`. Refusals
+/// don't carry a hop (we never learned what hop the Trust Plane would have
+/// minted), so they use the empty-string hop_class to keep the series
+/// distinct from any real successor row.
+fn record_pca_issue(result: &'static str, hop: u32) {
+    let hop_class = match (result, hop) {
+        ("ok", 0) => "0",
+        ("ok", 1) => "1",
+        ("ok", 2) => "2",
+        ("ok", _) => "n",
+        _ => "",
+    };
+    metrics::counter!(
+        "proxilion_pca_issue_total",
+        "result" => result,
+        "hop_class" => hop_class,
+    )
+    .increment(1);
 }
 
 /// Outcome of an attempt to mint a successor PCA when the policy's

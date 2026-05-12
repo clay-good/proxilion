@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use super::{EmailNotifier, SlackNotifier, WebhookNotifier};
+use super::{BurstSuppressor, EmailNotifier, SlackNotifier, WebhookNotifier};
 
 /// Generic hot-swap cell for any notifier driver. Clone shares the same
 /// underlying ArcSwap, so all clones see swaps. Hand-written `Clone` so
@@ -54,11 +54,23 @@ pub type EmailHandle = Handle<EmailNotifier>;
 
 /// Per-driver bundle. Cheap to clone (each field is just an Arc). The
 /// adapter / approve flow holds one of these and fans out at notify time.
+///
+/// ui-less-surfaces.md §10.3 dev 2 — the burst suppressor instances live
+/// on the bundle so the `/api/v1/notifier/config` hot-swap path can
+/// re-attach the boot-time suppressor to a freshly-built notifier. Without
+/// this, a config change drops burst suppression silently (the new
+/// notifier has `burst: None`); with it, suppression state survives the
+/// swap and the bucket history persists across config changes.
 #[derive(Clone)]
 pub struct Notifiers {
     pub webhook: NotifierHandle,
     pub slack: SlackHandle,
     pub email: EmailHandle,
+    /// Boot-time webhook suppressor. Cloned into each new webhook notifier
+    /// the hot-swap path builds; `None` only in tests / empty bundles.
+    pub webhook_burst: Option<BurstSuppressor>,
+    /// Boot-time Slack suppressor. Same semantics as webhook_burst.
+    pub slack_burst: Option<BurstSuppressor>,
 }
 
 impl Notifiers {
@@ -67,6 +79,8 @@ impl Notifiers {
             webhook: Handle::new(None),
             slack: Handle::new(None),
             email: Handle::new(None),
+            webhook_burst: None,
+            slack_burst: None,
         }
     }
 

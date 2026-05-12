@@ -1,0 +1,56 @@
+name: static-html-no-js
+
+# ui-less-surfaces.md §11 open question #5 — the single server-rendered
+# HTML page Proxilion serves (the mobile approve landing) must never
+# grow into a SPA. Lint rule: no .js / .ts / .mjs / .jsx / .tsx files in
+# crates/proxy/static-html, and the embedded approve.html must not pull
+# `<script src=` from anywhere or include a non-trivial `<script>` block.
+#
+# Cheap shell check, runs on every PR.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  no-js-in-static-html:
+    name: no JS in static-html
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fail on JS-ish files in static-html
+        run: |
+          set -euo pipefail
+          DIR=crates/proxy/static-html
+          if [ ! -d "$DIR" ]; then
+            echo "::warning::$DIR does not exist; nothing to check"
+            exit 0
+          fi
+          # Allow .html and .css only. Anything else is a lint failure.
+          violations=$(find "$DIR" -type f ! -name '*.html' ! -name '*.css' || true)
+          if [ -n "$violations" ]; then
+            echo "::error::non-allowed files in $DIR (only .html / .css permitted):"
+            echo "$violations"
+            exit 1
+          fi
+          # Defensive: even inside .html, refuse <script src=...> and
+          # multi-line <script> blocks. Inline `<script>` with only the
+          # CSP boilerplate or a trivial single-line policy assertion is
+          # fine; the regex below catches both kinds.
+          if grep -RInE '<script\s+src=' "$DIR" >/dev/null; then
+            echo "::error::<script src=...> is not allowed in $DIR"
+            grep -RInE '<script\s+src=' "$DIR"
+            exit 1
+          fi
+          if grep -RInzoP '(?s)<script\b(?:(?!</script>).)*</script>' "$DIR" | \
+             grep -c $'\n' | awk '{exit ($1 > 0) ? 1 : 0}'; then
+            # awk inverts: any matched block fails CI. The grep above prints
+            # the matched blocks so reviewers see what tripped.
+            echo "::error::inline <script> blocks are not allowed in $DIR"
+            grep -RInzoP '(?s)<script\b(?:(?!</script>).)*</script>' "$DIR" || true
+            exit 1
+          fi
+          echo "ok: $DIR contains no JS files and no <script> blocks"

@@ -460,6 +460,15 @@ pub async fn approve_inner(
         "outcome" => "approved", "channel" => channel
     )
     .increment(1);
+    // spec.md §3.2 — `proxilion_override_latency_seconds{outcome}` histogram.
+    // Measures wall-clock from the original block (blocked_actions.at) to
+    // the operator's decision. Powers §3.5's "p50 < 5 min" override SLO.
+    let latency = (Utc::now() - blocked.at).num_milliseconds().max(0) as f64 / 1000.0;
+    metrics::histogram!(
+        "proxilion_override_latency_seconds",
+        "outcome" => "approved",
+    )
+    .record(latency);
 
     Ok(ApproveResponse {
         blocked_id: id,
@@ -500,21 +509,26 @@ pub async fn reject_inner(
     if body.reason.trim().is_empty() {
         return Err(ApiError::BadRequest("reason must be non-empty".into()));
     }
-    let updated = sqlx::query(
+    // RETURNING `at` so we can compute override-latency without a separate
+    // SELECT. SQL `now() - at` would also work but yields a `pg interval`
+    // type; passing the timestamp back and subtracting in Rust keeps the
+    // arithmetic side-effect-free.
+    let returned: Option<(chrono::DateTime<Utc>,)> = sqlx::query_as(
         "UPDATE blocked_actions
             SET status           = 'rejected',
                 reject_reason    = $2,
                 approver_subject = $3,
                 resolved_at      = now()
-          WHERE id = $1 AND status = 'pending'",
+          WHERE id = $1 AND status = 'pending'
+          RETURNING at",
     )
     .bind(id)
     .bind(&body.reason)
     .bind(body.approver_subject.as_deref().unwrap_or("operator"))
-    .execute(&state.db)
+    .fetch_optional(&state.db)
     .await
     .map_err(ApiError::Db)?;
-    if updated.rows_affected() == 0 {
+    if returned.is_none() {
         // Either no row, or it's not pending. Disambiguate with a follow-up
         // read for a friendlier error.
         let exists: Option<String> = sqlx::query_scalar(
@@ -536,6 +550,16 @@ pub async fn reject_inner(
         "outcome" => "rejected", "channel" => "api"
     )
     .increment(1);
+    if let Some((blocked_at,)) = returned {
+        // spec.md §3.2 — override latency for the reject path. Same shape
+        // as the approve histogram so a single PromQL panel covers both.
+        let latency = (Utc::now() - blocked_at).num_milliseconds().max(0) as f64 / 1000.0;
+        metrics::histogram!(
+            "proxilion_override_latency_seconds",
+            "outcome" => "rejected",
+        )
+        .record(latency);
+    }
     Ok(RejectResponse { blocked_id: id, status: "rejected" })
 }
 

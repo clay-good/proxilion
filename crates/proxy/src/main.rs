@@ -49,6 +49,22 @@ async fn main() -> anyhow::Result<()> {
         .expect("metrics recorder install failed");
     server::set_metrics_handle(handle);
 
+    // spec.md §3.2 — `proxilion_build_info{version,git_sha,rust_version}`.
+    // Gauge held at 1; the labels carry the values so Grafana can join
+    // `proxilion_build_info{git_sha="..."}` against other series for
+    // "what build was running when this fired" forensics.
+    //
+    // `GIT_SHA` and `RUSTC_VERSION` are read at compile time; CI can stamp
+    // them via `RUSTFLAGS='--cfg ...'` or simpler: build with the env vars
+    // set. Absent at compile time → "unknown" — fine for dev builds.
+    metrics::gauge!(
+        "proxilion_build_info",
+        "version" => env!("CARGO_PKG_VERSION"),
+        "git_sha" => option_env!("GIT_SHA").unwrap_or("unknown"),
+        "rust_version" => option_env!("RUSTC_VERSION").unwrap_or("unknown"),
+    )
+    .set(1.0);
+
     let cfg = match config::Config::load() {
         Ok(cfg) => cfg,
         Err(e) => {

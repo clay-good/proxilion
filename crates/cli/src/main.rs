@@ -84,6 +84,143 @@ enum Cmd {
     /// Notifier diagnostics (ui-less-surfaces.md §4.1).
     #[command(subcommand)]
     Notifier(NotifierCmd),
+    /// System + setup snapshot. Combines /healthz reachability + the
+    /// /api/v1/setup/status checklist into a single one-screen report.
+    /// Exits non-zero when /healthz is `ready:false` so a CI runner /
+    /// shell pipeline can gate on `proxilion-cli status` without parsing
+    /// JSON. ui-less-surfaces.md §4.1.
+    Status {
+        /// Output: pretty (default) | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
+    /// PCA inspection (ui-less-surfaces.md §4.1 — `pic` command tree).
+    /// Subset of the upstream §4.1 sketch: `show` and `verify` (the live
+    /// invariants-mode flip is wired through `policy set-mode` per
+    /// ui-less-surfaces.md §2 deviation 1; this subcommand is purely
+    /// the chain inspector).
+    #[command(subcommand)]
+    Pic(PicCmd),
+    /// Killswitch — revoke an agent's right to take further actions.
+    /// Spec.md §3.2. All three forms write to `kill_records`, mark
+    /// matching `agent_bearers.revoked_at`, and the auth middleware
+    /// rejects on the next request.
+    #[command(subcommand)]
+    Killswitch(KillswitchCmd),
+    /// Prometheus `/metrics` helpers (ui-less-surfaces.md §4.1).
+    #[command(subcommand)]
+    Metrics(MetricsCmd),
+    /// Trust Plane diagnostics (ui-less-surfaces.md §4.1).
+    #[command(subcommand)]
+    TrustPlane(TrustPlaneCmd),
+    /// OAuth client registry (ui-less-surfaces.md §4.1). Writes directly
+    /// to postgres via `DATABASE_URL` — no token required (same bootstrap
+    /// pattern as `tokens`). Replaces hand-editing `oauth_clients` via
+    /// psql / a migration.
+    #[command(subcommand)]
+    Clients(ClientsCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ClientsCmd {
+    /// List every OAuth client. By default skips revoked rows; `--all`
+    /// shows them.
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Register a new OAuth client.
+    Add {
+        /// Stable client id the agent will send in `?client_id=...`.
+        id: String,
+        #[arg(long)]
+        name: String,
+        /// One or more allowed redirect URIs. Pass `--redirect-uri` once
+        /// per URI; the agent's redirect_uri must match one exactly.
+        #[arg(long = "redirect-uri", required = true)]
+        redirect_uri: Vec<String>,
+    },
+    /// Soft-revoke a client. The row stays in the table (historical
+    /// sessions still resolve) but the authorize handler refuses new
+    /// flows. ui-less-surfaces.md §4.1.
+    Revoke {
+        id: String,
+        #[arg(long, default_value = "operator-initiated")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MetricsCmd {
+    /// Curl /metrics and pretty-print the top N series by sample count.
+    /// Mounted outside operator-auth — same trust boundary as the
+    /// Prometheus scrape target (assume operator network is private).
+    Sample {
+        /// Show only series whose name contains this substring.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Print every metric line in raw exposition format instead of
+        /// the grouped summary.
+        #[arg(long)]
+        raw: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TrustPlaneCmd {
+    /// Fetch the Trust Plane's federation/info endpoint — confirms the
+    /// upstream is reachable and surfaces the CAT key id the proxy will
+    /// verify chain signatures against.
+    Info,
+}
+
+#[derive(Subcommand, Debug)]
+enum PicCmd {
+    /// Fetch a PCA by id (same payload as `proxilion-cli pca`, kept here
+    /// so `pic show <id>` reads naturally alongside `pic verify <id>`).
+    Show {
+        /// PCA UUID.
+        id: String,
+    },
+    /// Walk a chain from this leaf to PCA_0 and report the result.
+    /// Non-zero exit when `intact:false`.
+    Verify {
+        /// Leaf PCA UUID.
+        id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KillswitchCmd {
+    /// Revoke a single session (`pxl_live_*` bearer chain rooted in this
+    /// OAuth session). All bearers under the session and all PCA-issuance
+    /// rights tied to it are revoked atomically.
+    Session {
+        /// Session UUID (the `id` column on `oauth_sessions`).
+        id: String,
+        /// Operator-visible reason; stored on `kill_records.reason`.
+        #[arg(long, default_value = "operator-initiated")]
+        reason: String,
+    },
+    /// Revoke every active session for a user (`p_0`). Use for full-user
+    /// kill — e.g., suspended account, compromised credentials.
+    User {
+        /// `p_0` value (typically `user:alice@org.com`, but accepts any
+        /// PrincipalIdentifier-shaped string).
+        p_0: String,
+        #[arg(long, default_value = "operator-initiated")]
+        reason: String,
+    },
+    /// Revoke EVERY active session globally. Requires explicit confirmation
+    /// to guard against fat-fingered fleet-wide kills.
+    All {
+        /// Must be `yes` (case-sensitive) for the kill to fire. Anything
+        /// else exits 2 with a "did you mean it?" message.
+        #[arg(long)]
+        confirm: String,
+        #[arg(long, default_value = "operator-initiated")]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -151,6 +288,33 @@ enum PolicyCmd {
         #[arg(long)]
         mode: Option<String>,
         /// Output: pretty | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
+    /// Show a single policy by id. Pulls the current loaded policy set
+    /// from the proxy (`GET /api/v1/policy`) and filters locally — no
+    /// new endpoint needed.
+    Show {
+        /// Policy id.
+        id: String,
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
+    /// Parse a candidate YAML file and report whether it's loadable.
+    /// Exit 0 on success, 1 on parse failure. ui-less-surfaces.md §4.1.
+    /// Local-only — does not touch the proxy or DB; safe to run in CI.
+    Validate {
+        /// YAML file to validate.
+        file: String,
+    },
+    /// Diff two policy YAML files. Reports added / removed / modified
+    /// policy ids and per-policy field deltas (mode, decision shape,
+    /// match-expression text, required_ops). Local-only, no proxy hit.
+    Diff {
+        /// Baseline YAML file.
+        before: String,
+        /// Candidate YAML file.
+        after: String,
         #[arg(long, default_value = "pretty")]
         format: String,
     },
@@ -345,6 +509,16 @@ enum ActionsCmd {
         #[arg(long, short = 'o')]
         output: Option<String>,
     },
+    /// Show the ordered PCA chain for a given session (every leaf the
+    /// agent's bearers minted, walked back to PCA_0). Wraps
+    /// `GET /api/v1/sessions/{id}/chain` (ui-less-surfaces.md §4.1).
+    Chain {
+        /// Session UUID (`oauth_sessions.id`).
+        session_id: String,
+        /// Output: pretty (default) | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
     /// Delete audit rows older than a window. Cron-friendly retention.
     Purge {
         /// Window like "90d", "30d", "7d", "24h", or an RFC3339 date. Rows
@@ -371,15 +545,367 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Health => cmd_health(&http, &cli.url).await,
-        Cmd::Pca { id } => cmd_pca(&http, &cli.url, &id).await,
-        Cmd::Verify { id } => cmd_verify(&http, &cli.url, &id).await,
+        Cmd::Pca { id } => cmd_pca(&http, &cli.url, &cli.token, &id).await,
+        Cmd::Verify { id } => cmd_verify(&http, &cli.url, &cli.token, &id).await,
         Cmd::Selftest => cmd_selftest(&http, &cli.url, &cli.trust_plane).await,
         Cmd::Actions(sub) => cmd_actions(&http, &cli.url, &cli.token, sub).await,
         Cmd::Tokens(sub) => cmd_tokens(sub).await,
         Cmd::Policy(sub) => cmd_policy(&http, &cli.url, &cli.token, sub).await,
         Cmd::Blocked(sub) => cmd_blocked(&http, &cli.url, &cli.token, sub).await,
         Cmd::Notifier(sub) => cmd_notifier(&http, &cli.url, &cli.token, sub).await,
+        Cmd::Status { format } => cmd_status(&http, &cli.url, &cli.token, &format).await,
+        Cmd::Pic(sub) => cmd_pic(&http, &cli.url, &cli.token, sub).await,
+        Cmd::Killswitch(sub) => cmd_killswitch(&http, &cli.url, &cli.token, sub).await,
+        Cmd::Metrics(sub) => cmd_metrics(&http, &cli.url, sub).await,
+        Cmd::TrustPlane(sub) => cmd_trust_plane(&http, &cli.trust_plane, sub).await,
+        Cmd::Clients(sub) => cmd_clients(sub).await,
     }
+}
+
+async fn cmd_clients(sub: ClientsCmd) -> Result<()> {
+    let db_url = std::env::var("DATABASE_URL")
+        .context("DATABASE_URL must be set (proxilion-cli clients writes directly to postgres)")?;
+    let pool = sqlx::PgPool::connect(&db_url)
+        .await
+        .context("connecting to postgres")?;
+    match sub {
+        ClientsCmd::List { all } => {
+            let rows: Vec<(
+                String,
+                String,
+                Vec<String>,
+                chrono::DateTime<chrono::Utc>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "SELECT id, name, redirect_uris, created_at, revoked_at, revoked_reason
+                   FROM oauth_clients
+                  WHERE ($1 OR revoked_at IS NULL)
+               ORDER BY created_at",
+            )
+            .bind(all)
+            .fetch_all(&pool)
+            .await
+            .context("selecting oauth_clients")?;
+            let arr: Vec<_> = rows
+                .into_iter()
+                .map(|(id, name, redirects, created, revoked, reason)| {
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "redirect_uris": redirects,
+                        "created_at": created.to_rfc3339(),
+                        "revoked_at": revoked.map(|t| t.to_rfc3339()),
+                        "revoked_reason": reason,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&arr)?);
+            Ok(())
+        }
+        ClientsCmd::Add {
+            id,
+            name,
+            redirect_uri,
+        } => {
+            // Defensive URL validation — every redirect_uri must parse as
+            // a real URL so we don't accept obvious typos that would
+            // 404 the OAuth handshake at exchange-time.
+            for u in &redirect_uri {
+                let parsed = reqwest::Url::parse(u)
+                    .map_err(|e| anyhow!("redirect_uri `{u}` is not a valid URL: {e}"))?;
+                if parsed.scheme() != "https" && parsed.scheme() != "http" {
+                    return Err(anyhow!(
+                        "redirect_uri `{u}` must use http(s); got scheme `{}`",
+                        parsed.scheme()
+                    ));
+                }
+            }
+            let res = sqlx::query(
+                "INSERT INTO oauth_clients (id, name, redirect_uris)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&id)
+            .bind(&name)
+            .bind(&redirect_uri)
+            .execute(&pool)
+            .await
+            .context("inserting oauth_clients")?;
+            if res.rows_affected() == 0 {
+                return Err(anyhow!("client id `{id}` already exists"));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "id": id,
+                    "name": name,
+                    "redirect_uris": redirect_uri,
+                }))?
+            );
+            Ok(())
+        }
+        ClientsCmd::Revoke { id, reason } => {
+            let res = sqlx::query(
+                "UPDATE oauth_clients
+                    SET revoked_at = now(), revoked_reason = $2
+                  WHERE id = $1 AND revoked_at IS NULL",
+            )
+            .bind(&id)
+            .bind(&reason)
+            .execute(&pool)
+            .await
+            .context("revoking oauth_clients row")?;
+            if res.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "no active client with id `{id}` (already revoked, or never existed)"
+                ));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "id": id,
+                    "revoked_reason": reason,
+                }))?
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_metrics(http: &reqwest::Client, url: &str, sub: MetricsCmd) -> Result<()> {
+    match sub {
+        MetricsCmd::Sample { filter, raw } => {
+            let body = http
+                .get(format!("{url}/metrics"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            if raw {
+                if let Some(f) = filter.as_deref() {
+                    for line in body.lines() {
+                        if line.contains(f) {
+                            println!("{line}");
+                        }
+                    }
+                } else {
+                    print!("{body}");
+                }
+                return Ok(());
+            }
+            // Group by metric family (the name before `{`). One row per
+            // family with: sample count, smallest value, largest value.
+            // HELP / TYPE lines are dropped — the operator wants the data,
+            // not the schema, in this view.
+            use std::collections::BTreeMap;
+            let mut by_family: BTreeMap<String, (usize, f64, f64)> = BTreeMap::new();
+            for line in body.lines() {
+                let line = line.trim_start();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                // `name{labels…} value` OR `name value`.
+                let (name_part, value_part) = match line.rsplit_once(' ') {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let family = match name_part.find('{') {
+                    Some(b) => &name_part[..b],
+                    None => name_part,
+                };
+                if let Some(f) = filter.as_deref() {
+                    if !family.contains(f) {
+                        continue;
+                    }
+                }
+                let v: f64 = value_part.parse().unwrap_or(f64::NAN);
+                let entry = by_family
+                    .entry(family.to_string())
+                    .or_insert((0usize, f64::INFINITY, f64::NEG_INFINITY));
+                entry.0 += 1;
+                if !v.is_nan() {
+                    if v < entry.1 {
+                        entry.1 = v;
+                    }
+                    if v > entry.2 {
+                        entry.2 = v;
+                    }
+                }
+            }
+            if by_family.is_empty() {
+                println!("(no metric families matched)");
+                return Ok(());
+            }
+            println!(
+                "{:<60} {:>8} {:>14} {:>14}",
+                "FAMILY", "SERIES", "MIN", "MAX"
+            );
+            for (fam, (count, min, max)) in by_family {
+                let min_s = if min.is_infinite() { "—".to_string() } else { format_metric_value(min) };
+                let max_s = if max.is_infinite() { "—".to_string() } else { format_metric_value(max) };
+                println!("{fam:<60} {count:>8} {min_s:>14} {max_s:>14}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Render a metric value compactly. Integers (no fractional part within
+/// 1e-9 tolerance) drop the decimal; floats keep up to 6 significant digits.
+fn format_metric_value(v: f64) -> String {
+    if (v.fract().abs() < 1e-9) && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.6}")
+    }
+}
+
+async fn cmd_trust_plane(
+    http: &reqwest::Client,
+    trust_plane_url: &str,
+    sub: TrustPlaneCmd,
+) -> Result<()> {
+    match sub {
+        TrustPlaneCmd::Info => {
+            let v: Value = http
+                .get(format!("{trust_plane_url}/v1/federation/info"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_status(http: &reqwest::Client, url: &str, token: &str, format: &str) -> Result<()> {
+    let healthz: Value = http
+        .get(format!("{url}/healthz"))
+        .send()
+        .await?
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let setup: Value = match auth_header(
+        http.get(format!("{url}/api/v1/setup/status")),
+        token,
+    )
+    .send()
+    .await
+    {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    let ready = healthz.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
+    let combined = serde_json::json!({
+        "ready": ready,
+        "healthz": healthz,
+        "setup": setup,
+    });
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&combined)?);
+    } else {
+        let symbol = if ready { GREEN } else { RED };
+        let label = if ready { "ready" } else { "NOT ready" };
+        println!("proxilion status — {symbol}{label}{RESET}");
+        println!("  endpoint: {url}");
+        if let Some(version) = healthz.get("version").and_then(|v| v.as_str()) {
+            println!("  version:  {version}");
+        }
+        if let Some(checks) = healthz.get("checks") {
+            println!("  checks:   {}", serde_json::to_string(checks).unwrap_or_default());
+        }
+        if !setup.is_null() {
+            println!("\nsetup checklist:");
+            println!("{}", serde_json::to_string_pretty(&setup).unwrap_or_default());
+        } else {
+            println!("\nsetup checklist: (unavailable — token missing or insufficient scope)");
+        }
+    }
+    if !ready {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn cmd_pic(http: &reqwest::Client, url: &str, token: &str, sub: PicCmd) -> Result<()> {
+    match sub {
+        PicCmd::Show { id } => {
+            let v: Value = auth_header(
+                http.get(format!("{url}/api/v1/pca/{}", urlencode(&id))),
+                token,
+            )
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+        PicCmd::Verify { id } => {
+            // Same shape as `cmd_verify` but token-aware so the operator's
+            // scope check fires (pca:read).
+            let v: Value = auth_header(
+                http.get(format!("{url}/api/v1/pca/{}/verify", urlencode(&id))),
+                token,
+            )
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            let intact = v.get("intact").and_then(|x| x.as_bool()).unwrap_or(false);
+            if !intact {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_killswitch(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    sub: KillswitchCmd,
+) -> Result<()> {
+    let (path, reason) = match sub {
+        KillswitchCmd::Session { id, reason } => {
+            (format!("/api/v1/killswitch/session/{}", urlencode(&id)), reason)
+        }
+        KillswitchCmd::User { p_0, reason } => {
+            (format!("/api/v1/killswitch/user/{}", urlencode(&p_0)), reason)
+        }
+        KillswitchCmd::All { confirm, reason } => {
+            if confirm != "yes" {
+                eprintln!(
+                    "{RED}refused{RESET}: `killswitch all` requires --confirm yes (case-sensitive). Got: {confirm:?}"
+                );
+                std::process::exit(2);
+            }
+            ("/api/v1/killswitch/all".to_string(), reason)
+        }
+    };
+    let resp = auth_header(http.post(format!("{url}{path}")), token)
+        .json(&serde_json::json!({ "reason": reason }))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        eprintln!("{RED}killswitch failed{RESET}: HTTP {} — {body}", status.as_u16());
+        std::process::exit(1);
+    }
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
 }
 
 fn auth_header<'a>(builder: reqwest::RequestBuilder, token: &'a str) -> reqwest::RequestBuilder {
@@ -398,23 +924,26 @@ async fn cmd_actions(
 ) -> Result<()> {
     match sub {
         ActionsCmd::Tail { decision, vendor, action, format } => {
-            actions_tail(http, url, decision, vendor, action, &format).await
+            actions_tail(http, url, token, decision, vendor, action, &format).await
         }
         ActionsCmd::List {
             decision, vendor, action, p_0, session_id, since, limit, all, format,
         } => {
             actions_list(
-                http, url, decision, vendor, action, p_0, session_id, since,
+                http, url, token, decision, vendor, action, p_0, session_id, since,
                 limit, all, &format,
             )
             .await
         }
-        ActionsCmd::Show { id, format } => actions_show(http, url, &id, &format).await,
+        ActionsCmd::Show { id, format } => actions_show(http, url, token, &id, &format).await,
         ActionsCmd::Export {
             format, since, until, decision, vendor, action, p_0, output,
         } => {
-            actions_export(http, url, &format, since, until, decision, vendor, action, p_0, output)
+            actions_export(http, url, token, &format, since, until, decision, vendor, action, p_0, output)
                 .await
+        }
+        ActionsCmd::Chain { session_id, format } => {
+            actions_chain(http, url, token, &session_id, &format).await
         }
         ActionsCmd::Purge { older_than, dry_run, format } => {
             actions_purge(http, url, token, &older_than, dry_run, &format).await
@@ -475,13 +1004,13 @@ fn parse_since(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
 async fn actions_tail(
     http: &reqwest::Client,
     url: &str,
+    token: &str,
     decision: Option<String>,
     vendor: Option<String>,
     action: Option<String>,
     format: &str,
 ) -> Result<()> {
-    let resp = http
-        .get(format!("{url}/api/v1/actions/stream"))
+    let resp = auth_header(http.get(format!("{url}/api/v1/actions/stream")), token)
         .send()
         .await
         .context("opening SSE stream")?
@@ -563,6 +1092,7 @@ fn print_pretty_event(json: &str) {
 async fn actions_list(
     http: &reqwest::Client,
     url: &str,
+    token: &str,
     decision: Option<String>,
     vendor: Option<String>,
     action: Option<String>,
@@ -592,7 +1122,12 @@ async fn actions_list(
         if let Some(v) = &session_id { q.push(format!("session_id={}", urlencode(v))); }
         if let Some(b) = before { q.push(format!("before={}", urlencode(&b.to_rfc3339()))); }
         let endpoint = format!("{url}/api/v1/actions?{}", q.join("&"));
-        let env: Value = http.get(&endpoint).send().await?.error_for_status()?.json().await?;
+        let env: Value = auth_header(http.get(&endpoint), token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         let rows = env.get("rows").and_then(|x| x.as_array()).cloned().unwrap_or_default();
         for r in &rows {
             // Honor --since by stopping once we've crossed the boundary.
@@ -630,14 +1165,65 @@ async fn actions_list(
     }
 }
 
-async fn actions_show(http: &reqwest::Client, url: &str, id: &str, format: &str) -> Result<()> {
-    let v: Value = http
-        .get(format!("{url}/api/v1/actions/{}", urlencode(id)))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+async fn actions_chain(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    session_id: &str,
+    format: &str,
+) -> Result<()> {
+    let v: Value = auth_header(
+        http.get(format!("{url}/api/v1/sessions/{}/chain", urlencode(session_id))),
+        token,
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!("session {session_id}");
+    let chain = v.get("chain").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    if chain.is_empty() {
+        println!("  (no PCA hops recorded for this session)");
+        return Ok(());
+    }
+    for (i, link) in chain.iter().enumerate() {
+        let hop = link.get("hop").and_then(|x| x.as_u64()).unwrap_or(0);
+        let id = link.get("pca_id").and_then(|x| x.as_str()).unwrap_or("?");
+        let p_0 = link.get("p_0").and_then(|x| x.as_str()).unwrap_or("?");
+        let ops_count = link
+            .get("ops")
+            .and_then(|x| x.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let prefix = if i == 0 { "└─" } else { "├─" };
+        println!(
+            "  {prefix} hop={hop} pca={id} p_0={p_0} ops={ops_count}"
+        );
+    }
+    Ok(())
+}
+
+async fn actions_show(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    id: &str,
+    format: &str,
+) -> Result<()> {
+    let v: Value = auth_header(
+        http.get(format!("{url}/api/v1/actions/{}", urlencode(id))),
+        token,
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -715,6 +1301,7 @@ async fn actions_show(http: &reqwest::Client, url: &str, id: &str, format: &str)
 async fn actions_export(
     http: &reqwest::Client,
     url: &str,
+    token: &str,
     format: &str,
     since: Option<String>,
     until: Option<String>,
@@ -737,7 +1324,10 @@ async fn actions_export(
     if let Some(v) = &action { q.push(format!("action={}", urlencode(v))); }
     if let Some(v) = &p_0 { q.push(format!("p_0={}", urlencode(v))); }
     let endpoint = format!("{url}/api/v1/actions/export?{}", q.join("&"));
-    let resp = http.get(&endpoint).send().await?.error_for_status()?;
+    let resp = auth_header(http.get(&endpoint), token)
+        .send()
+        .await?
+        .error_for_status()?;
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
     use std::io::Write;
@@ -768,26 +1358,30 @@ async fn cmd_health(http: &reqwest::Client, url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_pca(http: &reqwest::Client, url: &str, id: &str) -> Result<()> {
-    let v: Value = http
-        .get(format!("{url}/api/v1/pca/{}", urlencode(id)))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+async fn cmd_pca(http: &reqwest::Client, url: &str, token: &str, id: &str) -> Result<()> {
+    let v: Value = auth_header(
+        http.get(format!("{url}/api/v1/pca/{}", urlencode(id))),
+        token,
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
     println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
 }
 
-async fn cmd_verify(http: &reqwest::Client, url: &str, id: &str) -> Result<()> {
-    let v: Value = http
-        .get(format!("{url}/api/v1/pca/{}/verify", urlencode(id)))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+async fn cmd_verify(http: &reqwest::Client, url: &str, token: &str, id: &str) -> Result<()> {
+    let v: Value = auth_header(
+        http.get(format!("{url}/api/v1/pca/{}/verify", urlencode(id))),
+        token,
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
     println!("{}", serde_json::to_string_pretty(&v)?);
     let intact = v.get("intact").and_then(|x| x.as_bool()).unwrap_or(false);
     if !intact {
@@ -1003,6 +1597,44 @@ struct IssuePcaResponse {
     exp: Option<String>,
 }
 
+/// Compute a human-readable diff between two `PolicyDoc`s. Returns a
+/// list of `"field: before → after"` snippets for fields that changed.
+/// Comparison is shallow — `match` / `decision` / `read_filter` are
+/// compared via their YAML-serialized form so any structural change
+/// shows up as a single delta line rather than a recursive walk.
+fn field_diff(
+    before: &policy_engine::yaml::PolicyDoc,
+    after: &policy_engine::yaml::PolicyDoc,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if before.vendor != after.vendor {
+        out.push(format!("vendor: {} → {}", before.vendor, after.vendor));
+    }
+    if before.action != after.action {
+        out.push(format!("action: {} → {}", before.action, after.action));
+    }
+    if before.mode != after.mode {
+        out.push(format!("mode: {:?} → {:?}", before.mode, after.mode));
+    }
+    if before.pic_mode != after.pic_mode {
+        out.push(format!(
+            "pic_mode: {:?} → {:?}",
+            before.pic_mode, after.pic_mode
+        ));
+    }
+    if before.required_ops != after.required_ops {
+        out.push("required_ops changed".to_string());
+    }
+    let dump = |v: &serde_yaml::Value| serde_yaml::to_string(v).unwrap_or_default();
+    if dump(&before.match_) != dump(&after.match_) {
+        out.push("match changed".to_string());
+    }
+    if dump(&before.decision) != dump(&after.decision) {
+        out.push("decision changed".to_string());
+    }
+    out
+}
+
 fn urlencode(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -1213,6 +1845,134 @@ async fn cmd_policy(
                         p["vendor"].as_str().unwrap_or(""),
                         p["action"].as_str().unwrap_or(""),
                     );
+                }
+            }
+            Ok(())
+        }
+        PolicyCmd::Show { id, format } => {
+            let resp = auth_header(http.get(format!("{url}/api/v1/policy")), token)
+                .send()
+                .await
+                .context("GET /api/v1/policy")?
+                .error_for_status()
+                .context("/api/v1/policy returned an error")?;
+            let envelope: Value = resp.json().await?;
+            let policies = envelope["policies"].as_array().cloned().unwrap_or_default();
+            let Some(found) = policies.into_iter().find(|p| p["id"].as_str() == Some(&id))
+            else {
+                eprintln!("{RED}policy `{id}` not found{RESET}");
+                std::process::exit(1);
+            };
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&found)?);
+            } else {
+                println!("id:         {}", found["id"].as_str().unwrap_or(""));
+                println!("vendor:     {}", found["vendor"].as_str().unwrap_or(""));
+                println!("action:     {}", found["action"].as_str().unwrap_or(""));
+                println!("mode:       {}", found["mode"].as_str().unwrap_or(""));
+                println!("pic_mode:   {}", found["pic_mode"].as_str().unwrap_or(""));
+                if let Some(source) = envelope["source"].as_str() {
+                    println!("source:     {source}");
+                }
+            }
+            Ok(())
+        }
+        PolicyCmd::Validate { file } => {
+            let yaml = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading policy file {file}"))?;
+            match policy_engine::yaml::parse_policies(&yaml) {
+                Ok(policies) => {
+                    println!(
+                        "{GREEN}✓ valid{RESET}: {} polic{} parsed from `{file}`",
+                        policies.len(),
+                        if policies.len() == 1 { "y" } else { "ies" }
+                    );
+                    for p in &policies {
+                        println!(
+                            "  • {} ({}/{}, mode={:?}, pic_mode={:?})",
+                            p.id, p.vendor, p.action, p.mode, p.pic_mode
+                        );
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{RED}✗ invalid{RESET}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        PolicyCmd::Diff {
+            before,
+            after,
+            format,
+        } => {
+            let parse = |p: &str| -> Result<Vec<policy_engine::yaml::PolicyDoc>> {
+                let y = std::fs::read_to_string(p)
+                    .with_context(|| format!("reading policy file {p}"))?;
+                policy_engine::yaml::parse_policies(&y)
+                    .with_context(|| format!("parsing policy file {p}"))
+            };
+            let bs = parse(&before)?;
+            let as_ = parse(&after)?;
+            use std::collections::BTreeMap;
+            let mut b_by_id: BTreeMap<String, &policy_engine::yaml::PolicyDoc> = BTreeMap::new();
+            let mut a_by_id: BTreeMap<String, &policy_engine::yaml::PolicyDoc> = BTreeMap::new();
+            for p in &bs {
+                b_by_id.insert(p.id.clone(), p);
+            }
+            for p in &as_ {
+                a_by_id.insert(p.id.clone(), p);
+            }
+            let mut added: Vec<&str> = Vec::new();
+            let mut removed: Vec<&str> = Vec::new();
+            let mut modified: Vec<(String, Vec<String>)> = Vec::new();
+            for (id, ap) in &a_by_id {
+                match b_by_id.get(id) {
+                    None => added.push(id.as_str()),
+                    Some(bp) => {
+                        let deltas = field_diff(bp, ap);
+                        if !deltas.is_empty() {
+                            modified.push((id.clone(), deltas));
+                        }
+                    }
+                }
+            }
+            for id in b_by_id.keys() {
+                if !a_by_id.contains_key(id) {
+                    removed.push(id.as_str());
+                }
+            }
+            if format == "json" {
+                let payload = json!({
+                    "added": added,
+                    "removed": removed,
+                    "modified": modified.iter().map(|(id, fields)| json!({
+                        "id": id, "fields": fields,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                if added.is_empty() && removed.is_empty() && modified.is_empty() {
+                    println!("{GREEN}no changes{RESET}");
+                    return Ok(());
+                }
+                if !added.is_empty() {
+                    println!("{GREEN}+ added{RESET}");
+                    for id in &added {
+                        println!("    {id}");
+                    }
+                }
+                if !removed.is_empty() {
+                    println!("{RED}- removed{RESET}");
+                    for id in &removed {
+                        println!("    {id}");
+                    }
+                }
+                if !modified.is_empty() {
+                    println!("~ modified");
+                    for (id, fields) in &modified {
+                        println!("    {id}: {}", fields.join(", "));
+                    }
                 }
             }
             Ok(())

@@ -134,6 +134,22 @@ pub async fn run(cfg: Config) -> Result<()> {
             let policy_handle = build_policy_handle(&cfg)?;
             tokio::spawn(crate::policy_handle::spawn_watcher(policy_handle.clone()));
 
+            // spec.md §3.2 — `proxilion_trust_plane_up{}` + `proxilion_federation_bridge_up{}`
+            // gauges. Periodically GET each upstream's reachability endpoint and
+            // set the gauge to 1 / 0. 30s cadence matches what the customer's
+            // Grafana scrape interval can usefully render; a faster tick would
+            // burn upstream throughput for no observability gain.
+            tokio::spawn(spawn_upstream_health_probe(
+                cfg.trust_plane_url.clone(),
+                cfg.federation_bridge_url.clone(),
+            ));
+
+            // spec.md §3.2 — `proxilion_oauth_active_sessions{}` gauge.
+            // Counts agent_bearers rows that haven't been revoked. Tick at
+            // 30s — operators care about trends ("are we growing capacity?",
+            // "did killswitch land?"), not sub-minute precision.
+            tokio::spawn(spawn_active_sessions_probe(core.db.clone()));
+
             // Setup-status checklist (powers /admin/setup). Always-on so the
             // operator can use it to figure out what's still missing. Mounted
             // OUTSIDE the operator_auth layer — it's a checklist for an
@@ -325,6 +341,58 @@ async fn healthz(State(state): State<AppState>) -> (axum::http::StatusCode, Json
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(Healthz { ready, version: env!("CARGO_PKG_VERSION"), checks }))
+}
+
+/// Periodic upstream-reachability probe. Powers `proxilion_trust_plane_up`
+/// and `proxilion_federation_bridge_up` (spec.md §3.2). 30s tick — same
+/// cadence as the §3.4 dashboard's "is the system healthy?" panel.
+async fn spawn_upstream_health_probe(trust_plane_url: String, federation_bridge_url: String) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "upstream-health probe: failed to build client; gauges will read 0");
+            metrics::gauge!("proxilion_trust_plane_up").set(0.0);
+            metrics::gauge!("proxilion_federation_bridge_up").set(0.0);
+            return;
+        }
+    };
+    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        let (tp, fb) = tokio::join!(
+            probe_endpoint(&client, &trust_plane_url),
+            probe_endpoint(&client, &federation_bridge_url),
+        );
+        metrics::gauge!("proxilion_trust_plane_up").set(if tp.ok { 1.0 } else { 0.0 });
+        metrics::gauge!("proxilion_federation_bridge_up").set(if fb.ok { 1.0 } else { 0.0 });
+    }
+}
+
+/// Periodic count of unrevoked agent_bearers. Drives the
+/// `proxilion_oauth_active_sessions` gauge (spec.md §3.2). Cheap query —
+/// `revoked_at IS NULL` is a partial-index-friendly predicate and the
+/// table holds at most thousands of rows at the 99th-percentile deployment.
+async fn spawn_active_sessions_probe(db: sqlx::PgPool) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        let res: Result<(i64,), _> = sqlx::query_as(
+            "SELECT count(*) FROM agent_bearers WHERE revoked_at IS NULL",
+        )
+        .fetch_one(&db)
+        .await;
+        match res {
+            Ok((n,)) => metrics::gauge!("proxilion_oauth_active_sessions").set(n as f64),
+            Err(e) => {
+                // Don't reset the gauge on transient DB error — last-known
+                // value is more useful than a misleading 0.
+                tracing::debug!(error = %e, "active-sessions probe: DB unavailable; gauge unchanged");
+            }
+        }
+    }
 }
 
 async fn probe_endpoint(client: &reqwest::Client, url: &str) -> Check {
@@ -607,7 +675,65 @@ async fn build_notifiers(
     db: &sqlx::PgPool,
     policy: Option<&crate::policy_handle::PolicyHandle>,
 ) -> crate::notifier::Notifiers {
-    let n = crate::notifier::Notifiers::empty();
+    let mut n = crate::notifier::Notifiers::empty();
+
+    // ui-less-surfaces.md §10.3 dev 2 — build the burst suppressors at
+    // function entry (regardless of whether a driver is configured at
+    // boot) so the hot-swap path can re-attach them to freshly-built
+    // notifiers. The suppressors' `buckets: Arc<Mutex<...>>` field is
+    // shared across clones, so suppression state survives a config swap.
+    let make_suppressor = || {
+        let mut s = BurstSuppressor::new(BurstConfig::default());
+        if let Some(handle) = policy {
+            let handle: crate::policy_handle::PolicyHandle = handle.clone();
+            let resolver: crate::notifier::burst::BurstResolver =
+                Arc::new(move |policy_id| handle.load().burst_override_for(policy_id));
+            s = s.with_resolver(resolver);
+        }
+        s
+    };
+    let webhook_suppressor = make_suppressor();
+    let slack_suppressor = make_suppressor();
+    n.webhook_burst = Some(webhook_suppressor.clone());
+    n.slack_burst = Some(slack_suppressor.clone());
+
+    // Webhook flush loop (always spawned — it's idempotent when no notifier
+    // is configured; `handle.current().is_none()` makes the tick a no-op).
+    {
+        let proxy_url = cfg.proxy_base_url.clone();
+        let handle = n.webhook.clone();
+        let suppressor = webhook_suppressor.clone();
+        tokio::spawn(crate::notifier::burst::spawn_flush_loop(
+            suppressor,
+            move |summary| {
+                let h = handle.clone();
+                let url = proxy_url.clone();
+                async move {
+                    let Some(n) = h.current() else { return };
+                    let s = summary.with_details_url(&url);
+                    n.notify_summary(&s).await;
+                }
+            },
+        ));
+    }
+    // Slack flush loop (same idempotency).
+    {
+        let proxy_url = cfg.proxy_base_url.clone();
+        let handle = n.slack.clone();
+        let suppressor = slack_suppressor.clone();
+        tokio::spawn(crate::notifier::burst::spawn_flush_loop(
+            suppressor,
+            move |summary| {
+                let h = handle.clone();
+                let url = proxy_url.clone();
+                async move {
+                    let Some(n) = h.current() else { return };
+                    let s = summary.with_details_url(&url);
+                    n.notify_summary(&s).await;
+                }
+            },
+        ));
+    }
 
     // Webhook driver (ui-less-surfaces.md §10.3 + §8.4).
     if let Some((url, hex)) = resolve_webhook_config(cfg, db).await {
@@ -618,33 +744,7 @@ async fn build_notifiers(
                 cfg.proxy_base_url.clone(),
             ) {
                 Ok(wn) => {
-                    let mut suppressor = BurstSuppressor::new(BurstConfig::default());
-                    if let Some(handle) = policy {
-                        let handle: crate::policy_handle::PolicyHandle = handle.clone();
-                        let resolver: crate::notifier::burst::BurstResolver =
-                            Arc::new(move |policy_id| handle.load().burst_override_for(policy_id));
-                        suppressor = suppressor.with_resolver(resolver);
-                    }
-                    let wn = wn.with_burst(suppressor.clone());
                     let notifier = Arc::new(wn);
-                    let proxy_url = cfg.proxy_base_url.clone();
-                    // ui-less-surfaces.md §10.3 dev 2 — route flushes
-                    // through the handle each tick so a hot-swap via
-                    // `webhook.replace(...)` delivers the next flush to
-                    // the live notifier, not the one captured here.
-                    let handle = n.webhook.clone();
-                    tokio::spawn(crate::notifier::burst::spawn_flush_loop(
-                        suppressor,
-                        move |summary| {
-                            let h = handle.clone();
-                            let url = proxy_url.clone();
-                            async move {
-                                let Some(n) = h.current() else { return };
-                                let s = summary.with_details_url(&url);
-                                n.notify_summary(&s).await;
-                            }
-                        },
-                    ));
                     info!(
                         url = %url,
                         "blocked-action webhook notifier installed (with burst suppression)"
@@ -658,35 +758,15 @@ async fn build_notifiers(
     }
 
     // Slack driver (ui-less-surfaces.md §5.3).
-    if let Some((url, secret_text)) = resolve_slack_config(db).await {
-        let secret = crate::notifier::SlackSigningSecret::new(secret_text);
+    if let Some(slack_cfg) = resolve_slack_config(db).await {
+        let secret = crate::notifier::SlackSigningSecret::new(slack_cfg.signing_secret);
+        let url = slack_cfg.incoming_webhook_url;
         match crate::notifier::SlackNotifier::new(url.clone(), secret, cfg.proxy_base_url.clone()) {
             Ok(sn) => {
-                let mut suppressor = BurstSuppressor::new(BurstConfig::default());
-                if let Some(handle) = policy {
-                    let handle: crate::policy_handle::PolicyHandle = handle.clone();
-                    let resolver: crate::notifier::burst::BurstResolver =
-                        Arc::new(move |policy_id| handle.load().burst_override_for(policy_id));
-                    suppressor = suppressor.with_resolver(resolver);
-                }
-                let sn = sn.with_burst(suppressor.clone());
+                let sn = sn
+                    .with_user_map(slack_cfg.user_map)
+                    .with_burst(slack_suppressor.clone());
                 let notifier = Arc::new(sn);
-                let proxy_url = cfg.proxy_base_url.clone();
-                // ui-less-surfaces.md §10.3 dev 2 — flush via the handle
-                // so hot-swaps land on the live notifier.
-                let handle = n.slack.clone();
-                tokio::spawn(crate::notifier::burst::spawn_flush_loop(
-                    suppressor,
-                    move |summary| {
-                        let h = handle.clone();
-                        let url = proxy_url.clone();
-                        async move {
-                            let Some(n) = h.current() else { return };
-                            let s = summary.with_details_url(&url);
-                            n.notify_summary(&s).await;
-                        }
-                    },
-                ));
                 info!(url = %url, "blocked-action slack notifier installed (with burst suppression)");
                 n.slack.replace(Some(notifier));
             }
@@ -782,9 +862,15 @@ async fn resolve_email_config(db: &sqlx::PgPool) -> Option<EmailRowConfig> {
     })
 }
 
+struct SlackRowConfig {
+    incoming_webhook_url: String,
+    signing_secret: String,
+    user_map: std::collections::HashMap<String, String>,
+}
+
 /// Read the Slack driver row. No env fallback (Slack tokens belong in DB
 /// only; environment variables are too easy to leak).
-async fn resolve_slack_config(db: &sqlx::PgPool) -> Option<(String, String)> {
+async fn resolve_slack_config(db: &sqlx::PgPool) -> Option<SlackRowConfig> {
     let row: Option<(bool, serde_json::Value)> =
         sqlx::query_as("SELECT enabled, config FROM notifier_config WHERE id = 'slack'")
             .fetch_optional(db)
@@ -795,15 +881,27 @@ async fn resolve_slack_config(db: &sqlx::PgPool) -> Option<(String, String)> {
     if !enabled {
         return None;
     }
-    let url = conf
+    let incoming_webhook_url = conf
         .get("incoming_webhook_url")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())?;
-    let secret = conf
+    let signing_secret = conf
         .get("signing_secret")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())?;
-    Some((url, secret))
+    let user_map = match conf.get("user_map") {
+        Some(serde_json::Value::Object(m)) => m
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .filter(|(_, v)| !v.is_empty())
+            .collect(),
+        _ => std::collections::HashMap::new(),
+    };
+    Some(SlackRowConfig {
+        incoming_webhook_url,
+        signing_secret,
+        user_map,
+    })
 }
 
 fn build_siem_sink(cfg: &Config, tee: TeeStream) -> TeeStream {

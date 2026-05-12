@@ -36,16 +36,17 @@ pub struct EscalationSweepReport {
 /// per-row metric label is `policy_id` so a Grafana panel can show
 /// "which policies are timing out".
 pub async fn sweep_once(db: &PgPool) -> Result<ExpirySweepReport, sqlx::Error> {
-    let rows: Vec<(uuid::Uuid, Option<String>, String, String)> = sqlx::query_as(
-        "UPDATE blocked_actions
-            SET status = 'expired',
-                resolved_at = now()
-          WHERE status = 'pending'
-            AND expires_at < now()
-        RETURNING id, policy_id, vendor, action",
-    )
-    .fetch_all(db)
-    .await?;
+    let rows: Vec<(uuid::Uuid, Option<String>, String, String, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            "UPDATE blocked_actions
+                SET status = 'expired',
+                    resolved_at = now()
+              WHERE status = 'pending'
+                AND expires_at < now()
+            RETURNING id, policy_id, vendor, action, at",
+        )
+        .fetch_all(db)
+        .await?;
 
     let n = rows.len() as u64;
 
@@ -59,7 +60,7 @@ pub async fn sweep_once(db: &PgPool) -> Result<ExpirySweepReport, sqlx::Error> {
             .await?;
     metrics::gauge!("proxilion_overrides_pending").set(pending.0 as f64);
 
-    for (id, policy_id, vendor, action) in &rows {
+    for (id, policy_id, vendor, action, blocked_at) in &rows {
         info!(
             blocked_id = %id,
             policy_id = policy_id.as_deref().unwrap_or("(none)"),
@@ -81,6 +82,16 @@ pub async fn sweep_once(db: &PgPool) -> Result<ExpirySweepReport, sqlx::Error> {
             "channel" => "sweeper"
         )
         .increment(1);
+        // spec.md §3.2 — override latency on the expired path matches the
+        // TTL by construction, but record it so a single histogram covers
+        // all three resolution outcomes (approved / rejected / expired).
+        let latency =
+            (chrono::Utc::now() - *blocked_at).num_milliseconds().max(0) as f64 / 1000.0;
+        metrics::histogram!(
+            "proxilion_override_latency_seconds",
+            "outcome" => "expired",
+        )
+        .record(latency);
     }
     Ok(ExpirySweepReport { expired_rows: n })
 }

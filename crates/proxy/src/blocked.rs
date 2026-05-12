@@ -136,7 +136,21 @@ async fn persist_returning_id(db: &PgPool, r: &BlockedActionRecord<'_>) -> Optio
     .fetch_one(db)
     .await;
     match res {
-        Ok((id,)) => Some(id),
+        Ok((id,)) => {
+            // spec.md §3.2 — `proxilion_blocks_total{policy_id,reason}`.
+            // `reason` is the layer that produced the block (policy /
+            // pic_invariant / read_filter); the `policy_id` label degrades
+            // gracefully to `(none)` for Layer-A invariant breaks that
+            // never matched a Layer-B policy. Cardinality is bounded by
+            // the customer's YAML — see §3.3.
+            metrics::counter!(
+                "proxilion_blocks_total",
+                "policy_id" => r.policy_id.map(String::from).unwrap_or_else(|| "(none)".into()),
+                "reason" => r.layer.to_string(),
+            )
+            .increment(1);
+            Some(id)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "failed to persist blocked_action");
             None

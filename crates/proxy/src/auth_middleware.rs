@@ -290,7 +290,12 @@ async fn refresh_with_coalescing(
         .await?;
     if expires_at > Utc::now() + chrono::Duration::seconds(60) {
         debug!("refresh raced; using already-refreshed token");
-        metrics::counter!("proxilion_token_refreshes_total", "result" => "coalesced").increment(1);
+        metrics::counter!(
+            "proxilion_oauth_token_refreshes_total",
+            "vendor" => "google",
+            "result" => "coalesced",
+        )
+        .increment(1);
         return state
             .cipher
             .decrypt(&Ciphertext {
@@ -330,8 +335,12 @@ async fn refresh_with_coalescing(
         .map_err(|e| AuthFail::Refresh(e.to_string()))?;
 
     if !resp.status().is_success() {
-        metrics::counter!("proxilion_token_refreshes_total", "result" => "upstream_err")
-            .increment(1);
+        metrics::counter!(
+            "proxilion_oauth_token_refreshes_total",
+            "vendor" => "google",
+            "result" => "upstream_err",
+        )
+        .increment(1);
         return Err(AuthFail::Refresh(format!("Google returned {}", resp.status())));
     }
     let new: GoogleRefreshResp = resp
@@ -389,7 +398,12 @@ async fn refresh_with_coalescing(
             .await?;
         }
     }
-    metrics::counter!("proxilion_token_refreshes_total", "result" => "ok").increment(1);
+    metrics::counter!(
+        "proxilion_oauth_token_refreshes_total",
+        "vendor" => "google",
+        "result" => "ok",
+    )
+    .increment(1);
     Ok(new.access_token.into_bytes())
 }
 

@@ -15,6 +15,7 @@
 //! credential material and persist it only in `notifier_config.config`
 //! (redacted on GET), never in env.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
@@ -92,6 +93,13 @@ pub struct SlackNotifier {
     /// events are collapsed into a single summary message emitted by the
     /// flush loop via `notify_summary`.
     burst: Option<BurstSuppressor>,
+    /// Map of Slack user id (e.g. `U01ABC`) and/or username (without `@`)
+    /// to a stable operator subject — typically the operator's email. When
+    /// the interaction webhook resolves the clicker, this map is consulted
+    /// first so the attested override carries the operator's identity
+    /// rather than an opaque `slack:<username>`. Closes ui-less-surfaces.md
+    /// §5.3 dev 4.
+    user_map: HashMap<String, String>,
 }
 
 impl SlackNotifier {
@@ -115,6 +123,7 @@ impl SlackNotifier {
             proxy_public_url,
             http,
             burst: None,
+            user_map: HashMap::new(),
         })
     }
 
@@ -123,6 +132,29 @@ impl SlackNotifier {
     pub fn with_burst(mut self, suppressor: BurstSuppressor) -> Self {
         self.burst = Some(suppressor);
         self
+    }
+
+    /// Replace the slack-user → operator-subject map.
+    pub fn with_user_map(mut self, map: HashMap<String, String>) -> Self {
+        self.user_map = map;
+        self
+    }
+
+    /// Resolve a Slack user (id or username) to a configured operator
+    /// subject. Returns `None` when no mapping is configured for either
+    /// key — callers fall back to the `slack:<username>` shape.
+    pub fn resolve_user(&self, slack_user_id: Option<&str>, slack_username: Option<&str>) -> Option<String> {
+        if let Some(id) = slack_user_id {
+            if let Some(v) = self.user_map.get(id) {
+                return Some(v.clone());
+            }
+        }
+        if let Some(u) = slack_username {
+            if let Some(v) = self.user_map.get(u) {
+                return Some(v.clone());
+            }
+        }
+        None
     }
 
     pub fn signing_secret(&self) -> &SlackSigningSecret {
@@ -284,6 +316,7 @@ fn block_kit_payload(n: &BlockedNotification<'_>) -> serde_json::Value {
     );
     let approve_value = format!("approve:{}", n.blocked_id);
     let reject_value = format!("reject:{}", n.blocked_id);
+    let why_value = format!("why:{}", n.blocked_id);
 
     serde_json::json!({
         "blocks": [
@@ -304,7 +337,10 @@ fn block_kit_payload(n: &BlockedNotification<'_>) -> serde_json::Value {
                   { "type": "button",
                     "text": { "type": "plain_text", "text": "Reject" },
                     "style": "danger",
-                    "value": reject_value }
+                    "value": reject_value },
+                  { "type": "button",
+                    "text": { "type": "plain_text", "text": "Why?" },
+                    "value": why_value }
               ] },
             { "type": "context",
               "elements": [
@@ -330,6 +366,7 @@ pub fn parse_button_value(v: &str) -> Option<(SlackAction, Uuid)> {
     let action = match action_str {
         "approve" => SlackAction::Approve,
         "reject" => SlackAction::Reject,
+        "why" => SlackAction::Why,
         _ => return None,
     };
     let id = Uuid::parse_str(id_str).ok()?;
@@ -340,6 +377,10 @@ pub fn parse_button_value(v: &str) -> Option<(SlackAction, Uuid)> {
 pub enum SlackAction {
     Approve,
     Reject,
+    /// ui-less-surfaces.md §5.3: "[Why?]" — operator wants forensic
+    /// context for the blocked row without taking action. Handled with
+    /// an ephemeral Slack response, no state change.
+    Why,
 }
 
 #[cfg(test)]
@@ -375,8 +416,42 @@ mod tests {
         let actions = &p["blocks"][3]["elements"];
         assert_eq!(actions[0]["value"], format!("approve:{}", Uuid::nil()));
         assert_eq!(actions[1]["value"], format!("reject:{}", Uuid::nil()));
+        assert_eq!(actions[2]["value"], format!("why:{}", Uuid::nil()));
         assert_eq!(actions[0]["style"], "primary");
         assert_eq!(actions[1]["style"], "danger");
+        // Why button is neutral (no `style` attribute).
+        assert!(actions[2].get("style").is_none());
+    }
+
+    #[test]
+    fn parse_button_value_round_trip_why() {
+        let id = Uuid::new_v4();
+        let (a, parsed) = parse_button_value(&format!("why:{id}")).unwrap();
+        assert_eq!(a, SlackAction::Why);
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn user_map_resolves_by_id_then_username() {
+        let mut m = HashMap::new();
+        m.insert("U01ABC".to_string(), "alice@acme.com".to_string());
+        m.insert("bob".to_string(), "bob@acme.com".to_string());
+        let n = SlackNotifier::new(
+            "https://hooks.slack.com/services/T/B/X".into(),
+            SlackSigningSecret::new("s"),
+            "https://proxy.local".into(),
+        )
+        .unwrap()
+        .with_user_map(m);
+        assert_eq!(n.resolve_user(Some("U01ABC"), None).as_deref(), Some("alice@acme.com"));
+        assert_eq!(n.resolve_user(None, Some("bob")).as_deref(), Some("bob@acme.com"));
+        // Id takes precedence over username.
+        assert_eq!(
+            n.resolve_user(Some("U01ABC"), Some("bob")).as_deref(),
+            Some("alice@acme.com")
+        );
+        // Unmapped → None.
+        assert!(n.resolve_user(Some("U_UNKNOWN"), Some("charlie")).is_none());
     }
 
     #[test]

@@ -133,3 +133,17 @@ impl IntoResponse for AppError {
         self.body().into_response(status)
     }
 }
+
+/// Classify a `reqwest::Error` for the
+/// `proxilion_adapter_upstream_errors_total{kind}` metric (spec.md §3.2).
+/// Kind values: `timeout | network | other`. The 5xx case lives at the
+/// HTTP-status check site (status known there, not here).
+pub fn upstream_error_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() || e.is_request() {
+        "network"
+    } else {
+        "other"
+    }
+}

@@ -32,6 +32,38 @@ pub struct FederationClaims {
     pub iat: i64,
     /// Expiration epoch seconds.
     pub exp: i64,
+    /// Upstream IdP issuer URL (e.g. `https://acme.okta.com`). Carried
+    /// from the IdP-emitted JWT through the federation bridge for
+    /// observability — drives the `idp` label on
+    /// `proxilion_oauth_callback_total` (spec.md §3.2). Optional today:
+    /// the bridge stub may not surface it; production bridges always
+    /// will. `None` → `idp="unknown"` on the callback metric.
+    #[serde(default)]
+    pub iss: Option<String>,
+}
+
+/// Coarsely classify an IdP issuer URL into the bounded label set the
+/// spec.md §3.2 contract calls out (`okta|azure|google|oidc|unknown`).
+/// Substring match is intentional — Okta's iss is `https://<tenant>.okta.com`,
+/// Azure AD's is `https://login.microsoftonline.com/<tenant>/v2.0`, Google
+/// Workspace's is `https://accounts.google.com`. Anything else falls through
+/// to the generic `oidc` bucket (still useful — the customer can join the
+/// label against `proxilion_oauth_callback_total{result}` to see if generic
+/// OIDC IdPs are erroring at a different rate).
+pub fn infer_idp(iss: Option<&str>) -> &'static str {
+    let Some(s) = iss else { return "unknown" };
+    let s = s.to_ascii_lowercase();
+    if s.contains("okta.com") || s.contains("oktapreview.com") {
+        "okta"
+    } else if s.contains("microsoftonline.com") || s.contains("windows.net") {
+        "azure"
+    } else if s.contains("accounts.google.com") || s.contains("googleapis.com") {
+        "google"
+    } else if !s.is_empty() {
+        "oidc"
+    } else {
+        "unknown"
+    }
 }
 
 /// Decode a federation-bridge JWT.
@@ -83,6 +115,20 @@ mod tests {
         }));
         let err = validate_federation_token(&jwt).unwrap_err();
         assert!(matches!(err, OAuthError::BridgeRejected(_)));
+    }
+
+    #[test]
+    fn infer_idp_classifies_known_issuers() {
+        assert_eq!(infer_idp(Some("https://acme.okta.com")), "okta");
+        assert_eq!(infer_idp(Some("https://example.oktapreview.com")), "okta");
+        assert_eq!(
+            infer_idp(Some("https://login.microsoftonline.com/abc/v2.0")),
+            "azure"
+        );
+        assert_eq!(infer_idp(Some("https://accounts.google.com")), "google");
+        assert_eq!(infer_idp(Some("https://id.example.org/realms/main")), "oidc");
+        assert_eq!(infer_idp(Some("")), "unknown");
+        assert_eq!(infer_idp(None), "unknown");
     }
 
     #[test]

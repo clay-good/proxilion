@@ -53,6 +53,39 @@ async fn authorize(
     State(state): State<OAuthState>,
     Query(params): Query<AuthorizeParams>,
 ) -> Result<Redirect, OAuthError> {
+    let result = authorize_inner(state, params).await;
+    // spec.md §3.2 — `proxilion_oauth_authorize_total{result="ok|denied|error"}`.
+    // `denied` covers auth-level failures (bad_request, unknown_client,
+    // session_gone, bridge_rejected, pkce_fail, bad_auth_code, pic_invariant);
+    // `error` covers system failures (upstream, db, crypto, internal).
+    let label = match &result {
+        Ok(_) => "ok",
+        Err(e) => oauth_error_class(e),
+    };
+    metrics::counter!("proxilion_oauth_authorize_total", "result" => label).increment(1);
+    result
+}
+
+fn oauth_error_class(e: &OAuthError) -> &'static str {
+    match e {
+        OAuthError::BadRequest(_)
+        | OAuthError::UnknownClient
+        | OAuthError::SessionGone
+        | OAuthError::BridgeRejected(_)
+        | OAuthError::PkceFail
+        | OAuthError::BadAuthCode
+        | OAuthError::PicInvariant(_) => "denied",
+        OAuthError::Upstream(_)
+        | OAuthError::Db(_)
+        | OAuthError::Crypto
+        | OAuthError::Internal(_) => "error",
+    }
+}
+
+async fn authorize_inner(
+    state: OAuthState,
+    params: AuthorizeParams,
+) -> Result<Redirect, OAuthError> {
     if params.response_type != "code" {
         return Err(OAuthError::BadRequest("unsupported response_type".into()));
     }
@@ -60,11 +93,16 @@ async fn authorize(
         return Err(OAuthError::BadRequest("only S256 PKCE is supported".into()));
     }
 
-    let allowed: Option<(Vec<String>,)> =
-        sqlx::query_as("SELECT redirect_uris FROM oauth_clients WHERE id = $1")
-            .bind(&params.client_id)
-            .fetch_optional(&state.db)
-            .await?;
+    // 0013_oauth_client_revocation.sql — revoked clients are refused
+    // here. They stay in the table so historical sessions / audit rows
+    // referencing the id continue to resolve.
+    let allowed: Option<(Vec<String>,)> = sqlx::query_as(
+        "SELECT redirect_uris FROM oauth_clients
+          WHERE id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&params.client_id)
+    .fetch_optional(&state.db)
+    .await?;
     let Some((redirect_uris,)) = allowed else {
         return Err(OAuthError::UnknownClient);
     };
@@ -114,7 +152,46 @@ async fn bridge_callback(
     State(state): State<OAuthState>,
     Query(params): Query<BridgeCallback>,
 ) -> Result<Redirect, OAuthError> {
-    let claims = validate_federation_token(&params.federation_token)?;
+    let result = bridge_callback_inner(state, params).await;
+    // spec.md §3.2 — `proxilion_oauth_callback_total{idp,result}` for the
+    // bridge leg. `idp` is inferred from the JWT iss claim when present
+    // (`okta | azure | google | oidc | unknown`); production bridges
+    // always emit iss, the stub-friendly fallback is `unknown`. Same
+    // result classifier as the Google leg.
+    let (idp, label) = match &result {
+        Ok((_, idp)) => (*idp, "ok"),
+        Err((e, idp)) => (*idp, oauth_error_class(e)),
+    };
+    metrics::counter!(
+        "proxilion_oauth_callback_total",
+        "idp" => idp,
+        "result" => label,
+    )
+    .increment(1);
+    result.map(|(r, _)| r).map_err(|(e, _)| e)
+}
+
+async fn bridge_callback_inner(
+    state: OAuthState,
+    params: BridgeCallback,
+) -> Result<(Redirect, &'static str), (OAuthError, &'static str)> {
+    let claims = match validate_federation_token(&params.federation_token) {
+        Ok(c) => c,
+        Err(e) => return Err((e, "unknown")),
+    };
+    let idp = super::bridge::infer_idp(claims.iss.as_deref());
+    let res = bridge_callback_body(state, params, claims).await;
+    match res {
+        Ok(r) => Ok((r, idp)),
+        Err(e) => Err((e, idp)),
+    }
+}
+
+async fn bridge_callback_body(
+    state: OAuthState,
+    params: BridgeCallback,
+    claims: super::bridge::FederationClaims,
+) -> Result<Redirect, OAuthError> {
 
     if let Some(b64) = claims.pca_0_cbor_b64.as_deref() {
         let cbor = B64
@@ -209,6 +286,29 @@ struct GoogleTokenResponse {
 async fn google_callback(
     State(state): State<OAuthState>,
     Query(params): Query<GoogleCallback>,
+) -> Result<Redirect, OAuthError> {
+    let result = google_callback_inner(state, params).await;
+    // spec.md §3.2 — `proxilion_oauth_callback_total{idp,result}`.
+    // `idp="google"` here (the other handler `bridge_callback` carries the
+    // upstream IdP claim and could ride the same metric with idp="okta|azure|…"
+    // once federation-bridge-bin ships; today the bridge callback is a thin
+    // pass-through and skipped for metric simplicity).
+    let label = match &result {
+        Ok(_) => "ok",
+        Err(e) => oauth_error_class(e),
+    };
+    metrics::counter!(
+        "proxilion_oauth_callback_total",
+        "idp" => "google",
+        "result" => label,
+    )
+    .increment(1);
+    result
+}
+
+async fn google_callback_inner(
+    state: OAuthState,
+    params: GoogleCallback,
 ) -> Result<Redirect, OAuthError> {
     let session: Option<(String, String, Uuid, String, SqlxJson<serde_json::Value>)> =
         sqlx::query_as(

@@ -184,6 +184,9 @@ async fn get_config(State(state): State<NotifierApiState>) -> impl IntoResponse 
                     Value::String(redact_url(url)),
                 );
             }
+            // user_map (ui-less-surfaces.md §5.3 dev 4) is not secret — Slack
+            // user ids + operator emails are routinely visible in the audit
+            // trail. Echo it through so operators can audit the mapping.
         }
         json!({ "enabled": enabled, "config": c })
     });
@@ -259,9 +262,18 @@ async fn set_webhook(
             );
         }
     };
+    // ui-less-surfaces.md §10.3 dev 2 — re-attach the boot-time burst
+    // suppressor so the hot-swapped notifier keeps the suppression
+    // history. Cloning the suppressor shares the inner `buckets` Arc;
+    // counts and exemplars survive the swap.
     let new_notifier =
         match WebhookNotifier::new(url.clone(), secret, state.proxy_base_url.clone()) {
-            Ok(n) => std::sync::Arc::new(n),
+            Ok(mut n) => {
+                if let Some(b) = state.notifiers.webhook_burst.clone() {
+                    n = n.with_burst(b);
+                }
+                std::sync::Arc::new(n)
+            }
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -320,12 +332,48 @@ async fn set_slack(
             })),
         ),
     };
+    // Optional `user_map: { "U01ABC": "alice@acme.com", "bob": "bob@acme.com" }`
+    // — ui-less-surfaces.md §5.3 dev 4. Slack user id OR username → operator subject.
+    let user_map = match body.config.get("user_map") {
+        Some(Value::Object(m)) => {
+            let mut out = std::collections::HashMap::with_capacity(m.len());
+            for (k, v) in m {
+                let Some(s) = v.as_str() else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error":"user_map values must be strings",
+                            "key": k
+                        })),
+                    );
+                };
+                if !s.is_empty() {
+                    out.insert(k.clone(), s.to_string());
+                }
+            }
+            out
+        }
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"user_map must be an object of slack_user_id_or_username → operator_subject"})),
+            );
+        }
+        None => std::collections::HashMap::new(),
+    };
     let new_notifier = match SlackNotifier::new(
         url.clone(),
         SlackSigningSecret::new(signing_secret),
         state.proxy_base_url.clone(),
     ) {
-        Ok(n) => std::sync::Arc::new(n),
+        Ok(mut n) => {
+            n = n.with_user_map(user_map.clone());
+            // ui-less-surfaces.md §10.3 dev 2 — re-attach boot-time suppressor.
+            if let Some(b) = state.notifiers.slack_burst.clone() {
+                n = n.with_burst(b);
+            }
+            std::sync::Arc::new(n)
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -353,6 +401,7 @@ async fn set_slack(
             "driver": "slack",
             "enabled": enabled,
             "incoming_webhook_url_redacted": redact_url(&url),
+            "user_map_entries": user_map.len(),
         })),
     )
 }

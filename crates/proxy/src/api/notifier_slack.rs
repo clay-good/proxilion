@@ -157,14 +157,21 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
 
     // Extract `actions[0].value` and the user that clicked.
     let value = payload["actions"][0]["value"].as_str().unwrap_or("");
-    let approver = payload["user"]["username"]
-        .as_str()
-        .or_else(|| payload["user"]["id"].as_str())
-        .unwrap_or("slack-user");
+    let user_id = payload["user"]["id"].as_str();
+    let user_name = payload["user"]["username"].as_str();
+    let approver = user_name.or(user_id).unwrap_or("slack-user");
 
     let Some((action, blocked_id)) = parse_button_value(value) else {
         return slack_err(StatusCode::BAD_REQUEST, "unrecognized button value");
     };
+
+    // [Why?] (ui-less-surfaces.md §5.3 dev 2) — short-circuit before the
+    // trigger_id idempotency claim. Why is purely informational: it doesn't
+    // mutate the blocked row, doesn't consume a trigger_id, and returns an
+    // ephemeral message visible only to the clicker.
+    if matches!(action, SlackAction::Why) {
+        return handle_why(&state.db, blocked_id).await;
+    }
 
     // Trigger-id idempotency (ui-less-surfaces.md §5.3 deviation 3).
     // Slack retries delivery on timeout/network failure; without this
@@ -208,7 +215,13 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
         }
     }
 
-    let approver_subject = format!("slack:{approver}");
+    // ui-less-surfaces.md §5.3 dev 4 — user_map resolution. Prefer a
+    // mapped operator subject (typically the operator's email) over the
+    // opaque `slack:<username>` shape so the attested override carries
+    // the operator's stable identity.
+    let approver_subject = slack
+        .resolve_user(user_id, user_name)
+        .unwrap_or_else(|| format!("slack:{approver}"));
     let outcome: Result<String, String> = match action {
         SlackAction::Approve => {
             // Slack messages don't carry a justification field today; we
@@ -238,6 +251,7 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
                 Err(e) => Err(format!("Approve failed: {e}")),
             }
         }
+        SlackAction::Why => unreachable!("Why was handled above"),
         SlackAction::Reject => {
             let reason = format!("rejected via Slack by {approver}");
             match reject_inner(
@@ -290,6 +304,77 @@ fn slack_ok_message(text: &str) -> Response {
     let body = serde_json::json!({
         "response_type": "in_channel",
         "replace_original": true,
+        "text": text,
+    });
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Render the forensic-context ephemeral message (ui-less-surfaces.md
+/// §5.3 dev 2). Returns the blocked row's policy_id / detail / path /
+/// requested_ops as Slack mrkdwn, visible only to the clicker
+/// (`response_type: "ephemeral"`).
+async fn handle_why(db: &PgPool, blocked_id: uuid::Uuid) -> Response {
+    let row: Result<
+        Option<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Vec<String>,
+            chrono::DateTime<chrono::Utc>,
+        )>,
+        sqlx::Error,
+    > = sqlx::query_as(
+        "SELECT status, p_0, policy_id, detail, path, vendor, action, requested_ops, expires_at \
+         FROM blocked_actions WHERE id = $1",
+    )
+    .bind(blocked_id)
+    .fetch_optional(db)
+    .await;
+    let text = match row {
+        Ok(Some((status, p_0, policy_id, detail, path, vendor, action, ops, expires_at))) => {
+            // Truncate requested_ops list for channel hygiene; full set is
+            // visible via `proxilion-cli blocked show <id>`.
+            let ops_preview = if ops.is_empty() {
+                "—".to_string()
+            } else if ops.len() <= 5 {
+                ops.join(", ")
+            } else {
+                format!("{}, … (+{} more)", ops[..5].join(", "), ops.len() - 5)
+            };
+            format!(
+                "*Why blocked* `{id}`\n\
+                 *Status:* `{status}`  ·  *Vendor:* `{vendor}`  ·  *Action:* `{action}`\n\
+                 *p_0:* `{p_0}`  ·  *Policy:* `{policy_id}`\n\
+                 *Path:* `{path}`\n\
+                 *Requested ops:* {ops_preview}\n\
+                 *Detail:* {detail}\n\
+                 *Expires at:* `{expires_at}`",
+                id = blocked_id,
+                p_0 = p_0.as_deref().unwrap_or("—"),
+                policy_id = policy_id.as_deref().unwrap_or("—"),
+                path = path.as_deref().unwrap_or("—"),
+                detail = detail.as_deref().unwrap_or("—"),
+            )
+        }
+        Ok(None) => format!("Blocked action `{blocked_id}` not found."),
+        Err(e) => {
+            warn!(error = %e, %blocked_id, "why: DB lookup failed");
+            format!("Could not fetch details for `{blocked_id}`.")
+        }
+    };
+    metrics::counter!("proxilion_slack_interact_total", "result" => "why").increment(1);
+    let body = serde_json::json!({
+        "response_type": "ephemeral",
+        "replace_original": false,
         "text": text,
     });
     (

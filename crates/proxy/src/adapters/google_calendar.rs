@@ -26,7 +26,7 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use super::action_stream::ActionEvent;
-use super::error::AppError;
+use super::error::{upstream_error_kind, AppError};
 use super::read_filter;
 use super::state::AdapterState;
 use crate::pic::{CachedPca, PcaCache, SuccessorOutcome};
@@ -52,7 +52,36 @@ pub fn router(state: AdapterState) -> Router {
                 .patch(patch_event)
                 .delete(delete_event),
         )
+        // spec.md §4.1 dev 3 — calendarList discovery. Agent can enumerate
+        // the calendars the user has subscribed to; the PIC-bound ops atom
+        // gates discovery the same way it gates event-level access.
+        .route(
+            "/google/calendar/v3/users/me/calendarList",
+            get(list_calendar_list),
+        )
         .with_state(state)
+}
+
+#[instrument(skip(state, session, query))]
+async fn list_calendar_list(
+    State(state): State<AdapterState>,
+    SessionCtx(session): SessionCtx,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Response<axum::body::Body>, AppError> {
+    proxy_request(
+        &state,
+        &session,
+        CalendarRequest {
+            action: "calendar.calendarList.list".into(),
+            upstream_path: "/calendar/v3/users/me/calendarList".to_string(),
+            method: Method::GET,
+            policy_path: HashMap::new(),
+            query,
+            body_for_policy: HashMap::new(),
+            upstream_body: None,
+        },
+    )
+    .await
 }
 
 #[instrument(skip(state, session, query))]
@@ -283,9 +312,35 @@ async fn proxy_request(
     req: CalendarRequest,
 ) -> Result<Response<axum::body::Body>, AppError> {
     let request_id = Uuid::new_v4();
+    // spec.md §3.2 — `proxilion_adapter_request_duration_seconds`.
+    let adapter_started = std::time::Instant::now();
     let ctx = build_policy_ctx(state, session, &req);
 
-    let (outcome, mut policy_trace) = state.policy.load().evaluate_with_trace(&ctx)?;
+    // spec.md §3.2 — `proxilion_policy_evaluations_total` + duration.
+    let eval_started = std::time::Instant::now();
+    let eval_result = state.policy.load().evaluate_with_trace(&ctx);
+    metrics::histogram!("proxilion_policy_evaluation_duration_seconds")
+        .record(eval_started.elapsed().as_secs_f64());
+    let (outcome, mut policy_trace) = match eval_result {
+        Ok(pair) => {
+            metrics::counter!(
+                "proxilion_policy_evaluations_total",
+                "policy_id" => pair.0.matched_policy_id.clone().unwrap_or_else(|| "(none)".into()),
+                "result" => if pair.0.matched_policy_id.is_some() { "match" } else { "nomatch" },
+            )
+            .increment(1);
+            pair
+        }
+        Err(e) => {
+            metrics::counter!(
+                "proxilion_policy_evaluations_total",
+                "policy_id" => "(error)",
+                "result" => "error",
+            )
+            .increment(1);
+            return Err(e.into());
+        }
+    };
     // ui-less-surfaces.md §5.7 dev 2 — per-policy escalation deadline.
     let escalation_after_minutes = outcome
         .matched_policy_id
@@ -477,8 +532,30 @@ async fn proxy_request(
     if let Some(b) = req.upstream_body.as_ref() {
         builder = builder.header(CONTENT_TYPE, "application/json").body(b.clone());
     }
-    let upstream_resp = builder.send().await?;
+    let upstream_resp = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // spec.md §3.2 — `proxilion_adapter_upstream_errors_total{vendor,action,kind}`.
+            metrics::counter!(
+                "proxilion_adapter_upstream_errors_total",
+                "vendor" => "google",
+                "action" => req.action.clone(),
+                "kind" => upstream_error_kind(&e),
+            )
+            .increment(1);
+            return Err(e.into());
+        }
+    };
     let status = upstream_resp.status();
+    if status.is_server_error() {
+        metrics::counter!(
+            "proxilion_adapter_upstream_errors_total",
+            "vendor" => "google",
+            "action" => req.action.clone(),
+            "kind" => "5xx",
+        )
+        .increment(1);
+    }
     let content_type = upstream_resp
         .headers()
         .get(CONTENT_TYPE)
@@ -493,6 +570,29 @@ async fn proxy_request(
             let compiled = read_filter::CompiledFilter::compile(filter)
                 .map_err(|e| AppError::Internal(format!("read-filter regex: {e}")))?;
             let (b, o) = read_filter::apply(&body_bytes, &compiled, content_type.as_deref());
+            // spec.md §3.2 — readfilter scan + quarantined-bytes counters.
+            let scan_result = if !o.triggered { "clean" }
+                else if o.block { "quarantined" }
+                else { "stripped" };
+            metrics::counter!(
+                "proxilion_readfilter_scans_total",
+                "vendor" => "google",
+                "action" => req.action.clone(),
+                "result" => scan_result,
+            )
+            .increment(1);
+            if o.triggered {
+                let quarantined_bytes = if o.block {
+                    body_bytes.len() as u64
+                } else {
+                    (body_bytes.len() as u64).saturating_sub(b.len() as u64)
+                };
+                metrics::counter!(
+                    "proxilion_readfilter_quarantined_bytes_total",
+                    "vendor" => "google",
+                )
+                .increment(quarantined_bytes);
+            }
             if o.block {
                 super::policy_trace::mark_read_filter(
                     &mut policy_trace,
@@ -574,6 +674,21 @@ async fn proxy_request(
         let req_bytes: &[u8] = req.upstream_body.as_deref().unwrap_or(&[]);
         crate::audit_body::persist(&state.auth.db, request_id, mode, req_bytes, &final_body).await;
     }
+    // spec.md §3.2 — `proxilion_adapter_requests_total{vendor,action,decision,mode}`.
+    metrics::counter!(
+        "proxilion_adapter_requests_total",
+        "vendor" => "google",
+        "action" => req.action.clone(),
+        "decision" => decision_label.to_string(),
+        "mode" => if outcome.observe_would_have.is_some() { "observe" } else { "enforce" },
+    )
+    .increment(1);
+    metrics::histogram!(
+        "proxilion_adapter_request_duration_seconds",
+        "vendor" => "google",
+        "action" => req.action.clone(),
+    )
+    .record(adapter_started.elapsed().as_secs_f64());
     state
         .stream
         .publish(ActionEvent {

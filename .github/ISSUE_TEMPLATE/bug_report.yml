@@ -1,0 +1,112 @@
+name: Bug report
+description: Something's broken or behaving unexpectedly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing! A few notes before you write:
+
+        - **Security vulnerabilities** do not belong in a public issue.
+          See [SECURITY.md](https://github.com/clay-good/proxilion/blob/main/SECURITY.md)
+          for the private disclosure flow.
+        - **Spec questions** ("should Proxilion do X?") belong in
+          [Discussions](https://github.com/clay-good/proxilion/discussions),
+          not Issues. Issues are for concrete misbehavior of shipped code.
+        - **Upstream PIC issues** (provenance-core, provenance-plane)
+          go to <https://github.com/clay-good/provenance>.
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit SHA or release tag
+      description: >
+        `git rev-parse HEAD` if running from source, or the Docker tag
+        you pulled. "Latest main" is not a SHA.
+      placeholder: "ce05072 or v0.1.0 or docker.io/proxilion:main-2026-05-12"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deploy_mode
+    attributes:
+      label: Deployment mode
+      description: How is Proxilion sitting in the request path?
+      options:
+        - In-path proxy (Mode 1 — agent OAuth/API URLs point at Proxilion)
+        - Pre-flight advisor (Mode 2 — POST /v1/check)
+        - Audit-only ingestion (Mode 3 — SIEM-style)
+        - Local docker compose (development)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: >
+        The observed behavior. Concrete: exit codes, HTTP status codes,
+        log line excerpts (redacted of secrets), counter names + values.
+        Not "it doesn't work."
+      placeholder: |
+        `proxilion-cli policy reload` returns HTTP 500 with body
+        `{"error":"internal"}`. Log line:
+          WARN policy reload: parse failed at config/policy.yaml:42
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: >
+        Spec section, code path, prior behavior — what made the
+        observed behavior wrong. If unclear, say "I'm not sure if
+        this is a bug or working-as-intended."
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Ideally a `curl` or `proxilion-cli` invocation against a
+        default `docker compose` bring-up. If repro needs a specific
+        policy.yaml shape, paste the minimal stanza inline.
+      placeholder: |
+        ```bash
+        docker compose up -d --wait postgres trust-plane mock-okta
+        bash scripts/smoke-pic.sh
+        proxilion-cli policy reload --file <(cat <<'EOF'
+        - id: my-policy
+          ...
+        EOF
+        )
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        OS + arch, Rust toolchain (if building from source), postgres
+        version (the Trust Plane runs against postgres),
+        anything else that might matter.
+      placeholder: |
+        OS: macOS 14.5 (aarch64)
+        Rust: 1.85.0 stable
+        Postgres: 16.2 via docker compose
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: >
+        Logs (redacted), screenshots, related issues, your hypothesis
+        if you've poked around in the code. Optional.

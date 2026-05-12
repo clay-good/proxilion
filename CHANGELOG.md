@@ -16,6 +16,22 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Public-repo polish.**
+  [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — adopts Contributor
+  Covenant 2.1 verbatim with project-specific scope, reporting
+  channel (`hi@claygood.com` with `[proxilion-conduct]` prefix),
+  and enforcement ladder.
+  [.github/ISSUE_TEMPLATE/](.github/ISSUE_TEMPLATE/) — structured
+  bug-report and feature-request forms with required fields
+  (commit SHA, deploy mode, repro, spec section). Blank issues
+  disabled to force structured context up front; security
+  vulnerabilities redirected to SECURITY.md.
+  [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md)
+  — what's-new / why / tests / deviations / pre-flight checklist.
+  [Justfile](Justfile) — `just ci` runs every local CI gate;
+  `just install-tools` one-shots the dev-tool installs;
+  `just demo`, `just smoke`, `just up`, `just nuke` for common
+  compose operations.
 - **Repository docs.**
   [SECURITY.md](SECURITY.md) — vulnerability disclosure policy with
   private reporting address, response SLAs, in-scope / out-of-scope

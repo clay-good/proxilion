@@ -1,0 +1,25 @@
+# Issue template chooser config.
+#
+# `blank_issues_enabled: false` forces the issue creator through one of
+# the structured templates below. This is deliberate for a security
+# tool — a blank-form bug report often omits enough context (commit
+# SHA, deploy mode, observable vs threshold-crossed) that the first
+# round-trip is just asking for it. The structured templates ask up
+# front.
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security vulnerability disclosure
+    url: https://github.com/clay-good/proxilion/blob/main/SECURITY.md
+    about: >
+      Do not file a public GitHub issue for a suspected vulnerability.
+      See SECURITY.md for the private disclosure address and response SLAs.
+
+  - name: Spec questions / design discussion
+    url: https://github.com/clay-good/proxilion/discussions
+    about: >
+      Open-ended design questions about spec.md / ui-less-surfaces.md /
+      qiuth-patterns.md go in Discussions rather than Issues. Issues
+      are for concrete bug reports + feature requests with acceptance
+      criteria.

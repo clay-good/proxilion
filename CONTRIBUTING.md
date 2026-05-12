@@ -10,6 +10,10 @@ If you're reporting a security vulnerability, **read
 [SECURITY.md](SECURITY.md) first** — please don't open a public
 GitHub issue for it.
 
+Project participation is governed by the
+[Code of Conduct](CODE_OF_CONDUCT.md) (Contributor Covenant 2.1). The
+short version: be excellent to each other.
+
 ## Where the design lives
 
 Specs are the source of truth, the code follows them, not the other
@@ -71,7 +75,9 @@ Four workflows in `.github/workflows/`:
 | `static-html-no-js.yml` | Lints the one server-rendered HTML page to keep it script-free | [.github/workflows/static-html-no-js.yml](.github/workflows/static-html-no-js.yml) |
 | `release.yml` | On `v*.*.*` tag: builds `proxilion-cli` for 4 targets, packs `.tar.gz`, uploads to GitHub Release | [.github/workflows/release.yml](.github/workflows/release.yml) |
 
-Run them locally before pushing:
+Run them locally before pushing. The shortest path is `just ci` (see
+the [Justfile](Justfile) — `just install-tools` first to one-shot the
+dev-tool installs). Without `just`, copy-paste:
 
 ```bash
 cargo fmt --all

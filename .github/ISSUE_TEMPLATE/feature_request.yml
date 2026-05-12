@@ -1,0 +1,93 @@
+name: Feature request
+description: A new capability — adapter, CLI command, metric, policy operator, etc.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests need three things to be actionable: (1) the
+        concrete user story, (2) where in the spec it belongs (or why
+        it should be added to the spec), and (3) the smallest version
+        that delivers value.
+
+        The
+        [docs/specs/](https://github.com/clay-good/proxilion/tree/main/docs/specs)
+        files have an "Open questions" / "Deviations" block per section —
+        if your request matches an existing entry there, link it; the
+        review can focus on the *how* instead of re-justifying the *what*.
+
+        Items deliberately out of scope (see
+        [CONTRIBUTING.md](https://github.com/clay-good/proxilion/blob/main/CONTRIBUTING.md#out-of-scope-by-design)):
+        web dashboard, telemetry, hosted SaaS shape, integrations not
+        spec'd, large supply-chain-surface deps. Filing those will get
+        a polite close + link to that section.
+
+  - type: textarea
+    id: user_story
+    attributes:
+      label: User story
+      description: >
+        Who has this problem, what are they trying to do, and what
+        does success look like? Concrete: a security engineer
+        deploying Proxilion in front of a Vertex agent, not "users."
+      placeholder: |
+        As a security engineer running Proxilion in front of a
+        cross-vendor agent, I want to gate Salesforce writes the same
+        way Gmail sends are gated today, so the agent can read Drive
+        but not push records into our customer CRM without operator
+        sign-off.
+    validations:
+      required: true
+
+  - type: textarea
+    id: spec_section
+    attributes:
+      label: Where in the spec
+      description: >
+        Cite the section of spec.md / ui-less-surfaces.md /
+        qiuth-patterns.md this fits into. If it's a new section, say
+        which milestone (M0–M5) and what neighbors it would have.
+      placeholder: |
+        spec.md §2.1 (write adapters) — Salesforce adapter would sit
+        alongside Gmail with the same Layer-A + Layer-B + read-filter
+        template. Likely M5 (post-design-partner) given the breadth of
+        Salesforce APIs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: minimum_viable
+    attributes:
+      label: The smallest version that delivers value
+      description: >
+        Not the full thing — the *one slice* you'd ship first to prove
+        the shape. Helps us not bite off a multi-week project as the
+        first PR.
+      placeholder: |
+        Just `sObject create` for two object types (Account + Contact)
+        with an `external_recipient`-equivalent body shape, plus the
+        existing Block Kit approve flow. Other sObjects can ride the
+        same template once the pattern is proven.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        What does today's Proxilion look like for this problem? (e.g.
+        "I currently block the agent's egress at the firewall, which
+        also blocks legitimate Gmail.") What other tools have you tried?
+      placeholder: |
+        We currently route Salesforce through a separate gateway with
+        a static IP allowlist. That's coarse — blocks all writes when
+        we really want per-record human-in-the-loop.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: >
+        Sketches, prior art links, willingness to contribute the PR
+        yourself. Optional.

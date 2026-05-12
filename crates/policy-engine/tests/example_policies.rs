@@ -2,9 +2,7 @@
 
 use std::collections::HashMap;
 
-use policy_engine::{
-    Decision, Engine, OpsAtom, RequestContext, UserCtx,
-};
+use policy_engine::{Decision, Engine, OpsAtom, RequestContext, UserCtx};
 
 const POLICIES: &str = r#"
 - id: gmail-external-send-gate
@@ -75,7 +73,10 @@ fn gmail_ctx(to_domain: &str) -> RequestContext {
 fn drive_get_resolves_ops_with_path_id() {
     let engine = Engine::new(POLICIES).expect("engine compiles");
     let out = engine.evaluate(&drive_ctx("abc123")).expect("evaluates");
-    assert_eq!(out.matched_policy_id.as_deref(), Some("drive-injection-filter"));
+    assert_eq!(
+        out.matched_policy_id.as_deref(),
+        Some("drive-injection-filter")
+    );
     assert!(matches!(out.decision, Decision::Allow));
     assert_eq!(out.required_ops.required.len(), 1);
     let atom = &out.required_ops.required[0];
@@ -89,11 +90,17 @@ fn drive_get_resolves_ops_with_path_id() {
 fn gmail_external_send_blocks() {
     let engine = Engine::new(POLICIES).unwrap();
     let out = engine.evaluate(&gmail_ctx("external.example")).unwrap();
-    assert_eq!(out.matched_policy_id.as_deref(), Some("gmail-external-send-gate"));
+    assert_eq!(
+        out.matched_policy_id.as_deref(),
+        Some("gmail-external-send-gate")
+    );
     match out.decision {
         Decision::Block {
             override_allowed, ..
-        } => assert!(override_allowed, "override should be allowed via justification"),
+        } => assert!(
+            override_allowed,
+            "override should be allowed via justification"
+        ),
         d => panic!("expected Block, got {d:?}"),
     }
 }

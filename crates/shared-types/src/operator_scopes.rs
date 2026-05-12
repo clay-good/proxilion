@@ -98,7 +98,10 @@ mod tests {
     fn descriptions_are_non_empty() {
         for (s, desc, endpoints) in SCOPE_CATALOGUE {
             assert!(!desc.is_empty(), "scope `{s}` has empty description");
-            assert!(!endpoints.is_empty(), "scope `{s}` has empty endpoints list");
+            assert!(
+                !endpoints.is_empty(),
+                "scope `{s}` has empty endpoints list"
+            );
         }
     }
 }

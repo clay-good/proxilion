@@ -200,7 +200,7 @@ impl PolicyHandle {
     }
 
     /// Async reload via the attached [`PolicyLoader`]. Returns the report
-    /// + the loader's new version token. Used by the watcher when a
+    /// plus the loader's new version token. Used by the watcher when a
     /// loader is attached; falls back to `reload_from_disk` otherwise.
     /// qiuth-patterns.md §5.
     pub async fn reload_via_loader(&self) -> ReloadReport {
@@ -285,11 +285,7 @@ impl PolicyHandle {
 /// indent level, then replaces an existing top-level `mode:` line or
 /// inserts one directly after the `id:` line. Returns
 /// `SetModeError::NotFound` when the id isn't present at the top level.
-fn edit_mode_in_yaml(
-    yaml: &str,
-    policy_id: &str,
-    mode: Mode,
-) -> Result<String, SetModeError> {
+fn edit_mode_in_yaml(yaml: &str, policy_id: &str, mode: Mode) -> Result<String, SetModeError> {
     let mode_value = match mode {
         Mode::Enforce => "enforce",
         Mode::Observe => "observe",
@@ -331,8 +327,8 @@ fn edit_mode_in_yaml(
     // at a line less-indented than the dash (a new document scope).
     // Blank lines and comments don't end the block.
     let mut block_end = lines.len();
-    for j in (start_idx + 1)..lines.len() {
-        let line = strip_eol(lines[j]);
+    for (j, raw) in lines.iter().enumerate().skip(start_idx + 1) {
+        let line = strip_eol(raw);
         if line.trim().is_empty() {
             continue;
         }
@@ -352,8 +348,13 @@ fn edit_mode_in_yaml(
     // means indented exactly at `field_indent` — guards against matching
     // `mode:` inside a nested `match:` map.
     let mut mode_line_idx: Option<usize> = None;
-    for j in (start_idx + 1)..block_end {
-        let line = strip_eol(lines[j]);
+    for (j, raw) in lines
+        .iter()
+        .enumerate()
+        .skip(start_idx + 1)
+        .take(block_end.saturating_sub(start_idx + 1))
+    {
+        let line = strip_eol(raw);
         let lead = leading_ws_len(line);
         if lead != field_indent.len() {
             continue;
@@ -363,7 +364,7 @@ fn edit_mode_in_yaml(
             && rest
                 .as_bytes()
                 .get(5)
-                .map_or(true, |b| matches!(b, b' ' | b'\t' | b'#'))
+                .is_none_or(|b| matches!(b, b' ' | b'\t' | b'#'))
         {
             mode_line_idx = Some(j);
             break;
@@ -533,10 +534,7 @@ pub async fn spawn_watcher(handle: PolicyHandle) {
     let Some(path) = handle.source().cloned() else {
         return;
     };
-    let mut last_mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
-        Ok(t) => Some(t),
-        Err(_) => None,
-    };
+    let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     info!(path = %path.display(), interval_seconds = WATCH_INTERVAL.as_secs(), "policy file watcher started");
     loop {
         tokio::time::sleep(WATCH_INTERVAL).await;
@@ -661,7 +659,9 @@ mod tests {
   pic_mode: runtime-gate
 ";
         let h = PolicyHandle::new(engine_with(yaml), None, yaml.into());
-        let report = h.set_mode("alpha-policy", Mode::Observe).expect("set_mode ok");
+        let report = h
+            .set_mode("alpha-policy", Mode::Observe)
+            .expect("set_mode ok");
         assert!(report.ok);
 
         let new_yaml = h.raw_yaml();
@@ -677,7 +677,10 @@ mod tests {
         assert!(new_yaml.contains("# next policy gates external gmail sends"));
         // beta-policy is untouched.
         assert!(new_yaml.contains("- id: beta-policy"));
-        assert!(!new_yaml.contains("mode: enforce"), "old value should be gone");
+        assert!(
+            !new_yaml.contains("mode: enforce"),
+            "old value should be gone"
+        );
 
         // The actual engine state agrees — alpha is now Observe.
         let ctx = policy_engine::RequestContext {
@@ -715,7 +718,8 @@ mod tests {
   pic_mode: audit
 ";
         let h = PolicyHandle::new(engine_with(yaml), None, yaml.into());
-        h.set_mode("needs-mode", Mode::Disabled).expect("set_mode ok");
+        h.set_mode("needs-mode", Mode::Disabled)
+            .expect("set_mode ok");
         let new_yaml = h.raw_yaml();
         let id_pos = new_yaml.find("- id: needs-mode").unwrap();
         let mode_pos = new_yaml.find("mode: disabled").unwrap();

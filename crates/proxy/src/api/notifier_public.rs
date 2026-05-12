@@ -27,9 +27,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::api::blocked::{
-    ApproveBody, BlockedApiState, RejectBody, approve_inner, reject_inner,
-};
+use crate::api::blocked::{ApproveBody, BlockedApiState, RejectBody, approve_inner, reject_inner};
 
 #[derive(Clone)]
 pub struct NotifierPublicState {
@@ -59,10 +57,7 @@ struct SubmitForm {
 
 const HTML_TEMPLATE: &str = include_str!("../../static-html/approve.html");
 
-async fn landing(
-    State(state): State<NotifierPublicState>,
-    Query(q): Query<TokenQ>,
-) -> Response {
+async fn landing(State(state): State<NotifierPublicState>, Query(q): Query<TokenQ>) -> Response {
     let row = match load_token(&state.db, q.t).await {
         Ok(Some(r)) => r,
         Ok(None) => return render_error("Link unknown or already used"),
@@ -175,12 +170,11 @@ async fn submit(
     // OUTER lock here (FOR UPDATE on notifier_tokens row) means another
     // concurrent click sees consumed_at=NULL+row-locked and blocks
     // until we mark it.
-    if let Err(e) = sqlx::query(
-        "UPDATE notifier_tokens SET consumed_at = now() WHERE token_id = $1",
-    )
-    .bind(form.t)
-    .execute(&mut *tx)
-    .await
+    if let Err(e) =
+        sqlx::query("UPDATE notifier_tokens SET consumed_at = now() WHERE token_id = $1")
+            .bind(form.t)
+            .execute(&mut *tx)
+            .await
     {
         tracing::warn!(error = %e, "notifier_token: failed to mark consumed");
     }

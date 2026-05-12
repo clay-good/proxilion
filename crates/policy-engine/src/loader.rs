@@ -216,7 +216,11 @@ mod tests {
         // Bump mtime by writing again (sleep to ensure resolution).
         std::thread::sleep(std::time::Duration::from_millis(15));
         // Recreate the file's mtime by truncating + rewriting.
-        std::fs::write(&tmp.path, "- id: x\n  vendor: g\n  action: a\n  decision: allow\n  required_ops: []\n").unwrap();
+        std::fs::write(
+            &tmp.path,
+            "- id: x\n  vendor: g\n  action: a\n  decision: allow\n  required_ops: []\n",
+        )
+        .unwrap();
 
         let changed = l.changed_since(&b0.version).await.unwrap();
         assert!(changed.is_some(), "expected a new mtime token");
@@ -247,7 +251,10 @@ mod tests {
 
     fn tempfile_for_test() -> Tmp {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("proxilion-loader-test-{}.yaml", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "proxilion-loader-test-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
         let file = std::fs::File::create(&path).unwrap();
         Tmp { path, file }
     }

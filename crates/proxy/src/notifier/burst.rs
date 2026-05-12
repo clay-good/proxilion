@@ -123,15 +123,14 @@ impl BurstSummary {
 /// thin wrapper to keep call sites tidy. Kept here to avoid threading
 /// an extra dependency into `burst.rs`.
 fn urlencoding_encode(s: &str) -> String {
-    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
 }
 
 /// Per-policy override resolver. Returns `(threshold, window)` overrides
 /// for a given `policy_id`; each option may be unset (use the global
 /// default). ui-less-surfaces.md §5.6.
-pub type BurstResolver =
-    Arc<dyn Fn(&str) -> Option<(Option<usize>, Option<u64>)> + Send + Sync>;
+pub type BurstResolver = Arc<dyn Fn(&str) -> Option<(Option<usize>, Option<u64>)> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct BurstSuppressor {
@@ -411,8 +410,13 @@ mod tests {
     #[tokio::test]
     async fn per_policy_resolver_overrides_threshold() {
         // Global default threshold is 50; resolver returns 2 for policy "p".
-        let resolver: BurstResolver =
-            Arc::new(|pid| if pid == "p" { Some((Some(2), None)) } else { None });
+        let resolver: BurstResolver = Arc::new(|pid| {
+            if pid == "p" {
+                Some((Some(2), None))
+            } else {
+                None
+            }
+        });
         let s = BurstSuppressor::new(BurstConfig::default()).with_resolver(resolver);
         let now = Instant::now();
         let ops: Vec<String> = vec![];
@@ -484,7 +488,10 @@ mod tests {
             details_url: String::new(),
         }
         .with_details_url("https://proxy.local");
-        assert_eq!(s.details_url, "https://proxy.local/api/v1/blocked?policy_id=p");
+        assert_eq!(
+            s.details_url,
+            "https://proxy.local/api/v1/blocked?policy_id=p"
+        );
     }
 
     #[tokio::test]

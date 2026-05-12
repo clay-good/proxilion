@@ -110,7 +110,11 @@ mod tests {
             (ErrorCode::InternalError, "internal_error"),
         ];
         for (code, expected) in snapshot {
-            assert_eq!(code.as_str(), *expected, "code wire string changed for {code:?}");
+            assert_eq!(
+                code.as_str(),
+                *expected,
+                "code wire string changed for {code:?}"
+            );
         }
     }
 

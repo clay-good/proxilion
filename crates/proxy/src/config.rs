@@ -202,6 +202,16 @@ impl ConfigBuilder {
 
     /// Layer environment variables on top of the current values. Empty
     /// strings on optional vars are filtered like the prior loader did.
+    ///
+    /// **Naming note:** `from_*` taking `self` violates clippy's
+    /// `wrong_self_convention`, which expects constructors. This is a
+    /// fluent-builder *layer* method (qiuth-patterns.md §2 — the same
+    /// shape as `ConfigBuilder::from_file`); the `from_` prefix
+    /// describes the *source* being layered in, not a constructor.
+    /// Renaming to `with_env_layer` would be more conventional but
+    /// would break the published API surface; suppression with
+    /// rationale is the right trade.
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_env_layer(mut self) -> Result<Self, ConfigError> {
         if let Ok(raw) = env::var("PROXILION_BIND_ADDR") {
             self.bind_addr = raw
@@ -251,7 +261,9 @@ impl ConfigBuilder {
         if let Ok(v) = env::var("PROXILION_CUSTOMER_DOMAIN") {
             self.customer_domain = v;
         }
-        self.nats_url = env::var("PROXILION_NATS_URL").ok().filter(|s| !s.is_empty());
+        self.nats_url = env::var("PROXILION_NATS_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
         if let Ok(v) = env::var("PROXILION_NATS_SUBJECT_PREFIX") {
             self.nats_subject_prefix = v;
         }
@@ -289,6 +301,10 @@ impl ConfigBuilder {
     /// Per qiuth-patterns.md §2.2, this lives **between** defaults and
     /// env so `PROXILION_*` env vars always win — operators can still
     /// override file-based config without editing the file.
+    ///
+    /// (Same `from_*-takes-self` naming convention as `from_env_layer`
+    /// — describes the source being layered in, not a constructor.)
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_file(mut self, path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::FileLoad {
@@ -300,9 +316,7 @@ impl ConfigBuilder {
             reason: format!("parse: {e}"),
         })?;
         if let Some(v) = file.bind_addr {
-            self.bind_addr = v
-                .parse()
-                .map_err(|e| ConfigError::BindAddr(v.clone(), e))?;
+            self.bind_addr = v.parse().map_err(|e| ConfigError::BindAddr(v.clone(), e))?;
         }
         if let Some(v) = file.tls_cert_path {
             self.tls_cert_path = v;
@@ -435,17 +449,17 @@ impl ConfigBuilder {
             if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(ConfigError::InvalidValue {
                     field: "PROXILION_TOKEN_ENCRYPTION_KEY",
-                    reason: format!(
-                        "expected 64 hex chars (32 bytes), got {} chars",
-                        hex.len()
-                    ),
+                    reason: format!("expected 64 hex chars (32 bytes), got {} chars", hex.len()),
                 });
             }
         }
 
         // URL shape — reject obvious typos. Allow either http:// or https://.
         check_http_url("PROXILION_TRUST_PLANE_URL", &self.trust_plane_url)?;
-        check_http_url("PROXILION_FEDERATION_BRIDGE_URL", &self.federation_bridge_url)?;
+        check_http_url(
+            "PROXILION_FEDERATION_BRIDGE_URL",
+            &self.federation_bridge_url,
+        )?;
 
         // dev_mode = false → cert + key must exist on disk now. This is
         // the same behavior the prior `from_env` had inline.
@@ -534,7 +548,10 @@ mod tests {
 
     #[test]
     fn defaults_build_in_dev_mode() {
-        let c = ConfigBuilder::defaults().with_dev_mode(true).build().unwrap();
+        let c = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .build()
+            .unwrap();
         assert_eq!(c.bind_addr.to_string(), "0.0.0.0:8443");
         assert_eq!(c.trust_plane_url, "http://trust-plane:8080");
         assert!(c.operator_auth_enforced);
@@ -575,16 +592,16 @@ mod tests {
             .build();
         let err = r.unwrap_err();
         match err {
-            ConfigError::InvalidValue { field, .. } => assert_eq!(field, "PROXILION_TRUST_PLANE_URL"),
+            ConfigError::InvalidValue { field, .. } => {
+                assert_eq!(field, "PROXILION_TRUST_PLANE_URL")
+            }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 
     #[test]
     fn build_requires_cert_when_not_dev_mode() {
-        let r = ConfigBuilder::defaults()
-            .with_dev_mode(false)
-            .build();
+        let r = ConfigBuilder::defaults().with_dev_mode(false).build();
         let err = r.unwrap_err();
         assert!(matches!(err, ConfigError::MissingCert(_)));
     }

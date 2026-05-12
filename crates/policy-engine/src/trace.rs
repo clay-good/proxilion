@@ -137,7 +137,11 @@ impl From<&OpsAtom> for OpsAtomView {
 }
 
 impl PolicyTrace {
-    pub fn new(layers: Vec<LayerOutcome>, decision: Decision, required_ops: Vec<OpsAtomView>) -> Self {
+    pub fn new(
+        layers: Vec<LayerOutcome>,
+        decision: Decision,
+        required_ops: Vec<OpsAtomView>,
+    ) -> Self {
         Self {
             trace_id: Uuid::new_v4(),
             evaluated_at: Utc::now(),
@@ -175,7 +179,10 @@ mod tests {
         );
         assert!(!o.passed);
         assert_eq!(o.error_code, Some(ErrorCode::PolicyBlocked));
-        assert_eq!(o.matched_rule_id.as_deref(), Some("gmail-external-recipient"));
+        assert_eq!(
+            o.matched_rule_id.as_deref(),
+            Some("gmail-external-recipient")
+        );
     }
 
     #[test]
@@ -203,7 +210,10 @@ mod tests {
                     None,
                 ),
             ],
-            Decision::Block { reason: "policy".into(), override_allowed: true },
+            Decision::Block {
+                reason: "policy".into(),
+                override_allowed: true,
+            },
             vec![],
         );
         assert!(!t.allowed());

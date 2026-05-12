@@ -23,11 +23,7 @@ struct Cli {
     url: String,
 
     /// Trust Plane base URL (only used by `selftest`).
-    #[arg(
-        long,
-        env = "TRUST_PLANE_URL",
-        default_value = "http://localhost:8080"
-    )]
+    #[arg(long, env = "TRUST_PLANE_URL", default_value = "http://localhost:8080")]
     trust_plane: String,
 
     /// Accept self-signed certs (development only).
@@ -755,9 +751,11 @@ async fn cmd_metrics(http: &reqwest::Client, url: &str, sub: MetricsCmd) -> Resu
                     }
                 }
                 let v: f64 = value_part.parse().unwrap_or(f64::NAN);
-                let entry = by_family
-                    .entry(family.to_string())
-                    .or_insert((0usize, f64::INFINITY, f64::NEG_INFINITY));
+                let entry = by_family.entry(family.to_string()).or_insert((
+                    0usize,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                ));
                 entry.0 += 1;
                 if !v.is_nan() {
                     if v < entry.1 {
@@ -777,8 +775,16 @@ async fn cmd_metrics(http: &reqwest::Client, url: &str, sub: MetricsCmd) -> Resu
                 "FAMILY", "SERIES", "MIN", "MAX"
             );
             for (fam, (count, min, max)) in by_family {
-                let min_s = if min.is_infinite() { "—".to_string() } else { format_metric_value(min) };
-                let max_s = if max.is_infinite() { "—".to_string() } else { format_metric_value(max) };
+                let min_s = if min.is_infinite() {
+                    "—".to_string()
+                } else {
+                    format_metric_value(min)
+                };
+                let max_s = if max.is_infinite() {
+                    "—".to_string()
+                } else {
+                    format_metric_value(max)
+                };
                 println!("{fam:<60} {count:>8} {min_s:>14} {max_s:>14}");
             }
             Ok(())
@@ -824,17 +830,17 @@ async fn cmd_status(http: &reqwest::Client, url: &str, token: &str, format: &str
         .json()
         .await
         .unwrap_or_else(|_| serde_json::json!({}));
-    let setup: Value = match auth_header(
-        http.get(format!("{url}/api/v1/setup/status")),
-        token,
-    )
-    .send()
-    .await
+    let setup: Value = match auth_header(http.get(format!("{url}/api/v1/setup/status")), token)
+        .send()
+        .await
     {
         Ok(r) if r.status().is_success() => r.json().await.unwrap_or(Value::Null),
         _ => Value::Null,
     };
-    let ready = healthz.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ready = healthz
+        .get("ready")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let combined = serde_json::json!({
         "ready": ready,
         "healthz": healthz,
@@ -851,11 +857,17 @@ async fn cmd_status(http: &reqwest::Client, url: &str, token: &str, format: &str
             println!("  version:  {version}");
         }
         if let Some(checks) = healthz.get("checks") {
-            println!("  checks:   {}", serde_json::to_string(checks).unwrap_or_default());
+            println!(
+                "  checks:   {}",
+                serde_json::to_string(checks).unwrap_or_default()
+            );
         }
         if !setup.is_null() {
             println!("\nsetup checklist:");
-            println!("{}", serde_json::to_string_pretty(&setup).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&setup).unwrap_or_default()
+            );
         } else {
             println!("\nsetup checklist: (unavailable — token missing or insufficient scope)");
         }
@@ -910,12 +922,14 @@ async fn cmd_killswitch(
     sub: KillswitchCmd,
 ) -> Result<()> {
     let (path, reason) = match sub {
-        KillswitchCmd::Session { id, reason } => {
-            (format!("/api/v1/killswitch/session/{}", urlencode(&id)), reason)
-        }
-        KillswitchCmd::User { p_0, reason } => {
-            (format!("/api/v1/killswitch/user/{}", urlencode(&p_0)), reason)
-        }
+        KillswitchCmd::Session { id, reason } => (
+            format!("/api/v1/killswitch/session/{}", urlencode(&id)),
+            reason,
+        ),
+        KillswitchCmd::User { p_0, reason } => (
+            format!("/api/v1/killswitch/user/{}", urlencode(&p_0)),
+            reason,
+        ),
         KillswitchCmd::All { confirm, reason } => {
             if confirm != "yes" {
                 eprintln!(
@@ -933,14 +947,17 @@ async fn cmd_killswitch(
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        eprintln!("{RED}killswitch failed{RESET}: HTTP {} — {body}", status.as_u16());
+        eprintln!(
+            "{RED}killswitch failed{RESET}: HTTP {} — {body}",
+            status.as_u16()
+        );
         std::process::exit(1);
     }
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }
 
-fn auth_header<'a>(builder: reqwest::RequestBuilder, token: &'a str) -> reqwest::RequestBuilder {
+fn auth_header(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
     if token.is_empty() {
         builder
     } else {
@@ -955,31 +972,53 @@ async fn cmd_actions(
     sub: ActionsCmd,
 ) -> Result<()> {
     match sub {
-        ActionsCmd::Tail { decision, vendor, action, format } => {
-            actions_tail(http, url, token, decision, vendor, action, &format).await
-        }
+        ActionsCmd::Tail {
+            decision,
+            vendor,
+            action,
+            format,
+        } => actions_tail(http, url, token, decision, vendor, action, &format).await,
         ActionsCmd::List {
-            decision, vendor, action, p_0, session_id, since, limit, all, format,
+            decision,
+            vendor,
+            action,
+            p_0,
+            session_id,
+            since,
+            limit,
+            all,
+            format,
         } => {
             actions_list(
-                http, url, token, decision, vendor, action, p_0, session_id, since,
-                limit, all, &format,
+                http, url, token, decision, vendor, action, p_0, session_id, since, limit, all,
+                &format,
             )
             .await
         }
         ActionsCmd::Show { id, format } => actions_show(http, url, token, &id, &format).await,
         ActionsCmd::Export {
-            format, since, until, decision, vendor, action, p_0, output,
+            format,
+            since,
+            until,
+            decision,
+            vendor,
+            action,
+            p_0,
+            output,
         } => {
-            actions_export(http, url, token, &format, since, until, decision, vendor, action, p_0, output)
-                .await
+            actions_export(
+                http, url, token, &format, since, until, decision, vendor, action, p_0, output,
+            )
+            .await
         }
         ActionsCmd::Chain { session_id, format } => {
             actions_chain(http, url, token, &session_id, &format).await
         }
-        ActionsCmd::Purge { older_than, dry_run, format } => {
-            actions_purge(http, url, token, &older_than, dry_run, &format).await
-        }
+        ActionsCmd::Purge {
+            older_than,
+            dry_run,
+            format,
+        } => actions_purge(http, url, token, &older_than, dry_run, &format).await,
     }
 }
 
@@ -991,15 +1030,13 @@ async fn actions_purge(
     dry_run: bool,
     format: &str,
 ) -> Result<()> {
-    let cutoff = parse_since(older_than)
-        .with_context(|| format!("invalid --older-than {older_than:?}"))?;
+    let cutoff =
+        parse_since(older_than).with_context(|| format!("invalid --older-than {older_than:?}"))?;
     let body = serde_json::json!({
         "older_than": cutoff.to_rfc3339(),
         "dry_run": dry_run,
     });
-    let req = http
-        .post(format!("{url}/api/v1/actions/purge"))
-        .json(&body);
+    let req = http.post(format!("{url}/api/v1/actions/purge")).json(&body);
     let resp = auth_header(req, token).send().await?;
     let status = resp.status();
     let payload: serde_json::Value = resp.json().await?;
@@ -1028,8 +1065,8 @@ fn parse_since(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     }
     let dur = humantime::parse_duration(s)
         .with_context(|| format!("--since {s:?} is not a duration or RFC3339 date"))?;
-    let chrono_dur = chrono::Duration::from_std(dur)
-        .map_err(|_| anyhow!("--since duration overflows"))?;
+    let chrono_dur =
+        chrono::Duration::from_std(dur).map_err(|_| anyhow!("--since duration overflows"))?;
     Ok(chrono::Utc::now() - chrono_dur)
 }
 
@@ -1065,10 +1102,17 @@ async fn actions_tail(
                     event = e.trim().to_string();
                 }
             }
-            if event != "action" || data.is_empty() { continue; }
+            if event != "action" || data.is_empty() {
+                continue;
+            }
             // Client-side filter — the SSE endpoint does not take query
             // params, so this is the place to apply tail-time filters.
-            if !matches_tail_filter(&data, decision.as_deref(), vendor.as_deref(), action.as_deref()) {
+            if !matches_tail_filter(
+                &data,
+                decision.as_deref(),
+                vendor.as_deref(),
+                action.as_deref(),
+            ) {
                 continue;
             }
             match format {
@@ -1096,9 +1140,21 @@ fn matches_tail_filter(
         Err(_) => return true,
     };
     let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
-    if let Some(d) = decision { if field("decision") != d { return false; } }
-    if let Some(d) = vendor   { if field("vendor")   != d { return false; } }
-    if let Some(d) = action   { if field("action")   != d { return false; } }
+    if let Some(d) = decision {
+        if field("decision") != d {
+            return false;
+        }
+    }
+    if let Some(d) = vendor {
+        if field("vendor") != d {
+            return false;
+        }
+    }
+    if let Some(d) = action {
+        if field("action") != d {
+            return false;
+        }
+    }
     true
 }
 
@@ -1141,18 +1197,30 @@ async fn actions_list(
     let limit = limit.clamp(1, 500);
     if matches!(format, "pretty") {
         println!(
-            "{DIM}{:<25}  {:>22}  {:>3}  {:<32}  {}{RESET}",
-            "at", "decision", "st", "action", "p_0"
+            "{DIM}{:<25}  {:>22}  {:>3}  {:<32}  p_0{RESET}",
+            "at", "decision", "st", "action"
         );
     }
     loop {
         let mut q = vec![format!("limit={limit}")];
-        if let Some(v) = &decision { q.push(format!("decision={}", urlencode(v))); }
-        if let Some(v) = &vendor { q.push(format!("vendor={}", urlencode(v))); }
-        if let Some(v) = &action { q.push(format!("action={}", urlencode(v))); }
-        if let Some(v) = &p_0 { q.push(format!("p_0={}", urlencode(v))); }
-        if let Some(v) = &session_id { q.push(format!("session_id={}", urlencode(v))); }
-        if let Some(b) = before { q.push(format!("before={}", urlencode(&b.to_rfc3339()))); }
+        if let Some(v) = &decision {
+            q.push(format!("decision={}", urlencode(v)));
+        }
+        if let Some(v) = &vendor {
+            q.push(format!("vendor={}", urlencode(v)));
+        }
+        if let Some(v) = &action {
+            q.push(format!("action={}", urlencode(v)));
+        }
+        if let Some(v) = &p_0 {
+            q.push(format!("p_0={}", urlencode(v)));
+        }
+        if let Some(v) = &session_id {
+            q.push(format!("session_id={}", urlencode(v)));
+        }
+        if let Some(b) = before {
+            q.push(format!("before={}", urlencode(&b.to_rfc3339())));
+        }
         let endpoint = format!("{url}/api/v1/actions?{}", q.join("&"));
         let env: Value = auth_header(http.get(&endpoint), token)
             .send()
@@ -1160,14 +1228,24 @@ async fn actions_list(
             .error_for_status()?
             .json()
             .await?;
-        let rows = env.get("rows").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        let rows = env
+            .get("rows")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
         for r in &rows {
             // Honor --since by stopping once we've crossed the boundary.
             if let Some(s) = since_dt {
                 let at = r.get("at").and_then(|x| x.as_str()).and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&chrono::Utc))
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|d| d.with_timezone(&chrono::Utc))
                 });
-                if let Some(t) = at { if t < s { return Ok(()); } }
+                if let Some(t) = at {
+                    if t < s {
+                        return Ok(());
+                    }
+                }
             }
             match format {
                 "json" => println!("{}", serde_json::to_string(r)?),
@@ -1176,7 +1254,10 @@ async fn actions_list(
             }
             total += 1;
         }
-        let next = env.get("next_before").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let next = env
+            .get("next_before")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
         if !all || rows.is_empty() {
             if format == "pretty" {
                 println!("{DIM}-- {total} rows --{RESET}");
@@ -1185,7 +1266,8 @@ async fn actions_list(
         }
         match next {
             Some(s) => {
-                before = Some(chrono::DateTime::parse_from_rfc3339(&s)?.with_timezone(&chrono::Utc));
+                before =
+                    Some(chrono::DateTime::parse_from_rfc3339(&s)?.with_timezone(&chrono::Utc));
             }
             None => {
                 if format == "pretty" {
@@ -1205,7 +1287,10 @@ async fn actions_chain(
     format: &str,
 ) -> Result<()> {
     let v: Value = auth_header(
-        http.get(format!("{url}/api/v1/sessions/{}/chain", urlencode(session_id))),
+        http.get(format!(
+            "{url}/api/v1/sessions/{}/chain",
+            urlencode(session_id)
+        )),
         token,
     )
     .send()
@@ -1218,7 +1303,11 @@ async fn actions_chain(
         return Ok(());
     }
     println!("session {session_id}");
-    let chain = v.get("chain").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let chain = v
+        .get("chain")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
     if chain.is_empty() {
         println!("  (no PCA hops recorded for this session)");
         return Ok(());
@@ -1233,9 +1322,7 @@ async fn actions_chain(
             .map(|a| a.len())
             .unwrap_or(0);
         let prefix = if i == 0 { "└─" } else { "├─" };
-        println!(
-            "  {prefix} hop={hop} pca={id} p_0={p_0} ops={ops_count}"
-        );
+        println!("  {prefix} hop={hop} pca={id} p_0={p_0} ops={ops_count}");
     }
     Ok(())
 }
@@ -1261,14 +1348,39 @@ async fn actions_show(
         return Ok(());
     }
     println!("{}", "─".repeat(70));
-    println!("action {}", v.get("id").and_then(|x| x.as_str()).unwrap_or("?"));
-    println!("  at:       {}", v.get("at").and_then(|x| x.as_str()).unwrap_or("?"));
-    println!("  vendor:   {}", v.get("vendor").and_then(|x| x.as_str()).unwrap_or("?"));
-    println!("  action:   {}", v.get("action").and_then(|x| x.as_str()).unwrap_or("?"));
-    println!("  method:   {}  {}", v.get("method").and_then(|x| x.as_str()).unwrap_or(""), v.get("path").and_then(|x| x.as_str()).unwrap_or(""));
-    println!("  status:   {}", v.get("status").and_then(|x| x.as_u64()).unwrap_or(0));
-    println!("  decision: {}", v.get("decision").and_then(|x| x.as_str()).unwrap_or("?"));
-    println!("  p_0:      {}", v.get("p_0").and_then(|x| x.as_str()).unwrap_or("?"));
+    println!(
+        "action {}",
+        v.get("id").and_then(|x| x.as_str()).unwrap_or("?")
+    );
+    println!(
+        "  at:       {}",
+        v.get("at").and_then(|x| x.as_str()).unwrap_or("?")
+    );
+    println!(
+        "  vendor:   {}",
+        v.get("vendor").and_then(|x| x.as_str()).unwrap_or("?")
+    );
+    println!(
+        "  action:   {}",
+        v.get("action").and_then(|x| x.as_str()).unwrap_or("?")
+    );
+    println!(
+        "  method:   {}  {}",
+        v.get("method").and_then(|x| x.as_str()).unwrap_or(""),
+        v.get("path").and_then(|x| x.as_str()).unwrap_or("")
+    );
+    println!(
+        "  status:   {}",
+        v.get("status").and_then(|x| x.as_u64()).unwrap_or(0)
+    );
+    println!(
+        "  decision: {}",
+        v.get("decision").and_then(|x| x.as_str()).unwrap_or("?")
+    );
+    println!(
+        "  p_0:      {}",
+        v.get("p_0").and_then(|x| x.as_str()).unwrap_or("?")
+    );
     if let Some(s) = v.get("session_id").and_then(|x| x.as_str()) {
         println!("  session:  {s}");
     }
@@ -1280,7 +1392,11 @@ async fn actions_show(
     }
     println!();
     println!("PCA chain (root → leaf)");
-    let chain = v.get("chain").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let chain = v
+        .get("chain")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
     if chain.is_empty() {
         println!("  (none)");
     } else {
@@ -1293,11 +1409,13 @@ async fn actions_show(
             let ops: Vec<String> = link
                 .get("ops")
                 .and_then(|x| x.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            println!(
-                "  {icon} hop {hop:<2}  {DIM}pca={pca_id}{RESET}",
-            );
+            println!("  {icon} hop {hop:<2}  {DIM}pca={pca_id}{RESET}",);
             println!("       p_0={p_0}");
             if let Some(prev) = &prev_ops {
                 let cur: std::collections::HashSet<String> = ops.iter().cloned().collect();
@@ -1307,7 +1425,8 @@ async fn actions_show(
                 } else {
                     println!(
                         "       ops [{}] — {RED}narrowed: removed {}{RESET}",
-                        ops.len(), removed.len()
+                        ops.len(),
+                        removed.len()
                     );
                     for r in removed.iter().take(3) {
                         println!("          - {r}");
@@ -1317,13 +1436,19 @@ async fn actions_show(
                 println!("       ops [{}]", ops.len());
             }
             prev_ops = Some(ops.iter().cloned().collect());
-            if i + 1 < chain.len() { println!("       │"); }
+            if i + 1 < chain.len() {
+                println!("       │");
+            }
         }
     }
     if let Some(b) = v.get("chain_broken_at").and_then(|x| x.as_str()) {
         println!("  {RED}✗ chain broken at {b}{RESET}");
     } else if !chain.is_empty() {
-        println!("  {GREEN}✓ chain intact ({} link{}){RESET}", chain.len(), if chain.len() == 1 { "" } else { "s" });
+        println!(
+            "  {GREEN}✓ chain intact ({} link{}){RESET}",
+            chain.len(),
+            if chain.len() == 1 { "" } else { "s" }
+        );
     }
     println!("{}", "─".repeat(70));
     Ok(())
@@ -1351,10 +1476,18 @@ async fn actions_export(
     if let Some(u) = until {
         q.push(format!("until={}", urlencode(&u)));
     }
-    if let Some(v) = &decision { q.push(format!("decision={}", urlencode(v))); }
-    if let Some(v) = &vendor { q.push(format!("vendor={}", urlencode(v))); }
-    if let Some(v) = &action { q.push(format!("action={}", urlencode(v))); }
-    if let Some(v) = &p_0 { q.push(format!("p_0={}", urlencode(v))); }
+    if let Some(v) = &decision {
+        q.push(format!("decision={}", urlencode(v)));
+    }
+    if let Some(v) = &vendor {
+        q.push(format!("vendor={}", urlencode(v)));
+    }
+    if let Some(v) = &action {
+        q.push(format!("action={}", urlencode(v)));
+    }
+    if let Some(v) = &p_0 {
+        q.push(format!("p_0={}", urlencode(v)));
+    }
     let endpoint = format!("{url}/api/v1/actions/export?{}", q.join("&"));
     let resp = auth_header(http.get(&endpoint), token)
         .send()
@@ -1364,8 +1497,9 @@ async fn actions_export(
     use futures_util::StreamExt;
     use std::io::Write;
     let mut sink: Box<dyn Write> = match output {
-        Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(&p)
-            .with_context(|| format!("creating {p}"))?)),
+        Some(p) => Box::new(std::io::BufWriter::new(
+            std::fs::File::create(&p).with_context(|| format!("creating {p}"))?,
+        )),
         None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
     };
     let mut bytes_written: u64 = 0;
@@ -1437,8 +1571,9 @@ fn ok(name: &str, latency_ms: u128, detail: &str) {
 }
 fn fail(name: &str, latency_ms: u128, detail: &str) {
     println!(
-        "  {RED}✗{RESET} {name:<28}{DIM}{:>6}ms{RESET}   {RED}{detail}{RESET}"
-    , latency_ms);
+        "  {RED}✗{RESET} {name:<28}{DIM}{:>6}ms{RESET}   {RED}{detail}{RESET}",
+        latency_ms
+    );
 }
 
 async fn cmd_selftest(
@@ -1465,7 +1600,11 @@ async fn cmd_selftest(
                     if ready {
                         ok("proxy /healthz", dt, "ready=true");
                     } else {
-                        fail("proxy /healthz", dt, &format!("status={status}, ready=false — see `proxilion-cli health`"));
+                        fail(
+                            "proxy /healthz",
+                            dt,
+                            &format!("status={status}, ready=false — see `proxilion-cli health`"),
+                        );
                         all_ok = false;
                     }
                 }
@@ -1494,23 +1633,39 @@ async fn cmd_selftest(
                 ok(
                     "trust-plane /federation/info",
                     dt,
-                    &format!("kid={} pubkey={} bytes (b64)", info.kid, info.public_key.len()),
+                    &format!(
+                        "kid={} pubkey={} bytes (b64)",
+                        info.kid,
+                        info.public_key.len()
+                    ),
                 );
                 Some(info.kid)
             }
             Err(e) => {
-                fail("trust-plane /federation/info", dt, &format!("bad JSON: {e}"));
+                fail(
+                    "trust-plane /federation/info",
+                    dt,
+                    &format!("bad JSON: {e}"),
+                );
                 all_ok = false;
                 None
             }
         },
         Ok(r) => {
-            fail("trust-plane /federation/info", dt, &format!("status {}", r.status()));
+            fail(
+                "trust-plane /federation/info",
+                dt,
+                &format!("status {}", r.status()),
+            );
             all_ok = false;
             None
         }
         Err(e) => {
-            fail("trust-plane /federation/info", dt, &format!("unreachable: {e}"));
+            fail(
+                "trust-plane /federation/info",
+                dt,
+                &format!("unreachable: {e}"),
+            );
             all_ok = false;
             None
         }
@@ -1734,21 +1889,29 @@ async fn cmd_tokens(sub: TokensCmd) -> Result<()> {
             .fetch_one(&pool)
             .await
             .context("inserting operator_tokens")?;
-            println!("{}", serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "id": row.0.to_string(),
-                "name": name,
-                "scopes": scope,
-                "token": plaintext,
-                "note": "This token is shown ONCE. Store it in a secrets manager."
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "id": row.0.to_string(),
+                    "name": name,
+                    "scopes": scope,
+                    "token": plaintext,
+                    "note": "This token is shown ONCE. Store it in a secrets manager."
+                }))?
+            );
             Ok(())
         }
         TokensCmd::List { all } => {
-            let rows: Vec<(uuid::Uuid, String, Vec<String>, chrono::DateTime<chrono::Utc>,
-                           Option<chrono::DateTime<chrono::Utc>>,
-                           Option<chrono::DateTime<chrono::Utc>>,
-                           Option<String>)> = sqlx::query_as(
+            let rows: Vec<(
+                uuid::Uuid,
+                String,
+                Vec<String>,
+                chrono::DateTime<chrono::Utc>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<String>,
+            )> = sqlx::query_as(
                 "SELECT id, name, scopes, created_at, last_used_at, revoked_at, revoked_reason
                  FROM operator_tokens
                  WHERE ($1 OR revoked_at IS NULL)
@@ -1758,23 +1921,26 @@ async fn cmd_tokens(sub: TokensCmd) -> Result<()> {
             .fetch_all(&pool)
             .await
             .context("selecting operator_tokens")?;
-            let arr: Vec<_> = rows.into_iter().map(|r| {
-                json!({
-                    "id": r.0.to_string(),
-                    "name": r.1,
-                    "scopes": r.2,
-                    "created_at": r.3.to_rfc3339(),
-                    "last_used_at": r.4.map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
-                    "revoked_at": r.5.map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
-                    "revoked_reason": r.6,
+            let arr: Vec<_> = rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "id": r.0.to_string(),
+                        "name": r.1,
+                        "scopes": r.2,
+                        "created_at": r.3.to_rfc3339(),
+                        "last_used_at": r.4.map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
+                        "revoked_at": r.5.map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
+                        "revoked_reason": r.6,
+                    })
                 })
-            }).collect();
+                .collect();
             println!("{}", serde_json::to_string_pretty(&arr)?);
             Ok(())
         }
         TokensCmd::Revoke { id, reason } => {
-            let uuid = uuid::Uuid::parse_str(&id)
-                .map_err(|e| anyhow!("invalid UUID `{id}`: {e}"))?;
+            let uuid =
+                uuid::Uuid::parse_str(&id).map_err(|e| anyhow!("invalid UUID `{id}`: {e}"))?;
             let res = sqlx::query(
                 "UPDATE operator_tokens
                  SET revoked_at = now(), revoked_reason = $2
@@ -1789,11 +1955,14 @@ async fn cmd_tokens(sub: TokensCmd) -> Result<()> {
             if n == 0 {
                 return Err(anyhow!("no active token with id {id} (already revoked?)"));
             }
-            println!("{}", serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "id": id,
-                "revoked": n,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "id": id,
+                    "revoked": n,
+                }))?
+            );
             Ok(())
         }
         TokensCmd::Scopes { .. } => unreachable!("handled above before pool open"),
@@ -1806,25 +1975,22 @@ fn cmd_tokens_scopes(format: &str) -> Result<()> {
         "json" => {
             let arr: Vec<_> = catalogue
                 .iter()
-                .map(|(s, d, e)| json!({
-                    "scope": s,
-                    "description": d,
-                    "endpoints": e,
-                }))
+                .map(|(s, d, e)| {
+                    json!({
+                        "scope": s,
+                        "description": d,
+                        "endpoints": e,
+                    })
+                })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&arr)?);
         }
         _ => {
             // Pretty: aligned columns, plus a header. Width of the scope
             // column is the longest scope + 2.
-            let max = catalogue
-                .iter()
-                .map(|(s, _, _)| s.len())
-                .max()
-                .unwrap_or(0)
-                + 2;
-            println!("{:width$}{}", "scope", "description", width = max);
-            println!("{:width$}{}", "-----", "-----------", width = max);
+            let max = catalogue.iter().map(|(s, _, _)| s.len()).max().unwrap_or(0) + 2;
+            println!("{:width$}description", "scope", width = max);
+            println!("{:width$}-----------", "-----", width = max);
             for (s, d, e) in catalogue {
                 println!("{:width$}{}", s, d, width = max);
                 println!("{:width$}  endpoints: {}", "", e, width = max);
@@ -1838,12 +2004,7 @@ fn cmd_tokens_scopes(format: &str) -> Result<()> {
 // Policy management (ui-less-surfaces.md §4)
 // ─────────────────────────────────────────────────────────────────────────
 
-async fn cmd_policy(
-    http: &reqwest::Client,
-    url: &str,
-    token: &str,
-    sub: PolicyCmd,
-) -> Result<()> {
+async fn cmd_policy(http: &reqwest::Client, url: &str, token: &str, sub: PolicyCmd) -> Result<()> {
     match sub {
         PolicyCmd::List { mode, format } => {
             let resp = auth_header(http.get(format!("{url}/api/v1/policy")), token)
@@ -1866,7 +2027,10 @@ async fn cmd_policy(
             } else {
                 let source = envelope["source"].as_str().unwrap_or("(unset)");
                 println!("source: {source}");
-                println!("{:<40} {:<10} {:<10} {}", "id", "mode", "pic_mode", "vendor/action");
+                println!(
+                    "{:<40} {:<10} {:<10} vendor/action",
+                    "id", "mode", "pic_mode"
+                );
                 println!("{}", "─".repeat(78));
                 for p in &filtered {
                     println!(
@@ -1890,8 +2054,7 @@ async fn cmd_policy(
                 .context("/api/v1/policy returned an error")?;
             let envelope: Value = resp.json().await?;
             let policies = envelope["policies"].as_array().cloned().unwrap_or_default();
-            let Some(found) = policies.into_iter().find(|p| p["id"].as_str() == Some(&id))
-            else {
+            let Some(found) = policies.into_iter().find(|p| p["id"].as_str() == Some(&id)) else {
                 eprintln!("{RED}policy `{id}` not found{RESET}");
                 std::process::exit(1);
             };
@@ -2028,14 +2191,11 @@ async fn cmd_policy(
                     "mode must be one of: enforce | observe | disabled (got `{mode}`)"
                 ));
             }
-            let resp = auth_header(
-                http.post(format!("{url}/api/v1/policy/{id}/mode")),
-                token,
-            )
-            .json(&json!({"mode": mode}))
-            .send()
-            .await
-            .context("POST /api/v1/policy/{id}/mode")?;
+            let resp = auth_header(http.post(format!("{url}/api/v1/policy/{id}/mode")), token)
+                .json(&json!({"mode": mode}))
+                .send()
+                .await
+                .context("POST /api/v1/policy/{id}/mode")?;
             let status = resp.status();
             let body: Value = resp.json().await.unwrap_or(json!({}));
             println!("{}", serde_json::to_string_pretty(&body)?);
@@ -2048,7 +2208,17 @@ async fn cmd_policy(
             file,
             editor,
             no_reload,
-        } => cmd_policy_edit(http, url, token, file.as_deref(), editor.as_deref(), no_reload).await,
+        } => {
+            cmd_policy_edit(
+                http,
+                url,
+                token,
+                file.as_deref(),
+                editor.as_deref(),
+                no_reload,
+            )
+            .await
+        }
         PolicyCmd::Simulate {
             file,
             against,
@@ -2102,8 +2272,7 @@ async fn cmd_policy_edit(
 
     // 3. Drop a `<path>.bak` so a bad edit is recoverable.
     let backup = format!("{path}.bak");
-    std::fs::write(&backup, &original)
-        .with_context(|| format!("writing backup `{backup}`"))?;
+    std::fs::write(&backup, &original).with_context(|| format!("writing backup `{backup}`"))?;
 
     // 4. Resolve the editor command. Precedence: --editor > $EDITOR > $VISUAL > vi.
     let editor_cmd = explicit_editor
@@ -2195,11 +2364,7 @@ async fn cmd_policy_edit(
 /// path the proxy is loading policy from. Returns an error when the
 /// proxy hasn't been configured with a source (the synthetic empty
 /// policy set; `source` is null).
-async fn resolve_policy_source(
-    http: &reqwest::Client,
-    url: &str,
-    token: &str,
-) -> Result<String> {
+async fn resolve_policy_source(http: &reqwest::Client, url: &str, token: &str) -> Result<String> {
     let resp = auth_header(http.get(format!("{url}/api/v1/policy")), token)
         .send()
         .await
@@ -2268,9 +2433,10 @@ async fn cmd_policy_simulate(
     let since_str = since.to_rfc3339();
 
     loop {
-        let mut req = http
-            .get(format!("{url}/api/v1/actions"))
-            .query(&[("since", since_str.as_str()), ("limit", &page_limit.to_string())]);
+        let mut req = http.get(format!("{url}/api/v1/actions")).query(&[
+            ("since", since_str.as_str()),
+            ("limit", &page_limit.to_string()),
+        ]);
         if let Some(b) = before.as_deref() {
             req = req.query(&[("before", b)]);
         }
@@ -2431,7 +2597,10 @@ async fn cmd_policy_simulate(
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Replayed {total} actions over `{against}` ({} unreplayable)", unreplayable);
+        println!(
+            "Replayed {total} actions over `{against}` ({} unreplayable)",
+            unreplayable
+        );
         if total == 0 {
             println!("No history in the window.");
         } else {
@@ -2503,7 +2672,10 @@ mod policy_edit_tests {
     #[test]
     fn shell_quote_wraps_in_single_quotes() {
         assert_eq!(shell_quote("/etc/policy.yaml"), "'/etc/policy.yaml'");
-        assert_eq!(shell_quote("path with spaces.yaml"), "'path with spaces.yaml'");
+        assert_eq!(
+            shell_quote("path with spaces.yaml"),
+            "'path with spaces.yaml'"
+        );
     }
 
     #[test]
@@ -2555,7 +2727,10 @@ mod policy_edit_tests {
 fn parse_window(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     if let Some(rest) = s.strip_prefix("last-") {
         // Accept "7d", "24h", "1h", "15m", "30s".
-        let (num, unit) = rest.split_at(rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len()));
+        let (num, unit) = rest.split_at(
+            rest.find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len()),
+        );
         let n: i64 = num
             .parse()
             .map_err(|e| anyhow!("invalid window number `{num}`: {e}"))?;
@@ -2593,8 +2768,12 @@ async fn cmd_blocked(
             format,
         } => {
             let mut q = vec![("status", status), ("limit", limit.to_string())];
-            if let Some(v) = p_0 { q.push(("p_0", v)); }
-            if let Some(v) = policy_id { q.push(("policy_id", v)); }
+            if let Some(v) = p_0 {
+                q.push(("p_0", v));
+            }
+            if let Some(v) = policy_id {
+                q.push(("policy_id", v));
+            }
             let resp = auth_header(http.get(format!("{url}/api/v1/blocked")), token)
                 .query(&q)
                 .send()
@@ -2608,8 +2787,8 @@ async fn cmd_blocked(
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
                 println!(
-                    "{:<38} {:<11} {:<22} {:<22} {}",
-                    "id", "status", "p_0", "action", "policy_id"
+                    "{:<38} {:<11} {:<22} {:<22} policy_id",
+                    "id", "status", "p_0", "action"
                 );
                 println!("{}", "─".repeat(120));
                 for r in &rows {
@@ -2776,7 +2955,9 @@ async fn cmd_notifier(
                 let configured = webhook["configured"].as_bool().unwrap_or(false);
                 if !configured {
                     println!("webhook: \x1b[33mnot configured\x1b[0m");
-                    println!("  set PROXILION_BLOCKED_WEBHOOK_URL + PROXILION_BLOCKED_WEBHOOK_HMAC_KEY to enable");
+                    println!(
+                        "  set PROXILION_BLOCKED_WEBHOOK_URL + PROXILION_BLOCKED_WEBHOOK_HMAC_KEY to enable"
+                    );
                 } else {
                     println!(
                         "webhook: \x1b[32mconfigured\x1b[0m  ({})",
@@ -2828,7 +3009,11 @@ async fn cmd_notifier(
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
         }
-        NotifierCmd::SetWebhook { url: hook_url, hmac_hex, disabled } => {
+        NotifierCmd::SetWebhook {
+            url: hook_url,
+            hmac_hex,
+            disabled,
+        } => {
             let body = json!({
                 "driver": "webhook",
                 "enabled": !disabled,
@@ -2847,7 +3032,12 @@ async fn cmd_notifier(
             }
             Ok(())
         }
-        NotifierCmd::SetEmail { smtp_url, from, to, disabled } => {
+        NotifierCmd::SetEmail {
+            smtp_url,
+            from,
+            to,
+            disabled,
+        } => {
             let body = json!({
                 "driver": "email",
                 "enabled": !disabled,
@@ -2870,7 +3060,11 @@ async fn cmd_notifier(
             }
             Ok(())
         }
-        NotifierCmd::SetSlack { incoming_webhook_url, signing_secret, disabled } => {
+        NotifierCmd::SetSlack {
+            incoming_webhook_url,
+            signing_secret,
+            disabled,
+        } => {
             let body = json!({
                 "driver": "slack",
                 "enabled": !disabled,

@@ -192,7 +192,6 @@ async fn bridge_callback_body(
     params: BridgeCallback,
     claims: super::bridge::FederationClaims,
 ) -> Result<Redirect, OAuthError> {
-
     if let Some(b64) = claims.pca_0_cbor_b64.as_deref() {
         let cbor = B64
             .decode(b64)
@@ -406,7 +405,7 @@ async fn google_callback_inner(
             hop: resp.hop as i32,
             predecessor_id: Some(pca_0_id),
             signature: vec![],
-                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
+            pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
         })
         .await
         .map_err(|e| OAuthError::Internal(e.to_string()))?;
@@ -556,18 +555,35 @@ async fn token(
     }
 
     let mut tx = state.db.begin().await?;
-    let row: Option<(Vec<u8>, Uuid, String, String, Vec<u8>, Vec<u8>, DateTime<Utc>, Option<DateTime<Utc>>)> =
-        sqlx::query_as(
-            "SELECT bearer_sha256_pending, session_id, code_challenge, code_challenge_method,
+    let row: Option<(
+        Vec<u8>,
+        Uuid,
+        String,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+    )> = sqlx::query_as(
+        "SELECT bearer_sha256_pending, session_id, code_challenge, code_challenge_method,
                     bearer_ciphertext, bearer_nonce, expires_at, consumed_at
                FROM auth_codes
               WHERE code = $1
               FOR UPDATE",
-        )
-        .bind(&form.code)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let Some((bearer_sha, session_id, challenge, method, bearer_ct, bearer_nonce, expires_at, consumed_at)) = row
+    )
+    .bind(&form.code)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((
+        bearer_sha,
+        session_id,
+        challenge,
+        method,
+        bearer_ct,
+        bearer_nonce,
+        expires_at,
+        consumed_at,
+    )) = row
     else {
         return Err(OAuthError::BadAuthCode);
     };

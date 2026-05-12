@@ -18,8 +18,8 @@ use crate::match_expr;
 use crate::ops::{OpsExpression, OpsParseError};
 use crate::trace::{LayerOutcome, OpsAtomView, PolicyEvalMode, PolicyLayer, PolicyTrace};
 use crate::yaml::{
-    parse_policies, AuditBodyMode, Mode, PicMode, PolicyDoc, QuarantineActionCfg,
-    QuarantinePatternCfg, ReadFilterCfg,
+    AuditBodyMode, Mode, PicMode, PolicyDoc, QuarantineActionCfg, QuarantinePatternCfg,
+    ReadFilterCfg, parse_policies,
 };
 
 #[derive(Debug, Error)]
@@ -70,7 +70,11 @@ impl Engine {
     pub fn email_recipients_for(
         &self,
         policy_id: &str,
-    ) -> Option<(Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)> {
+    ) -> Option<(
+        Option<Vec<String>>,
+        Option<Vec<String>>,
+        Option<Vec<String>>,
+    )> {
         let p = self.policies.iter().find(|p| p.id == policy_id)?;
         let r = p.notifier_recipients.as_ref()?;
         Some((r.to.clone(), r.cc.clone(), r.bcc.clone()))
@@ -144,7 +148,11 @@ impl Engine {
                 matched_policy_id: Some(p.id.clone()),
                 decision,
                 required_ops: OpsExpression::resolve(&p.required_ops, ctx)?,
-                read_filter: p.read_filter.as_ref().map(compile_read_filter).transpose()?,
+                read_filter: p
+                    .read_filter
+                    .as_ref()
+                    .map(compile_read_filter)
+                    .transpose()?,
                 pic_mode: p.pic_mode,
                 mode: p.mode,
                 observe_would_have,
@@ -381,10 +389,15 @@ fn parse_decision(p: &PolicyDoc) -> Result<Decision, Error> {
                     override_allowed,
                 });
             }
-            Err(Error::BadDecision(format!("unrecognized decision: {:?}", p.decision)))
+            Err(Error::BadDecision(format!(
+                "unrecognized decision: {:?}",
+                p.decision
+            )))
         }
         Yaml::Null => Ok(Decision::Allow),
-        other => Err(Error::BadDecision(format!("decision must be string/map, got {other:?}"))),
+        other => Err(Error::BadDecision(format!(
+            "decision must be string/map, got {other:?}"
+        ))),
     }
 }
 
@@ -411,4 +424,3 @@ fn compile_read_filter(cfg: &ReadFilterCfg) -> Result<ReadFilter, Error> {
         },
     })
 }
-

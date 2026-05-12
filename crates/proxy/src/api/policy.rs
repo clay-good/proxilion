@@ -22,8 +22,8 @@ pub struct PolicyApiState {
 }
 
 pub fn router(state: PolicyApiState) -> Router {
-    use axum::middleware::from_fn_with_state;
     use crate::operator_auth::scope_check;
+    use axum::middleware::from_fn_with_state;
     Router::new()
         .route(
             "/api/v1/policy",

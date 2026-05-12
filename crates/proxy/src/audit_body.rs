@@ -175,8 +175,14 @@ pub fn redact_pii_text(text: &str) -> String {
     // Order matters: known token shapes (api keys, bearers) before generic
     // digit-pattern redactors so e.g. a Slack token's leading 10-digit
     // workspace id isn't pre-redacted by the phone-number regex.
-    let mut s = r.api_key.replace_all(text, "<REDACTED_API_KEY>").into_owned();
-    s = r.bearer.replace_all(&s, "Bearer <REDACTED_TOKEN>").into_owned();
+    let mut s = r
+        .api_key
+        .replace_all(text, "<REDACTED_API_KEY>")
+        .into_owned();
+    s = r
+        .bearer
+        .replace_all(&s, "Bearer <REDACTED_TOKEN>")
+        .into_owned();
     s = r.email.replace_all(&s, "<REDACTED_EMAIL>").into_owned();
     s = r.ssn.replace_all(&s, "<REDACTED_SSN>").into_owned();
     s = r.credit_card.replace_all(&s, "<REDACTED_CC>").into_owned();
@@ -203,7 +209,12 @@ mod tests {
 
     #[test]
     fn redacts_phone() {
-        for n in ["(415) 555-1234", "415-555-1234", "415.555.1234", "4155551234"] {
+        for n in [
+            "(415) 555-1234",
+            "415-555-1234",
+            "415.555.1234",
+            "4155551234",
+        ] {
             let s = redact_pii_text(n);
             assert!(s.contains("<REDACTED_PHONE>"), "input {n} → {s}");
         }
@@ -229,7 +240,11 @@ mod tests {
         // Test fixtures are split via `concat!()` so GitHub's secret-scanning
         // pattern doesn't flag the source file. The redactor sees the
         // concatenated string at runtime.
-        let pxl = concat!("pxl", "_live_", "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP");
+        let pxl = concat!(
+            "pxl",
+            "_live_",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP"
+        );
         let sk = concat!("sk", "-1234567890abcdefghij");
         let ghp = concat!("ghp", "_abcdefghijklmnopqrstuvwxyz0123");
         let xox = concat!("xox", "b-1234567890-abcdefghijklmnop");

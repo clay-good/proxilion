@@ -27,8 +27,8 @@ pub struct OAuthState {
 pub struct GoogleClient {
     pub client_id: String,
     pub client_secret: String,
-    pub auth_url: String,   // default: https://accounts.google.com/o/oauth2/v2/auth
-    pub token_url: String,  // default: https://oauth2.googleapis.com/token
+    pub auth_url: String, // default: https://accounts.google.com/o/oauth2/v2/auth
+    pub token_url: String, // default: https://oauth2.googleapis.com/token
 }
 
 impl GoogleClient {

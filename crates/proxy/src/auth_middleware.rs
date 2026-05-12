@@ -145,8 +145,17 @@ async fn build_session(state: &AuthState, token: &str) -> Result<SessionContext,
 
     // 3. Look up bearer + join google_tokens.
     let row: Option<(
-        Uuid, Uuid, Uuid, String, Vec<u8>, Vec<u8>,
-        Option<Vec<u8>>, Option<Vec<u8>>, String, DateTime<Utc>, Option<DateTime<Utc>>,
+        Uuid,
+        Uuid,
+        Uuid,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        String,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
     )> = sqlx::query_as(
         r#"
         SELECT ab.session_id, ab.pca_1_id, gt.id,
@@ -280,14 +289,13 @@ async fn refresh_with_coalescing(
     let _guard = lock.lock().await;
 
     // Re-read after lock to see if another waiter already refreshed.
-    let (access_ct, access_nonce, expires_at): (Vec<u8>, Vec<u8>, DateTime<Utc>) =
-        sqlx::query_as(
-            "SELECT access_token_ciphertext, access_token_nonce, expires_at
+    let (access_ct, access_nonce, expires_at): (Vec<u8>, Vec<u8>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT access_token_ciphertext, access_token_nonce, expires_at
                FROM google_tokens WHERE id = $1",
-        )
-        .bind(google_tokens_id)
-        .fetch_one(&state.db)
-        .await?;
+    )
+    .bind(google_tokens_id)
+    .fetch_one(&state.db)
+    .await?;
     if expires_at > Utc::now() + chrono::Duration::seconds(60) {
         debug!("refresh raced; using already-refreshed token");
         metrics::counter!(
@@ -341,7 +349,10 @@ async fn refresh_with_coalescing(
             "result" => "upstream_err",
         )
         .increment(1);
-        return Err(AuthFail::Refresh(format!("Google returned {}", resp.status())));
+        return Err(AuthFail::Refresh(format!(
+            "Google returned {}",
+            resp.status()
+        )));
     }
     let new: GoogleRefreshResp = resp
         .json()

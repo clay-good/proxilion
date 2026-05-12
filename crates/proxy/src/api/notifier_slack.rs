@@ -23,10 +23,8 @@ use axum::{
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-use crate::api::blocked::{
-    approve_inner, reject_inner, ApproveBody, BlockedApiState, RejectBody,
-};
-use crate::notifier::{parse_button_value, SlackAction, SlackHandle};
+use crate::api::blocked::{ApproveBody, BlockedApiState, RejectBody, approve_inner, reject_inner};
+use crate::notifier::{SlackAction, SlackHandle, parse_button_value};
 
 #[derive(Clone)]
 pub struct SlackInteractState {
@@ -55,11 +53,7 @@ enum TriggerClaim {
 /// partial index on `blocked_actions.slack_trigger_id` enforces
 /// "at most one trigger_id per row" at the database layer; this query
 /// surfaces the racing-trigger_id case as `Conflict` instead of a 500.
-async fn claim_trigger_id(
-    db: &PgPool,
-    blocked_id: uuid::Uuid,
-    trigger_id: &str,
-) -> TriggerClaim {
+async fn claim_trigger_id(db: &PgPool, blocked_id: uuid::Uuid, trigger_id: &str) -> TriggerClaim {
     // Single-statement claim: only succeeds when the row is still pending
     // AND no trigger_id is set. Returns the row's id so we can distinguish
     // "claimed now" (1 row) from "couldn't claim" (0 rows).
@@ -140,13 +134,13 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
     }
 
     // Parse the form body: a single `payload=<urlencoded-json>` field.
-    let form: std::collections::HashMap<String, String> =
-        match serde_urlencoded::from_bytes(&bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                return slack_err(StatusCode::BAD_REQUEST, &format!("form parse: {e}"));
-            }
-        };
+    let form: std::collections::HashMap<String, String> = match serde_urlencoded::from_bytes(&bytes)
+    {
+        Ok(m) => m,
+        Err(e) => {
+            return slack_err(StatusCode::BAD_REQUEST, &format!("form parse: {e}"));
+        }
+    };
     let Some(payload_raw) = form.get("payload") else {
         return slack_err(StatusCode::BAD_REQUEST, "missing payload");
     };

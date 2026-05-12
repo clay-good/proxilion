@@ -214,17 +214,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(atoms.required.len(), 2);
-        assert!(atoms.required.iter().any(|a| a.object.contains("evil.example")));
-        assert!(atoms.required.iter().any(|a| a.object.contains("spam.example")));
+        assert!(
+            atoms
+                .required
+                .iter()
+                .any(|a| a.object.contains("evil.example"))
+        );
+        assert!(
+            atoms
+                .required
+                .iter()
+                .any(|a| a.object.contains("spam.example"))
+        );
     }
 
     #[test]
     fn scalar_template_still_resolves() {
-        let exp = OpsExpression::resolve(
-            &["drive:read:file/${path.id}".to_string()],
-            &ctx(),
-        )
-        .unwrap();
+        let exp =
+            OpsExpression::resolve(&["drive:read:file/${path.id}".to_string()], &ctx()).unwrap();
         assert_eq!(exp.required.len(), 1);
         assert_eq!(exp.required[0].object, "file/abc123");
     }
@@ -236,11 +243,8 @@ mod tests {
         body.insert("b".into(), serde_json::json!(["p", "q"]));
         let mut c = ctx();
         c.body = body;
-        let err = OpsExpression::resolve(
-            &["test:do:${body.a}:${body.b}".to_string()],
-            &c,
-        )
-        .unwrap_err();
+        let err =
+            OpsExpression::resolve(&["test:do:${body.a}:${body.b}".to_string()], &c).unwrap_err();
         assert!(matches!(err, OpsParseError::Malformed));
     }
 

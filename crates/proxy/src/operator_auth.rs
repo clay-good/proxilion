@@ -157,7 +157,10 @@ pub fn generate() -> String {
     const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut bytes = [0u8; BODY_LEN];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let body: String = bytes.iter().map(|b| ALPH[(*b as usize) % ALPH.len()] as char).collect();
+    let body: String = bytes
+        .iter()
+        .map(|b| ALPH[(*b as usize) % ALPH.len()] as char)
+        .collect();
     format!("{PREFIX}{body}")
 }
 
@@ -340,37 +343,32 @@ pub async fn scope_check(
 /// — the middleware already enforces *presence* of any valid token when
 /// `enforced=true`.
 #[allow(dead_code)] // wired in §future when per-endpoint scopes are added
-pub fn require_scope(
-    req: &Request<Body>,
-    scope: &str,
-) -> Result<OperatorPrincipal, Response> {
+pub fn require_scope(req: &Request<Body>, scope: &str) -> Result<OperatorPrincipal, Response> {
     let principal = req
         .extensions()
         .get::<OperatorPrincipal>()
         .cloned()
         .ok_or_else(|| unauthorized("no_principal"))?;
-    principal
-        .require_scope(scope)
-        .map_err(|e| {
-            metrics::counter!(
-                "proxilion_operator_auth_total",
-                "result" => "rejected",
-                "reason" => "scope_denied"
-            )
-            .increment(1);
-            (
-                StatusCode::FORBIDDEN,
-                [(HeaderName::from_static("content-type"), "application/json")],
-                serde_json::json!({
-                    "error": "insufficient scope",
-                    "code": "scope_denied",
-                    "required": scope,
-                    "have": e.have,
-                })
-                .to_string(),
-            )
-                .into_response()
-        })?;
+    principal.require_scope(scope).map_err(|e| {
+        metrics::counter!(
+            "proxilion_operator_auth_total",
+            "result" => "rejected",
+            "reason" => "scope_denied"
+        )
+        .increment(1);
+        (
+            StatusCode::FORBIDDEN,
+            [(HeaderName::from_static("content-type"), "application/json")],
+            serde_json::json!({
+                "error": "insufficient scope",
+                "code": "scope_denied",
+                "required": scope,
+                "have": e.have,
+            })
+            .to_string(),
+        )
+            .into_response()
+    })?;
     Ok(principal)
 }
 

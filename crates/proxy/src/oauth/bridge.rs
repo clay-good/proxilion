@@ -85,10 +85,14 @@ pub fn validate_federation_token(jwt: &str) -> Result<FederationClaims, OAuthErr
 
     let now = chrono::Utc::now().timestamp();
     if now > claims.exp {
-        return Err(OAuthError::BridgeRejected("federation token expired".into()));
+        return Err(OAuthError::BridgeRejected(
+            "federation token expired".into(),
+        ));
     }
     if claims.iat > now + 60 {
-        return Err(OAuthError::BridgeRejected("federation token issued in the future".into()));
+        return Err(OAuthError::BridgeRejected(
+            "federation token issued in the future".into(),
+        ));
     }
     Ok(claims)
 }
@@ -126,7 +130,10 @@ mod tests {
             "azure"
         );
         assert_eq!(infer_idp(Some("https://accounts.google.com")), "google");
-        assert_eq!(infer_idp(Some("https://id.example.org/realms/main")), "oidc");
+        assert_eq!(
+            infer_idp(Some("https://id.example.org/realms/main")),
+            "oidc"
+        );
         assert_eq!(infer_idp(Some("")), "unknown");
         assert_eq!(infer_idp(None), "unknown");
     }

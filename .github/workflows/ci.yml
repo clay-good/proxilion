@@ -1,0 +1,121 @@
+name: ci
+
+# Rust CI gate — fmt + clippy + test. The coverage workflow runs tests
+# again but also computes lcov; this one is the fast-feedback path for
+# fmt / lint correctness without the cargo-llvm-cov overhead.
+#
+# Documented in spec.md §0.7 as the canonical CI shape; the file was
+# missing for a while and got reintroduced here.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # SHA-pinned upstream git deps (provenance-core) need the CLI fetcher.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --component rustfmt --no-self-update
+          rustup default stable
+      - name: fmt check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --component clippy --no-self-update
+          rustup default stable
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-clippy-
+      # Three lint families are deliberately allowed:
+      #   type_complexity — codebase has a few sqlx tuple returns we
+      #     don't want to alias just for clippy's sake.
+      #   too_many_arguments — `cmd_policy_simulate` legitimately takes
+      #     9 args; factoring into a struct is a pure-cosmetic shuffle.
+      #   result_large_err — `AppError` is intentionally fat for the
+      #     IntoResponse blanket; the variant set is the public API.
+      # All other warnings are errors. Add per-site `#[allow(...)]`
+      # rather than expanding this list.
+      - name: clippy
+        run: |
+          cargo clippy --workspace --all-targets -- \
+            -D warnings \
+            -A clippy::type_complexity \
+            -A clippy::too_many_arguments \
+            -A clippy::result_large_err
+
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-test-
+      - name: test
+        run: cargo test --workspace --locked
+
+  build-release:
+    name: cargo build --release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-
+      # Release build with -D warnings catches anything debug builds
+      # let through (lifetime-elision warnings can be release-only when
+      # `inline` decisions differ). The build artifact isn't published
+      # by this workflow — that's a separate release-cut workflow.
+      - name: release build
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --workspace --release --locked

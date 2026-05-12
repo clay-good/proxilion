@@ -51,8 +51,8 @@ pub struct BlockedApiState {
 }
 
 pub fn router(state: BlockedApiState) -> Router {
-    use axum::middleware::from_fn_with_state;
     use crate::operator_auth::scope_check;
+    use axum::middleware::from_fn_with_state;
     let read = || from_fn_with_state("blocks:read", scope_check);
     let approve_scope = || from_fn_with_state("blocks:approve", scope_check);
     Router::new()
@@ -146,10 +146,7 @@ async fn issue_link(
     .await
     .map_err(ApiError::Db)?;
 
-    let url = format!(
-        "/notifier/approve?t={token}",
-        token = row.0
-    );
+    let url = format!("/notifier/approve?t={token}", token = row.0);
     metrics::counter!(
         "proxilion_overrides_requested_total",
         "channel" => "email_link"
@@ -226,7 +223,11 @@ async fn list(
 ) -> Result<Json<ListResponse>, ApiError> {
     let limit = p.limit.unwrap_or(50).clamp(1, 500) as i64;
     let status_filter = p.status.as_deref().unwrap_or("pending");
-    let status_filter = if status_filter == "all" { None } else { Some(status_filter) };
+    let status_filter = if status_filter == "all" {
+        None
+    } else {
+        Some(status_filter)
+    };
 
     // Auto-expire `pending` rows whose expires_at has passed before listing,
     // so callers see a coherent view. Cheap UPDATE; idempotent.
@@ -265,7 +266,10 @@ async fn list(
     } else {
         None
     };
-    Ok(Json(ListResponse { rows: out, next_before }))
+    Ok(Json(ListResponse {
+        rows: out,
+        next_before,
+    }))
 }
 
 async fn show(
@@ -357,13 +361,11 @@ pub async fn approve_inner(
         )));
     }
     if blocked.expires_at <= Utc::now() {
-        sqlx::query(
-            "UPDATE blocked_actions SET status='expired', resolved_at=now() WHERE id=$1",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(ApiError::Db)?;
+        sqlx::query("UPDATE blocked_actions SET status='expired', resolved_at=now() WHERE id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::Db)?;
         tx.commit().await.map_err(ApiError::Db)?;
         return Err(ApiError::Conflict("block expired before approval".into()));
     }
@@ -378,9 +380,11 @@ pub async fn approve_inner(
         .get(pred_id)
         .await
         .map_err(|e| ApiError::Internal(format!("pca_cache: {e}")))?
-        .ok_or_else(|| ApiError::Internal(format!(
-            "predecessor PCA {pred_id} not in cache — chain unrecoverable"
-        )))?;
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "predecessor PCA {pred_id} not in cache — chain unrecoverable"
+            ))
+        })?;
 
     let requested_ops = blocked.requested_ops.clone();
     if requested_ops.is_empty() {
@@ -432,7 +436,7 @@ pub async fn approve_inner(
             hop: pca.hop as i32,
             predecessor_id: Some(pred_id),
             signature: vec![],
-                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
+            pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
         })
         .await
         .map_err(|e| ApiError::Internal(format!("pca_cache insert: {e}")))?;
@@ -537,13 +541,12 @@ pub async fn reject_inner(
     if returned.is_none() {
         // Either no row, or it's not pending. Disambiguate with a follow-up
         // read for a friendlier error.
-        let exists: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM blocked_actions WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(ApiError::Db)?;
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT status FROM blocked_actions WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(ApiError::Db)?;
         return Err(match exists {
             None => ApiError::NotFound,
             Some(s) => ApiError::Conflict(format!(
@@ -566,7 +569,10 @@ pub async fn reject_inner(
         )
         .record(latency);
     }
-    Ok(RejectResponse { blocked_id: id, status: "rejected" })
+    Ok(RejectResponse {
+        blocked_id: id,
+        status: "rejected",
+    })
 }
 
 fn row_to_blocked(r: &sqlx::postgres::PgRow) -> Result<BlockedRow, ApiError> {

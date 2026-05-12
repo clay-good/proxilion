@@ -23,8 +23,8 @@ use sha2::Sha256;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::burst::{BurstSummary, BurstSuppressor};
 use super::BlockedNotification;
+use super::burst::{BurstSummary, BurstSuppressor};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -143,7 +143,11 @@ impl SlackNotifier {
     /// Resolve a Slack user (id or username) to a configured operator
     /// subject. Returns `None` when no mapping is configured for either
     /// key — callers fall back to the `slack:<username>` shape.
-    pub fn resolve_user(&self, slack_user_id: Option<&str>, slack_username: Option<&str>) -> Option<String> {
+    pub fn resolve_user(
+        &self,
+        slack_user_id: Option<&str>,
+        slack_username: Option<&str>,
+    ) -> Option<String> {
         if let Some(id) = slack_user_id {
             if let Some(v) = self.user_map.get(id) {
                 return Some(v.clone());
@@ -297,7 +301,11 @@ fn summary_block_kit_payload(s: &BurstSummary) -> serde_json::Value {
 }
 
 fn plural(n: u64, word: &str) -> String {
-    if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
 }
 
 /// Build the Block Kit JSON. Format mirrors ui-less-surfaces.md §5.3.
@@ -443,8 +451,14 @@ mod tests {
         )
         .unwrap()
         .with_user_map(m);
-        assert_eq!(n.resolve_user(Some("U01ABC"), None).as_deref(), Some("alice@acme.com"));
-        assert_eq!(n.resolve_user(None, Some("bob")).as_deref(), Some("bob@acme.com"));
+        assert_eq!(
+            n.resolve_user(Some("U01ABC"), None).as_deref(),
+            Some("alice@acme.com")
+        );
+        assert_eq!(
+            n.resolve_user(None, Some("bob")).as_deref(),
+            Some("bob@acme.com")
+        );
         // Id takes precedence over username.
         assert_eq!(
             n.resolve_user(Some("U01ABC"), Some("bob")).as_deref(),
@@ -572,7 +586,10 @@ mod tests {
         // Action block with the "Open full list" button points at details_url.
         let actions = blocks[2]["elements"].as_array().unwrap();
         assert_eq!(actions[0]["text"]["text"], "Open full list");
-        assert_eq!(actions[0]["url"], "https://proxy.local/api/v1/blocked?policy_id=gmail-x");
+        assert_eq!(
+            actions[0]["url"],
+            "https://proxy.local/api/v1/blocked?policy_id=gmail-x"
+        );
     }
 
     #[test]

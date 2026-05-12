@@ -65,10 +65,11 @@ impl RequestContext {
                 "email" => Some(self.user.email.clone()),
                 _ => None,
             },
-            "body" => self
-                .body
-                .get(tail)
-                .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())),
+            "body" => self.body.get(tail).map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| v.to_string())
+            }),
             "headers" => self.headers.get(tail).cloned(),
             _ => None,
         }

@@ -12,7 +12,9 @@ pub mod rego;
 pub mod trace;
 pub mod yaml;
 
-pub use loader::{FilePolicyLoader, PolicyBundle, PolicyLoadError, PolicyLoader, StaticPolicyLoader};
+pub use loader::{
+    FilePolicyLoader, PolicyBundle, PolicyLoadError, PolicyLoader, StaticPolicyLoader,
+};
 
 pub use context::{RequestContext, UserCtx};
 pub use decision::{Decision, Pattern, QuarantineAction, ReadFilter};

@@ -29,7 +29,9 @@ impl WebhookSecret {
             return Err(NotifierBuildError("hmac secret is empty".into()));
         }
         if hex.len() % 2 != 0 {
-            return Err(NotifierBuildError("hmac secret hex length must be even".into()));
+            return Err(NotifierBuildError(
+                "hmac secret hex length must be even".into(),
+            ));
         }
         if hex.len() < 32 {
             return Err(NotifierBuildError(
@@ -308,10 +310,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/hook"))
             .and(header_exists("x-proxilion-signature"))
-            .and(header(
-                "x-proxilion-schema",
-                BlockedNotification::SCHEMA,
-            ))
+            .and(header("x-proxilion-schema", BlockedNotification::SCHEMA))
             .and(header(
                 "x-proxilion-blocked-id",
                 blocked_id.to_string().as_str(),

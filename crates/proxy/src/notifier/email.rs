@@ -33,8 +33,13 @@ use super::BlockedNotification;
 /// when the policy explicitly set it. `None` outer → fall through to the
 /// global recipients on the notifier. ui-less-surfaces.md §5.4 dev 3.
 pub type EmailRecipientsResolver = Arc<
-    dyn Fn(&str) -> Option<(Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)>
-        + Send
+    dyn Fn(
+            &str,
+        ) -> Option<(
+            Option<Vec<String>>,
+            Option<Vec<String>>,
+            Option<Vec<String>>,
+        )> + Send
         + Sync,
 >;
 
@@ -96,7 +101,9 @@ impl EmailNotifier {
             .parse()
             .map_err(|e| EmailBuildError(format!("from address: {e}")))?;
         if to.is_empty() {
-            return Err(EmailBuildError("at least one `to` recipient required".into()));
+            return Err(EmailBuildError(
+                "at least one `to` recipient required".into(),
+            ));
         }
         let to: Vec<Mailbox> = to
             .iter()
@@ -179,8 +186,14 @@ impl EmailNotifier {
             }
         };
 
-        let approve_url = format!("{}/notifier/approve?t={}", self.proxy_public_url, approve_token);
-        let reject_url = format!("{}/notifier/approve?t={}", self.proxy_public_url, reject_token);
+        let approve_url = format!(
+            "{}/notifier/approve?t={}",
+            self.proxy_public_url, approve_token
+        );
+        let reject_url = format!(
+            "{}/notifier/approve?t={}",
+            self.proxy_public_url, reject_token
+        );
 
         let subject = if is_escalation {
             format!(
@@ -250,9 +263,7 @@ impl EmailNotifier {
         // for that list so a typo in policy YAML can't black-hole a block.
         let (to_list, cc_list, bcc_list) = self.resolve_recipients(n.policy_id);
 
-        let mut builder = Message::builder()
-            .from(self.from.clone())
-            .subject(subject);
+        let mut builder = Message::builder().from(self.from.clone()).subject(subject);
         for to in &to_list {
             builder = builder.to(to.clone());
         }
@@ -347,8 +358,8 @@ impl EmailNotifier {
         &self,
         policy_id: Option<&str>,
     ) -> (Vec<Mailbox>, Vec<Mailbox>, Vec<Mailbox>) {
-        let override_lists = policy_id
-            .and_then(|id| self.recipients_resolver.as_ref().and_then(|r| r(id)));
+        let override_lists =
+            policy_id.and_then(|id| self.recipients_resolver.as_ref().and_then(|r| r(id)));
         let Some((to_o, cc_o, bcc_o)) = override_lists else {
             return (self.to.clone(), self.cc.clone(), self.bcc.clone());
         };
@@ -539,9 +550,8 @@ mod tests {
         )
         .expect("builds");
 
-        let resolver: EmailRecipientsResolver = Arc::new(|_id| {
-            Some((Some(vec!["not-an-email".into()]), None, None))
-        });
+        let resolver: EmailRecipientsResolver =
+            Arc::new(|_id| Some((Some(vec!["not-an-email".into()]), None, None)));
         let n = n.with_recipients_resolver(resolver);
 
         let (to, _cc, _bcc) = n.resolve_recipients(Some("any"));

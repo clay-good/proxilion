@@ -37,15 +37,14 @@ pub enum VerifierError {
     Missing(Uuid),
     #[error("CAT signature failed to verify on pca {0}")]
     BadCatSignature(Uuid),
-    #[error("continuity broken between pca {child} and predecessor {parent}: provenance.cat_sig mismatch")]
+    #[error(
+        "continuity broken between pca {child} and predecessor {parent}: provenance.cat_sig mismatch"
+    )]
     ContinuityBroken { child: Uuid, parent: Uuid },
     #[error("monotonicity violated: {missing} not in predecessor's ops")]
     Monotonicity { missing: String },
     #[error("p_0 changed across hop ({child_p0} != {parent_p0})")]
-    P0Mismatch {
-        child_p0: String,
-        parent_p0: String,
-    },
+    P0Mismatch { child_p0: String, parent_p0: String },
     #[error("hop ordering: child hop {child} != parent hop {parent} + 1")]
     HopOrder { child: u32, parent: u32 },
     #[error("decoding signed PCA bytes: {0}")]
@@ -109,7 +108,10 @@ impl PicVerifier {
         let result = self.walk(leaf_pca_id).await;
         let (arc, violation_kind) = match result {
             Ok(r) => (Arc::new(r), None),
-            Err(ref e) => (Arc::new(err_to_result(leaf_pca_id, e)), Some(invariant_kind(e))),
+            Err(ref e) => (
+                Arc::new(err_to_result(leaf_pca_id, e)),
+                Some(invariant_kind(e)),
+            ),
         };
         let result_label = if arc.intact { "intact" } else { "broken" };
         metrics::counter!(
@@ -227,14 +229,13 @@ fn check_invariants(
     parent_id: Uuid,
     parent_signed: &SignedPca,
 ) -> Result<(), VerifierError> {
-    let prov =
-        child
-            .provenance
-            .as_ref()
-            .ok_or(VerifierError::ContinuityBroken {
-                child: child_id,
-                parent: parent_id,
-            })?;
+    let prov = child
+        .provenance
+        .as_ref()
+        .ok_or(VerifierError::ContinuityBroken {
+            child: child_id,
+            parent: parent_id,
+        })?;
     if prov.cat_sig != parent_signed.signature() {
         return Err(VerifierError::ContinuityBroken {
             child: child_id,
@@ -359,7 +360,7 @@ mod tests {
             hop: pca.hop as i32,
             predecessor_id: predecessor,
             signature: vec![],
-                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
+            pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
         }
     }
 
@@ -376,12 +377,22 @@ mod tests {
         );
         let signed0 = SignedPca::from_bytes(&cbor0).unwrap();
 
-        let (id1, cbor1, pca1) =
-            signed_pca_successor(&cat, &executor, &pca0, &signed0, &["drive:read:engineering/*"]);
+        let (id1, cbor1, pca1) = signed_pca_successor(
+            &cat,
+            &executor,
+            &pca0,
+            &signed0,
+            &["drive:read:engineering/*"],
+        );
         let signed1 = SignedPca::from_bytes(&cbor1).unwrap();
 
-        let (id2, cbor2, pca2) =
-            signed_pca_successor(&cat, &executor, &pca1, &signed1, &["drive:read:engineering/*"]);
+        let (id2, cbor2, pca2) = signed_pca_successor(
+            &cat,
+            &executor,
+            &pca1,
+            &signed1,
+            &["drive:read:engineering/*"],
+        );
 
         (
             cat,
@@ -521,7 +532,10 @@ mod tests {
             &SignedPca::from_bytes(&chain[0].cbor).unwrap(),
         )
         .unwrap_err();
-        assert!(matches!(err, VerifierError::ContinuityBroken { .. }), "got {err:?}");
+        assert!(
+            matches!(err, VerifierError::ContinuityBroken { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -540,6 +554,9 @@ mod tests {
             &SignedPca::from_bytes(&chain[0].cbor).unwrap(),
         )
         .unwrap_err();
-        assert!(matches!(err, VerifierError::P0Mismatch { .. }), "got {err:?}");
+        assert!(
+            matches!(err, VerifierError::P0Mismatch { .. }),
+            "got {err:?}"
+        );
     }
 }

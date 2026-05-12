@@ -21,12 +21,12 @@ use uuid::Uuid;
 
 use crate::adapters::action_stream::{ActionStream, BroadcastingActionStream};
 use crate::adapters::{AdapterState, google_calendar, google_drive, google_gmail};
-use crate::forwarder::{NatsBridge, SiemForwarder, SiemHmacKey, TeeStream};
-use crate::notifier::{BurstConfig, BurstSuppressor, WebhookNotifier, WebhookSecret};
 use crate::api::{self, ApiState};
 use crate::auth_middleware::{AuthState, RefreshCoordinator, auth_middleware};
 use crate::config::Config;
 use crate::crypto::TokenCipher;
+use crate::forwarder::{NatsBridge, SiemForwarder, SiemHmacKey, TeeStream};
+use crate::notifier::{BurstConfig, BurstSuppressor, WebhookNotifier, WebhookSecret};
 use crate::oauth::state::GoogleClient;
 use crate::oauth::{self, OAuthState};
 use crate::pic::{CatKeyRegistry, PcaCache, PicExecutor, PicVerifier};
@@ -53,8 +53,7 @@ struct ReadinessProbe {
 
 pub async fn run(cfg: Config) -> Result<()> {
     if cfg.dev_mode {
-        ensure_dev_cert(&cfg.tls_cert_path, &cfg.tls_key_path)
-            .context("generating dev cert")?;
+        ensure_dev_cert(&cfg.tls_cert_path, &cfg.tls_key_path).context("generating dev cert")?;
     }
 
     let tls = RustlsConfig::from_pem_file(&cfg.tls_cert_path, &cfg.tls_key_path)
@@ -125,7 +124,11 @@ pub async fn run(cfg: Config) -> Result<()> {
             // Demo mode: if PROXILION_DEMO=1 (or DB is empty), seed synthetic
             // history and start a slow ticker.
             if crate::demo::should_run(&core.db).await {
-                let _ = crate::demo::start(adapter_stream.clone());
+                // The JoinHandle is intentionally dropped — the demo
+                // task is fire-and-forget for the lifetime of the
+                // proxy. `drop(…)` is the explicit-intent shape
+                // clippy's `let_underscore_future` wants.
+                drop(crate::demo::start(adapter_stream.clone()));
             }
 
             // Build the hot-reloadable policy handle. Initial load + watcher
@@ -155,14 +158,16 @@ pub async fn run(cfg: Config) -> Result<()> {
             // OUTSIDE the operator_auth layer — it's a checklist for an
             // operator who hasn't issued a token yet.
             let policy_count = policy_handle.load().policy_count();
-            app = app.merge(crate::api::setup::router(crate::api::setup::SetupApiState {
-                db: core.db.clone(),
-                google_configured: cfg.google_client_id.is_some()
-                    && cfg.google_client_secret.is_some(),
-                federation_bridge_url: cfg.federation_bridge_url.clone(),
-                policy_path_configured: cfg.policy_path.is_some(),
-                policy_count,
-            }));
+            app = app.merge(crate::api::setup::router(
+                crate::api::setup::SetupApiState {
+                    db: core.db.clone(),
+                    google_configured: cfg.google_client_id.is_some()
+                        && cfg.google_client_secret.is_some(),
+                    federation_bridge_url: cfg.federation_bridge_url.clone(),
+                    policy_path_configured: cfg.policy_path.is_some(),
+                    policy_count,
+                },
+            ));
 
             // Build the /api/v1/* router behind the operator_auth middleware.
             let api_state = ApiState {
@@ -190,30 +195,38 @@ pub async fn run(cfg: Config) -> Result<()> {
                 notifiers.email.clone(),
             ));
             let protected_api = api::router(api_state)
-                .merge(crate::api::actions::router(crate::api::actions::ActionsApiState {
-                    db: core.db.clone(),
-                    stream: action_stream.clone(),
-                    pca_cache: auth_state.pca_cache.clone(),
-                }))
-                .merge(crate::api::blocked::router(crate::api::blocked::BlockedApiState {
-                    db: core.db.clone(),
-                    pca_cache: auth_state.pca_cache.clone(),
-                    pic: core.pic.clone(),
-                }))
+                .merge(crate::api::actions::router(
+                    crate::api::actions::ActionsApiState {
+                        db: core.db.clone(),
+                        stream: action_stream.clone(),
+                        pca_cache: auth_state.pca_cache.clone(),
+                    },
+                ))
+                .merge(crate::api::blocked::router(
+                    crate::api::blocked::BlockedApiState {
+                        db: core.db.clone(),
+                        pca_cache: auth_state.pca_cache.clone(),
+                        pic: core.pic.clone(),
+                    },
+                ))
                 .merge(crate::api::killswitch::router(
                     crate::api::killswitch::KillswitchApiState {
                         db: core.db.clone(),
                         kill_cache: auth_state.kill_cache.clone(),
                     },
                 ))
-                .merge(crate::api::policy::router(crate::api::policy::PolicyApiState {
-                    policy: policy_handle.clone(),
-                }))
-                .merge(crate::api::notifier::router(crate::api::notifier::NotifierApiState {
-                    notifiers: notifiers.clone(),
-                    db: core.db.clone(),
-                    proxy_base_url: cfg.proxy_base_url.clone(),
-                }));
+                .merge(crate::api::policy::router(
+                    crate::api::policy::PolicyApiState {
+                        policy: policy_handle.clone(),
+                    },
+                ))
+                .merge(crate::api::notifier::router(
+                    crate::api::notifier::NotifierApiState {
+                        notifiers: notifiers.clone(),
+                        db: core.db.clone(),
+                        proxy_base_url: cfg.proxy_base_url.clone(),
+                    },
+                ));
             let operator_state = crate::operator_auth::OperatorAuthState::new(
                 core.db.clone(),
                 cfg.operator_auth_enforced,
@@ -258,8 +271,12 @@ pub async fn run(cfg: Config) -> Result<()> {
             // Google creds.
             if let Some(oauth_state) = build_oauth_state(&cfg, &core) {
                 let adapter_state = build_adapter_state(
-                    &cfg, &auth_state, &oauth_state, adapter_stream,
-                    policy_handle, notifiers,
+                    &cfg,
+                    &auth_state,
+                    &oauth_state,
+                    adapter_stream,
+                    policy_handle,
+                    notifiers,
                 )?;
                 app = app.merge(oauth::router(oauth_state));
                 app = app.merge(protected_router(auth_state.clone()));
@@ -314,18 +331,29 @@ async fn healthz(State(state): State<AppState>) -> (axum::http::StatusCode, Json
     // Critical checks decide `ready`. The federation_bridge probe is
     // informational only — the bridge service is deferred (see spec §0.4)
     // and not part of every deployment.
-    checks.insert("trust_plane", probe_endpoint(&state.http, &state.trust_plane_url).await);
+    checks.insert(
+        "trust_plane",
+        probe_endpoint(&state.http, &state.trust_plane_url).await,
+    );
     if let Some(r) = state.readiness.get() {
         checks.insert("database", probe_db(&r.db).await);
         checks.insert("cat_key", probe_cat_key(&r.cat_keys).await);
     } else {
         checks.insert(
             "database",
-            Check { ok: false, detail: Some("core bootstrap incomplete (no DATABASE_URL?)".into()), latency_ms: 0 },
+            Check {
+                ok: false,
+                detail: Some("core bootstrap incomplete (no DATABASE_URL?)".into()),
+                latency_ms: 0,
+            },
         );
         checks.insert(
             "cat_key",
-            Check { ok: false, detail: Some("core bootstrap incomplete".into()), latency_ms: 0 },
+            Check {
+                ok: false,
+                detail: Some("core bootstrap incomplete".into()),
+                latency_ms: 0,
+            },
         );
     }
     let ready = checks.values().all(|c| c.ok);
@@ -340,7 +368,14 @@ async fn healthz(State(state): State<AppState>) -> (axum::http::StatusCode, Json
     } else {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(Healthz { ready, version: env!("CARGO_PKG_VERSION"), checks }))
+    (
+        status,
+        Json(Healthz {
+            ready,
+            version: env!("CARGO_PKG_VERSION"),
+            checks,
+        }),
+    )
 }
 
 /// Periodic upstream-reachability probe. Powers `proxilion_trust_plane_up`
@@ -379,11 +414,10 @@ async fn spawn_active_sessions_probe(db: sqlx::PgPool) {
     let mut ticker = tokio::time::interval(Duration::from_secs(30));
     loop {
         ticker.tick().await;
-        let res: Result<(i64,), _> = sqlx::query_as(
-            "SELECT count(*) FROM agent_bearers WHERE revoked_at IS NULL",
-        )
-        .fetch_one(&db)
-        .await;
+        let res: Result<(i64,), _> =
+            sqlx::query_as("SELECT count(*) FROM agent_bearers WHERE revoked_at IS NULL")
+                .fetch_one(&db)
+                .await;
         match res {
             Ok((n,)) => metrics::gauge!("proxilion_oauth_active_sessions").set(n as f64),
             Err(e) => {
@@ -622,8 +656,8 @@ fn build_policy_handle(cfg: &Config) -> Result<crate::policy_handle::PolicyHandl
     if let Some(p) = cfg.policy_path.as_ref() {
         let yaml = std::fs::read_to_string(p)
             .with_context(|| format!("reading policy file {}", p.display()))?;
-        let engine = policy_engine::Engine::new(&yaml)
-            .map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
+        let engine =
+            policy_engine::Engine::new(&yaml).map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
         let loader = Arc::new(policy_engine::FilePolicyLoader::new(p));
         let initial_version = loader.version_token_sync().unwrap_or_default();
         Ok(crate::policy_handle::PolicyHandle::with_loader(
@@ -635,8 +669,8 @@ fn build_policy_handle(cfg: &Config) -> Result<crate::policy_handle::PolicyHandl
         ))
     } else {
         let yaml = String::from("[]");
-        let engine = policy_engine::Engine::new(&yaml)
-            .map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
+        let engine =
+            policy_engine::Engine::new(&yaml).map_err(|e| anyhow::anyhow!("policy engine: {e}"))?;
         Ok(crate::policy_handle::PolicyHandle::new(engine, None, yaml))
     }
 }
@@ -657,8 +691,14 @@ async fn resolve_webhook_config(cfg: &Config, db: &sqlx::PgPool) -> Option<(Stri
             info!("notifier_config: webhook row exists but enabled=false — notifier disabled");
             return None;
         }
-        let url = conf.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let hex = conf.get("hmac_key").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let url = conf
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let hex = conf
+            .get("hmac_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         if let (Some(u), Some(h)) = (url, hex) {
             return Some((u, h));
         }
@@ -738,21 +778,19 @@ async fn build_notifiers(
     // Webhook driver (ui-less-surfaces.md §10.3 + §8.4).
     if let Some((url, hex)) = resolve_webhook_config(cfg, db).await {
         match WebhookSecret::from_hex(&hex) {
-            Ok(secret) => match WebhookNotifier::new(
-                url.clone(),
-                secret,
-                cfg.proxy_base_url.clone(),
-            ) {
-                Ok(wn) => {
-                    let notifier = Arc::new(wn);
-                    info!(
-                        url = %url,
-                        "blocked-action webhook notifier installed (with burst suppression)"
-                    );
-                    n.webhook.replace(Some(notifier));
+            Ok(secret) => {
+                match WebhookNotifier::new(url.clone(), secret, cfg.proxy_base_url.clone()) {
+                    Ok(wn) => {
+                        let notifier = Arc::new(wn);
+                        info!(
+                            url = %url,
+                            "blocked-action webhook notifier installed (with burst suppression)"
+                        );
+                        n.webhook.replace(Some(notifier));
+                    }
+                    Err(e) => warn!(error = %e, "WebhookNotifier build failed; webhook disabled"),
                 }
-                Err(e) => warn!(error = %e, "WebhookNotifier build failed; webhook disabled"),
-            },
+            }
             Err(e) => warn!(error = %e, "webhook HMAC key invalid; webhook disabled"),
         }
     }
@@ -789,9 +827,7 @@ async fn build_notifiers(
                 if let Some(handle) = policy {
                     let handle: crate::policy_handle::PolicyHandle = handle.clone();
                     let resolver: crate::notifier::email::EmailRecipientsResolver =
-                        Arc::new(move |policy_id| {
-                            handle.load().email_recipients_for(policy_id)
-                        });
+                        Arc::new(move |policy_id| handle.load().email_recipients_for(policy_id));
                     en = en.with_recipients_resolver(resolver);
                 }
                 info!(from = %cfg_row.from, "blocked-action email notifier installed");
@@ -825,8 +861,14 @@ async fn resolve_email_config(db: &sqlx::PgPool) -> Option<EmailRowConfig> {
     if !enabled {
         return None;
     }
-    let smtp_url = conf.get("smtp_url").and_then(|v| v.as_str()).map(String::from)?;
-    let from = conf.get("from").and_then(|v| v.as_str()).map(String::from)?;
+    let smtp_url = conf
+        .get("smtp_url")
+        .and_then(|v| v.as_str())
+        .map(String::from)?;
+    let from = conf
+        .get("from")
+        .and_then(|v| v.as_str())
+        .map(String::from)?;
     // `to` may be a single string OR an array of strings.
     let to: Vec<String> = match conf.get("to") {
         Some(serde_json::Value::String(s)) => vec![s.clone()],
@@ -909,7 +951,9 @@ fn build_siem_sink(cfg: &Config, tee: TeeStream) -> TeeStream {
         return tee;
     };
     let Some(hex) = cfg.siem_hmac_key_hex.as_deref() else {
-        warn!("PROXILION_SIEM_WEBHOOK_URL set but PROXILION_SIEM_HMAC_KEY missing — SIEM forwarder disabled");
+        warn!(
+            "PROXILION_SIEM_WEBHOOK_URL set but PROXILION_SIEM_HMAC_KEY missing — SIEM forwarder disabled"
+        );
         return tee;
     };
     let key = match SiemHmacKey::from_hex(hex) {
@@ -1086,7 +1130,11 @@ fn ensure_dev_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
     if let Some(parent) = key_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    warn!(?cert_path, ?key_path, "PROXILION_DEV=1: generating self-signed cert");
+    warn!(
+        ?cert_path,
+        ?key_path,
+        "PROXILION_DEV=1: generating self-signed cert"
+    );
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
         .context("rcgen failed")?;
     let mut cf = std::fs::File::create(cert_path)?;

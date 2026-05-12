@@ -25,7 +25,9 @@ pub use email::{EmailBuildError, EmailNotifier};
 #[allow(unused_imports)]
 pub use handle::{EmailHandle, Handle, NotifierHandle, Notifiers, SlackHandle};
 #[allow(unused_imports)]
-pub use slack::{parse_button_value, SlackAction, SlackBuildError, SlackNotifier, SlackSigningSecret};
+pub use slack::{
+    SlackAction, SlackBuildError, SlackNotifier, SlackSigningSecret, parse_button_value,
+};
 #[allow(unused_imports)]
 pub use webhook::{NotifierBuildError, WebhookNotifier, WebhookSecret};
 

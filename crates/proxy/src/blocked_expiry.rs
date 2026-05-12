@@ -36,17 +36,22 @@ pub struct EscalationSweepReport {
 /// per-row metric label is `policy_id` so a Grafana panel can show
 /// "which policies are timing out".
 pub async fn sweep_once(db: &PgPool) -> Result<ExpirySweepReport, sqlx::Error> {
-    let rows: Vec<(uuid::Uuid, Option<String>, String, String, chrono::DateTime<chrono::Utc>)> =
-        sqlx::query_as(
-            "UPDATE blocked_actions
+    let rows: Vec<(
+        uuid::Uuid,
+        Option<String>,
+        String,
+        String,
+        chrono::DateTime<chrono::Utc>,
+    )> = sqlx::query_as(
+        "UPDATE blocked_actions
                 SET status = 'expired',
                     resolved_at = now()
               WHERE status = 'pending'
                 AND expires_at < now()
             RETURNING id, policy_id, vendor, action, at",
-        )
-        .fetch_all(db)
-        .await?;
+    )
+    .fetch_all(db)
+    .await?;
 
     let n = rows.len() as u64;
 
@@ -85,8 +90,7 @@ pub async fn sweep_once(db: &PgPool) -> Result<ExpirySweepReport, sqlx::Error> {
         // spec.md §3.2 — override latency on the expired path matches the
         // TTL by construction, but record it so a single histogram covers
         // all three resolution outcomes (approved / rejected / expired).
-        let latency =
-            (chrono::Utc::now() - *blocked_at).num_milliseconds().max(0) as f64 / 1000.0;
+        let latency = (chrono::Utc::now() - *blocked_at).num_milliseconds().max(0) as f64 / 1000.0;
         metrics::histogram!(
             "proxilion_override_latency_seconds",
             "outcome" => "expired",
@@ -205,10 +209,7 @@ pub async fn spawn(db: PgPool, tick_interval: Duration, email: EmailHandle) {
             Ok(_) => {}
             Err(e) => {
                 warn!(error = %e, "expiry sweep failed; will retry next tick");
-                metrics::counter!(
-                    "proxilion_blocked_expiry_sweep_failures_total"
-                )
-                .increment(1);
+                metrics::counter!("proxilion_blocked_expiry_sweep_failures_total").increment(1);
             }
         }
         match sweep_escalations(&db, &email).await {
@@ -218,10 +219,7 @@ pub async fn spawn(db: PgPool, tick_interval: Duration, email: EmailHandle) {
             Ok(_) => {}
             Err(e) => {
                 warn!(error = %e, "escalation sweep failed; will retry next tick");
-                metrics::counter!(
-                    "proxilion_blocked_escalation_sweep_failures_total"
-                )
-                .increment(1);
+                metrics::counter!("proxilion_blocked_escalation_sweep_failures_total").increment(1);
             }
         }
     }

@@ -31,9 +31,9 @@ pub struct ActionsApiState {
 }
 
 pub fn router(state: ActionsApiState) -> Router {
+    use crate::operator_auth::scope_check;
     use axum::middleware::from_fn_with_state;
     use axum::routing::{get, post};
-    use crate::operator_auth::scope_check;
     let read = || from_fn_with_state("actions:read", scope_check);
     let export_scope = || from_fn_with_state("actions:export", scope_check);
     let purge_scope = || from_fn_with_state("actions:purge", scope_check);
@@ -43,8 +43,14 @@ pub fn router(state: ActionsApiState) -> Router {
         .route("/api/v1/actions", get(list).route_layer(read()))
         .route("/api/v1/actions/recent", get(recent).route_layer(read()))
         .route("/api/v1/actions/stream", get(stream).route_layer(read()))
-        .route("/api/v1/actions/export", get(export).route_layer(export_scope()))
-        .route("/api/v1/actions/purge", post(purge).route_layer(purge_scope()))
+        .route(
+            "/api/v1/actions/export",
+            get(export).route_layer(export_scope()),
+        )
+        .route(
+            "/api/v1/actions/purge",
+            post(purge).route_layer(purge_scope()),
+        )
         .route("/api/v1/actions/{id}", get(get_action).route_layer(read()))
         .route(
             "/api/v1/sessions/{id}/chain",
@@ -148,14 +154,17 @@ async fn list(
     } else {
         None
     };
-    Ok(Json(ListResponse { rows: out, next_before }))
+    Ok(Json(ListResponse {
+        rows: out,
+        next_before,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
 struct ExportParams {
     /// `ndjson` (default), `json`, or `csv`. The streaming code path is NDJSON
-    /// + CSV; `json` falls back to a single bulk array materialised in memory
-    /// and is intended for small windows only.
+    /// plus CSV; `json` falls back to a single bulk array materialised in
+    /// memory and is intended for small windows only.
     format: Option<String>,
     decision: Option<String>,
     p_0: Option<String>,
@@ -179,16 +188,15 @@ async fn export(
     let (content_type, header_line): (&str, Option<&'static str>) = match fmt {
         "csv" => (
             "text/csv; charset=utf-8",
-            Some("id,request_id,session_id,p_0,leaf_pca_id,vendor,action,method,path,status,decision,block_reason,read_filter_triggered,quarantined_count,policy_id,at\n"),
+            Some(
+                "id,request_id,session_id,p_0,leaf_pca_id,vendor,action,method,path,status,decision,block_reason,read_filter_triggered,quarantined_count,policy_id,at\n",
+            ),
         ),
         "ndjson" | "json" => ("application/x-ndjson; charset=utf-8", None),
         _ => {
-            return crate::error_envelope::ErrorBody::new(
-                "unsupported format",
-                "bad_request",
-            )
-            .with_fix("Use format=ndjson (default) or format=csv.")
-            .into_response(StatusCode::BAD_REQUEST);
+            return crate::error_envelope::ErrorBody::new("unsupported format", "bad_request")
+                .with_fix("Use format=ndjson (default) or format=csv.")
+                .into_response(StatusCode::BAD_REQUEST);
         }
     };
 
@@ -437,7 +445,18 @@ async fn get_action(
     // Audit-body row, if any. Joined by request_id (the audit_body table
     // uses request_id as its PK so the adapter can insert without
     // awaiting the action_events row's generated UUID).
-    let audit_body: Option<AuditBody> = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>, i32, i32)>(
+    let audit_body: Option<AuditBody> = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i32,
+            i32,
+        ),
+    >(
         "SELECT mode, request_hash, response_hash,
                 request_body_b64, response_body_b64,
                 request_bytes, response_bytes
@@ -574,9 +593,7 @@ async fn stream(
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                 // Client is too slow; emit a "lagged" event so the JS can
                 // reconcile by hitting /actions and skipping ahead.
-                Some(Ok(Event::default()
-                    .event("lagged")
-                    .data(n.to_string())))
+                Some(Ok(Event::default().event("lagged").data(n.to_string())))
             }
         }
     });

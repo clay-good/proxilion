@@ -26,7 +26,7 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use super::action_stream::ActionEvent;
-use super::error::{upstream_error_kind, AppError};
+use super::error::{AppError, upstream_error_kind};
 use super::read_filter;
 use super::state::AdapterState;
 use crate::pic::{CachedPca, PcaCache, SuccessorOutcome};
@@ -378,7 +378,7 @@ async fn proxy_request(
                     detail: Some(&detail),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &requested_ops,
-                        escalation_after_minutes,
+                    escalation_after_minutes,
                     request_canonical_json: Some(crate::blocked::canonical_request_json(
                         &method_str,
                         &req.upstream_path,
@@ -431,7 +431,7 @@ async fn proxy_request(
                     hop: pca2.hop as i32,
                     predecessor_id: Some(session.leaf_pca_id),
                     signature: vec![],
-                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
+                    pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
                 })
                 .await
                 .map_err(|e| AppError::Internal(format!("pca_cache: {e}")))?;
@@ -512,7 +512,7 @@ async fn proxy_request(
                     detail: Some(&d),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &leaf_ops,
-                        escalation_after_minutes,
+                    escalation_after_minutes,
                     request_canonical_json: Some(crate::blocked::canonical_request_json(
                         &method_str,
                         &req.upstream_path,
@@ -546,7 +546,9 @@ async fn proxy_request(
         builder = builder.query(&req.query);
     }
     if let Some(b) = req.upstream_body.as_ref() {
-        builder = builder.header(CONTENT_TYPE, "application/json").body(b.clone());
+        builder = builder
+            .header(CONTENT_TYPE, "application/json")
+            .body(b.clone());
     }
     let upstream_resp = match builder.send().await {
         Ok(r) => r,
@@ -581,15 +583,18 @@ async fn proxy_request(
 
     // Read filter — only on GETs.
     let (final_body, filter_outcome) =
-        if req.method == Method::GET && outcome.read_filter.is_some() {
-            let filter = outcome.read_filter.as_ref().expect("guarded above");
+        if let (&Method::GET, Some(filter)) = (&req.method, outcome.read_filter.as_ref()) {
             let compiled = read_filter::CompiledFilter::compile(filter)
                 .map_err(|e| AppError::Internal(format!("read-filter regex: {e}")))?;
             let (b, o) = read_filter::apply(&body_bytes, &compiled, content_type.as_deref());
             // spec.md §3.2 — readfilter scan + quarantined-bytes counters.
-            let scan_result = if !o.triggered { "clean" }
-                else if o.block { "quarantined" }
-                else { "stripped" };
+            let scan_result = if !o.triggered {
+                "clean"
+            } else if o.block {
+                "quarantined"
+            } else {
+                "stripped"
+            };
             metrics::counter!(
                 "proxilion_readfilter_scans_total",
                 "vendor" => "google",
@@ -672,10 +677,7 @@ async fn proxy_request(
     // label. The action event records the "would have" outcome so the
     // operator can promote the policy to enforce later.
     let decision_label = match &outcome.decision {
-        Decision::Allow => outcome
-            .observe_would_have
-            .as_deref()
-            .unwrap_or("allow"),
+        Decision::Allow => outcome.observe_would_have.as_deref().unwrap_or("allow"),
         Decision::Block { .. } => "block",
         Decision::RequireConfirmation { .. } => "require_confirmation",
         Decision::RateLimit { .. } => "rate_limit",
@@ -762,9 +764,9 @@ async fn proxy_request(
         resp_headers.insert(HeaderName::from_static("x-proxilion-trace-id"), v);
     }
     super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
-    Ok(builder
+    builder
         .body(axum::body::Body::from(final_body))
-        .map_err(|e| AppError::Internal(e.to_string()))?)
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 fn build_policy_ctx(
@@ -817,7 +819,12 @@ async fn read_bounded(resp: reqwest::Response, max: usize) -> Result<Vec<u8>, Ap
     Ok(bytes.to_vec())
 }
 
-fn insert_proxy_headers(headers: &mut HeaderMap, request_id: Uuid, outcome: &Outcome, pca_id: Uuid) {
+fn insert_proxy_headers(
+    headers: &mut HeaderMap,
+    request_id: Uuid,
+    outcome: &Outcome,
+    pca_id: Uuid,
+) {
     headers.insert(
         HeaderName::from_static("x-proxilion-request-id"),
         HeaderValue::from_str(&request_id.to_string()).expect("uuid"),
@@ -870,7 +877,11 @@ fn build_event_body_ctx(event: &Value, customer_domain: &str) -> HashMap<String,
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|a| a.get("email").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .filter_map(|a| {
+                    a.get("email")
+                        .and_then(|e| e.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -880,7 +891,9 @@ fn build_event_body_ctx(event: &Value, customer_domain: &str) -> HashMap<String,
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    let external = domains.iter().any(|d| !d.eq_ignore_ascii_case(customer_domain));
+    let external = domains
+        .iter()
+        .any(|d| !d.eq_ignore_ascii_case(customer_domain));
     out.insert("attendee_count".to_string(), Value::from(attendees.len()));
     out.insert(
         "attendee_domains".to_string(),
@@ -931,10 +944,7 @@ mod tests {
     #[test]
     fn domain_of_works() {
         assert_eq!(domain_of("alice@acme.com").as_deref(), Some("acme.com"));
-        assert_eq!(
-            domain_of("Bob@Example.COM").as_deref(),
-            Some("example.com")
-        );
+        assert_eq!(domain_of("Bob@Example.COM").as_deref(), Some("example.com"));
         assert_eq!(domain_of("invalid").as_deref(), None);
     }
 
@@ -961,7 +971,10 @@ mod tests {
         let ctx = build_event_body_ctx(&ev, "acme.com");
         assert_eq!(ctx.get("external_attendee"), Some(&Value::Bool(true)));
         assert_eq!(ctx.get("attendee_count"), Some(&Value::from(2)));
-        assert_eq!(ctx.get("visibility"), Some(&Value::String("private".into())));
+        assert_eq!(
+            ctx.get("visibility"),
+            Some(&Value::String("private".into()))
+        );
         assert_eq!(ctx.get("summary_present"), Some(&Value::Bool(true)));
         // Domains de-duplicated + sorted.
         let domains = ctx.get("attendee_domains").unwrap().as_array().unwrap();
@@ -989,7 +1002,7 @@ mod tests {
         assert_eq!(ctx.get("attendee_count"), Some(&Value::from(0)));
         assert_eq!(ctx.get("external_attendee"), Some(&Value::Bool(false)));
         // Missing visibility absent, not Null.
-        assert!(ctx.get("visibility").is_none());
+        assert!(!ctx.contains_key("visibility"));
     }
 
     #[test]

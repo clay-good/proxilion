@@ -115,11 +115,7 @@ pub async fn persist(db: &PgPool, r: BlockedActionRecord<'_>) {
 /// this variant so the human-approval channel fires as soon as the row
 /// commits. Notification is fire-and-forget — the request response and
 /// the durable row never wait on the webhook receiver.
-pub async fn persist_and_notify(
-    db: &PgPool,
-    notifiers: &Notifiers,
-    r: BlockedActionRecord<'_>,
-) {
+pub async fn persist_and_notify(db: &PgPool, notifiers: &Notifiers, r: BlockedActionRecord<'_>) {
     let id = match persist_returning_id(db, &r).await {
         Some(id) => id,
         None => return,
@@ -306,7 +302,14 @@ mod canonical_request_json_tests {
     #[test]
     fn shapes_a_well_formed_object() {
         let (path_params, body) = empty_maps();
-        let s = canonical_request_json("GET", "/drive/v3/files/abc", "google", "drive.files.get", &path_params, &body);
+        let s = canonical_request_json(
+            "GET",
+            "/drive/v3/files/abc",
+            "google",
+            "drive.files.get",
+            &path_params,
+            &body,
+        );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["method"], "GET");
         assert_eq!(v["path"], "/drive/v3/files/abc");
@@ -377,8 +380,22 @@ mod canonical_request_json_tests {
         let mut path_params = HashMap::new();
         path_params.insert("id".into(), "file-123".into());
         let body = HashMap::new();
-        let a = canonical_request_json("GET", "/x", "google", "drive.files.get", &path_params, &body);
-        let b = canonical_request_json("GET", "/x", "google", "drive.files.get", &path_params, &body);
+        let a = canonical_request_json(
+            "GET",
+            "/x",
+            "google",
+            "drive.files.get",
+            &path_params,
+            &body,
+        );
+        let b = canonical_request_json(
+            "GET",
+            "/x",
+            "google",
+            "drive.files.get",
+            &path_params,
+            &body,
+        );
         assert_eq!(a, b);
         let v: serde_json::Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["path_params"]["id"], "file-123");

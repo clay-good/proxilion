@@ -421,8 +421,7 @@ mod tests {
             .await;
 
         let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
-        let fwd =
-            SiemForwarder::new(format!("{}/siem", server.uri()), key).unwrap();
+        let fwd = SiemForwarder::new(format!("{}/siem", server.uri()), key).unwrap();
         fwd.publish(sample()).await;
         // wiremock asserts the matcher on drop; if it didn't match, the
         // test panics. Reaching this line is success.
@@ -468,7 +467,10 @@ mod tests {
         // We assert `count` header matches the batch size (3).
         Mock::given(method("POST"))
             .and(path("/siem"))
-            .and(header("x-proxilion-schema", "proxilion.action_event_batch.v1"))
+            .and(header(
+                "x-proxilion-schema",
+                "proxilion.action_event_batch.v1",
+            ))
             .and(header("x-proxilion-batch-count", "3"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
@@ -490,7 +492,10 @@ mod tests {
     async fn batch_mode_flush_drains_partial_buffer() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(header("x-proxilion-schema", "proxilion.action_event_batch.v1"))
+            .and(header(
+                "x-proxilion-schema",
+                "proxilion.action_event_batch.v1",
+            ))
             .and(header("x-proxilion-batch-count", "2"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)

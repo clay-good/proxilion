@@ -49,7 +49,9 @@ fn engine() -> Engine {
 
 #[test]
 fn single_string_to_is_normalized_to_vec() {
-    let (to, cc, bcc) = engine().email_recipients_for("only-to").expect("override present");
+    let (to, cc, bcc) = engine()
+        .email_recipients_for("only-to")
+        .expect("override present");
     assert_eq!(to.as_deref(), Some(&["security@acme.com".to_string()][..]));
     assert!(cc.is_none());
     assert!(bcc.is_none());
@@ -67,7 +69,9 @@ fn full_override_all_three_lists() {
 
 #[test]
 fn cc_only_leaves_to_and_bcc_unset() {
-    let (to, cc, bcc) = engine().email_recipients_for("cc-only").expect("override present");
+    let (to, cc, bcc) = engine()
+        .email_recipients_for("cc-only")
+        .expect("override present");
     assert!(to.is_none(), "to inherits the global default");
     assert_eq!(cc.as_deref(), Some(&["legal@acme.com".to_string()][..]));
     assert!(bcc.is_none());
@@ -99,10 +103,18 @@ fn escalation_after_minutes_absent_when_only_recipients_set() {
 
 #[test]
 fn escalation_after_minutes_absent_when_no_recipients_block() {
-    assert!(engine().escalation_after_minutes_for("no-override").is_none());
+    assert!(
+        engine()
+            .escalation_after_minutes_for("no-override")
+            .is_none()
+    );
 }
 
 #[test]
 fn escalation_after_minutes_unknown_policy_is_none() {
-    assert!(engine().escalation_after_minutes_for("no-such-id").is_none());
+    assert!(
+        engine()
+            .escalation_after_minutes_for("no-such-id")
+            .is_none()
+    );
 }

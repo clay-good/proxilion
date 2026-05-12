@@ -88,7 +88,10 @@ mod tests {
         let a = c.encrypt(b"hi").unwrap();
         let b = c.encrypt(b"hi").unwrap();
         assert_ne!(a.nonce, b.nonce, "nonce must be random per encryption");
-        assert_ne!(a.bytes, b.bytes, "ciphertext must differ across encryptions");
+        assert_ne!(
+            a.bytes, b.bytes,
+            "ciphertext must differ across encryptions"
+        );
     }
 
     #[test]

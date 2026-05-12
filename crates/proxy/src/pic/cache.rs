@@ -111,15 +111,17 @@ impl PcaCache {
         .bind(pca_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, cbor, p_0, ops, hop, pred, sig, profile)| CachedPca {
-            pca_id: id,
-            cbor,
-            p_0,
-            ops: serde_json::from_value(ops.0).unwrap_or_default(),
-            hop,
-            predecessor_id: pred,
-            signature: sig,
-            pic_profile: profile,
-        }))
+        Ok(
+            row.map(|(id, cbor, p_0, ops, hop, pred, sig, profile)| CachedPca {
+                pca_id: id,
+                cbor,
+                p_0,
+                ops: serde_json::from_value(ops.0).unwrap_or_default(),
+                hop,
+                predecessor_id: pred,
+                signature: sig,
+                pic_profile: profile,
+            }),
+        )
     }
 }

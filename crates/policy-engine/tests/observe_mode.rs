@@ -54,10 +54,17 @@ fn observe_mode_demotes_block_to_allow_with_label() {
     body.insert("external_recipient".into(), serde_json::Value::Bool(true));
     let out = engine.evaluate(&ctx("gmail.messages.send", body)).unwrap();
     // Decision must be Allow so the adapter lets the request through.
-    assert!(matches!(out.decision, Decision::Allow), "decision={:?}", out.decision);
+    assert!(
+        matches!(out.decision, Decision::Allow),
+        "decision={:?}",
+        out.decision
+    );
     // But the "would have" label must record what happened.
     assert_eq!(out.observe_would_have.as_deref(), Some("observe_block"));
-    assert_eq!(out.matched_policy_id.as_deref(), Some("gmail-external-recipient"));
+    assert_eq!(
+        out.matched_policy_id.as_deref(),
+        Some("gmail-external-recipient")
+    );
     assert_eq!(out.mode, policy_engine::Mode::Observe);
 }
 
@@ -89,7 +96,9 @@ fn disabled_mode_skips_evaluation() {
     let engine = Engine::new(POLICY).unwrap();
     // A delete action that the disabled policy would have blocked falls
     // through to the default Allow with no matched policy id.
-    let out = engine.evaluate(&ctx("drive.files.delete", HashMap::new())).unwrap();
+    let out = engine
+        .evaluate(&ctx("drive.files.delete", HashMap::new()))
+        .unwrap();
     assert_eq!(out.matched_policy_id, None);
     assert!(matches!(out.decision, Decision::Allow));
     assert_eq!(out.observe_would_have, None);
@@ -105,7 +114,9 @@ fn default_mode_is_enforce_when_field_missing() {
   required_ops: []
 "#;
     let engine = Engine::new(yaml).unwrap();
-    let out = engine.evaluate(&ctx("drive.files.get", HashMap::new())).unwrap();
+    let out = engine
+        .evaluate(&ctx("drive.files.get", HashMap::new()))
+        .unwrap();
     // No `mode:` in YAML → enforce.
     assert!(matches!(out.decision, Decision::Block { .. }));
     assert_eq!(out.observe_would_have, None);

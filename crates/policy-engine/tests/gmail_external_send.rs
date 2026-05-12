@@ -36,11 +36,21 @@ fn ctx_with_external(external: bool, to_domain: &str) -> RequestContext {
 #[test]
 fn external_recipient_is_blocked() {
     let e = engine();
-    let outcome = e.evaluate(&ctx_with_external(true, "evilcorp.example")).unwrap();
-    assert_eq!(outcome.matched_policy_id.as_deref(), Some("gmail-external-send-gate"));
+    let outcome = e
+        .evaluate(&ctx_with_external(true, "evilcorp.example"))
+        .unwrap();
+    assert_eq!(
+        outcome.matched_policy_id.as_deref(),
+        Some("gmail-external-send-gate")
+    );
     match outcome.decision {
-        Decision::Block { override_allowed, .. } => {
-            assert!(override_allowed, "policy declares override: requires_justification");
+        Decision::Block {
+            override_allowed, ..
+        } => {
+            assert!(
+                override_allowed,
+                "policy declares override: requires_justification"
+            );
         }
         other => panic!("expected Block, got {other:?}"),
     }
@@ -58,7 +68,9 @@ fn internal_only_is_allowed() {
 #[test]
 fn required_ops_resolves_to_send_atom() {
     let e = engine();
-    let outcome = e.evaluate(&ctx_with_external(true, "evilcorp.example")).unwrap();
+    let outcome = e
+        .evaluate(&ctx_with_external(true, "evilcorp.example"))
+        .unwrap();
     assert_eq!(outcome.required_ops.required.len(), 1);
     let atom = &outcome.required_ops.required[0];
     assert_eq!(atom.scheme, "gmail");

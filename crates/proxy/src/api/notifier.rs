@@ -37,8 +37,8 @@ pub struct NotifierApiState {
 }
 
 pub fn router(state: NotifierApiState) -> Router {
-    use axum::middleware::from_fn_with_state;
     use crate::operator_auth::scope_check;
+    use axum::middleware::from_fn_with_state;
     Router::new()
         .route(
             "/api/v1/notifier/show",
@@ -259,57 +259,65 @@ struct TestRequest {
 // ─────────────────────────────────────────────────────────────────────────
 
 async fn get_config(State(state): State<NotifierApiState>) -> impl IntoResponse {
-    let rows: Vec<(String, bool, Value)> = sqlx::query_as(
-        "SELECT id, enabled, config FROM notifier_config ORDER BY id",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let webhook = rows.iter().find(|(id, _, _)| id == "webhook").map(|(_, enabled, cfg)| {
-        let mut c = cfg.clone();
-        if let Some(obj) = c.as_object_mut() {
-            obj.remove("hmac_key");
-            obj.insert(
-                "hmac_key_set".into(),
-                Value::Bool(cfg.get("hmac_key").is_some()),
-            );
-            if let Some(url) = cfg.get("url").and_then(|v| v.as_str()) {
-                obj.insert("url_redacted".into(), Value::String(redact_url(url)));
-            }
-        }
-        json!({ "enabled": enabled, "config": c })
-    });
-    let slack = rows.iter().find(|(id, _, _)| id == "slack").map(|(_, enabled, cfg)| {
-        let mut c = cfg.clone();
-        if let Some(obj) = c.as_object_mut() {
-            obj.remove("signing_secret");
-            obj.insert(
-                "signing_secret_set".into(),
-                Value::Bool(cfg.get("signing_secret").is_some()),
-            );
-            if let Some(url) = cfg.get("incoming_webhook_url").and_then(|v| v.as_str()) {
+    let rows: Vec<(String, bool, Value)> =
+        sqlx::query_as("SELECT id, enabled, config FROM notifier_config ORDER BY id")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
+    let webhook = rows
+        .iter()
+        .find(|(id, _, _)| id == "webhook")
+        .map(|(_, enabled, cfg)| {
+            let mut c = cfg.clone();
+            if let Some(obj) = c.as_object_mut() {
+                obj.remove("hmac_key");
                 obj.insert(
-                    "incoming_webhook_url_redacted".into(),
-                    Value::String(redact_url(url)),
+                    "hmac_key_set".into(),
+                    Value::Bool(cfg.get("hmac_key").is_some()),
                 );
+                if let Some(url) = cfg.get("url").and_then(|v| v.as_str()) {
+                    obj.insert("url_redacted".into(), Value::String(redact_url(url)));
+                }
             }
-            // user_map (ui-less-surfaces.md §5.3 dev 4) is not secret — Slack
-            // user ids + operator emails are routinely visible in the audit
-            // trail. Echo it through so operators can audit the mapping.
-        }
-        json!({ "enabled": enabled, "config": c })
-    });
-    let email = rows.iter().find(|(id, _, _)| id == "email").map(|(_, enabled, cfg)| {
-        let mut c = cfg.clone();
-        // smtp_url usually contains user:pass — redact host portion only.
-        if let Some(obj) = c.as_object_mut() {
-            if let Some(url) = cfg.get("smtp_url").and_then(|v| v.as_str()) {
-                obj.insert("smtp_url_redacted".into(), Value::String(redact_url(url)));
-                obj.remove("smtp_url");
+            json!({ "enabled": enabled, "config": c })
+        });
+    let slack = rows
+        .iter()
+        .find(|(id, _, _)| id == "slack")
+        .map(|(_, enabled, cfg)| {
+            let mut c = cfg.clone();
+            if let Some(obj) = c.as_object_mut() {
+                obj.remove("signing_secret");
+                obj.insert(
+                    "signing_secret_set".into(),
+                    Value::Bool(cfg.get("signing_secret").is_some()),
+                );
+                if let Some(url) = cfg.get("incoming_webhook_url").and_then(|v| v.as_str()) {
+                    obj.insert(
+                        "incoming_webhook_url_redacted".into(),
+                        Value::String(redact_url(url)),
+                    );
+                }
+                // user_map (ui-less-surfaces.md §5.3 dev 4) is not secret — Slack
+                // user ids + operator emails are routinely visible in the audit
+                // trail. Echo it through so operators can audit the mapping.
             }
-        }
-        json!({ "enabled": enabled, "config": c })
-    });
+            json!({ "enabled": enabled, "config": c })
+        });
+    let email = rows
+        .iter()
+        .find(|(id, _, _)| id == "email")
+        .map(|(_, enabled, cfg)| {
+            let mut c = cfg.clone();
+            // smtp_url usually contains user:pass — redact host portion only.
+            if let Some(obj) = c.as_object_mut() {
+                if let Some(url) = cfg.get("smtp_url").and_then(|v| v.as_str()) {
+                    obj.insert("smtp_url_redacted".into(), Value::String(redact_url(url)));
+                    obj.remove("smtp_url");
+                }
+            }
+            json!({ "enabled": enabled, "config": c })
+        });
     Json(json!({ "webhook": webhook, "slack": slack, "email": email }))
 }
 
@@ -350,17 +358,21 @@ async fn set_webhook(
 ) -> (StatusCode, Json<Value>) {
     let url = match body.config.get("url").and_then(|v| v.as_str()) {
         Some(u) if !u.is_empty() => u.to_string(),
-        _ => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"config.url is required"})),
-        ),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"config.url is required"})),
+            );
+        }
     };
     let hmac_hex = match body.config.get("hmac_key").and_then(|v| v.as_str()) {
         Some(h) if !h.is_empty() => h.to_string(),
-        _ => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"config.hmac_key is required (hex)"})),
-        ),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"config.hmac_key is required (hex)"})),
+            );
+        }
     };
     let secret = match WebhookSecret::from_hex(&hmac_hex) {
         Ok(s) => s,
@@ -375,21 +387,21 @@ async fn set_webhook(
     // suppressor so the hot-swapped notifier keeps the suppression
     // history. Cloning the suppressor shares the inner `buckets` Arc;
     // counts and exemplars survive the swap.
-    let new_notifier =
-        match WebhookNotifier::new(url.clone(), secret, state.proxy_base_url.clone()) {
-            Ok(mut n) => {
-                if let Some(b) = state.notifiers.webhook_burst.clone() {
-                    n = n.with_burst(b);
-                }
-                std::sync::Arc::new(n)
+    let new_notifier = match WebhookNotifier::new(url.clone(), secret, state.proxy_base_url.clone())
+    {
+        Ok(mut n) => {
+            if let Some(b) = state.notifiers.webhook_burst.clone() {
+                n = n.with_burst(b);
             }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error":"notifier build failed","detail": e.to_string()})),
-                );
-            }
-        };
+            std::sync::Arc::new(n)
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"notifier build failed","detail": e.to_string()})),
+            );
+        }
+    };
     if let Err(e) = persist_config(&state, "webhook", enabled, &body.config, &principal.name).await
     {
         return e;
@@ -421,25 +433,29 @@ async fn set_slack(
     body: SetConfigBody,
     enabled: bool,
 ) -> (StatusCode, Json<Value>) {
-    let url = match body.config.get("incoming_webhook_url").and_then(|v| v.as_str()) {
-        Some(u) if !u.is_empty() => u.to_string(),
-        _ => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"config.incoming_webhook_url is required"})),
-        ),
-    };
-    let signing_secret = match body
+    let url = match body
         .config
-        .get("signing_secret")
+        .get("incoming_webhook_url")
         .and_then(|v| v.as_str())
     {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"config.incoming_webhook_url is required"})),
+            );
+        }
+    };
+    let signing_secret = match body.config.get("signing_secret").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error":"config.signing_secret is required (Slack signed-request secret)"
-            })),
-        ),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error":"config.signing_secret is required (Slack signed-request secret)"
+                })),
+            );
+        }
     };
     // Optional `user_map: { "U01ABC": "alice@acme.com", "bob": "bob@acme.com" }`
     // — ui-less-surfaces.md §5.3 dev 4. Slack user id OR username → operator subject.
@@ -465,7 +481,9 @@ async fn set_slack(
         Some(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error":"user_map must be an object of slack_user_id_or_username → operator_subject"})),
+                Json(
+                    json!({"error":"user_map must be an object of slack_user_id_or_username → operator_subject"}),
+                ),
             );
         }
         None => std::collections::HashMap::new(),
@@ -523,17 +541,23 @@ async fn set_email(
 ) -> (StatusCode, Json<Value>) {
     let smtp_url = match body.config.get("smtp_url").and_then(|v| v.as_str()) {
         Some(u) if !u.is_empty() => u.to_string(),
-        _ => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"config.smtp_url is required (e.g. smtps://user:pass@smtp.example.com:465)"})),
-        ),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error":"config.smtp_url is required (e.g. smtps://user:pass@smtp.example.com:465)"}),
+                ),
+            );
+        }
     };
     let from = match body.config.get("from").and_then(|v| v.as_str()) {
         Some(f) if !f.is_empty() => f.to_string(),
-        _ => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"config.from is required (RFC 5322 address)"})),
-        ),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"config.from is required (RFC 5322 address)"})),
+            );
+        }
     };
     let to: Vec<String> = match body.config.get("to") {
         Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
@@ -541,10 +565,12 @@ async fn set_email(
             .iter()
             .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from))
             .collect(),
-        _ => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"config.to is required (string or non-empty array)"})),
-        ),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"config.to is required (string or non-empty array)"})),
+            );
+        }
     };
     if to.is_empty() {
         return (
@@ -665,7 +691,10 @@ mod tests {
             "https://hooks.slack.com/..."
         );
         assert_eq!(redact_url("https://example.com"), "https://example.com");
-        assert_eq!(redact_url("https://example.com/path"), "https://example.com/...");
+        assert_eq!(
+            redact_url("https://example.com/path"),
+            "https://example.com/..."
+        );
     }
 
     /// Driver-string parsing: `all` fans out, a single name targets,

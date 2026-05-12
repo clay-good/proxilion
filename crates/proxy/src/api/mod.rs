@@ -36,8 +36,8 @@ pub struct ApiState {
 }
 
 pub fn router(state: ApiState) -> Router {
-    use axum::middleware::from_fn_with_state;
     use crate::operator_auth::scope_check;
+    use axum::middleware::from_fn_with_state;
     Router::new()
         .route(
             "/api/v1/pca/{id}",
@@ -85,7 +85,11 @@ async fn verify_pca(
     State(state): State<ApiState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = state.verifier.verify_chain(id).await.map_err(ApiError::Verifier)?;
+    let result = state
+        .verifier
+        .verify_chain(id)
+        .await
+        .map_err(ApiError::Verifier)?;
     Ok(Json(serde_json::json!({
         "intact": result.intact,
         "links_verified": result.links_verified,

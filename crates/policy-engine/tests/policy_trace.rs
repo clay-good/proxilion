@@ -2,9 +2,7 @@
 
 use std::collections::HashMap;
 
-use policy_engine::{
-    Decision, Engine, PolicyEvalMode, PolicyLayer, RequestContext, UserCtx,
-};
+use policy_engine::{Decision, Engine, PolicyEvalMode, PolicyLayer, RequestContext, UserCtx};
 use serde_json::Value;
 use shared_types::ErrorCode;
 
@@ -56,7 +54,10 @@ fn trace_records_layer_a_and_layer_b_on_block() {
         .find(|l| l.layer == PolicyLayer::LayerA)
         .expect("Layer A present");
     assert!(layer_a.passed);
-    assert!(layer_a.matched_rule_id.is_some(), "Layer A records required-ops count");
+    assert!(
+        layer_a.matched_rule_id.is_some(),
+        "Layer A records required-ops count"
+    );
 
     // Layer B should record the block with `policy_blocked`.
     let layer_b = trace
@@ -127,9 +128,15 @@ fn trace_records_read_filter_slot_when_policy_configures_one() {
         .layers
         .iter()
         .find(|l| l.layer == PolicyLayer::ReadFilter);
-    assert!(rf.is_some(), "read-filter slot present when policy configures one");
+    assert!(
+        rf.is_some(),
+        "read-filter slot present when policy configures one"
+    );
     let rf = rf.unwrap();
-    assert!(rf.passed, "engine emits pending=true; adapter mutates after scan");
+    assert!(
+        rf.passed,
+        "engine emits pending=true; adapter mutates after scan"
+    );
 }
 
 /// qiuth-patterns.md §3.4 deviation 2 — `Comprehensive` mode walks every
@@ -188,7 +195,11 @@ fn comprehensive_mode_records_would_also_match_diagnostics() {
         .iter()
         .filter(|l| l.layer == PolicyLayer::LayerB)
         .collect();
-    assert_eq!(layer_b.len(), 3, "first match + two would-also-match overlaps");
+    assert_eq!(
+        layer_b.len(),
+        3,
+        "first match + two would-also-match overlaps"
+    );
     assert_eq!(layer_b[0].matched_rule_id.as_deref(), Some("first-block"));
     let ids: Vec<_> = layer_b[1..]
         .iter()
@@ -198,7 +209,10 @@ fn comprehensive_mode_records_would_also_match_diagnostics() {
     assert!(ids.contains(&"third-allow"));
     for l in &layer_b[1..] {
         assert!(
-            l.detail.as_deref().unwrap_or("").starts_with("would_also_match:"),
+            l.detail
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("would_also_match:"),
             "diagnostic detail flagged with would_also_match prefix"
         );
     }

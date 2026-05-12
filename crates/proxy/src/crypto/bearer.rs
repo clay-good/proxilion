@@ -39,10 +39,7 @@ impl Bearer {
         }
         let body = &input[PREFIX.len()..];
         // base32 alphabet check.
-        if !body
-            .bytes()
-            .all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'))
-        {
+        if !body.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7')) {
             return None;
         }
         Some(input)
@@ -99,7 +96,9 @@ mod tests {
 
     #[test]
     fn rejects_wrong_prefix() {
-        assert!(Bearer::parse("pxl_test_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_none());
+        assert!(
+            Bearer::parse("pxl_test_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_none()
+        );
     }
 
     #[test]
@@ -119,6 +118,9 @@ mod tests {
     fn debug_does_not_leak() {
         let b = Bearer::generate();
         let dbg = format!("{b:?}");
-        assert!(!dbg.contains(b.as_str()), "Bearer Debug must not leak the token");
+        assert!(
+            !dbg.contains(b.as_str()),
+            "Bearer Debug must not leak the token"
+        );
     }
 }

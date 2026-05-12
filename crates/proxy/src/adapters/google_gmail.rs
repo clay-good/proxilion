@@ -8,7 +8,7 @@
 //!
 //! The novelty over Drive is the **send** path: it parses the RFC 2822 body
 //! out of the `{ "raw": "<base64url>" }` payload, extracts recipient domains
-//! + subject + attachment count, and exposes them under `body.*` so the
+//! plus subject + attachment count, and exposes them under `body.*` so the
 //! policy engine can implement the gmail-external-send-gate per spec.md §9.
 
 use std::collections::HashMap;
@@ -19,8 +19,8 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use axum::http::{HeaderName, HeaderValue, Method, Response, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use base64::engine::general_purpose::{URL_SAFE as B64URL, URL_SAFE_NO_PAD as B64URL_NP};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,7 +29,7 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use super::action_stream::ActionEvent;
-use super::error::{upstream_error_kind, AppError};
+use super::error::{AppError, upstream_error_kind};
 use super::read_filter;
 use super::state::AdapterState;
 use crate::pic::{CachedPca, PcaCache, SuccessorOutcome};
@@ -100,8 +100,10 @@ async fn send_message(
             // Re-serialize the raw payload — we never trust round-trip of the
             // mailparse output (it normalizes headers). Forward exactly what
             // the agent sent.
-            upstream_body: Some(serde_json::to_vec(&SendUpstreamBody { raw: &body.raw })
-                .map_err(|e| AppError::Internal(e.to_string()))?),
+            upstream_body: Some(
+                serde_json::to_vec(&SendUpstreamBody { raw: &body.raw })
+                    .map_err(|e| AppError::Internal(e.to_string()))?,
+            ),
             upstream_content_type: Some("application/json".into()),
         },
     )
@@ -247,7 +249,7 @@ async fn proxy_request(
                     detail: Some(&detail_str),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &requested_ops,
-                        escalation_after_minutes,
+                    escalation_after_minutes,
                     request_canonical_json: Some(crate::blocked::canonical_request_json(
                         &method_str,
                         &req.upstream_path,
@@ -300,7 +302,7 @@ async fn proxy_request(
                     hop: pca2.hop as i32,
                     predecessor_id: Some(session.leaf_pca_id),
                     signature: vec![],
-                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
+                    pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
                 })
                 .await
                 .map_err(|e| AppError::Internal(format!("pca_cache: {e}")))?;
@@ -381,7 +383,7 @@ async fn proxy_request(
                     detail: Some(&d),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &leaf_ops,
-                        escalation_after_minutes,
+                    escalation_after_minutes,
                     request_canonical_json: Some(crate::blocked::canonical_request_json(
                         &method_str,
                         &req.upstream_path,
@@ -396,9 +398,7 @@ async fn proxy_request(
             return Err(AppError::PicInvariantViolation(d));
         }
         Err(crate::pic::ExecutorError::Upstream { status, body }) => {
-            return Err(AppError::Internal(format!(
-                "trust plane {status}: {body}"
-            )));
+            return Err(AppError::Internal(format!("trust plane {status}: {body}")));
         }
         Err(other) => return Err(AppError::Internal(other.to_string())),
     };
@@ -454,91 +454,94 @@ async fn proxy_request(
     let body_bytes = read_bounded(upstream_resp, MAX_BODY).await?;
 
     // Read filter — only for read paths.
-    let (final_body, filter_outcome) = if req.method == Method::GET && outcome.read_filter.is_some()
-    {
-        let filter = outcome.read_filter.as_ref().expect("guarded above");
-        let compiled = read_filter::CompiledFilter::compile(filter)
-            .map_err(|e| AppError::Internal(format!("read-filter regex: {e}")))?;
-        let (b, o) = read_filter::apply(&body_bytes, &compiled, content_type.as_deref());
-        // spec.md §3.2 — readfilter scan + quarantined-bytes counters.
-        let scan_result = if !o.triggered { "clean" }
-            else if o.block { "quarantined" }
-            else { "stripped" };
-        metrics::counter!(
-            "proxilion_readfilter_scans_total",
-            "vendor" => "google",
-            "action" => req.action.clone(),
-            "result" => scan_result,
-        )
-        .increment(1);
-        if o.triggered {
-            let quarantined_bytes = if o.block {
-                body_bytes.len() as u64
+    let (final_body, filter_outcome) =
+        if let (&Method::GET, Some(filter)) = (&req.method, outcome.read_filter.as_ref()) {
+            let compiled = read_filter::CompiledFilter::compile(filter)
+                .map_err(|e| AppError::Internal(format!("read-filter regex: {e}")))?;
+            let (b, o) = read_filter::apply(&body_bytes, &compiled, content_type.as_deref());
+            // spec.md §3.2 — readfilter scan + quarantined-bytes counters.
+            let scan_result = if !o.triggered {
+                "clean"
+            } else if o.block {
+                "quarantined"
             } else {
-                (body_bytes.len() as u64).saturating_sub(b.len() as u64)
+                "stripped"
             };
             metrics::counter!(
-                "proxilion_readfilter_quarantined_bytes_total",
+                "proxilion_readfilter_scans_total",
                 "vendor" => "google",
+                "action" => req.action.clone(),
+                "result" => scan_result,
             )
-            .increment(quarantined_bytes);
-        }
-        if o.block {
-            super::policy_trace::mark_read_filter(
-                &mut policy_trace,
-                true,
-                outcome.matched_policy_id.clone(),
-                format!("BlockRequest pattern matched ({} hits)", o.matches),
-            );
-            super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
-            crate::blocked::persist_and_notify(
-                &state.auth.db,
-                &state.notifier,
-                crate::blocked::BlockedActionRecord {
-                    request_id,
-                    session_id: session.agent_session_id,
-                    p_0: Some(&session.p_0),
-                    vendor: "google",
-                    action: &req.action,
-                    method: &method_str,
-                    path: &req.upstream_path,
-                    layer: "read_filter",
-                    policy_id: outcome.matched_policy_id.as_deref(),
-                    detail: Some("BlockRequest pattern matched"),
-                    predecessor_pca_id: None,
-                    requested_ops: &[],
+            .increment(1);
+            if o.triggered {
+                let quarantined_bytes = if o.block {
+                    body_bytes.len() as u64
+                } else {
+                    (body_bytes.len() as u64).saturating_sub(b.len() as u64)
+                };
+                metrics::counter!(
+                    "proxilion_readfilter_quarantined_bytes_total",
+                    "vendor" => "google",
+                )
+                .increment(quarantined_bytes);
+            }
+            if o.block {
+                super::policy_trace::mark_read_filter(
+                    &mut policy_trace,
+                    true,
+                    outcome.matched_policy_id.clone(),
+                    format!("BlockRequest pattern matched ({} hits)", o.matches),
+                );
+                super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
+                crate::blocked::persist_and_notify(
+                    &state.auth.db,
+                    &state.notifier,
+                    crate::blocked::BlockedActionRecord {
+                        request_id,
+                        session_id: session.agent_session_id,
+                        p_0: Some(&session.p_0),
+                        vendor: "google",
+                        action: &req.action,
+                        method: &method_str,
+                        path: &req.upstream_path,
+                        layer: "read_filter",
+                        policy_id: outcome.matched_policy_id.as_deref(),
+                        detail: Some("BlockRequest pattern matched"),
+                        predecessor_pca_id: None,
+                        requested_ops: &[],
                         escalation_after_minutes,
-                    request_canonical_json: Some(crate::blocked::canonical_request_json(
-                        &method_str,
-                        &req.upstream_path,
-                        "google",
-                        &req.action,
-                        &req.policy_path,
-                        &req.body_for_policy,
-                    )),
-                },
+                        request_canonical_json: Some(crate::blocked::canonical_request_json(
+                            &method_str,
+                            &req.upstream_path,
+                            "google",
+                            &req.action,
+                            &req.policy_path,
+                            &req.body_for_policy,
+                        )),
+                    },
+                )
+                .await;
+                return Err(AppError::ReadFilterBlocked);
+            }
+            persist_quarantine_samples(
+                &state.auth.db,
+                request_id,
+                session.agent_session_id,
+                outcome.matched_policy_id.as_deref(),
+                &o.samples,
             )
             .await;
-            return Err(AppError::ReadFilterBlocked);
-        }
-        persist_quarantine_samples(
-            &state.auth.db,
-            request_id,
-            session.agent_session_id,
-            outcome.matched_policy_id.as_deref(),
-            &o.samples,
-        )
-        .await;
-        super::policy_trace::mark_read_filter(
-            &mut policy_trace,
-            false,
-            outcome.matched_policy_id.clone(),
-            format!("{} matches, {} samples", o.matches, o.samples.len()),
-        );
-        (b, o)
-    } else {
-        (body_bytes, Default::default())
-    };
+            super::policy_trace::mark_read_filter(
+                &mut policy_trace,
+                false,
+                outcome.matched_policy_id.clone(),
+                format!("{} matches, {} samples", o.matches, o.samples.len()),
+            );
+            (b, o)
+        } else {
+            (body_bytes, Default::default())
+        };
 
     // Observe mode (ui-less-surfaces.md §2.5): if the policy would have
     // blocked / required_confirmation / rate_limited but is in observe
@@ -546,10 +549,7 @@ async fn proxy_request(
     // label. The action event records the "would have" outcome so the
     // operator can promote the policy to enforce later.
     let decision_label = match &outcome.decision {
-        Decision::Allow => outcome
-            .observe_would_have
-            .as_deref()
-            .unwrap_or("allow"),
+        Decision::Allow => outcome.observe_would_have.as_deref().unwrap_or("allow"),
         Decision::Block { .. } => "block",
         Decision::RequireConfirmation { .. } => "require_confirmation",
         Decision::RateLimit { .. } => "rate_limit",
@@ -637,9 +637,9 @@ async fn proxy_request(
         resp_headers.insert(HeaderName::from_static("x-proxilion-trace-id"), v);
     }
     super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
-    Ok(builder
+    builder
         .body(axum::body::Body::from(final_body))
-        .map_err(|e| AppError::Internal(e.to_string()))?)
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 fn build_policy_ctx(
@@ -754,9 +754,7 @@ struct ParsedSend {
 fn decode_b64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     // Gmail's `raw` is base64url; padding is optional. Try padded first,
     // fall back to no-pad.
-    B64URL
-        .decode(s)
-        .or_else(|_| B64URL_NP.decode(s))
+    B64URL.decode(s).or_else(|_| B64URL_NP.decode(s))
 }
 
 fn parse_mime(raw: &[u8]) -> Result<ParsedSend, mailparse::MailParseError> {
@@ -854,15 +852,24 @@ fn build_send_body_ctx(
     let external_recipient = domains.iter().any(|d| d != &cd);
 
     let mut body = HashMap::new();
-    body.insert("to".into(), Value::Array(
-        parsed.to.iter().map(|s| Value::String(s.clone())).collect(),
-    ));
-    body.insert("cc".into(), Value::Array(
-        parsed.cc.iter().map(|s| Value::String(s.clone())).collect(),
-    ));
-    body.insert("bcc".into(), Value::Array(
-        parsed.bcc.iter().map(|s| Value::String(s.clone())).collect(),
-    ));
+    body.insert(
+        "to".into(),
+        Value::Array(parsed.to.iter().map(|s| Value::String(s.clone())).collect()),
+    );
+    body.insert(
+        "cc".into(),
+        Value::Array(parsed.cc.iter().map(|s| Value::String(s.clone())).collect()),
+    );
+    body.insert(
+        "bcc".into(),
+        Value::Array(
+            parsed
+                .bcc
+                .iter()
+                .map(|s| Value::String(s.clone()))
+                .collect(),
+        ),
+    );
     // `to_domain` is the FIRST unique recipient domain (alphabetical). This
     // matches the spec.md §9 example policy which compares a single value via
     // `not_in`. Multi-domain expansion is §2.2.
@@ -884,10 +891,7 @@ fn build_send_body_ctx(
         "subject_present".into(),
         Value::Bool(parsed.subject.is_some()),
     );
-    body.insert(
-        "from_p0".into(),
-        Value::String(from_p0.to_owned()),
-    );
+    body.insert("from_p0".into(), Value::String(from_p0.to_owned()));
     body
 }
 
@@ -900,9 +904,8 @@ mod tests {
     use super::*;
 
     fn build_raw(to: &str, subject: &str, body: &str) -> String {
-        let raw = format!(
-            "To: {to}\r\nFrom: alice@acme.com\r\nSubject: {subject}\r\n\r\n{body}\r\n"
-        );
+        let raw =
+            format!("To: {to}\r\nFrom: alice@acme.com\r\nSubject: {subject}\r\n\r\n{body}\r\n");
         B64URL_NP.encode(raw.as_bytes())
     }
 
@@ -982,8 +985,14 @@ mod tests {
 
     #[test]
     fn domain_of_helper() {
-        assert_eq!(domain_of("alice@example.com").as_deref(), Some("example.com"));
-        assert_eq!(domain_of("alice@ExAmPle.COM").as_deref(), Some("example.com"));
+        assert_eq!(
+            domain_of("alice@example.com").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            domain_of("alice@ExAmPle.COM").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(domain_of("no-at-symbol"), None);
     }
 

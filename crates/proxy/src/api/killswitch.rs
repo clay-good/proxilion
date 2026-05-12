@@ -40,12 +40,18 @@ pub struct KillswitchApiState {
 }
 
 pub fn router(state: KillswitchApiState) -> Router {
-    use axum::middleware::from_fn_with_state;
     use crate::operator_auth::scope_check;
+    use axum::middleware::from_fn_with_state;
     let kill = || from_fn_with_state("killswitch:revoke", scope_check);
     Router::new()
-        .route("/api/v1/killswitch/session/{id}", post(kill_session).route_layer(kill()))
-        .route("/api/v1/killswitch/user/{p0}", post(kill_user).route_layer(kill()))
+        .route(
+            "/api/v1/killswitch/session/{id}",
+            post(kill_session).route_layer(kill()),
+        )
+        .route(
+            "/api/v1/killswitch/user/{p0}",
+            post(kill_user).route_layer(kill()),
+        )
         .route("/api/v1/killswitch/all", post(kill_all).route_layer(kill()))
         .with_state(Arc::new(state))
 }
@@ -89,7 +95,17 @@ async fn kill_session(
     .map_err(ApiError::Db)?;
     let n = hashes.len() as i64;
     populate_kill_cache(&state.kill_cache, &hashes).await;
-    Ok(Json(persist(&state.db, "session", &id.to_string(), &reason, body.operator_subject.as_deref(), n).await?))
+    Ok(Json(
+        persist(
+            &state.db,
+            "session",
+            &id.to_string(),
+            &reason,
+            body.operator_subject.as_deref(),
+            n,
+        )
+        .await?,
+    ))
 }
 
 async fn kill_user(
@@ -116,7 +132,17 @@ async fn kill_user(
     .map_err(ApiError::Db)?;
     let n = hashes.len() as i64;
     populate_kill_cache(&state.kill_cache, &hashes).await;
-    Ok(Json(persist(&state.db, "user", &p0, &reason, body.operator_subject.as_deref(), n).await?))
+    Ok(Json(
+        persist(
+            &state.db,
+            "user",
+            &p0,
+            &reason,
+            body.operator_subject.as_deref(),
+            n,
+        )
+        .await?,
+    ))
 }
 
 async fn kill_all(
@@ -129,7 +155,10 @@ async fn kill_all(
             "/killswitch/all requires { confirm: \"yes\" } in the body".into(),
         ));
     }
-    let reason = body.reason.clone().unwrap_or_else(|| "killswitch:all".into());
+    let reason = body
+        .reason
+        .clone()
+        .unwrap_or_else(|| "killswitch:all".into());
     let hashes: Vec<(Vec<u8>,)> = sqlx::query_as(
         "UPDATE agent_bearers
             SET revoked_at      = now(),
@@ -143,7 +172,17 @@ async fn kill_all(
     .map_err(ApiError::Db)?;
     let n = hashes.len() as i64;
     populate_kill_cache(&state.kill_cache, &hashes).await;
-    Ok(Json(persist(&state.db, "all", "*", &reason, body.operator_subject.as_deref(), n).await?))
+    Ok(Json(
+        persist(
+            &state.db,
+            "all",
+            "*",
+            &reason,
+            body.operator_subject.as_deref(),
+            n,
+        )
+        .await?,
+    ))
 }
 
 /// Push `bearer_sha256` BYTEA values from a RETURNING result into the
@@ -182,12 +221,11 @@ async fn persist(
     .fetch_one(db)
     .await
     .map_err(ApiError::Db)?;
-    let at: DateTime<Utc> =
-        sqlx::query_scalar("SELECT at FROM kill_records WHERE id = $1")
-            .bind(record_id)
-            .fetch_one(db)
-            .await
-            .map_err(ApiError::Db)?;
+    let at: DateTime<Utc> = sqlx::query_scalar("SELECT at FROM kill_records WHERE id = $1")
+        .bind(record_id)
+        .fetch_one(db)
+        .await
+        .map_err(ApiError::Db)?;
     metrics::counter!(
         "proxilion_killswitch_invocations_total",
         "scope" => scope.to_string()

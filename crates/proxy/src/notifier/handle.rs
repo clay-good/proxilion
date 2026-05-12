@@ -95,7 +95,7 @@ impl Notifiers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifier::{WebhookSecret, WebhookNotifier};
+    use crate::notifier::{WebhookNotifier, WebhookSecret};
 
     fn mk_webhook(url: &str) -> Arc<WebhookNotifier> {
         let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();

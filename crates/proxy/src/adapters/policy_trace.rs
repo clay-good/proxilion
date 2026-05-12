@@ -81,10 +81,7 @@ pub fn summary(trace: &PolicyTrace) -> String {
             if l.passed {
                 format!("{layer}=ok")
             } else {
-                let code = l
-                    .error_code
-                    .map(|c| c.as_str())
-                    .unwrap_or("unknown");
+                let code = l.error_code.map(|c| c.as_str()).unwrap_or("unknown");
                 format!("{layer}={code}")
             }
         })
@@ -96,7 +93,8 @@ pub fn summary(trace: &PolicyTrace) -> String {
 /// at INFO; denied traces log at WARN so operators can filter cleanly.
 pub fn emit(trace: &PolicyTrace, request_id: uuid::Uuid, vendor: &str, action: &str) {
     let summary = summary(trace);
-    let trace_json = serde_json::to_string(trace).unwrap_or_else(|_| "<trace serialization failed>".to_string());
+    let trace_json =
+        serde_json::to_string(trace).unwrap_or_else(|_| "<trace serialization failed>".to_string());
     if trace.allowed() {
         tracing::info!(
             request_id = %request_id,
@@ -142,7 +140,11 @@ mod tests {
     fn mark_layer_a_failed_replaces_passed_entry() {
         let mut t = fresh_trace();
         mark_layer_a_failed(&mut t, "missing drive:write:bob/*".into());
-        let la = t.layers.iter().find(|l| l.layer == PolicyLayer::LayerA).unwrap();
+        let la = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .unwrap();
         assert!(!la.passed);
         assert_eq!(la.error_code, Some(ErrorCode::PicInvariantViolation));
         assert_eq!(la.detail.as_deref(), Some("missing drive:write:bob/*"));
@@ -153,7 +155,11 @@ mod tests {
         let mut t = fresh_trace();
         assert!(t.layers.iter().all(|l| l.layer != PolicyLayer::ReadFilter));
         mark_read_filter(&mut t, false, Some("p1".into()), "no matches".into());
-        let rf = t.layers.iter().find(|l| l.layer == PolicyLayer::ReadFilter).unwrap();
+        let rf = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::ReadFilter)
+            .unwrap();
         assert!(rf.passed);
         assert_eq!(rf.matched_rule_id.as_deref(), Some("p1"));
     }

@@ -74,7 +74,11 @@ pub fn parse_missing_atoms(detail: &str) -> Vec<String> {
     let inner = &detail[open + 1..open + 1 + close];
     inner
         .split(',')
-        .map(|s| s.trim().trim_matches(|c: char| c == '"' || c == '\'').to_string())
+        .map(|s| {
+            s.trim()
+                .trim_matches(|c: char| c == '"' || c == '\'')
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
         .collect()
 }

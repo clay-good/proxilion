@@ -25,10 +25,7 @@ use tokio::sync::OnceCell;
 use tracing::{debug, info, instrument};
 
 use shared_types::provenance::{
-    self as pc,
-    crypto::KeyPair,
-    pca::ExecutorBinding,
-    poc::PocBuilder,
+    self as pc, crypto::KeyPair, pca::ExecutorBinding, poc::PocBuilder,
 };
 
 use policy_engine::PicMode;
@@ -64,9 +61,13 @@ struct Inner {
 
 impl PicExecutor {
     /// `key_seed` — 32 raw bytes of the Ed25519 seed.
-    pub fn new(trust_plane_url: String, kid: String, key_seed: &[u8; 32]) -> Result<Self, ExecutorError> {
-        let keypair = KeyPair::from_bytes(&kid, key_seed)
-            .map_err(|e| ExecutorError::Core(e.to_string()))?;
+    pub fn new(
+        trust_plane_url: String,
+        kid: String,
+        key_seed: &[u8; 32],
+    ) -> Result<Self, ExecutorError> {
+        let keypair =
+            KeyPair::from_bytes(&kid, key_seed).map_err(|e| ExecutorError::Core(e.to_string()))?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent(concat!("Proxilion/", env!("CARGO_PKG_VERSION")))
@@ -85,7 +86,11 @@ impl PicExecutor {
     pub fn dev_ephemeral(trust_plane_url: String) -> Result<Self, ExecutorError> {
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
-        Self::new(trust_plane_url, format!("proxy-dev-{}", uuid::Uuid::new_v4()), &seed)
+        Self::new(
+            trust_plane_url,
+            format!("proxy-dev-{}", uuid::Uuid::new_v4()),
+            &seed,
+        )
     }
 
     #[allow(dead_code)] // surfaced to observability/diagnostics in §1.2
@@ -444,7 +449,6 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ExecutorError::Invariant(_)),
-            "got: {err:?}");
+        assert!(matches!(err, ExecutorError::Invariant(_)), "got: {err:?}");
     }
 }

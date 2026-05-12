@@ -21,7 +21,7 @@ use tracing::{info, instrument};
 use uuid::Uuid;
 
 use super::action_stream::ActionEvent;
-use super::error::{upstream_error_kind, AppError};
+use super::error::{AppError, upstream_error_kind};
 use super::read_filter;
 use super::state::AdapterState;
 use crate::pic::{CachedPca, PcaCache, SuccessorOutcome};
@@ -192,7 +192,7 @@ async fn proxy_request(
                     detail: Some(&format!("{e}")),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &requested_ops,
-                        escalation_after_minutes,
+                    escalation_after_minutes,
                     request_canonical_json: Some(crate::blocked::canonical_request_json(
                         "GET",
                         &req.upstream_path,
@@ -246,7 +246,7 @@ async fn proxy_request(
                     hop: pca2.hop as i32,
                     predecessor_id: Some(session.leaf_pca_id),
                     signature: vec![],
-                pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
+                    pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
                 })
                 .await
                 .map_err(|e| AppError::Internal(format!("pca_cache: {e}")))?;
@@ -330,7 +330,7 @@ async fn proxy_request(
                     detail: Some(&d),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &leaf_ops,
-                        escalation_after_minutes,
+                    escalation_after_minutes,
                     request_canonical_json: Some(crate::blocked::canonical_request_json(
                         "GET",
                         &req.upstream_path,
@@ -412,9 +412,13 @@ async fn proxy_request(
         // `clean | stripped | quarantined`; "stripped" covers `replace_with_marker`
         // / `strip_silently` (content modified, request proceeds), "quarantined"
         // covers `block_request` (full body quarantined, request blocked).
-        let scan_result = if !o.triggered { "clean" }
-            else if o.block { "quarantined" }
-            else { "stripped" };
+        let scan_result = if !o.triggered {
+            "clean"
+        } else if o.block {
+            "quarantined"
+        } else {
+            "stripped"
+        };
         metrics::counter!(
             "proxilion_readfilter_scans_total",
             "vendor" => "google",
@@ -460,7 +464,7 @@ async fn proxy_request(
                     // content already crossed our wire. Audit only.
                     predecessor_pca_id: None,
                     requested_ops: &[],
-                        escalation_after_minutes,
+                    escalation_after_minutes,
                     request_canonical_json: Some(crate::blocked::canonical_request_json(
                         "GET",
                         &req.upstream_path,
@@ -500,10 +504,7 @@ async fn proxy_request(
     // label. The action event records the "would have" outcome so the
     // operator can promote the policy to enforce later.
     let decision_label = match &outcome.decision {
-        Decision::Allow => outcome
-            .observe_would_have
-            .as_deref()
-            .unwrap_or("allow"),
+        Decision::Allow => outcome.observe_would_have.as_deref().unwrap_or("allow"),
         Decision::Block { .. } => "block",
         Decision::RequireConfirmation { .. } => "require_confirmation",
         Decision::RateLimit { .. } => "rate_limit",
@@ -590,9 +591,9 @@ async fn proxy_request(
         resp_headers.insert(HeaderName::from_static("x-proxilion-trace-id"), v);
     }
     super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
-    Ok(builder
+    builder
         .body(axum::body::Body::from(final_body))
-        .map_err(|e| AppError::Internal(e.to_string()))?)
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 fn build_policy_ctx(
@@ -648,7 +649,12 @@ async fn read_bounded(resp: reqwest::Response, max: usize) -> Result<Vec<u8>, Ap
     Ok(bytes.to_vec())
 }
 
-fn insert_proxy_headers(headers: &mut HeaderMap, request_id: Uuid, outcome: &Outcome, pca_id: Uuid) {
+fn insert_proxy_headers(
+    headers: &mut HeaderMap,
+    request_id: Uuid,
+    outcome: &Outcome,
+    pca_id: Uuid,
+) {
     headers.insert(
         HeaderName::from_static("x-proxilion-request-id"),
         HeaderValue::from_str(&request_id.to_string()).expect("uuid"),
@@ -696,11 +702,7 @@ async fn persist_quarantine_samples(
 // Silence the unused import on `Bytes` / `Json` / `StatusCode` if a future
 // refactor moves their call sites.
 #[allow(dead_code)]
-const _USED: (
-    Option<Bytes>,
-    Option<Json<()>>,
-    StatusCode,
-) = (None, None, StatusCode::OK);
+const _USED: (Option<Bytes>, Option<Json<()>>, StatusCode) = (None, None, StatusCode::OK);
 
 #[cfg(test)]
 mod tests {
@@ -795,7 +797,9 @@ mod tests {
         };
         let resp = err.into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["code"], "policy_blocked");
         // Structured extras now carry policy_id + override_allowed.
@@ -813,12 +817,11 @@ mod tests {
         );
         let resp = err.into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["code"], "pic_invariant_violation");
-        assert!(v["detail"]
-            .as_str()
-            .unwrap()
-            .contains("monotonicity"));
+        assert!(v["detail"].as_str().unwrap().contains("monotonicity"));
     }
 }

@@ -1,0 +1,38 @@
+# `cargo audit` configuration.
+#
+# Authoritative source: <https://docs.rs/cargo-audit/latest/cargo_audit/config/>
+#
+# Each `ignore` entry must carry a comment with: (a) why the advisory is
+# present in our dep tree, (b) why we believe it's not exploitable in our
+# build, and (c) the unblock condition. Treat the ignore list as a
+# tracked technical debt — anything here should have a follow-up issue.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin attack timing side-channel in `rsa 0.9.x`.
+    # `rsa` is in our Cargo.lock via `sqlx-mysql`, which is itself pulled
+    # in by `sqlx-macros-core` for compile-time SQL type metadata across
+    # all sqlx backends. We declare `sqlx = { features = ["postgres", ...] }`
+    # and never use the MySQL backend at runtime — `cargo tree -i sqlx-mysql`
+    # reports no reverse-dep edge from our crates, so the vulnerable code
+    # paths are never reached. No fixed upstream version exists yet; the
+    # `rsa` crate authors are working on a constant-time fix (tracked at
+    # https://github.com/RustCrypto/RSA/issues/19).
+    # Unblock: drop this ignore when `rsa >= 0.10.0` (constant-time impl)
+    # lands and `sqlx-mysql` picks it up — or when the `sqlx` maintainers
+    # ship a feature flag that stops `sqlx-macros-core` from referencing
+    # MySQL.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2025-0134 — `rustls-pemfile` is unmaintained.
+    # This is a "warning" advisory, not a security vulnerability. The
+    # crate still works correctly for PEM parsing; it's just no longer
+    # under active development. Used directly for cert/key loading and
+    # transitively via `axum-server`'s TLS support. The maintained
+    # successor (`rustls-pki-types`) covers the type vocabulary but not
+    # the PEM-parsing entry points we use, so the migration is non-
+    # trivial. Tracked alongside future axum-server upgrades.
+    # Unblock: drop this ignore when `axum-server` migrates off
+    # `rustls-pemfile`, or when we move to a different TLS terminator.
+    "RUSTSEC-2025-0134",
+]

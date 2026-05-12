@@ -1,0 +1,55 @@
+name: cargo-audit
+
+# Proactive vulnerability detection against the RustSec advisory DB.
+# Same data source Dependabot scans against; running it in CI surfaces
+# new advisories on PRs (and the weekly cron) instead of after a vuln
+# lands on `main` and Dependabot opens an alert.
+#
+# History: 2026-05-12 push surfaced 4 `rustls-webpki` advisories
+# (1 HIGH, 1 MEDIUM, 2 LOW) coming in via `async-nats 0.38`. They were
+# fixable in one bump (`async-nats 0.48`); we'd rather catch the next
+# one before it merges.
+#
+# Failure mode: this workflow fails the PR on any unfiltered advisory.
+# To temporarily allow an advisory while a fix is in flight, add it to
+# `.cargo/audit.toml` under `[advisories].ignore = [...]` with a comment
+# pointing at the tracking PR.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Weekly catch-all so newly-published advisories surface even when
+  # there's no PR activity. RustSec publishes ~daily; one scan per week
+  # is plenty for a service of this size.
+  schedule:
+    - cron: "23 7 * * 1"  # Mondays 07:23 UTC
+  # Manual trigger for ad-hoc re-scans after dependency bumps.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The SHA-pinned upstream git deps (provenance-core) need the CLI
+  # fetcher in restricted CI environments.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install cargo-audit from a pre-built binary — `cargo install`
+      # would compile from source and add ~2 min for no benefit.
+      - name: install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: run cargo audit
+        # `--deny warnings` flips RustSec "warning" advisories (unmaintained
+        # crates, deprecated APIs) into failures alongside genuine
+        # vulnerabilities. Yanked-crate detection is on by default.
+        run: cargo audit --deny warnings

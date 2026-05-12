@@ -134,15 +134,6 @@ pub async fn run(cfg: Config) -> Result<()> {
             let policy_handle = build_policy_handle(&cfg)?;
             tokio::spawn(crate::policy_handle::spawn_watcher(policy_handle.clone()));
 
-            // Blocked-action expiry sweeper (ui-less-surfaces.md §5.7).
-            // Flips `pending` rows whose `expires_at` has passed to
-            // `expired` once per minute. Operates independently of the
-            // notifier — no fan-out on expiry by design.
-            tokio::spawn(crate::blocked_expiry::spawn(
-                core.db.clone(),
-                crate::blocked_expiry::DEFAULT_TICK_INTERVAL,
-            ));
-
             // Setup-status checklist (powers /admin/setup). Always-on so the
             // operator can use it to figure out what's still missing. Mounted
             // OUTSIDE the operator_auth layer — it's a checklist for an
@@ -169,6 +160,19 @@ pub async fn run(cfg: Config) -> Result<()> {
             // independently hot-swappable via `/api/v1/notifier/config`.
             // DB-stored config wins; env vars are the bootstrap fallback.
             let notifiers = build_notifiers(&cfg, &core.db, Some(&policy_handle)).await;
+
+            // Blocked-action expiry + escalation sweeper (ui-less-surfaces.md
+            // §5.7). Expiry flips `pending` rows past `expires_at` to
+            // `expired` once per minute. Escalation re-fires the email
+            // notifier (REMINDER: subject) for rows past `escalation_at`,
+            // stamping `escalated_at` so each row escalates at most once.
+            // Spawned AFTER `build_notifiers` so the email handle clone
+            // sees the live driver on its first tick.
+            tokio::spawn(crate::blocked_expiry::spawn(
+                core.db.clone(),
+                crate::blocked_expiry::DEFAULT_TICK_INTERVAL,
+                notifiers.email.clone(),
+            ));
             let protected_api = api::router(api_state)
                 .merge(crate::api::actions::router(crate::api::actions::ActionsApiState {
                     db: core.db.clone(),
@@ -194,10 +198,10 @@ pub async fn run(cfg: Config) -> Result<()> {
                     db: core.db.clone(),
                     proxy_base_url: cfg.proxy_base_url.clone(),
                 }));
-            let operator_state = crate::operator_auth::OperatorAuthState {
-                db: core.db.clone(),
-                enforced: cfg.operator_auth_enforced,
-            };
+            let operator_state = crate::operator_auth::OperatorAuthState::new(
+                core.db.clone(),
+                cfg.operator_auth_enforced,
+            );
             if !cfg.operator_auth_enforced {
                 warn!(
                     "PROXILION_DISABLE_OPERATOR_AUTH=1 — /api/v1/* is unauthenticated. \
@@ -623,14 +627,19 @@ async fn build_notifiers(
                     }
                     let wn = wn.with_burst(suppressor.clone());
                     let notifier = Arc::new(wn);
-                    let nfor = notifier.clone();
                     let proxy_url = cfg.proxy_base_url.clone();
+                    // ui-less-surfaces.md §10.3 dev 2 — route flushes
+                    // through the handle each tick so a hot-swap via
+                    // `webhook.replace(...)` delivers the next flush to
+                    // the live notifier, not the one captured here.
+                    let handle = n.webhook.clone();
                     tokio::spawn(crate::notifier::burst::spawn_flush_loop(
                         suppressor,
                         move |summary| {
-                            let n = nfor.clone();
+                            let h = handle.clone();
                             let url = proxy_url.clone();
                             async move {
+                                let Some(n) = h.current() else { return };
                                 let s = summary.with_details_url(&url);
                                 n.notify_summary(&s).await;
                             }
@@ -662,14 +671,17 @@ async fn build_notifiers(
                 }
                 let sn = sn.with_burst(suppressor.clone());
                 let notifier = Arc::new(sn);
-                let nfor = notifier.clone();
                 let proxy_url = cfg.proxy_base_url.clone();
+                // ui-less-surfaces.md §10.3 dev 2 — flush via the handle
+                // so hot-swaps land on the live notifier.
+                let handle = n.slack.clone();
                 tokio::spawn(crate::notifier::burst::spawn_flush_loop(
                     suppressor,
                     move |summary| {
-                        let n = nfor.clone();
+                        let h = handle.clone();
                         let url = proxy_url.clone();
                         async move {
+                            let Some(n) = h.current() else { return };
                             let s = summary.with_details_url(&url);
                             n.notify_summary(&s).await;
                         }
@@ -693,7 +705,15 @@ async fn build_notifiers(
             cfg.proxy_base_url.clone(),
             db.clone(),
         ) {
-            Ok(en) => {
+            Ok(mut en) => {
+                if let Some(handle) = policy {
+                    let handle: crate::policy_handle::PolicyHandle = handle.clone();
+                    let resolver: crate::notifier::email::EmailRecipientsResolver =
+                        Arc::new(move |policy_id| {
+                            handle.load().email_recipients_for(policy_id)
+                        });
+                    en = en.with_recipients_resolver(resolver);
+                }
                 info!(from = %cfg_row.from, "blocked-action email notifier installed");
                 n.email.replace(Some(Arc::new(en)));
             }

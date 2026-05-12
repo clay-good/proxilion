@@ -47,6 +47,15 @@ pub struct PolicyDoc {
     #[serde(default)]
     pub notifier_burst: Option<BurstCfg>,
 
+    /// Per-policy email recipient routing (ui-less-surfaces.md §5.4 dev 3).
+    /// When present, the email notifier overrides the global `to`/`cc`/`bcc`
+    /// from `notifier_config.email` for any blocked action that matches this
+    /// policy. `None` → fall through to the global recipient list. Each
+    /// field is independently optional: a policy can override just `to` and
+    /// inherit `cc` / `bcc`.
+    #[serde(default)]
+    pub notifier_recipients: Option<RecipientsCfg>,
+
     /// Per-policy body audit minimization (ui-less-surfaces.md §6.4).
     /// `None` → bodies are NOT persisted (the privacy default).
     /// `Some(Hash)` → SHA-256 of req+resp bytes is stored.
@@ -62,6 +71,47 @@ pub enum AuditBodyMode {
     Hash,
     RedactPii,
     Full,
+}
+
+/// Per-policy email recipient override. ui-less-surfaces.md §5.4 dev 3.
+/// Accepts either a single string or an array of strings per field, mirroring
+/// the `notifier_config.email` payload shape. Each field is independently
+/// optional — `None` means "inherit the global value."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecipientsCfg {
+    #[serde(default, deserialize_with = "deserialize_string_or_vec_opt")]
+    pub to: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec_opt")]
+    pub cc: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec_opt")]
+    pub bcc: Option<Vec<String>>,
+    /// Per-policy escalation deadline in minutes (ui-less-surfaces.md
+    /// §5.7 dev 2). When set, the adapter writes
+    /// `escalation_at = blocked_at + N min` on the blocked_actions row;
+    /// the expiry sweeper re-fires the email notifier (subject prefixed
+    /// REMINDER:) when the deadline passes without a decision, then
+    /// stamps `escalated_at` so escalation runs at most once per row.
+    /// `None` → no escalation for this policy.
+    #[serde(default)]
+    pub escalation_after_minutes: Option<u32>,
+}
+
+fn deserialize_string_or_vec_opt<'de, D>(de: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum One {
+        S(String),
+        V(Vec<String>),
+    }
+    Option::<One>::deserialize(de).map(|opt| {
+        opt.map(|o| match o {
+            One::S(s) => vec![s],
+            One::V(v) => v,
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

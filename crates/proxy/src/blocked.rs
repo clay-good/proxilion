@@ -32,6 +32,12 @@ pub struct BlockedActionRecord<'a> {
     /// authority. Override re-uses this so the approved action is bound to
     /// the exact same authority the original attempt declared.
     pub requested_ops: &'a [String],
+    /// Per-policy escalation deadline in minutes (ui-less-surfaces.md
+    /// §5.7 dev 2). When set, persist writes
+    /// `escalation_at = now() + N min`; the sweeper re-fires the email
+    /// notifier with a REMINDER: subject prefix when the deadline lapses.
+    /// `None` → no escalation.
+    pub escalation_after_minutes: Option<u32>,
 }
 
 #[allow(dead_code)]
@@ -99,11 +105,19 @@ pub async fn persist_and_notify(
 }
 
 async fn persist_returning_id(db: &PgPool, r: &BlockedActionRecord<'_>) -> Option<Uuid> {
+    // `escalation_at` is computed in SQL so it shares the same `now()`
+    // clock as the row's `blocked_at` default — important for the
+    // sweeper's `escalation_at < now()` comparison to be self-consistent.
+    let escalation_minutes_sql = r.escalation_after_minutes.map(|m| m as i64);
     let res: Result<(Uuid,), _> = sqlx::query_as(
         "INSERT INTO blocked_actions
             (request_id, session_id, p_0, vendor, action, method, path,
-             layer, policy_id, detail, predecessor_pca_id, requested_ops)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             layer, policy_id, detail, predecessor_pca_id, requested_ops,
+             escalation_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                 CASE WHEN $13::bigint IS NULL THEN NULL
+                      ELSE now() + ($13::bigint * interval '1 minute')
+                 END)
          RETURNING id",
     )
     .bind(r.request_id)
@@ -118,6 +132,7 @@ async fn persist_returning_id(db: &PgPool, r: &BlockedActionRecord<'_>) -> Optio
     .bind(r.detail)
     .bind(r.predecessor_pca_id)
     .bind(r.requested_ops)
+    .bind(escalation_minutes_sql)
     .fetch_one(db)
     .await;
     match res {

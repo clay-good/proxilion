@@ -192,7 +192,7 @@ Implementation note: gate this with a `PolicyEvalMode::FailFast | Comprehensive`
 **Remaining deviations.**
 
 1. **Engine still exposes `evaluate(&ctx) -> Outcome` unchanged.** The trace-less entry point is still the public API for callers that don't need the structured trace; the three Google adapters now use `evaluate_with_trace` exclusively, but unit tests and any future embed callers can stay on the lighter path.
-2. **`PolicyEvalMode::{FailFast, Comprehensive}` defined but not yet observed.** The current engine evaluates fail-fast by structure (the YAML interpreter returns on the first match). `Comprehensive` mode that walks every later policy for "would also have matched" diagnostics is a follow-up tied to the explain-this-denial replay path — file an issue when a customer asks.
+2. ~~`PolicyEvalMode::{FailFast, Comprehensive}` defined but not yet observed.~~ **Resolved 2026-05-12.** [`Engine::evaluate_with_trace_mode(&ctx, PolicyEvalMode::Comprehensive)`](../../crates/policy-engine/src/rego.rs) walks every later policy after the first match and appends one extra Layer-B [`LayerOutcome`](../../crates/policy-engine/src/trace.rs) per "would-also-have-matched" rule, with `detail` prefixed `would_also_match:` so a downstream renderer can distinguish primary from diagnostic outcomes. The `final_decision` stays authoritative from the first match — overlaps are purely informational. `evaluate_with_trace` continues to default to `FailFast` (the hot-path entry point); the dashboard's explain-this-denial replay flips to `Comprehensive`. Verified by the new `comprehensive_mode_records_would_also_match_diagnostics` test in [crates/policy-engine/tests/policy_trace.rs](../../crates/policy-engine/tests/policy_trace.rs).
 
 ---
 

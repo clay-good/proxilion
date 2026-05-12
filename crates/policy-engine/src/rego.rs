@@ -16,7 +16,7 @@ use crate::context::RequestContext;
 use crate::decision::{Decision, Pattern, QuarantineAction, ReadFilter};
 use crate::match_expr;
 use crate::ops::{OpsExpression, OpsParseError};
-use crate::trace::{LayerOutcome, OpsAtomView, PolicyLayer, PolicyTrace};
+use crate::trace::{LayerOutcome, OpsAtomView, PolicyEvalMode, PolicyLayer, PolicyTrace};
 use crate::yaml::{
     parse_policies, AuditBodyMode, Mode, PicMode, PolicyDoc, QuarantineActionCfg,
     QuarantinePatternCfg, ReadFilterCfg,
@@ -60,6 +60,34 @@ impl Engine {
         let p = self.policies.iter().find(|p| p.id == policy_id)?;
         let b = p.notifier_burst.as_ref()?;
         Some((b.threshold, b.window_seconds))
+    }
+
+    /// Per-policy email recipient overrides (ui-less-surfaces.md §5.4 dev 3).
+    /// Returns `(to, cc, bcc)` where each is `Some` only when the policy
+    /// explicitly set that list. `None` outer → policy doesn't exist OR has
+    /// no `notifier_recipients:` block. The email notifier substitutes each
+    /// `Some` list for the global value at send time.
+    pub fn email_recipients_for(
+        &self,
+        policy_id: &str,
+    ) -> Option<(Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)> {
+        let p = self.policies.iter().find(|p| p.id == policy_id)?;
+        let r = p.notifier_recipients.as_ref()?;
+        Some((r.to.clone(), r.cc.clone(), r.bcc.clone()))
+    }
+
+    /// Per-policy escalation deadline (ui-less-surfaces.md §5.7 dev 2).
+    /// Returns the number of minutes after a blocked row is persisted at
+    /// which the email notifier should re-fire as a reminder. `None` →
+    /// the policy doesn't carry an escalation block (the common default
+    /// — no escalation, just expire at `expires_at`).
+    pub fn escalation_after_minutes_for(&self, policy_id: &str) -> Option<u32> {
+        self.policies
+            .iter()
+            .find(|p| p.id == policy_id)?
+            .notifier_recipients
+            .as_ref()?
+            .escalation_after_minutes
     }
 }
 
@@ -149,6 +177,22 @@ impl Engine {
         &self,
         ctx: &RequestContext,
     ) -> Result<(Outcome, PolicyTrace), Error> {
+        self.evaluate_with_trace_mode(ctx, PolicyEvalMode::FailFast)
+    }
+
+    /// Same as [`Engine::evaluate_with_trace`], but in
+    /// [`PolicyEvalMode::Comprehensive`] the engine walks every later
+    /// policy after the first match and records an additional
+    /// `LayerB` [`LayerOutcome`] per policy that *would* also have matched
+    /// (with `matched_rule_id` set and `detail` prefixed `would_also_match:`).
+    /// The `final_decision` is still authoritative from the first match —
+    /// this is purely diagnostic. Use from the dashboard "explain this
+    /// denial" replay path, never the hot path. Per qiuth-patterns.md §3.3.
+    pub fn evaluate_with_trace_mode(
+        &self,
+        ctx: &RequestContext,
+        mode: PolicyEvalMode,
+    ) -> Result<(Outcome, PolicyTrace), Error> {
         let started = Instant::now();
         let outcome = self.evaluate(ctx)?;
         let mut layers: Vec<LayerOutcome> = Vec::with_capacity(3);
@@ -194,6 +238,62 @@ impl Engine {
             ),
         };
         layers.push(layer_b);
+
+        // Comprehensive mode — collect diagnostics for every *later* policy
+        // that would also have matched the same context. The first match
+        // already populated `outcome` above; here we walk the remainder so
+        // the operator can see overlapping rules in a single replay.
+        if mode == PolicyEvalMode::Comprehensive {
+            let first_matched = outcome.matched_policy_id.as_deref();
+            let mut seen_first = false;
+            for p in &self.policies {
+                if p.vendor != ctx.vendor || p.action != ctx.action {
+                    continue;
+                }
+                if p.mode == crate::yaml::Mode::Disabled {
+                    continue;
+                }
+                if !match_expr::evaluate(&p.match_, ctx)? {
+                    continue;
+                }
+                // Skip the policy that fail-fast already recorded.
+                if !seen_first && Some(p.id.as_str()) == first_matched {
+                    seen_first = true;
+                    continue;
+                }
+                let would_decision = parse_decision(p)?;
+                let extra = match &would_decision {
+                    Decision::Allow => LayerOutcome {
+                        layer: PolicyLayer::LayerB,
+                        passed: true,
+                        matched_rule_id: Some(p.id.clone()),
+                        error_code: None,
+                        detail: Some(format!("would_also_match: allow ({:?})", p.mode)),
+                    },
+                    Decision::Block { reason, .. } => LayerOutcome::failed(
+                        PolicyLayer::LayerB,
+                        ErrorCode::PolicyBlocked,
+                        Some(p.id.clone()),
+                        Some(format!("would_also_match: {reason}")),
+                    ),
+                    Decision::RequireConfirmation { reason } => LayerOutcome::failed(
+                        PolicyLayer::LayerB,
+                        ErrorCode::RequireConfirmation,
+                        Some(p.id.clone()),
+                        Some(format!("would_also_match: {reason}")),
+                    ),
+                    Decision::RateLimit { burst, per_seconds } => LayerOutcome::failed(
+                        PolicyLayer::LayerB,
+                        ErrorCode::RateLimited,
+                        Some(p.id.clone()),
+                        Some(format!(
+                            "would_also_match: burst={burst} per_seconds={per_seconds}"
+                        )),
+                    ),
+                };
+                layers.push(extra);
+            }
+        }
 
         // Read filter — engine only records that a filter is configured;
         // the actual scan result lands on the adapter when the response

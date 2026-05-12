@@ -180,6 +180,11 @@ async fn proxy_request(
     let ctx = build_policy_ctx(state, session, &req);
 
     let (outcome, mut policy_trace) = state.policy.load().evaluate_with_trace(&ctx)?;
+    // ui-less-surfaces.md §5.7 dev 2 — per-policy escalation deadline.
+    let escalation_after_minutes = outcome
+        .matched_policy_id
+        .as_deref()
+        .and_then(|id| state.policy.load().escalation_after_minutes_for(id));
     let requested_ops: Vec<String> = outcome
         .required_ops
         .required
@@ -216,6 +221,7 @@ async fn proxy_request(
                     detail: Some(&detail_str),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &requested_ops,
+                        escalation_after_minutes,
                 },
             )
             .await;
@@ -341,6 +347,7 @@ async fn proxy_request(
                     detail: Some(&d),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &leaf_ops,
+                        escalation_after_minutes,
                 },
             )
             .await;
@@ -413,6 +420,7 @@ async fn proxy_request(
                     detail: Some("BlockRequest pattern matched"),
                     predecessor_pca_id: None,
                     requested_ops: &[],
+                        escalation_after_minutes,
                 },
             )
             .await;

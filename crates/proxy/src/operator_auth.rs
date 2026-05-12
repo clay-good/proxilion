@@ -24,6 +24,7 @@
 //! once at startup so it's loud in CI / prod logs.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -33,6 +34,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::warn;
@@ -51,6 +53,17 @@ pub const WILDCARD: &str = "*";
 // The proxy itself doesn't render the catalogue (that's the CLI's job),
 // but tests can pull it from `shared_types::operator_scopes::SCOPE_CATALOGUE`.
 
+/// `last_used_at` debounce window (ui-less-surfaces.md §4.4 dev 4). When
+/// the same token authenticates within this window, we skip the DB
+/// `UPDATE` — the timestamp it would have written is at most this stale.
+/// Tradeoff: write amplification reduced to 1 / token / minute at most;
+/// observability loss is bounded.
+const LAST_USED_DEBOUNCE: Duration = Duration::from_secs(60);
+
+/// Per-process moka cache mapping `token_id -> Instant of last DB touch`.
+/// Capacity matches the bearer kill-cache — bounded RAM, no leak.
+const TOUCH_CACHE_CAPACITY: u64 = 100_000;
+
 #[derive(Clone)]
 pub struct OperatorAuthState {
     pub db: PgPool,
@@ -59,6 +72,26 @@ pub struct OperatorAuthState {
     /// access works. Enabled by default; set
     /// `PROXILION_DISABLE_OPERATOR_AUTH=1` to flip off.
     pub enforced: bool,
+    /// Per-process debounce of `last_used_at` writes (ui-less-surfaces.md
+    /// §4.4 dev 4). A token's `Instant` lands here on every successful
+    /// auth; subsequent auths within `LAST_USED_DEBOUNCE` skip the DB
+    /// update.
+    touch_cache: Cache<Uuid, Instant>,
+}
+
+impl OperatorAuthState {
+    pub fn new(db: PgPool, enforced: bool) -> Self {
+        Self {
+            db,
+            enforced,
+            touch_cache: Cache::builder()
+                .max_capacity(TOUCH_CACHE_CAPACITY)
+                // Idle eviction matches the debounce window — once a
+                // token hasn't touched in 2×debounce we drop its entry.
+                .time_to_idle(LAST_USED_DEBOUNCE * 2)
+                .build(),
+        }
+    }
 }
 
 /// Authenticated principal, inserted into request extensions when the
@@ -185,19 +218,49 @@ pub async fn middleware(
         scopes: Arc::new(row.2),
         last_used_at: row.3,
     };
-    // Best-effort touch; failure must not fail the request. Clone the
-    // pool so the spawned future doesn't borrow from `state`.
-    let db = state.db.clone();
+    // Best-effort touch; failure must not fail the request. Debounced
+    // per ui-less-surfaces.md §4.4 dev 4 — skip the DB UPDATE if this
+    // token was already touched within `LAST_USED_DEBOUNCE`. Drops
+    // sustained-load write amplification from one UPDATE per request
+    // to at most one UPDATE per token per minute.
     let token_id = principal.token_id;
-    tokio::spawn(async move {
-        let r = sqlx::query("UPDATE operator_tokens SET last_used_at = now() WHERE id = $1")
-            .bind(token_id)
-            .execute(&db)
-            .await;
-        if let Err(e) = r {
-            tracing::warn!(error = %e, "operator_auth: last_used_at update failed");
+    let now = Instant::now();
+    let should_write = match state.touch_cache.get(&token_id).await {
+        Some(prev) if now.duration_since(prev) < LAST_USED_DEBOUNCE => {
+            metrics::counter!(
+                "proxilion_operator_last_used_writes_total",
+                "result" => "debounced"
+            )
+            .increment(1);
+            false
         }
-    });
+        _ => true,
+    };
+    if should_write {
+        state.touch_cache.insert(token_id, now).await;
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            let r = sqlx::query("UPDATE operator_tokens SET last_used_at = now() WHERE id = $1")
+                .bind(token_id)
+                .execute(&db)
+                .await;
+            match r {
+                Ok(_) => metrics::counter!(
+                    "proxilion_operator_last_used_writes_total",
+                    "result" => "ok"
+                )
+                .increment(1),
+                Err(e) => {
+                    tracing::warn!(error = %e, "operator_auth: last_used_at update failed");
+                    metrics::counter!(
+                        "proxilion_operator_last_used_writes_total",
+                        "result" => "error"
+                    )
+                    .increment(1);
+                }
+            }
+        });
+    }
     req.extensions_mut().insert(principal);
     metrics::counter!(
         "proxilion_operator_auth_total",
@@ -365,6 +428,37 @@ mod tests {
         assert!(p.require_scope("actions:read").is_ok());
         let err = p.require_scope("policy:write").unwrap_err();
         assert_eq!(err.required, "policy:write");
+    }
+
+    #[tokio::test]
+    async fn touch_cache_debounces_within_window() {
+        // ui-less-surfaces.md §4.4 dev 4 — first auth seeds the cache,
+        // subsequent auths within `LAST_USED_DEBOUNCE` see the prior
+        // Instant and skip the UPDATE. We exercise the cache directly
+        // (full middleware needs a live PgPool).
+        let cache: Cache<Uuid, Instant> = Cache::builder()
+            .max_capacity(TOUCH_CACHE_CAPACITY)
+            .time_to_idle(LAST_USED_DEBOUNCE * 2)
+            .build();
+        let token_id = Uuid::new_v4();
+        let t0 = Instant::now();
+
+        // First request: cache miss → would write.
+        assert!(cache.get(&token_id).await.is_none());
+        cache.insert(token_id, t0).await;
+
+        // Second request immediately after: cache hit AND within window
+        // → debounced.
+        let prev = cache.get(&token_id).await.expect("cache hit");
+        let elapsed = Instant::now().duration_since(prev);
+        assert!(
+            elapsed < LAST_USED_DEBOUNCE,
+            "elapsed should be below the debounce window"
+        );
+
+        // A different token doesn't share the entry.
+        let other = Uuid::new_v4();
+        assert!(cache.get(&other).await.is_none());
     }
 
     #[test]

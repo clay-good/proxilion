@@ -17,6 +17,7 @@
 //! require auth, and "no auth" is one URL form (`smtp://user:pass@…:25`)
 //! that we don't go out of our way to disable.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use lettre::message::{Mailbox, MultiPart, SinglePart, header::ContentType};
@@ -26,6 +27,16 @@ use sqlx::PgPool;
 use tracing::{debug, warn};
 
 use super::BlockedNotification;
+
+/// Per-policy recipient override resolver. Returns the policy's
+/// `notifier_recipients:` block as `(to, cc, bcc)`; each list is `Some` only
+/// when the policy explicitly set it. `None` outer → fall through to the
+/// global recipients on the notifier. ui-less-surfaces.md §5.4 dev 3.
+pub type EmailRecipientsResolver = Arc<
+    dyn Fn(&str) -> Option<(Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, thiserror::Error)]
 #[error("email build: {0}")]
@@ -46,6 +57,11 @@ pub struct EmailNotifier {
     /// §5.4 dev 5). 0 disables retry; 3 is the production default,
     /// chosen to match the webhook + SIEM forwarder's retry budget.
     max_retries: u32,
+    /// Optional per-policy recipient resolver (ui-less-surfaces.md §5.4
+    /// dev 3). When set, each notify() call looks up the matched policy
+    /// id and substitutes the policy's `notifier_recipients:` block for
+    /// any of to/cc/bcc that the policy explicitly overrode.
+    recipients_resolver: Option<EmailRecipientsResolver>,
 }
 
 impl EmailNotifier {
@@ -112,6 +128,7 @@ impl EmailNotifier {
             proxy_public_url,
             db,
             max_retries: 3,
+            recipients_resolver: None,
         })
     }
 
@@ -122,11 +139,31 @@ impl EmailNotifier {
         self
     }
 
+    /// Attach a per-policy recipient resolver. ui-less-surfaces.md §5.4 dev 3.
+    pub fn with_recipients_resolver(mut self, r: EmailRecipientsResolver) -> Self {
+        self.recipients_resolver = Some(r);
+        self
+    }
+
     pub fn proxy_public_url(&self) -> &str {
         &self.proxy_public_url
     }
 
+    /// Re-fire the email notifier as an escalation reminder
+    /// (ui-less-surfaces.md §5.7 dev 2). Identical body shape to
+    /// [`Self::notify`] but the Subject is prefixed `REMINDER:` so the
+    /// approver's mail client renders the second message distinctly
+    /// from the original. Fresh tokens are minted — the original
+    /// approve/reject links may have been consumed mid-deliberation.
+    pub async fn notify_escalation(&self, n: &BlockedNotification<'_>) {
+        self.notify_inner(n, true).await;
+    }
+
     pub async fn notify(&self, n: &BlockedNotification<'_>) {
+        self.notify_inner(n, false).await;
+    }
+
+    async fn notify_inner(&self, n: &BlockedNotification<'_>, is_escalation: bool) {
         // Issue two single-use signed-URL tokens — one approve, one reject.
         // Both inherit a 30-minute TTL (same as the existing email flow).
         let (approve_token, reject_token) = match issue_tokens(&self.db, n).await {
@@ -145,11 +182,19 @@ impl EmailNotifier {
         let approve_url = format!("{}/notifier/approve?t={}", self.proxy_public_url, approve_token);
         let reject_url = format!("{}/notifier/approve?t={}", self.proxy_public_url, reject_token);
 
-        let subject = format!(
-            "[Proxilion] Blocked: {} by {}",
-            n.action,
-            n.p_0.unwrap_or("(unknown)")
-        );
+        let subject = if is_escalation {
+            format!(
+                "[Proxilion] REMINDER: Blocked: {} by {}",
+                n.action,
+                n.p_0.unwrap_or("(unknown)")
+            )
+        } else {
+            format!(
+                "[Proxilion] Blocked: {} by {}",
+                n.action,
+                n.p_0.unwrap_or("(unknown)")
+            )
+        };
 
         let plain = format!(
             "Proxilion blocked an action that needs your review.\n\n\
@@ -198,16 +243,23 @@ impl EmailNotifier {
             blocked_id = n.blocked_id,
         );
 
+        // ui-less-surfaces.md §5.4 dev 3 — per-policy recipient override.
+        // The resolver may return per-list Some(...) values; for each list
+        // the policy explicitly set, use it instead of the global default.
+        // Parse on demand; on parse failure, fall back to the global default
+        // for that list so a typo in policy YAML can't black-hole a block.
+        let (to_list, cc_list, bcc_list) = self.resolve_recipients(n.policy_id);
+
         let mut builder = Message::builder()
             .from(self.from.clone())
             .subject(subject);
-        for to in &self.to {
+        for to in &to_list {
             builder = builder.to(to.clone());
         }
-        for cc in &self.cc {
+        for cc in &cc_list {
             builder = builder.cc(cc.clone());
         }
-        for bcc in &self.bcc {
+        for bcc in &bcc_list {
             builder = builder.bcc(bcc.clone());
         }
         let message = match builder.multipart(
@@ -253,10 +305,11 @@ impl EmailNotifier {
                     metrics::counter!(
                         "proxilion_email_send_total",
                         "result" => "ok",
-                        "layer" => n.layer.to_string()
+                        "layer" => n.layer.to_string(),
+                        "kind" => if is_escalation { "escalation" } else { "initial" }
                     )
                     .increment(1);
-                    debug!(blocked_id = %n.blocked_id, attempt, "email sent");
+                    debug!(blocked_id = %n.blocked_id, attempt, is_escalation, "email sent");
                     return;
                 }
                 Err(e) if e.is_permanent() => {
@@ -284,6 +337,52 @@ impl EmailNotifier {
             tokio::time::sleep(Duration::from_millis(backoff_ms.min(10_000))).await;
         }
     }
+}
+
+impl EmailNotifier {
+    /// Resolve the effective `(to, cc, bcc)` for a notification by layering
+    /// the policy's `notifier_recipients:` override on top of the global
+    /// defaults. ui-less-surfaces.md §5.4 dev 3.
+    fn resolve_recipients(
+        &self,
+        policy_id: Option<&str>,
+    ) -> (Vec<Mailbox>, Vec<Mailbox>, Vec<Mailbox>) {
+        let override_lists = policy_id
+            .and_then(|id| self.recipients_resolver.as_ref().and_then(|r| r(id)));
+        let Some((to_o, cc_o, bcc_o)) = override_lists else {
+            return (self.to.clone(), self.cc.clone(), self.bcc.clone());
+        };
+        let to = match to_o {
+            Some(list) => parse_or_fallback(&list, &self.to, "to"),
+            None => self.to.clone(),
+        };
+        let cc = match cc_o {
+            Some(list) => parse_or_fallback(&list, &self.cc, "cc"),
+            None => self.cc.clone(),
+        };
+        let bcc = match bcc_o {
+            Some(list) => parse_or_fallback(&list, &self.bcc, "bcc"),
+            None => self.bcc.clone(),
+        };
+        (to, cc, bcc)
+    }
+}
+
+fn parse_or_fallback(list: &[String], fallback: &[Mailbox], field: &str) -> Vec<Mailbox> {
+    let mut out = Vec::with_capacity(list.len());
+    for s in list {
+        match s.parse::<Mailbox>() {
+            Ok(m) => out.push(m),
+            Err(e) => {
+                warn!(
+                    field, addr = %s, error = %e,
+                    "email: per-policy recipient parse failed; falling back to global default"
+                );
+                return fallback.to_vec();
+            }
+        }
+    }
+    out
 }
 
 async fn issue_tokens(
@@ -380,6 +479,76 @@ mod tests {
         .err()
         .expect("expected build error");
         assert!(err.0.contains("from"));
+    }
+
+    #[tokio::test]
+    async fn per_policy_resolver_overrides_to_cc_bcc() {
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new_with_recipients(
+            "smtp://localhost:25",
+            "sec@acme.com",
+            &["default-to@acme.com".into()],
+            &["default-cc@acme.com".into()],
+            &["default-bcc@acme.com".into()],
+            "https://proxy.local".into(),
+            pool,
+        )
+        .expect("builds");
+
+        let resolver: EmailRecipientsResolver = Arc::new(|policy_id| match policy_id {
+            "security" => Some((
+                Some(vec!["sec-team@acme.com".into()]),
+                None,
+                Some(vec!["audit@acme.com".into()]),
+            )),
+            _ => None,
+        });
+        let n = n.with_recipients_resolver(resolver);
+
+        // Policy with an override: to + bcc replaced, cc inherits the default.
+        let (to, cc, bcc) = n.resolve_recipients(Some("security"));
+        assert_eq!(to.len(), 1);
+        assert_eq!(to[0].email.to_string(), "sec-team@acme.com");
+        assert_eq!(cc.len(), 1);
+        assert_eq!(cc[0].email.to_string(), "default-cc@acme.com");
+        assert_eq!(bcc.len(), 1);
+        assert_eq!(bcc[0].email.to_string(), "audit@acme.com");
+
+        // Policy with no override: every list falls through to global.
+        let (to, cc, bcc) = n.resolve_recipients(Some("other"));
+        assert_eq!(to[0].email.to_string(), "default-to@acme.com");
+        assert_eq!(cc[0].email.to_string(), "default-cc@acme.com");
+        assert_eq!(bcc[0].email.to_string(), "default-bcc@acme.com");
+
+        // No policy id at all: also falls through.
+        let (to, _, _) = n.resolve_recipients(None);
+        assert_eq!(to[0].email.to_string(), "default-to@acme.com");
+    }
+
+    #[tokio::test]
+    async fn per_policy_resolver_invalid_addr_falls_back_to_global() {
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new_with_recipients(
+            "smtp://localhost:25",
+            "sec@acme.com",
+            &["default-to@acme.com".into()],
+            &[],
+            &[],
+            "https://proxy.local".into(),
+            pool,
+        )
+        .expect("builds");
+
+        let resolver: EmailRecipientsResolver = Arc::new(|_id| {
+            Some((Some(vec!["not-an-email".into()]), None, None))
+        });
+        let n = n.with_recipients_resolver(resolver);
+
+        let (to, _cc, _bcc) = n.resolve_recipients(Some("any"));
+        // Malformed override address — global default must be preserved so
+        // the block doesn't go to a black hole.
+        assert_eq!(to.len(), 1);
+        assert_eq!(to[0].email.to_string(), "default-to@acme.com");
     }
 
     /// A dummy pool stub for constructor-error tests. The constructor

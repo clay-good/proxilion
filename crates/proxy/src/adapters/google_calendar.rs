@@ -47,7 +47,10 @@ pub fn router(state: AdapterState) -> Router {
         )
         .route(
             "/google/calendar/v3/calendars/{calendarId}/events/{eventId}",
-            get(get_event).put(update_event).patch(patch_event),
+            get(get_event)
+                .put(update_event)
+                .patch(patch_event)
+                .delete(delete_event),
         )
         .with_state(state)
 }
@@ -165,6 +168,41 @@ async fn update_event(
     .await
 }
 
+/// `events.delete` (spec.md §4.1 dev 2). No request body; Google returns
+/// 204 No Content on success. Policy context surfaces `path.cid` + `path.eid`
+/// so a customer can gate destructive deletes (e.g. block on managed
+/// calendars). The default `required_ops` template for delete is
+/// `calendar:delete:${user.email}/event/${path.eid}` — opt-in via policy.
+#[instrument(skip(state, session, query))]
+async fn delete_event(
+    State(state): State<AdapterState>,
+    SessionCtx(session): SessionCtx,
+    Path((calendar_id, event_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Response<axum::body::Body>, AppError> {
+    let mut policy_path = HashMap::new();
+    policy_path.insert("cid".to_string(), calendar_id.clone());
+    policy_path.insert("eid".to_string(), event_id.clone());
+    proxy_request(
+        &state,
+        &session,
+        CalendarRequest {
+            action: "calendar.events.delete".into(),
+            upstream_path: format!(
+                "/calendar/v3/calendars/{}/events/{}",
+                urlencoding(&calendar_id),
+                urlencoding(&event_id)
+            ),
+            method: Method::DELETE,
+            policy_path,
+            query,
+            body_for_policy: HashMap::new(),
+            upstream_body: None,
+        },
+    )
+    .await
+}
+
 #[instrument(skip(state, session, query, body))]
 async fn patch_event(
     State(state): State<AdapterState>,
@@ -248,6 +286,11 @@ async fn proxy_request(
     let ctx = build_policy_ctx(state, session, &req);
 
     let (outcome, mut policy_trace) = state.policy.load().evaluate_with_trace(&ctx)?;
+    // ui-less-surfaces.md §5.7 dev 2 — per-policy escalation deadline.
+    let escalation_after_minutes = outcome
+        .matched_policy_id
+        .as_deref()
+        .and_then(|id| state.policy.load().escalation_after_minutes_for(id));
     let requested_ops: Vec<String> = outcome
         .required_ops
         .required
@@ -280,6 +323,7 @@ async fn proxy_request(
                     detail: Some(&detail),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &requested_ops,
+                        escalation_after_minutes,
                 },
             )
             .await;
@@ -405,6 +449,7 @@ async fn proxy_request(
                     detail: Some(&d),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &leaf_ops,
+                        escalation_after_minutes,
                 },
             )
             .await;
@@ -472,6 +517,7 @@ async fn proxy_request(
                         detail: Some("BlockRequest pattern matched"),
                         predecessor_pca_id: None,
                         requested_ops: &[],
+                        escalation_after_minutes,
                     },
                 )
                 .await;

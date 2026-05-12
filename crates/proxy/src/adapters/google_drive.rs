@@ -126,6 +126,11 @@ async fn proxy_request(
     let ctx = build_policy_ctx(state, session, &req);
 
     let (outcome, mut policy_trace) = state.policy.load().evaluate_with_trace(&ctx)?;
+    // ui-less-surfaces.md §5.7 dev 2 — per-policy escalation deadline.
+    let escalation_after_minutes = outcome
+        .matched_policy_id
+        .as_deref()
+        .and_then(|id| state.policy.load().escalation_after_minutes_for(id));
     // Compute the ops the next-hop PCA would carry. Hoisted above the Layer-B
     // gate so the block record (if we end up blocking) carries the same
     // `requested_ops` an override would re-mint with.
@@ -156,6 +161,7 @@ async fn proxy_request(
                     detail: Some(&format!("{e}")),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &requested_ops,
+                        escalation_after_minutes,
                 },
             )
             .await;
@@ -285,6 +291,7 @@ async fn proxy_request(
                     detail: Some(&d),
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &leaf_ops,
+                        escalation_after_minutes,
                 },
             )
             .await;
@@ -353,6 +360,7 @@ async fn proxy_request(
                     // content already crossed our wire. Audit only.
                     predecessor_pca_id: None,
                     requested_ops: &[],
+                        escalation_after_minutes,
                 },
             )
             .await;

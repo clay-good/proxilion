@@ -327,6 +327,32 @@ enum PolicyCmd {
         /// Target mode: `enforce`, `observe`, or `disabled`.
         mode: String,
     },
+    /// Open the live policy YAML in `$EDITOR`, validate on save, and
+    /// hot-reload the proxy. ui-less-surfaces.md §4.1 `policy edit`.
+    ///
+    /// File-path resolution: `--file <path>` wins; otherwise the path
+    /// is pulled from `GET /api/v1/policy` (`source` field). When the
+    /// proxy's source path isn't reachable from this machine (remote
+    /// deployment), pass `--file` explicitly to edit a local copy.
+    ///
+    /// Pre-flight: a backup copy is dropped at `<path>.bak` before the
+    /// editor opens. On a validation failure the new file is reverted
+    /// from the backup; the backup is removed on a successful reload.
+    Edit {
+        /// Path to the policy YAML. If unset, queried from the proxy.
+        #[arg(long)]
+        file: Option<String>,
+        /// Editor command. Defaults to `$EDITOR`, then `$VISUAL`, then
+        /// `vi`. Passed verbatim to the shell, so you can use e.g.
+        /// `--editor "code --wait"`.
+        #[arg(long)]
+        editor: Option<String>,
+        /// Skip the `POST /api/v1/policy/reload` after the save.
+        /// Local-only validation; the operator can hot-reload manually
+        /// later via `proxilion-cli policy reload`.
+        #[arg(long)]
+        no_reload: bool,
+    },
     /// Replay historical action_events against a candidate YAML and
     /// report would-have-block deltas per policy. ui-less-surfaces.md §2.4.
     Simulate {
@@ -2012,6 +2038,11 @@ async fn cmd_policy(
             }
             Ok(())
         }
+        PolicyCmd::Edit {
+            file,
+            editor,
+            no_reload,
+        } => cmd_policy_edit(http, url, token, file.as_deref(), editor.as_deref(), no_reload).await,
         PolicyCmd::Simulate {
             file,
             against,
@@ -2034,6 +2065,160 @@ async fn cmd_policy(
             .await
         }
     }
+}
+
+/// `proxilion-cli policy edit` — guided editor flow over the live
+/// `policy.yaml`. Unblocked by §11.1 (the comment-preserving
+/// `set_mode` edit lands in [`policy_handle::edit_mode_in_yaml`]).
+/// This command writes the *whole file* (not just a single field), so
+/// the operator's editor session is the source of truth — there's no
+/// proxy-side merge logic to worry about; we just validate + reload.
+async fn cmd_policy_edit(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    explicit_file: Option<&str>,
+    explicit_editor: Option<&str>,
+    no_reload: bool,
+) -> Result<()> {
+    // 1. Resolve the policy file path.
+    let path = match explicit_file {
+        Some(p) => p.to_string(),
+        None => resolve_policy_source(http, url, token)
+            .await
+            .context("could not resolve policy file path; pass --file <path>")?,
+    };
+
+    // 2. Sanity-check it exists and is a regular file before invoking
+    //    the editor (cheap; saves a confusing editor-on-nothing UX).
+    let original = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading current policy file `{path}`"))?;
+
+    // 3. Drop a `<path>.bak` so a bad edit is recoverable.
+    let backup = format!("{path}.bak");
+    std::fs::write(&backup, &original)
+        .with_context(|| format!("writing backup `{backup}`"))?;
+
+    // 4. Resolve the editor command. Precedence: --editor > $EDITOR > $VISUAL > vi.
+    let editor_cmd = explicit_editor
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .or_else(|| std::env::var("VISUAL").ok())
+        .unwrap_or_else(|| "vi".to_string());
+
+    // 5. Spawn the editor, wait for it to exit.
+    println!("opening `{path}` in `{editor_cmd}` (backup at `{backup}`)…");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor_cmd} {}", shell_quote(&path)))
+        .status()
+        .with_context(|| format!("spawning editor `{editor_cmd}`"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&backup);
+        return Err(anyhow!(
+            "editor `{editor_cmd}` exited with {status}; not reloading"
+        ));
+    }
+
+    // 6. Read back, short-circuit on no-change.
+    let updated = std::fs::read_to_string(&path)
+        .with_context(|| format!("re-reading `{path}` after editor"))?;
+    if updated == original {
+        let _ = std::fs::remove_file(&backup);
+        println!("{GREEN}no changes — nothing to reload{RESET}");
+        return Ok(());
+    }
+
+    // 7. Local validation via the policy engine — same parse the proxy
+    //    will run on reload. Roll back on failure so we never leave the
+    //    file in a state that would break the next process restart.
+    if let Err(e) = policy_engine::yaml::parse_policies(&updated) {
+        std::fs::write(&path, &original)
+            .with_context(|| format!("restoring `{path}` from in-memory original"))?;
+        let _ = std::fs::remove_file(&backup);
+        return Err(anyhow!(
+            "{RED}✗ candidate YAML failed to parse{RESET}: {e}\n\
+             rolled back to original. Re-run `proxilion-cli policy edit` to retry."
+        ));
+    }
+    println!("{GREEN}✓ candidate YAML parses locally{RESET}");
+
+    if no_reload {
+        println!(
+            "skipping hot-reload (--no-reload). \
+             Run `proxilion-cli policy reload` when you're ready."
+        );
+        // Keep the backup on `--no-reload`; the operator may want it.
+        return Ok(());
+    }
+
+    // 8. Hot-reload via the proxy. The proxy parses+validates again
+    //    before swapping; on its failure we still roll the file back so
+    //    a manual restart wouldn't leave the proxy stuck on bad YAML.
+    let resp = auth_header(http.post(format!("{url}/api/v1/policy/reload")), token)
+        .send()
+        .await
+        .context("POST /api/v1/policy/reload")?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(json!({}));
+    if !status.is_success() {
+        std::fs::write(&path, &original)
+            .with_context(|| format!("restoring `{path}` from in-memory original"))?;
+        return Err(anyhow!(
+            "reload failed (HTTP {status}); rolled back `{path}`.\nresponse: {}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        ));
+    }
+    println!(
+        "{GREEN}✓ reloaded{RESET}: {} polic{} live",
+        body["policy_count"].as_u64().unwrap_or(0),
+        if body["policy_count"].as_u64() == Some(1) {
+            "y"
+        } else {
+            "ies"
+        }
+    );
+
+    // 9. Reload succeeded → remove the backup. The operator's `git
+    //    diff` is the canonical history from here.
+    let _ = std::fs::remove_file(&backup);
+    Ok(())
+}
+
+/// Fetch `GET /api/v1/policy` and pull out the `source` field — the
+/// path the proxy is loading policy from. Returns an error when the
+/// proxy hasn't been configured with a source (the synthetic empty
+/// policy set; `source` is null).
+async fn resolve_policy_source(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<String> {
+    let resp = auth_header(http.get(format!("{url}/api/v1/policy")), token)
+        .send()
+        .await
+        .context("GET /api/v1/policy")?
+        .error_for_status()
+        .context("/api/v1/policy returned an error")?;
+    let envelope: Value = resp.json().await?;
+    envelope["source"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            anyhow!(
+                "proxy reports no policy source (PROXILION_POLICY_PATH unset?); \
+                 pass --file <path> to edit a local file"
+            )
+        })
+}
+
+/// Minimal shell-quote for a single filesystem path. The path is the
+/// only operator-supplied data crossing into `sh -c`, so we just need
+/// to wrap it safely. Hardens against spaces, quotes, `$`, etc. POSIX
+/// single-quoting: every embedded `'` becomes `'\''`.
+fn shell_quote(s: &str) -> String {
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 // Replay history against a candidate YAML and report would-have-block deltas.
@@ -2302,6 +2487,60 @@ mod simulate_tests {
     #[test]
     fn parse_window_accepts_rfc3339() {
         parse_window("2026-01-01T00:00:00Z").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod policy_edit_tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_wraps_in_single_quotes() {
+        assert_eq!(shell_quote("/etc/policy.yaml"), "'/etc/policy.yaml'");
+        assert_eq!(shell_quote("path with spaces.yaml"), "'path with spaces.yaml'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quote() {
+        // POSIX `'\''` idiom: close, escape literal `'`, reopen.
+        assert_eq!(shell_quote("o'reilly.yaml"), "'o'\\''reilly.yaml'");
+    }
+
+    #[test]
+    fn shell_quote_neutralizes_metacharacters() {
+        // `$`, backticks, `;`, `|`, and `&` are all literal inside
+        // single quotes — the wrapper alone is enough.
+        let nasty = "policy.yaml; rm -rf $HOME && echo `id`";
+        let quoted = shell_quote(nasty);
+        assert!(quoted.starts_with('\''));
+        assert!(quoted.ends_with('\''));
+        assert!(quoted.contains("$HOME"));
+        assert!(quoted.contains("`id`"));
+    }
+
+    /// The candidate-YAML validation step is the same `parse_policies`
+    /// call the proxy will run on reload; we pin it here as the
+    /// pre-flight guard the CLI relies on. ui-less-surfaces.md §11.1
+    /// → §4.1 `policy edit` chain.
+    #[test]
+    fn validation_step_accepts_well_formed_yaml() {
+        let yaml = "\
+- id: edit-test
+  vendor: google
+  action: drive.files.get
+  decision: allow
+  required_ops: []
+  pic_mode: audit
+";
+        let parsed = policy_engine::yaml::parse_policies(yaml).expect("valid");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "edit-test");
+    }
+
+    #[test]
+    fn validation_step_rejects_malformed_yaml() {
+        let bad = "not yaml :: [::";
+        assert!(policy_engine::yaml::parse_policies(bad).is_err());
     }
 }
 

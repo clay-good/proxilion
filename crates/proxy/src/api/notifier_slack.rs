@@ -319,28 +319,39 @@ fn slack_ok_message(text: &str) -> Response {
 /// requested_ops as Slack mrkdwn, visible only to the clicker
 /// (`response_type: "ephemeral"`).
 async fn handle_why(db: &PgPool, blocked_id: uuid::Uuid) -> Response {
-    let row: Result<
-        Option<(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            Vec<String>,
-            chrono::DateTime<chrono::Utc>,
-        )>,
-        sqlx::Error,
-    > = sqlx::query_as(
-        "SELECT status, p_0, policy_id, detail, path, vendor, action, requested_ops, expires_at \
+    type WhyRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        Vec<String>,
+        chrono::DateTime<chrono::Utc>,
+        Option<String>,
+    );
+    let row: Result<Option<WhyRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT status, p_0, policy_id, detail, path, vendor, action, requested_ops, expires_at, \
+                request_canonical_json \
          FROM blocked_actions WHERE id = $1",
     )
     .bind(blocked_id)
     .fetch_optional(db)
     .await;
     let text = match row {
-        Ok(Some((status, p_0, policy_id, detail, path, vendor, action, ops, expires_at))) => {
+        Ok(Some((
+            status,
+            p_0,
+            policy_id,
+            detail,
+            path,
+            vendor,
+            action,
+            ops,
+            expires_at,
+            request_canonical_json,
+        ))) => {
             // Truncate requested_ops list for channel hygiene; full set is
             // visible via `proxilion-cli blocked show <id>`.
             let ops_preview = if ops.is_empty() {
@@ -350,6 +361,23 @@ async fn handle_why(db: &PgPool, blocked_id: uuid::Uuid) -> Response {
             } else {
                 format!("{}, … (+{} more)", ops[..5].join(", "), ops.len() - 5)
             };
+            // Render the request snapshot as a fenced code block when
+            // present. Keep the §5.3 dev 2 "4 KB cap" honored at the
+            // adapter side (canonical_request_json already truncates);
+            // we hard-cap here at 2 KB as a defense-in-depth so a
+            // pre-truncation column can't fill a Slack channel.
+            const SLACK_REQ_CAP: usize = 2048;
+            let request_block = match request_canonical_json {
+                Some(s) => {
+                    let snippet = if s.len() > SLACK_REQ_CAP {
+                        format!("{}…", &s[..SLACK_REQ_CAP])
+                    } else {
+                        s
+                    };
+                    format!("\n*Request:*\n```\n{snippet}\n```")
+                }
+                None => String::new(),
+            };
             format!(
                 "*Why blocked* `{id}`\n\
                  *Status:* `{status}`  ·  *Vendor:* `{vendor}`  ·  *Action:* `{action}`\n\
@@ -357,7 +385,7 @@ async fn handle_why(db: &PgPool, blocked_id: uuid::Uuid) -> Response {
                  *Path:* `{path}`\n\
                  *Requested ops:* {ops_preview}\n\
                  *Detail:* {detail}\n\
-                 *Expires at:* `{expires_at}`",
+                 *Expires at:* `{expires_at}`{request_block}",
                 id = blocked_id,
                 p_0 = p_0.as_deref().unwrap_or("—"),
                 policy_id = policy_id.as_deref().unwrap_or("—"),

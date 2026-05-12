@@ -38,6 +38,72 @@ pub struct BlockedActionRecord<'a> {
     /// notifier with a REMINDER: subject prefix when the deadline lapses.
     /// `None` → no escalation.
     pub escalation_after_minutes: Option<u32>,
+    /// Canonical JSON snapshot of the request the agent tried to make
+    /// (spec.md §2.1 dev 3 — resolved 2026-05-12). Truncated to 4 KB by
+    /// `canonical_request_json`; `None` is tolerated for back-compat
+    /// with paths that haven't been migrated yet, in which case the
+    /// approver surfaces fall back to the `(method, path, action)`
+    /// triple. Use [`canonical_request_json`] to build this consistently
+    /// across adapters.
+    pub request_canonical_json: Option<String>,
+}
+
+/// Build a deterministic, 4 KB-bounded JSON snapshot of the request as
+/// the policy engine saw it. Keys are emitted in a fixed order so the
+/// rendered output is stable; nested maps go through `serde_json` which
+/// sorts alphabetically. The body and path-params maps reflect *what
+/// the adapter opted into exposing to the policy engine* — spec.md §5.4
+/// default-deny semantics, so a Drive list response can't accidentally
+/// leak file content into the approver view.
+///
+/// Truncation: if the rendered JSON exceeds `CANONICAL_REQUEST_MAX_LEN`
+/// (4 KB), the value is replaced with a small envelope
+/// `{"truncated":true,"original_len":N}` so downstream consumers know
+/// what happened. The metric `proxilion_blocked_canonical_truncated_total`
+/// ticks on truncation.
+pub const CANONICAL_REQUEST_MAX_LEN: usize = 4096;
+
+pub fn canonical_request_json(
+    method: &str,
+    upstream_path: &str,
+    vendor: &str,
+    action: &str,
+    path_params: &std::collections::HashMap<String, String>,
+    body_for_policy: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    // Manual key ordering — top-level fields appear in a stable shape
+    // so operators reading raw rows or NDJSON exports get the same
+    // layout every time. Nested maps go through `serde_json::Value`
+    // which sorts keys alphabetically.
+    let payload = serde_json::json!({
+        "method": method,
+        "path": upstream_path,
+        "vendor": vendor,
+        "action": action,
+        "path_params": path_params,
+        "body": body_for_policy,
+    });
+    let s = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    if s.len() <= CANONICAL_REQUEST_MAX_LEN {
+        s
+    } else {
+        let len = s.len();
+        metrics::counter!(
+            "proxilion_blocked_canonical_truncated_total",
+            "vendor" => vendor.to_string(),
+            "action" => action.to_string(),
+        )
+        .increment(1);
+        serde_json::json!({
+            "truncated": true,
+            "original_len": len,
+            "method": method,
+            "path": upstream_path,
+            "vendor": vendor,
+            "action": action,
+        })
+        .to_string()
+    }
 }
 
 #[allow(dead_code)]
@@ -113,11 +179,12 @@ async fn persist_returning_id(db: &PgPool, r: &BlockedActionRecord<'_>) -> Optio
         "INSERT INTO blocked_actions
             (request_id, session_id, p_0, vendor, action, method, path,
              layer, policy_id, detail, predecessor_pca_id, requested_ops,
-             escalation_at)
+             escalation_at, request_canonical_json)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  CASE WHEN $13::bigint IS NULL THEN NULL
                       ELSE now() + ($13::bigint * interval '1 minute')
-                 END)
+                 END,
+                 $14)
          RETURNING id",
     )
     .bind(r.request_id)
@@ -133,6 +200,7 @@ async fn persist_returning_id(db: &PgPool, r: &BlockedActionRecord<'_>) -> Optio
     .bind(r.predecessor_pca_id)
     .bind(r.requested_ops)
     .bind(escalation_minutes_sql)
+    .bind(r.request_canonical_json.as_deref())
     .fetch_one(db)
     .await;
     match res {
@@ -221,5 +289,98 @@ impl OwnedBlockedNotification {
             approve_url: self.approve_url.clone(),
             reject_url: self.reject_url.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_request_json_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn empty_maps() -> (HashMap<String, String>, HashMap<String, serde_json::Value>) {
+        (HashMap::new(), HashMap::new())
+    }
+
+    /// The output is valid JSON and carries the top-level identification
+    /// triple the approver surfaces rely on (method, path, action).
+    #[test]
+    fn shapes_a_well_formed_object() {
+        let (path_params, body) = empty_maps();
+        let s = canonical_request_json("GET", "/drive/v3/files/abc", "google", "drive.files.get", &path_params, &body);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["method"], "GET");
+        assert_eq!(v["path"], "/drive/v3/files/abc");
+        assert_eq!(v["vendor"], "google");
+        assert_eq!(v["action"], "drive.files.get");
+        assert!(v["truncated"].is_null());
+    }
+
+    /// Body fields the adapter exposed land under `body.*`. Reads with
+    /// empty `body_for_policy` produce an empty object (no surprise
+    /// leakage from response bodies).
+    #[test]
+    fn body_is_only_what_adapter_exposed() {
+        let path_params = HashMap::new();
+        let mut body = HashMap::new();
+        body.insert("external_recipient".into(), serde_json::Value::Bool(true));
+        body.insert(
+            "to_domains".into(),
+            serde_json::json!(["evil.example", "spam.example"]),
+        );
+        let s = canonical_request_json(
+            "POST",
+            "/gmail/v1/users/me/messages/send",
+            "google",
+            "gmail.messages.send",
+            &path_params,
+            &body,
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["body"]["external_recipient"], true);
+        assert_eq!(v["body"]["to_domains"][0], "evil.example");
+        // No fields the adapter didn't opt into.
+        assert!(v["body"]["subject"].is_null());
+    }
+
+    /// At the 4 KB cap the function emits a stub instead of the full
+    /// JSON, and the `proxilion_blocked_canonical_truncated_total`
+    /// counter ticks (asserted indirectly via the response shape).
+    #[test]
+    fn truncates_oversize_bodies() {
+        let path_params = HashMap::new();
+        let mut body = HashMap::new();
+        body.insert("blob".into(), serde_json::Value::String("x".repeat(8192)));
+        let s = canonical_request_json(
+            "POST",
+            "/gmail/v1/users/me/messages/send",
+            "google",
+            "gmail.messages.send",
+            &path_params,
+            &body,
+        );
+        assert!(s.len() <= CANONICAL_REQUEST_MAX_LEN + 256, "{}", s.len());
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert!(v["original_len"].as_u64().unwrap() > CANONICAL_REQUEST_MAX_LEN as u64);
+        // Identification fields survive the truncation envelope so the
+        // approver still knows what the request was.
+        assert_eq!(v["method"], "POST");
+        assert_eq!(v["action"], "gmail.messages.send");
+    }
+
+    /// Path params land under `path_params` exactly as the adapter
+    /// surfaced them (no transformation). Two calls with the same
+    /// inputs produce byte-equal output — the `request_canonical_json`
+    /// audit row is reproducible.
+    #[test]
+    fn is_deterministic_across_calls() {
+        let mut path_params = HashMap::new();
+        path_params.insert("id".into(), "file-123".into());
+        let body = HashMap::new();
+        let a = canonical_request_json("GET", "/x", "google", "drive.files.get", &path_params, &body);
+        let b = canonical_request_json("GET", "/x", "google", "drive.files.get", &path_params, &body);
+        assert_eq!(a, b);
+        let v: serde_json::Value = serde_json::from_str(&a).unwrap();
+        assert_eq!(v["path_params"]["id"], "file-123");
     }
 }

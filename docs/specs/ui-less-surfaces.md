@@ -185,7 +185,7 @@ hot-reload path as a manual edit.
 **Spec deviations to flag.**
 
 1. **No `pic_invariants.mode` top-level field.** §2.2 sketches a `defaults: { pic_invariants: { mode: enforce } }` block. PIC invariant enforcement is already per-policy via the existing `pic_mode: audit | runtime-gate`, which gives the same observability story without adding a defaults pre-processor. If a customer asks for global PIC observe-mode (e.g. for a migration), it's a one-line `for_each_policy` over the loaded set.
-2. **CST-preserving editor not used.** §11.1 flags `yq` vs hand-rolled CST. We use `serde_yaml` round-trip on `set_mode` — comments and key ordering ARE NOT preserved across writes. The mutation lives in memory; the file watcher picks up the operator's manual edits independently. A CST-preserving editor is a follow-up when a customer reports a real comment-mangling regression.
+2. ~~**CST-preserving editor not used.** §11.1 flags `yq` vs hand-rolled CST. We use `serde_yaml` round-trip on `set_mode` — comments and key ordering ARE NOT preserved across writes. The mutation lives in memory; the file watcher picks up the operator's manual edits independently. A CST-preserving editor is a follow-up when a customer reports a real comment-mangling regression.~~ **Resolved 2026-05-12** via the line-oriented edit in [`policy_handle::edit_mode_in_yaml`](../../crates/proxy/src/policy_handle.rs); comments + ordering survive byte-for-byte. See §11.1 for the full rationale. The legacy `serde_yaml` round-trip still backs an exotic-YAML fallback path; both are validated by parsing into an `Engine` before the atomic swap.
 3. ~~`policy simulate` not yet shipped.~~ **Resolved 2026-05-12.** [`crates/cli/src/main.rs::cmd_policy_simulate`](../../crates/cli/src/main.rs) implements `proxilion-cli policy simulate <file> --against last-7d`. The flow: parse the candidate YAML into a `policy_engine::Engine`, page through `/api/v1/actions` (200-line limit, follows `next_before` cursors), rehydrate a `RequestContext` per historical row from `vendor`, `action`, `p_0`, and the body-shape fields the adapters write into `action_events.extra` (`to_domain`/`to_domains`/`external_recipient` for Gmail; `attendee_domains`/`external_attendee` for Calendar; `request_path_params` for Drive), then aggregate per-`policy_id` counts: `was_blocked` (history), `now_blocked` (candidate), `would_now_block` / `would_now_allow` (deltas). Output: `--format pretty` (aligned columns + max-pct summary) or `--format json`. `--fail-if-delta-exceeds 5.0` exits 1 when any policy's delta-percentage of total replayed events exceeds the threshold, suitable for CI gates. 4 unit tests cover the window parser (`last-7d` / `last-15m` / `last-30s` / RFC 3339 / unknown unit).<br><br>**Deviations.** (a) Reads/writes whose body fields aren't in `extra` (default-deny privacy posture per §6.4) are replayed with empty body context — match expressions against `body.*` will not fire, undercounting deltas for policies that gate on body shape. The customer can opt their policies into `audit_body: full` for a richer simulation pass. (b) Groups are unknown post-hoc (we don't persist them on the action_events row), so `groups`-based match expressions are skipped. (c) Replay is single-shot; no cron-friendly "watch this trend over weeks" surface — that's a daily-cron-running-this-CLI ergonomic, not a missing primitive.
 
 ---
@@ -507,7 +507,7 @@ COMMANDS
 
 - `proxilion-cli policy show <id> [--format pretty|json]` — pulls the live policy set via `GET /api/v1/policy` and filters by id locally. No new endpoint needed (the existing list response carries every field a show would surface). Exits 1 with a red "not found" if the id is missing.
 - `proxilion-cli policy validate <file>` — local-only YAML parse via `policy_engine::yaml::parse_policies`. Prints one-line summary per policy on success; exits 1 with the serde_yaml error on failure. Safe to run in CI without proxy or DB access — fits `lint + validate + simulate` in a single pre-merge pipeline.
-- `proxilion-cli policy diff <before> <after> [--format pretty|json]` — local-only diff between two policy YAML files. Reports `added` / `removed` / `modified` policy ids; modified rows list which fields changed (`vendor / action / mode / pic_mode / required_ops / match / decision`). Comparison of structural fields (`match`, `decision`) is YAML-serialization-equality rather than recursive walk — surfaces "this changed" without false-positive deltas from key ordering. **Deviation:** `policy edit` (opens `$EDITOR` on `policy.yaml` + validates + hot-reloads) is still unimplemented — operators can edit the file manually and `proxilion-cli policy reload` to apply. Shipping a guided edit flow requires deciding whether to vendor `yq` for CST-preserving writes (open question #1 in §11); deferred until that decision lands.
+- `proxilion-cli policy diff <before> <after> [--format pretty|json]` — local-only diff between two policy YAML files. Reports `added` / `removed` / `modified` policy ids; modified rows list which fields changed (`vendor / action / mode / pic_mode / required_ops / match / decision`). Comparison of structural fields (`match`, `decision`) is YAML-serialization-equality rather than recursive walk — surfaces "this changed" without false-positive deltas from key ordering. ~~**Deviation:** `policy edit` (opens `$EDITOR` on `policy.yaml` + validates + hot-reloads) is still unimplemented — operators can edit the file manually and `proxilion-cli policy reload` to apply. The CST-preservation blocker that gated `policy edit` is now resolved (§11.1 — `policy_handle::edit_mode_in_yaml` does a comment-safe line-oriented edit); shipping the `$EDITOR` wrapper is now purely an ergonomic add and is the next CLI piece to land.~~ **Resolved 2026-05-12.** `proxilion-cli policy edit [--file <path>] [--editor "code --wait"] [--no-reload]` ships in [crates/cli/src/main.rs::cmd_policy_edit](../../crates/cli/src/main.rs). The flow: resolve the file path (`--file` wins; otherwise `GET /api/v1/policy` returns the live `source`), drop a `<path>.bak` backup, spawn `$EDITOR` / `$VISUAL` / `vi` via `sh -c` with the path POSIX-shell-quoted, wait for clean exit, short-circuit on no-change, parse the result through `policy_engine::yaml::parse_policies` (the same parse the proxy will run), roll back from the in-memory original on validation failure, then `POST /api/v1/policy/reload` and roll back on a proxy-side parse failure too. The backup is removed only after a successful reload — the operator's `git diff` is the canonical history from there. `--no-reload` skips the reload and keeps the backup. 5 new unit tests pin the POSIX shell-quote behavior (spaces, embedded `'`, `$`/backtick neutralization) and the local-validation contract. **Deviation from the §4.1 sketch:** the command writes the *whole file* — there's no field-level merge logic. The operator's editor session is the source of truth; the proxy only validates + reloads. This sidesteps the entire class of "what if two operators edit at once?" race questions (last-write-wins via `git`, same as every other policy-as-code workflow). The `set_mode` field-level edit path remains for the API-driven mode-flip flow.
 
 **Status (2026-05-12) — `metrics sample` and `trust-plane info` shipped.**
 
@@ -612,7 +612,7 @@ approve-from-mobile use cases (§5.4).
 
 **Spec deviations to flag.**
 
-1. **`POST /api/v1/policy/{id}/mode` round-trips through serde_yaml.** Same caveat as the original notice: comments / key ordering are not preserved across writes. Still tracked alongside §11.1 (CST-preserving editor).
+1. ~~**`POST /api/v1/policy/{id}/mode` round-trips through serde_yaml.** Same caveat as the original notice: comments / key ordering are not preserved across writes. Still tracked alongside §11.1 (CST-preserving editor).~~ **Resolved 2026-05-12.** `set_mode` does a line-oriented in-place edit ([`policy_handle::edit_mode_in_yaml`](../../crates/proxy/src/policy_handle.rs)) that preserves comments, key ordering, blank lines, and the trailing comment on the edited line itself. `serde_yaml` is the fallback for YAML shapes the line walker can't recognize. See §11.1.
 2. **No `proxilion-cli init` wrapper.** §4.4 sketches `proxilion-cli init` as the bootstrap command. We ship the same functionality split into the three explicit verbs (`issue`/`list`/`revoke`) — that fits better with operator scripting (`set -e`-friendly, JSON output to `jq`) than a one-shot `init` that prints a token to a TTY. A thin `init` alias can be added when an installer needs it.
 3. ~~No `proxilion-cli tokens scopes` listing.~~ **Resolved 2026-05-12.** [crates/shared-types/src/operator_scopes.rs](../../crates/shared-types/src/operator_scopes.rs) is now the single source of truth for the scope catalogue (`SCOPE_CATALOGUE: &[(scope, description, endpoints)]`). [crates/proxy/src/operator_auth.rs](../../crates/proxy/src/operator_auth.rs) consumes it; the CLI ships `proxilion-cli tokens scopes [--format pretty|json]` ([crates/cli/src/main.rs::cmd_tokens_scopes](../../crates/cli/src/main.rs)). The command does not require `DATABASE_URL` — it's a pure read of the in-binary catalogue, so it works in CI / container builds where the env-less invariant matters. 3 unit tests in `operator_scopes::tests` pin "no duplicate scopes," "wildcard present," and "every entry has a non-empty description + endpoints list."
 4. ~~`last_used_at` writes are fire-and-forget.~~ **Resolved 2026-05-12.** [crates/proxy/src/operator_auth.rs](../../crates/proxy/src/operator_auth.rs) — `OperatorAuthState` now carries a per-process `moka::future::Cache<Uuid, Instant>` (`TOUCH_CACHE_CAPACITY = 100_000`, `time_to_idle = 2 × LAST_USED_DEBOUNCE`). Every successful auth checks the cache: if the token was touched within `LAST_USED_DEBOUNCE` (60s), the DB `UPDATE` is skipped and `proxilion_operator_last_used_writes_total{result="debounced"}` ticks; otherwise the cache is seeded with the current `Instant` and the existing fire-and-forget `tokio::spawn` UPDATE runs (now tagged `result="ok|error"`). Drops sustained-load write amplification from one UPDATE per request to at most one UPDATE per token per minute; observability loss is bounded — `last_used_at` is at most `LAST_USED_DEBOUNCE` stale. Verified by `touch_cache_debounces_within_window` in [`operator_auth::tests`](../../crates/proxy/src/operator_auth.rs).
@@ -834,7 +834,7 @@ endpoints + landing page are live. Delivered:
 
 **Spec deviations to flag.**
 
-1. **No outbound email composer.** §5.4 promises Plain-text + HTML mail bodies, DMARC/SPF/DKIM alignment, signed mailto reject links. We ship the *chokepoint* (signed URL + landing page); the email body composition + SMTP delivery is the next layer. The notifier driver model (Slack / Email / Webhook trait) lives in §10.3 as a separate deferred item.
+1. ~~**No outbound email composer.** §5.4 promises Plain-text + HTML mail bodies, DMARC/SPF/DKIM alignment, signed mailto reject links. We ship the *chokepoint* (signed URL + landing page); the email body composition + SMTP delivery is the next layer. The notifier driver model (Slack / Email / Webhook trait) lives in §10.3 as a separate deferred item.~~ **Resolved 2026-05-12.** [crates/proxy/src/notifier/email.rs](../../crates/proxy/src/notifier/email.rs) — `EmailNotifier` ships the full SMTP delivery path via `lettre`: plain-text composition with the signed approve / reject URLs, configurable `from` / cc / bcc, transient-vs-permanent error classification on send (retried with exponential backoff for transient, recorded permanent for the audit row), per-policy recipient overrides via `notifier_recipients:` in `policy.yaml`, and a `notify_escalation` variant that re-fires with a `REMINDER:` subject prefix for the §5.7 dev 2 escalation sweep. Counters: `proxilion_email_send_total{kind="initial|escalation",result}`, `proxilion_email_send_failures_total{reason}`. DMARC / SPF / DKIM alignment lives at the customer's SMTP relay rather than proxy-side — three known-good configurations documented in [docs/install/email.md](../install/email.md) (resolves §11 open question #3). Signed-URL approve/reject links are clickable in any HTML-capable mail client; a follow-on HTML body shape (for prettier rendering in Outlook / Gmail) is the only piece of §5.4 we deliberately haven't shipped — the plain-text version round-trips cleanly through every relay we've tested.
 2. **Single signed URL — not HMAC-signed query string.** §5.4 specifies a URL with an HMAC token. We use a UUID-keyed `notifier_tokens` row (essentially a single-use bearer in DB rather than a self-contained signed JWT). Both shapes are equivalent for one-time-use links; the DB-keyed shape is replay-resistant by construction (single-use enforced by `consumed_at` UPDATE inside the locking transaction) and doesn't require key rotation. A future iteration can layer HMAC-signed URLs on top for stateless verification if a customer's email infrastructure needs that.
 3. ~~Metric `_total` counters coalesce to 1.~~ **Resolved 2026-05-11.** Root-caused to a `get_or_create_counter` non-idempotency bug in `metrics-util 0.19.1` (used by `metrics-exporter-prometheus 0.16.2`): each `metrics::counter!("name")` call site was inserting a *fresh* `Arc<AtomicU64>` into the registry's sharded hashmap, so increments split across N counters with the LAST-inserted one rendered. Confirmed via a minimal repro that printed Arc addresses — two `registry.get_or_create_counter(&same_key, |c| c.clone())` calls returned different Arc pointers. Bumping `metrics-exporter-prometheus = "0.17"` (pulls `metrics-util 0.20.3`) makes `get_or_create_counter` idempotent and counters accumulate correctly. Live verification: 5 unauth probes → `proxilion_auth_attempts_total{result="rejected"} 5`; signed-link stress's `proxilion_overrides_requested_total{channel="email_link"} = 3` after 3 issue-link calls.
 
@@ -1294,11 +1294,32 @@ attested override PCA branch.
 
 ## 11. Open questions
 
-1. **Editor preservation for `policy.yaml`.** YAML round-trip without
+1. ~~**Editor preservation for `policy.yaml`.** YAML round-trip without
    trashing comments needs a CST-aware library. Options: vendor `yamlfmt`
    logic, depend on `serde_yaml::Value` + a separate comment-attachment
    pass, or shell out to `yq`. Decision: prototype in M0 with `yq`,
-   replace if it shows up in profiles. Tracked.
+   replace if it shows up in profiles. Tracked.~~
+   **Resolved 2026-05-12.** Skipped both `yq` (external-binary
+   dependency on the proxy's hot path) and a full CST parser in favor
+   of a **line-oriented in-place edit**: `set_mode` locates the
+   `<dash_indent>- id: <policy_id>` line, finds (or inserts) the
+   top-level `mode:` field at the matching field indent, and rewrites
+   only that one line. Comments above and below the field, key
+   ordering, blank lines, the trailing `# inline comment` on the edited
+   line itself, and the rest of the bundle survive byte-for-byte. The
+   legacy `serde_yaml::Value` round-trip remains as a defensive
+   fallback for exotic YAML shapes the line walker doesn't recognize
+   (anonymous mapping at the top level, block flows, etc.). Both paths
+   validate the result by parsing into an `Engine` before the atomic
+   swap, so a mangled edit can't take down the live policy set.
+   Implementation: [crates/proxy/src/policy_handle.rs::edit_mode_in_yaml](../../crates/proxy/src/policy_handle.rs)
+   plus four new tests (`set_mode_preserves_comments_and_ordering`,
+   `set_mode_inserts_when_field_absent`,
+   `set_mode_does_not_match_nested_mode_key`,
+   `edit_mode_in_yaml_not_found_falls_through_to_serde`) that pin the
+   guarantee. `proxilion-cli policy edit` is the natural follow-on
+   ergonomic — the `$EDITOR` wrapper called out in §4.1 dev "policy
+   edit" — and is now unblocked.
 2. **Slack workspace vs Slack app distribution.** Customers self-host
    Proxilion; do they each install a per-workspace Slack app, or do we
    ship a public Slack app they install once with workspace-scoped
@@ -1315,18 +1336,51 @@ attested override PCA branch.
    signature / DMARC alignment / metric reasons, and an explicit
    "what we deliberately do not do" section (no proxy-side DKIM, no
    bounce-handling — the relay owns those).
-4. **Multi-tenant approver mapping.** §5.3 hand-waves "map Slack user ID
+4. ~~**Multi-tenant approver mapping.** §5.3 hand-waves "map Slack user ID
    to operator identity." For an org with hundreds of approvers, this
-   needs SCIM or an IdP-group sync. Out of scope for v1; document.
-5. **The one-HTML-page exception.** §5.4's mobile approve page is the
+   needs SCIM or an IdP-group sync. Out of scope for v1; document.~~
+   **Resolved 2026-05-12.** v1 ships the static `notifier_config.slack.user_map`
+   shipped under §5.3 dev 4 (`U_SLACK_ID → operator_email`) as the
+   small-team path; the larger-org SCIM / IdP-group sync path is
+   documented end-to-end in [docs/install/multi-tenant-approvers.md](../install/multi-tenant-approvers.md).
+   The doc walks the three sizing tiers (<25, 25–250, 250+ approvers),
+   gives a concrete Okta-SCIM → Postgres sync pattern (cron + JSON
+   bulk-upsert into `notifier_config.slack.user_map`), explains why we
+   chose static map over live IdP lookup on the interaction hot path
+   (Slack's 3-second response budget), and lists the metrics + audit
+   columns operators should watch (`slack_interact_total{result="why"}`
+   is the canary for "approvers don't know who they are").
+5. ~~**The one-HTML-page exception.** §5.4's mobile approve page is the
    single React-less HTML file Proxilion serves. We should be principled
    about not letting it grow into a SPA. Lint rule:
-   `find crates/proxy/static-approval -name '*.js'` must be empty in CI.
+   `find crates/proxy/static-approval -name '*.js'` must be empty in CI.~~
+   **Resolved 2026-05-12.** [.github/workflows/static-html-no-js.yml](../../.github/workflows/static-html-no-js.yml)
+   runs on every PR + push to `main` and fails CI if anything other than
+   `.html` / `.css` lands in [crates/proxy/static-html/](../../crates/proxy/static-html/),
+   if a `<script src=...>` is ever added, or if a multi-line inline
+   `<script>` block creeps in. Inline CSP boilerplate and trivial
+   single-line scripts pass; SPA-shaped drift fails loudly. (The
+   directory name diverged from the spec sketch — `static-html` vs
+   `static-approval` — the workflow tracks the actual path.)
 6. **OTLP push vs scrape.** Default is `/metrics` scrape. Some customers
    (Datadog Agent, Grafana Cloud) prefer push. The exporter facade
    supports both; defaulting to scrape avoids egress firewall conversations.
-7. **CLI vs API auth tokens — same or different?** Likely same scheme
-   (`pxl_operator_*`), different scopes. Confirm in the M0 implementation.
+7. ~~**CLI vs API auth tokens — same or different?** Likely same scheme
+   (`pxl_operator_*`), different scopes. Confirm in the M0 implementation.~~
+   **Resolved 2026-05-12.** Same scheme, scopes-per-route. The CLI sends
+   `Authorization: Bearer pxl_operator_<52 base32>` against the same
+   `/api/v1/*` surface a third-party HTTP client would hit
+   ([crates/proxy/src/operator_auth.rs](../../crates/proxy/src/operator_auth.rs));
+   `parse_token` + the `pxl_operator_` prefix + `BODY_LEN=52` are the
+   single source of truth. Scopes are exact-match strings on the token
+   row (`policy:read`, `blocks:approve`, `killswitch:revoke`,
+   `actions:export`, `pca:read`, `tokens:admin`, …) checked per route
+   via `operator_auth::scope_check` / `require_scope`; `*` is the
+   bootstrap-admin wildcard. CLI and API differ only in *what scopes
+   you'd typically issue them* — a CI bot might hold
+   `actions:read,pca:read`; an on-call operator holds
+   `blocks:approve,policy:write`. The CLI itself is a thin HTTP client;
+   no special-cased CLI-only auth path exists.
 
 ---
 

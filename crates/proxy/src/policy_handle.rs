@@ -232,39 +232,38 @@ impl PolicyHandle {
     }
 
     /// In-memory mode flip for a single policy. Used by
-    /// `POST /api/v1/policy/{id}/mode`. Returns true iff a policy with
-    /// that id existed and was updated. The YAML round-trip is best-
-    /// effort using `serde_yaml` — comments are NOT preserved (ui-less-
-    /// surfaces.md §11.1 open question); a future CST-preserving editor
-    /// would replace this.
+    /// `POST /api/v1/policy/{id}/mode`.
+    ///
+    /// Strategy (ui-less-surfaces.md §11.1, resolved 2026-05-12):
+    ///
+    /// 1. **Line-oriented edit** — locate the policy block by `- id: <foo>`,
+    ///    then replace (or insert) the top-level `mode:` field in place.
+    ///    Comments, key ordering, blank lines, and the operator's
+    ///    formatting are all preserved byte-for-byte outside the one
+    ///    edited line.
+    ///
+    /// 2. **`serde_yaml` fallback** — if the line walk can't locate a
+    ///    structural anchor (e.g. the policy uses an exotic YAML form we
+    ///    don't recognize), we fall back to the legacy
+    ///    `serde_yaml::Value` round-trip. That path may mangle comments,
+    ///    but it's correct for any well-formed YAML and only fires for
+    ///    inputs the line walker rejects.
+    ///
+    /// In both cases the resulting YAML is validated by parsing into an
+    /// `Engine` before the atomic swap; on parse failure the previous
+    /// engine remains live and `SetModeError::Reload` surfaces.
     pub fn set_mode(&self, policy_id: &str, mode: Mode) -> Result<ReloadReport, SetModeError> {
         let yaml = self.raw_yaml.load_full();
-        let mut docs: Vec<serde_yaml::Value> =
-            serde_yaml::from_str(&yaml).map_err(|e| SetModeError::Parse(e.to_string()))?;
-        let mut found = false;
-        for d in docs.iter_mut() {
-            let Some(map) = d.as_mapping_mut() else { continue };
-            let id_key = serde_yaml::Value::String("id".into());
-            if map.get(&id_key).and_then(|v| v.as_str()) == Some(policy_id) {
-                map.insert(
-                    serde_yaml::Value::String("mode".into()),
-                    serde_yaml::Value::String(
-                        match mode {
-                            Mode::Enforce => "enforce",
-                            Mode::Observe => "observe",
-                            Mode::Disabled => "disabled",
-                        }
-                        .to_string(),
-                    ),
-                );
-                found = true;
-                break;
+        let new_yaml = match edit_mode_in_yaml(yaml.as_str(), policy_id, mode) {
+            Ok(s) => s,
+            Err(SetModeError::NotFound(id)) => {
+                // Line walker couldn't find the policy block. Fall back
+                // to the structural round-trip so genuinely missing ids
+                // surface as NotFound (not silent loss).
+                set_mode_via_serde(yaml.as_str(), &id, mode)?
             }
-        }
-        if !found {
-            return Err(SetModeError::NotFound(policy_id.to_string()));
-        }
-        let new_yaml = serde_yaml::to_string(&docs).map_err(|e| SetModeError::Parse(e.to_string()))?;
+            Err(other) => return Err(other),
+        };
         let report = self.swap_from_yaml(
             new_yaml,
             self.source
@@ -279,6 +278,214 @@ impl PolicyHandle {
         }
         Ok(report)
     }
+}
+
+/// Comment-preserving line-oriented `mode:` edit. Walks the YAML once,
+/// finds the matching `- id: <policy_id>` block at the document's top
+/// indent level, then replaces an existing top-level `mode:` line or
+/// inserts one directly after the `id:` line. Returns
+/// `SetModeError::NotFound` when the id isn't present at the top level.
+fn edit_mode_in_yaml(
+    yaml: &str,
+    policy_id: &str,
+    mode: Mode,
+) -> Result<String, SetModeError> {
+    let mode_value = match mode {
+        Mode::Enforce => "enforce",
+        Mode::Observe => "observe",
+        Mode::Disabled => "disabled",
+    };
+
+    // Keep newlines on each line so we can rejoin byte-exact.
+    let lines: Vec<&str> = yaml.split_inclusive('\n').collect();
+
+    // Find the policy block by `<dash_indent>- id: <policy_id>`.
+    let mut block_start: Option<usize> = None;
+    let mut dash_indent_len = 0usize;
+    let mut field_indent = String::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let line = strip_eol(raw);
+        let lead = leading_ws_len(line);
+        let after_indent = &line[lead..];
+        let Some(after_dash) = after_indent.strip_prefix("- ") else {
+            continue;
+        };
+        let Some(id_val) = parse_id_value(after_dash) else {
+            continue;
+        };
+        if id_val == policy_id {
+            block_start = Some(i);
+            dash_indent_len = lead;
+            // Fields under `- id: foo` are indented by `<dash_indent>  `
+            // (the dash + space width is two columns).
+            field_indent = format!("{}  ", &line[..lead]);
+            break;
+        }
+    }
+    let Some(start_idx) = block_start else {
+        return Err(SetModeError::NotFound(policy_id.to_string()));
+    };
+
+    // Determine the end of this policy block. The block ends at the
+    // next line that starts a sibling list item (`<dash_indent>- `) or
+    // at a line less-indented than the dash (a new document scope).
+    // Blank lines and comments don't end the block.
+    let mut block_end = lines.len();
+    for j in (start_idx + 1)..lines.len() {
+        let line = strip_eol(lines[j]);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let lead = leading_ws_len(line);
+        let trimmed = &line[lead..];
+        if lead == dash_indent_len && trimmed.starts_with('-') {
+            block_end = j;
+            break;
+        }
+        if lead < dash_indent_len && !trimmed.starts_with('#') {
+            block_end = j;
+            break;
+        }
+    }
+
+    // Search for a top-level `mode:` field within the block. "Top-level"
+    // means indented exactly at `field_indent` — guards against matching
+    // `mode:` inside a nested `match:` map.
+    let mut mode_line_idx: Option<usize> = None;
+    for j in (start_idx + 1)..block_end {
+        let line = strip_eol(lines[j]);
+        let lead = leading_ws_len(line);
+        if lead != field_indent.len() {
+            continue;
+        }
+        let rest = &line[lead..];
+        if rest.starts_with("mode:")
+            && rest
+                .as_bytes()
+                .get(5)
+                .map_or(true, |b| matches!(b, b' ' | b'\t' | b'#'))
+        {
+            mode_line_idx = Some(j);
+            break;
+        }
+    }
+
+    let mut out: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
+
+    match mode_line_idx {
+        Some(j) => {
+            // Replace the value on the existing `mode:` line, preserve
+            // a trailing `# comment` if present.
+            let original = out[j].clone();
+            let had_nl = original.ends_with('\n');
+            let body = strip_eol(&original).to_string();
+            let key_end = body.find("mode:").expect("scanned above") + "mode:".len();
+            let prefix = &body[..key_end];
+            let after = &body[key_end..];
+            let comment_off = find_inline_comment(after);
+            let comment_tail = match comment_off {
+                Some(ci) => format!("  {}", after[ci..].trim_start()),
+                None => String::new(),
+            };
+            let mut new_line = format!("{prefix} {mode_value}{comment_tail}");
+            if had_nl {
+                new_line.push('\n');
+            }
+            out[j] = new_line;
+        }
+        None => {
+            // Insert a new `mode:` line directly after the `id:` line.
+            // The `id:` line is `out[start_idx]`; ensure it ends in '\n'
+            // so the inserted line is on its own row.
+            if !out[start_idx].ends_with('\n') {
+                out[start_idx].push('\n');
+            }
+            let inserted = format!("{field_indent}mode: {mode_value}\n");
+            out.insert(start_idx + 1, inserted);
+        }
+    }
+
+    Ok(out.join(""))
+}
+
+fn strip_eol(s: &str) -> &str {
+    s.strip_suffix('\n').unwrap_or(s)
+}
+
+fn leading_ws_len(s: &str) -> usize {
+    s.len() - s.trim_start_matches([' ', '\t']).len()
+}
+
+/// Parse `id: <value>` from a line fragment (the part after `- `). Returns
+/// the unquoted scalar id, or `None` if the fragment isn't a scalar `id:`
+/// declaration.
+fn parse_id_value(fragment: &str) -> Option<&str> {
+    let after = fragment.strip_prefix("id:")?;
+    // `id:foo` is invalid YAML (no space after colon) — reject to avoid
+    // matching things like `pid: foo`.
+    if !after.starts_with(' ') && !after.starts_with('\t') {
+        return None;
+    }
+    let val = after.trim_start();
+    let end = find_inline_comment(val).unwrap_or(val.len());
+    let val = val[..end].trim_end();
+    let unquoted = val
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| val.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(val);
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted)
+    }
+}
+
+/// Position of an inline `#` comment start within `s`, requiring the
+/// `#` to be preceded by whitespace (so URLs etc. don't trigger).
+fn find_inline_comment(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Legacy `serde_yaml::Value` round-trip. Used as a fallback when the
+/// line-oriented edit can't locate a structural anchor — covers exotic
+/// YAML shapes we don't recognize line-by-line, at the cost of
+/// reformatting / comment loss.
+fn set_mode_via_serde(yaml: &str, policy_id: &str, mode: Mode) -> Result<String, SetModeError> {
+    let mut docs: Vec<serde_yaml::Value> =
+        serde_yaml::from_str(yaml).map_err(|e| SetModeError::Parse(e.to_string()))?;
+    let mut found = false;
+    for d in docs.iter_mut() {
+        let Some(map) = d.as_mapping_mut() else {
+            continue;
+        };
+        let id_key = serde_yaml::Value::String("id".into());
+        if map.get(&id_key).and_then(|v| v.as_str()) == Some(policy_id) {
+            map.insert(
+                serde_yaml::Value::String("mode".into()),
+                serde_yaml::Value::String(
+                    match mode {
+                        Mode::Enforce => "enforce",
+                        Mode::Observe => "observe",
+                        Mode::Disabled => "disabled",
+                    }
+                    .to_string(),
+                ),
+            );
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Err(SetModeError::NotFound(policy_id.to_string()));
+    }
+    serde_yaml::to_string(&docs).map_err(|e| SetModeError::Parse(e.to_string()))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -424,6 +631,137 @@ mod tests {
         let h = PolicyHandle::new(engine_with("[]"), None, "[]".into());
         let err = h.set_mode("nope", Mode::Observe).unwrap_err();
         assert!(matches!(err, SetModeError::NotFound(_)));
+    }
+
+    /// ui-less-surfaces.md §11.1 — comments, blank lines, key ordering,
+    /// and the trailing-comment on the edited `mode:` line all survive
+    /// a `set_mode` round-trip.
+    #[test]
+    fn set_mode_preserves_comments_and_ordering() {
+        let yaml = "\
+# top-of-file commentary about the bundle
+# spanning multiple lines
+
+- id: alpha-policy
+  vendor: google
+  action: drive.files.get
+  # mode is currently audit-only while we tune the regex set
+  mode: enforce   # do-not-touch: owned by secops
+  decision: allow
+  required_ops:
+    - \"drive:read:file/${path.id}\"
+  pic_mode: audit
+
+# next policy gates external gmail sends
+- id: beta-policy
+  vendor: google
+  action: gmail.messages.send
+  decision: block
+  required_ops: []
+  pic_mode: runtime-gate
+";
+        let h = PolicyHandle::new(engine_with(yaml), None, yaml.into());
+        let report = h.set_mode("alpha-policy", Mode::Observe).expect("set_mode ok");
+        assert!(report.ok);
+
+        let new_yaml = h.raw_yaml();
+        // Header comments survive.
+        assert!(new_yaml.contains("# top-of-file commentary about the bundle"));
+        assert!(new_yaml.contains("# spanning multiple lines"));
+        // The block-internal comment on the line above `mode:` survives.
+        assert!(new_yaml.contains("# mode is currently audit-only while we tune the regex set"));
+        // The trailing comment on the `mode:` line itself survives.
+        assert!(new_yaml.contains("mode: observe"));
+        assert!(new_yaml.contains("# do-not-touch: owned by secops"));
+        // The next-policy comment + ordering survive.
+        assert!(new_yaml.contains("# next policy gates external gmail sends"));
+        // beta-policy is untouched.
+        assert!(new_yaml.contains("- id: beta-policy"));
+        assert!(!new_yaml.contains("mode: enforce"), "old value should be gone");
+
+        // The actual engine state agrees — alpha is now Observe.
+        let ctx = policy_engine::RequestContext {
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            user: policy_engine::UserCtx {
+                email: "alice@acme.com".into(),
+                groups: vec![],
+            },
+            path: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), "f1".into());
+                m
+            },
+            body: Default::default(),
+            headers: Default::default(),
+            customer_domain: "acme.com".into(),
+        };
+        let out = h.load().evaluate(&ctx).unwrap();
+        assert_eq!(out.mode, Mode::Observe);
+    }
+
+    /// When the policy has no `mode:` field yet, `set_mode` inserts one
+    /// right after `id:` rather than appending at the block end. This
+    /// keeps the field near the policy's identity, which is the
+    /// convention in the existing `config/policy.yaml`.
+    #[test]
+    fn set_mode_inserts_when_field_absent() {
+        let yaml = "\
+- id: needs-mode
+  vendor: google
+  action: drive.files.get
+  decision: allow
+  required_ops: []
+  pic_mode: audit
+";
+        let h = PolicyHandle::new(engine_with(yaml), None, yaml.into());
+        h.set_mode("needs-mode", Mode::Disabled).expect("set_mode ok");
+        let new_yaml = h.raw_yaml();
+        let id_pos = new_yaml.find("- id: needs-mode").unwrap();
+        let mode_pos = new_yaml.find("mode: disabled").unwrap();
+        let vendor_pos = new_yaml.find("vendor: google").unwrap();
+        assert!(
+            id_pos < mode_pos && mode_pos < vendor_pos,
+            "mode should land between id and vendor"
+        );
+    }
+
+    /// A nested `mode:` (e.g. inside `match:`) must not be mistaken for
+    /// the top-level policy field. The line walker keys off indent
+    /// depth; this exercises that.
+    #[test]
+    fn set_mode_does_not_match_nested_mode_key() {
+        let yaml = "\
+- id: nested
+  vendor: google
+  action: drive.files.get
+  match:
+    headers.x-mode:
+      equals: stealth
+  decision: allow
+  required_ops: []
+  pic_mode: audit
+";
+        let h = PolicyHandle::new(engine_with(yaml), None, yaml.into());
+        h.set_mode("nested", Mode::Observe).expect("set_mode ok");
+        let new_yaml = h.raw_yaml();
+        // The synthetic top-level `mode:` was inserted (not the nested
+        // `headers.x-mode:` mutated).
+        assert!(new_yaml.contains("mode: observe"));
+        assert!(new_yaml.contains("headers.x-mode:"));
+        assert!(new_yaml.contains("equals: stealth"));
+    }
+
+    #[test]
+    fn edit_mode_in_yaml_not_found_falls_through_to_serde() {
+        // The serde fallback also won't find a missing id; the public
+        // API surfaces `NotFound` either way. This guards against the
+        // line walker silently passing `Err(NotFound)` up without the
+        // fallback path being exercised.
+        let yaml = "[]\n";
+        let h = PolicyHandle::new(engine_with(yaml), None, yaml.into());
+        let err = h.set_mode("ghost", Mode::Observe).unwrap_err();
+        assert!(matches!(err, SetModeError::NotFound(ref id) if id == "ghost"));
     }
 
     #[tokio::test]

@@ -202,6 +202,11 @@ struct BlockedRow {
     resolved_at: Option<DateTime<Utc>>,
     expires_at: DateTime<Utc>,
     at: DateTime<Utc>,
+    /// Canonical JSON snapshot of the agent's request at block time
+    /// (spec.md §2.1 dev 3). Truncated to 4 KB; absent on pre-0014
+    /// historical rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_canonical_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,7 +217,8 @@ struct ListResponse {
 
 const ALL_COLS: &str = "id, request_id, session_id, p_0, vendor, action, method, path, layer, \
     policy_id, detail, predecessor_pca_id, requested_ops, status, override_pca_id, \
-    justification, approver_subject, reject_reason, resolved_at, expires_at, at";
+    justification, approver_subject, reject_reason, resolved_at, expires_at, at, \
+    request_canonical_json";
 
 async fn list(
     State(state): State<Arc<BlockedApiState>>,
@@ -588,6 +594,9 @@ fn row_to_blocked(r: &sqlx::postgres::PgRow) -> Result<BlockedRow, ApiError> {
         resolved_at: r.try_get("resolved_at")?,
         expires_at: r.try_get("expires_at")?,
         at: r.try_get("at")?,
+        request_canonical_json: r
+            .try_get::<Option<String>, _>("request_canonical_json")?
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
     })
 }
 

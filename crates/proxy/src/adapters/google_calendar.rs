@@ -379,6 +379,14 @@ async fn proxy_request(
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &requested_ops,
                         escalation_after_minutes,
+                    request_canonical_json: Some(crate::blocked::canonical_request_json(
+                        &method_str,
+                        &req.upstream_path,
+                        "google",
+                        &req.action,
+                        &req.policy_path,
+                        &req.body_for_policy,
+                    )),
                 },
             )
             .await;
@@ -505,6 +513,14 @@ async fn proxy_request(
                     predecessor_pca_id: Some(session.leaf_pca_id),
                     requested_ops: &leaf_ops,
                         escalation_after_minutes,
+                    request_canonical_json: Some(crate::blocked::canonical_request_json(
+                        &method_str,
+                        &req.upstream_path,
+                        "google",
+                        &req.action,
+                        &req.policy_path,
+                        &req.body_for_policy,
+                    )),
                 },
             )
             .await;
@@ -618,6 +634,14 @@ async fn proxy_request(
                         predecessor_pca_id: None,
                         requested_ops: &[],
                         escalation_after_minutes,
+                        request_canonical_json: Some(crate::blocked::canonical_request_json(
+                            &method_str,
+                            &req.upstream_path,
+                            "google",
+                            &req.action,
+                            &req.policy_path,
+                            &req.body_for_policy,
+                        )),
                     },
                 )
                 .await;

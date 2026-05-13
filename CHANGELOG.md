@@ -14,6 +14,17 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ## [Unreleased]
 
+### Changed
+
+- **`LogFormat` wired through `Config`** (qiuth-patterns.md §2.3
+  follow-through). [crates/proxy/src/main.rs](crates/proxy/src/main.rs)
+  now loads `Config` before `init_tracing` and passes `cfg.log_format`
+  into the tracing subscriber. Previously `init_tracing` read
+  `PROXILION_LOG_FORMAT` directly via `std::env::var`, bypassing the
+  layered config — operators could not set `log_format = "pretty"`
+  from `proxilion.toml`. The `#[allow(dead_code)]` annotation on
+  `Config::log_format` is dropped now that the field has a consumer.
+
 ### Removed
 
 - **`Config::from_env()` removed** (qiuth-patterns.md §2.4 Phase 3).

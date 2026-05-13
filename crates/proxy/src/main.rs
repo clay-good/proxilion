@@ -25,7 +25,19 @@ mod session;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
+    // Load config first so `init_tracing` can honor `log_format` from the
+    // layered config (TOML file → env vars → defaults), not just the env
+    // var. Config load errors go to stderr — tracing isn't up yet.
+    let cfg = match config::Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("config error: {e:#}");
+            // EX_CONFIG per sysexits.h
+            std::process::exit(78);
+        }
+    };
+
+    init_tracing(cfg.log_format);
     info!("proxilion proxy starting");
 
     // rustls 0.23 requires explicit CryptoProvider selection.
@@ -65,33 +77,23 @@ async fn main() -> anyhow::Result<()> {
     )
     .set(1.0);
 
-    let cfg = match config::Config::load() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("config error: {e:#}");
-            // EX_CONFIG per sysexits.h
-            std::process::exit(78);
-        }
-    };
-
     server::run(cfg).await.context("server failed")?;
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(format: config::LogFormat) {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,proxy=debug"));
 
-    let json = std::env::var("PROXILION_LOG_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or(true);
-
     let registry = tracing_subscriber::registry().with(env_filter);
-    if json {
-        registry.with(fmt::layer().json().with_target(true)).init();
-    } else {
-        registry.with(fmt::layer().pretty()).init();
+    match format {
+        config::LogFormat::Json => {
+            registry.with(fmt::layer().json().with_target(true)).init();
+        }
+        config::LogFormat::Pretty => {
+            registry.with(fmt::layer().pretty()).init();
+        }
     }
 }

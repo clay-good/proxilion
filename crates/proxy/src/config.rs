@@ -33,7 +33,6 @@ pub struct Config {
     pub database_url: Option<String>,
     pub trust_plane_url: String,
     pub federation_bridge_url: String,
-    #[allow(dead_code)]
     pub log_format: LogFormat,
     /// Hex-encoded 32-byte key for AES-256-GCM token encryption.
     pub token_encryption_key_hex: Option<String>,

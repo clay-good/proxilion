@@ -207,3 +207,320 @@ fn type_name(v: &Yaml) -> String {
     }
     .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the match-expression interpreter — the operator
+    //! vocabulary from spec.md §0.3. Each operator branch in
+    //! `apply_op` plus the combinator paths (`all`, `any`, `not`,
+    //! `exists`) gets at least one happy-path and one boundary test.
+    //! Adapter-level integration with the engine is covered separately
+    //! in `tests/example_policies.rs`; here we exercise the
+    //! interpreter in isolation.
+    use super::*;
+    use crate::context::{RequestContext, UserCtx};
+    use std::collections::HashMap;
+
+    fn ctx() -> RequestContext {
+        let mut path = HashMap::new();
+        path.insert("id".into(), "abc123".into());
+        let mut headers = HashMap::new();
+        headers.insert("x-tenant".into(), "acme".into());
+        let mut body = HashMap::new();
+        body.insert(
+            "to_domains".into(),
+            serde_json::json!(["evil.example", "spam.example"]),
+        );
+        body.insert("recipient_count".into(), serde_json::json!(7));
+        body.insert("external_recipient".into(), serde_json::json!(true));
+        RequestContext {
+            vendor: "google".into(),
+            action: "gmail.messages.send".into(),
+            user: UserCtx {
+                email: "alice@acme.com".into(),
+                groups: vec!["engineering".into(), "secops".into()],
+            },
+            path,
+            body,
+            headers,
+            customer_domain: "acme.com".into(),
+        }
+    }
+
+    fn parse(yaml: &str) -> Yaml {
+        serde_yaml::from_str(yaml).expect("test yaml parses")
+    }
+
+    // --- null / empty match ---------------------------------------
+
+    #[test]
+    fn null_expr_matches_anything() {
+        let y = Yaml::Null;
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn empty_mapping_matches_anything() {
+        let y = parse("{}");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    // --- equals / not_equals --------------------------------------
+
+    #[test]
+    fn equals_matches_user_email() {
+        let y = parse("user.email: { equals: alice@acme.com }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn equals_rejects_mismatch() {
+        let y = parse("user.email: { equals: bob@acme.com }");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn not_equals_inverts() {
+        let y = parse("user.email: { not_equals: bob@acme.com }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn equals_resolves_template_in_rhs() {
+        // `${user.email}` substitutes against ctx; matching against
+        // itself trivially passes — proves the substitution wires.
+        let y = parse("user.email: { equals: \"${user.email}\" }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn equals_on_bool_value_renders_via_string() {
+        // body.external_recipient is bool true; rhs `true` is bool;
+        // match-engine renders RHS via `as_str_subst` so the lhs
+        // string-form ("true") needs to equal the rendered rhs.
+        let y = parse("body.external_recipient: { equals: true }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    // --- in / not_in ----------------------------------------------
+
+    #[test]
+    fn in_matches_when_lhs_in_list() {
+        let y = parse("user.email: { in: [alice@acme.com, bob@acme.com] }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn in_misses_when_lhs_absent() {
+        let y = parse("user.email: { in: [bob@acme.com] }");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn not_in_matches_when_lhs_absent() {
+        let y = parse("user.email: { not_in: [bob@acme.com] }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn not_in_misses_when_lhs_present() {
+        let y = parse("user.email: { not_in: [alice@acme.com] }");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    /// `not_in` against a missing field returns true — "field not in
+    /// list" is vacuously satisfied when the field doesn't exist.
+    /// Documents the asymmetry vs `in` (which returns false).
+    #[test]
+    fn missing_field_in_returns_false() {
+        let y = parse("body.nonexistent: { in: [x, y] }");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn missing_field_not_in_returns_true() {
+        let y = parse("body.nonexistent: { not_in: [x, y] }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    // --- matches (regex) ------------------------------------------
+
+    #[test]
+    fn matches_accepts_regex_hit() {
+        let y = parse("user.email: { matches: \"^alice@\" }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn matches_rejects_regex_miss() {
+        let y = parse("user.email: { matches: \"^bob@\" }");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn matches_with_invalid_regex_errors() {
+        let y = parse("user.email: { matches: \"[unclosed\" }");
+        let err = evaluate(&y, &ctx()).unwrap_err();
+        assert!(matches!(err, MatchError::BadShape { ref op, .. } if op == "matches"));
+    }
+
+    // --- greater_than / less_than ---------------------------------
+
+    #[test]
+    fn greater_than_compares_numerically() {
+        let y = parse("body.recipient_count: { greater_than: 5 }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn less_than_compares_numerically() {
+        let y = parse("body.recipient_count: { less_than: 10 }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn greater_than_non_numeric_lhs_returns_false() {
+        // user.email isn't parseable as f64 — comparison returns false
+        // rather than erroring (graceful degradation per
+        // apply_op's `_ => Ok(false)` fall-through).
+        let y = parse("user.email: { greater_than: 5 }");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    // --- all / any / not / exists ---------------------------------
+
+    #[test]
+    fn all_requires_every_child_true() {
+        let y = parse(
+            r#"
+all:
+  - user.email: { equals: alice@acme.com }
+  - body.recipient_count: { greater_than: 1 }
+"#,
+        );
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn all_fails_on_any_child_false() {
+        let y = parse(
+            r#"
+all:
+  - user.email: { equals: alice@acme.com }
+  - body.recipient_count: { greater_than: 100 }
+"#,
+        );
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn any_passes_when_one_child_true() {
+        let y = parse(
+            r#"
+any:
+  - user.email: { equals: bob@acme.com }
+  - user.email: { equals: alice@acme.com }
+"#,
+        );
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn any_fails_when_all_children_false() {
+        let y = parse(
+            r#"
+any:
+  - user.email: { equals: bob@acme.com }
+  - user.email: { equals: carol@acme.com }
+"#,
+        );
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn not_inverts_inner_result() {
+        let y = parse("not: { user.email: { equals: bob@acme.com } }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn exists_matches_when_field_present() {
+        let y = parse("exists: user.email");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn exists_misses_when_field_absent() {
+        let y = parse("exists: body.nonexistent");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    // --- top-level AND semantics ----------------------------------
+
+    /// Top-level mapping is AND of every key. Two clauses, both true →
+    /// match passes.
+    #[test]
+    fn top_level_and_matches_when_all_clauses_match() {
+        let y = parse(
+            r#"
+user.email: { equals: alice@acme.com }
+body.external_recipient: { equals: true }
+"#,
+        );
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    /// Two clauses, second false → match fails (short-circuit
+    /// behavior verified indirectly via failure).
+    #[test]
+    fn top_level_and_fails_when_any_clause_misses() {
+        let y = parse(
+            r#"
+user.email: { equals: alice@acme.com }
+body.external_recipient: { equals: false }
+"#,
+        );
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    // --- shape / error paths --------------------------------------
+
+    #[test]
+    fn top_level_non_mapping_errors() {
+        let y = parse("[a, b]");
+        let err = evaluate(&y, &ctx()).unwrap_err();
+        assert!(matches!(err, MatchError::BadShape { .. }));
+    }
+
+    #[test]
+    fn unsupported_operator_errors() {
+        let y = parse("user.email: { weird_op: foo }");
+        let err = evaluate(&y, &ctx()).unwrap_err();
+        assert!(matches!(err, MatchError::UnsupportedOp(ref op) if op == "weird_op"));
+    }
+
+    #[test]
+    fn field_value_not_mapping_errors() {
+        // `user.email: alice@acme.com` (scalar instead of operator map)
+        // is rejected — encourages the explicit `{ equals: ... }`
+        // shape and prevents accidental shortcuts that bypass the
+        // type-checking apparatus.
+        let y = parse("user.email: alice@acme.com");
+        let err = evaluate(&y, &ctx()).unwrap_err();
+        assert!(matches!(err, MatchError::BadShape { ref op, .. } if op == "user.email"));
+    }
+
+    #[test]
+    fn all_non_sequence_errors() {
+        let y = parse("all: foo");
+        let err = evaluate(&y, &ctx()).unwrap_err();
+        assert!(matches!(err, MatchError::BadShape { ref op, .. } if op == "all"));
+    }
+
+    #[test]
+    fn exists_non_string_errors() {
+        let y = parse("exists: [a, b]");
+        let err = evaluate(&y, &ctx()).unwrap_err();
+        assert!(matches!(err, MatchError::BadShape { ref op, .. } if op == "exists"));
+    }
+}

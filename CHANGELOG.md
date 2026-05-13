@@ -138,14 +138,27 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Tests
 
-- 164 proxy + 16 policy-engine + 9 CLI; all 13 test binaries green.
+- 164 proxy + **58** policy-engine (was 16, **+42 new**) + 9 CLI;
+  all 13 test binaries green.
 - `cargo audit --deny warnings` exits 0 with the two documented
   ignores filtered.
-- New test surfaces: `policy_handle` comment-preservation (4
-  tests), CLI `policy edit` shell-quote + local-validation (5
-  tests), `blocked::canonical_request_json` shape + default-deny
-  + truncation + determinism (4 tests), `api::notifier` test-driver
-  classification + `TestRequest` deserialization (2 tests).
+- **Test backfill** (qiuth-patterns.md §6 ratchet plan groundwork):
+  `match_expr.rs` (the entire spec.md §0.3 operator vocabulary
+  interpreter — 209 LOC, previously zero inline tests) gets 33 new
+  unit tests covering every operator branch (`equals` /
+  `not_equals` / `in` / `not_in` / `matches` / `greater_than` /
+  `less_than`), every combinator (`all` / `any` / `not` /
+  `exists`), the top-level AND semantics, missing-field
+  asymmetries, regex error paths, and four shape-error branches.
+  `decision.rs` gets 9 new tests pinning `Pattern::is_match`
+  (literal case-sensitivity, regex anchors + alternation) and the
+  `Decision` enum's snake_case wire-format contract.
+- New test surfaces from prior commits: `policy_handle`
+  comment-preservation (4 tests), CLI `policy edit` shell-quote +
+  local-validation (5 tests), `blocked::canonical_request_json`
+  shape + default-deny + truncation + determinism (4 tests),
+  `api::notifier` test-driver classification + `TestRequest`
+  deserialization (2 tests).
 
 ---
 

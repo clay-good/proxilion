@@ -1,0 +1,141 @@
+# Proxilion proxy configuration — example template.
+#
+# Copy this file and edit only what you need. Point the proxy at it via:
+#
+#     PROXILION_CONFIG_FILE=/etc/proxilion/proxilion.toml proxy
+#
+# Precedence chain (qiuth-patterns.md §2):
+#
+#     defaults  ->  this TOML file  ->  PROXILION_* env vars  ->  programmatic overrides
+#
+# So a `PROXILION_BIND_ADDR=...` env var always wins over the `bind_addr`
+# line below; the line below always wins over the built-in default. Field
+# names mirror the env-var conceptual model (snake_case, without the
+# PROXILION_ prefix) so `bind_addr = "..."` corresponds to PROXILION_BIND_ADDR.
+#
+# Unknown fields are rejected at boot (#[serde(deny_unknown_fields)]) — a
+# typo will surface as a clear `config file <path>: parse: ...` error
+# rather than silently using the default.
+
+# ============================================================================
+# Network & TLS
+# ============================================================================
+
+# Address the proxy listens on. Default: "0.0.0.0:8443".
+# bind_addr = "0.0.0.0:8443"
+
+# Paths to the TLS cert + key (PEM). When `dev_mode = true` the proxy
+# self-issues a cert at these paths on first boot; otherwise both files
+# must already exist.
+# tls_cert_path = "./certs/dev.crt"
+# tls_key_path  = "./certs/dev.key"
+
+# When true, the proxy generates a self-signed cert at the paths above
+# if they don't exist. Set via PROXILION_DEV=1 in compose / Docker.
+# Default: false.
+# dev_mode = false
+
+# The proxy's own public base URL — handed to upstream OAuth providers
+# as the redirect_uri. MUST match the URI registered with the IdP.
+# Default: "https://localhost:8443".
+# proxy_base_url = "https://proxy.example.com"
+
+# ============================================================================
+# Datastore
+# ============================================================================
+
+# Postgres connection string. Optional in dev (no persistence); required
+# in production. No default.
+# database_url = "postgres://proxilion:secret@db.internal:5432/proxilion"
+
+# ============================================================================
+# Upstream services
+# ============================================================================
+
+# Trust Plane URL — where PCA mint/verify round-trips go. Must start with
+# http:// or https://. Default: "http://trust-plane:8080" (compose).
+# trust_plane_url = "https://trust-plane.example.com"
+
+# Federation bridge URL — JWKS verification + IdP-JWT decoding for the
+# bridge_callback path. Default: "http://federation-bridge:8081" (compose).
+# federation_bridge_url = "https://federation-bridge.example.com"
+
+# ============================================================================
+# Observability
+# ============================================================================
+
+# Log format. "json" (default) for structured ingestion (ELK, Loki,
+# Datadog). "pretty" for human-readable local dev.
+# log_format = "json"
+
+# ============================================================================
+# Token encryption & OAuth (Google adapter)
+# ============================================================================
+
+# Hex-encoded 32-byte AES-256-GCM key used to encrypt upstream OAuth
+# refresh tokens at rest. EXACTLY 64 hex characters; truncated keys are
+# rejected at boot. Generate with `openssl rand -hex 32`. No default.
+# token_encryption_key_hex = "<64 hex chars>"
+
+# Google OAuth client credentials — used by the Drive / Gmail / Calendar
+# adapters to refresh upstream access tokens. No defaults.
+# google_client_id     = "your-client.apps.googleusercontent.com"
+# google_client_secret = "GOCSPX-..."
+
+# ============================================================================
+# Policy
+# ============================================================================
+
+# Path to the Layer-B policy YAML. When unset, every request defaults to
+# Allow (policy engine evaluates with an empty set). No default — but the
+# bundled `config/policy.yaml` is the right starting point in compose.
+# policy_path = "/etc/proxilion/policy.yaml"
+
+# Customer's primary domain, used for `${customer_domain}` substitution
+# in policy `required_ops` templates. Default: "example.com".
+# customer_domain = "yourco.com"
+
+# ============================================================================
+# Action stream (NATS) — spec.md §3.1
+# ============================================================================
+
+# Optional NATS URL. When set, every persisted action_event is fanned
+# out to NATS on subject `<prefix>.<vendor>.<action>`. The durable
+# record lives in postgres regardless — NATS is a live fan-out, not the
+# system of record. No default (NATS disabled).
+# nats_url            = "nats://nats.internal:4222"
+# nats_subject_prefix = "actions"
+
+# ============================================================================
+# SIEM forwarder — spec.md §3.3
+# ============================================================================
+
+# Optional SIEM webhook URL. When set, every persisted action_event is
+# POSTed with an HMAC-signed body to this URL. No default.
+# siem_webhook_url   = "https://siem.example.com/proxilion/ingest"
+# siem_hmac_key_hex  = "<64 hex chars>"
+
+# Batched SIEM delivery — ui-less-surfaces.md §3.3 / spec.md §3.3 dev 2.
+# When > 1, the forwarder collects up to N events per POST and amortizes
+# TLS overhead. When unset / 1, per-event delivery (the default).
+# siem_batch_size         = 50
+# siem_batch_max_age_secs = 5
+
+# ============================================================================
+# Blocked-action webhook — ui-less-surfaces.md §10.3
+# ============================================================================
+
+# Bootstrap webhook config. Once `notifier_config` is populated via
+# `proxilion-cli notifier set-webhook`, the DB row wins; these values
+# are the no-DB / first-boot fallback. No defaults.
+# blocked_webhook_url          = "https://notifier.example.com/proxilion"
+# blocked_webhook_hmac_key_hex = "<64 hex chars>"
+
+# ============================================================================
+# Operator auth — ui-less-surfaces.md §4.4
+# ============================================================================
+
+# When true (default), `/api/v1/*` requires a valid `pxl_operator_*`
+# bearer. Set to false (or `PROXILION_DISABLE_OPERATOR_AUTH=1`) only for
+# local dev. NEVER false in production.
+# operator_auth_enforced = true

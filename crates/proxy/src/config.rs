@@ -645,6 +645,36 @@ operator_auth_enforced = false
     }
 
     #[test]
+    fn example_toml_parses_with_defaults_only() {
+        // The shipped `config/proxilion.example.toml` is documentation
+        // for operators — every field is commented out, so loading it
+        // must produce a builder identical to `defaults()`. This
+        // test pins that contract: if a future change adds a new
+        // required field to FileConfig without updating the example,
+        // or if a comment-out drifts and a field accidentally becomes
+        // active, this test trips. Repo-relative path is fine — cargo
+        // sets CARGO_MANIFEST_DIR to the crate root.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let example = std::path::Path::new(manifest)
+            .join("..")
+            .join("..")
+            .join("config")
+            .join("proxilion.example.toml");
+        let c = ConfigBuilder::defaults()
+            .from_file(&example)
+            .expect("example TOML must parse")
+            .with_dev_mode(true)
+            .build()
+            .expect("example TOML must produce a valid Config");
+        // Sanity check: the example didn't accidentally activate a
+        // field that would shift behavior from defaults.
+        assert_eq!(c.bind_addr.to_string(), "0.0.0.0:8443");
+        assert_eq!(c.trust_plane_url, "http://trust-plane:8080");
+        assert_eq!(c.customer_domain, "example.com");
+        assert!(c.operator_auth_enforced);
+    }
+
+    #[test]
     fn programmatic_overrides_compose() {
         let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let c = ConfigBuilder::defaults()

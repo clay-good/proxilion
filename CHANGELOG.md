@@ -14,6 +14,19 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ## [Unreleased]
 
+### Added
+
+- **[`config/proxilion.example.toml`](config/proxilion.example.toml)** —
+  worked example for the layered TOML config that Phase 2 of qiuth-patterns
+  §2 added. Every `FileConfig` field is present, commented out, and
+  annotated with its default + a one-line explanation. Operators copy
+  the file and uncomment only what they want to override. Header
+  documents the precedence chain (`defaults → file → env → programmatic`).
+  A new `config::tests::example_toml_parses_with_defaults_only` unit
+  test pins the contract — when every field is commented out the
+  loader produces a builder identical to `defaults()` — so the
+  example can't silently drift away from `FileConfig`.
+
 ### Changed
 
 - **`LogFormat` wired through `Config`** (qiuth-patterns.md §2.3

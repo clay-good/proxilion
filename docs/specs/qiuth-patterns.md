@@ -101,7 +101,7 @@ The `LogFormat::Pretty | Json` field that's currently `#[allow(dead_code)]` ([co
 - Phase 2: add `from_file()` and `Config::load()`. Document the precedence order.
 - Phase 3: remove `Config::from_env()` once callers are migrated.
 
-### 2.5 Status (2026-05-12) — Phases 1 & 2 shipped.
+### 2.5 Status (2026-05-13) — Phases 1, 2, & 3 shipped.
 
 - [crates/proxy/src/config.rs](../../crates/proxy/src/config.rs) — new `ConfigBuilder` with `defaults()`, `from_env_layer()` (composes env vars on top), `with_*` overrides for every field, and `build()` (runs semantic validation, then constructs `Config`). `Config::from_env()` now delegates to `ConfigBuilder::defaults().from_env_layer()?.build()` — byte-identical with the prior loader, just refactored. `Config::load()` is the forward-looking convenience entry; today it aliases `from_env`, phase 2 will layer `PROXILION_CONFIG_FILE` underneath.
 - New `ConfigError::InvalidValue { field, reason }` variant carries the field name (e.g. `PROXILION_TOKEN_ENCRYPTION_KEY`) so the operator sees the env var that's wrong, not just "bad value somewhere."
@@ -119,6 +119,8 @@ The `LogFormat::Pretty | Json` field that's currently `#[allow(dead_code)]` ([co
 - Tests: 3 new in `config::tests` covering file-overrides-defaults, unknown-field-rejection, and missing-path failure.
 
 **Deviation.** Chose TOML over YAML: ops config (small, flat, comments) reads cleanly in TOML; YAML's anchors / multi-line strings aren't load-bearing here and `policy.yaml` keeps its YAML stack. The `policy_path` field still points at a YAML file — just the proxy's own knobs are TOML.
+
+**Phase 3 (2026-05-13).** `Config::from_env()` removed from [crates/proxy/src/config.rs](../../crates/proxy/src/config.rs). The Phase 2 backward-compat shim — kept under `#[allow(dead_code)]` while callers migrated — had zero remaining call sites (a workspace grep for `Config::from_env(` returned only the definition itself and its own docstring). `Config::load()` is now the single production entry point; embed/test callers use `ConfigBuilder::defaults()…build()` directly. Module docstring updated; `cargo build --workspace` and `cargo test --workspace` both clean.
 
 ---
 
@@ -412,7 +414,7 @@ Suggested sequence (each step is independently shippable):
 1. **§4 ErrorCode registry** — smallest, unblocks §3. ~1 day. ✅ shipped 2026-05-12.
 2. **§3 PolicyTrace** — depends on §4. ~3 days incl. dashboard wiring. ✅ shipped 2026-05-12 (types + engine entry + adapter wiring; `X-Proxilion-Trace-Id` surfaced on responses).
 3. **§5 PolicyLoader trait + cache** — independent of §3/§4 but easier to test once trace exists. ~3 days. ✅ shipped 2026-05-12 (`FilePolicyLoader` is the production path; `DbPolicyLoader` is a one-line plug-in).
-4. **§2 ConfigBuilder** — independent. Defer until embed API is on the roadmap; until then, env-only is fine. ~2 days. ✅ Phases 1 & 2 shipped 2026-05-12 (`from_env` delegates to builder + semantic validation in `build()`; `from_file` (TOML) + `Config::load()` precedence chain wired into `main.rs`).
+4. **§2 ConfigBuilder** — independent. Defer until embed API is on the roadmap; until then, env-only is fine. ~2 days. ✅ Phases 1, 2, & 3 shipped (Phases 1 & 2 on 2026-05-12 — builder + `from_file` (TOML) + `Config::load()` precedence chain wired into `main.rs`; Phase 3 on 2026-05-13 — `Config::from_env()` removed, callers fully migrated).
 5. **§6 Coverage gate** — adopt at the *current* level immediately; ratchet over months. ✅ Phase 1 shipped 2026-05-12 (60% lines / 60% functions floor in [.github/workflows/coverage.yml](../../.github/workflows/coverage.yml)).
 
 §3 and §4 should land in the same PR if possible — `LayerOutcome` references `ErrorCode` directly.

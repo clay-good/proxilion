@@ -14,6 +14,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ## [Unreleased]
 
+### Removed
+
+- **`Config::from_env()` removed** (qiuth-patterns.md §2.4 Phase 3).
+  The Phase 2 backward-compat shim — kept under `#[allow(dead_code)]`
+  while callers migrated — had zero remaining call sites
+  ([crates/proxy/src/config.rs](crates/proxy/src/config.rs)).
+  `Config::load()` is now the single production entry point
+  (defaults → optional TOML file → env vars); embed/test callers use
+  `ConfigBuilder::defaults()…build()` directly. Module docstring updated.
+
 ### Added
 
 - **Public-repo polish.**

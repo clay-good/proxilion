@@ -16,6 +16,8 @@
 //!   is a thin wrapper around it.
 //! - Phase 2 (shipped 2026-05-12): `ConfigBuilder::from_file` (TOML),
 //!   `Config::load` honors `PROXILION_CONFIG_FILE` underneath env.
+//! - Phase 3 (shipped 2026-05-13): `Config::from_env` removed — callers are
+//!   migrated to `Config::load` (production) or `ConfigBuilder` (embed/test).
 
 use std::env;
 use std::net::SocketAddr;
@@ -100,14 +102,6 @@ pub enum ConfigError {
 }
 
 impl Config {
-    /// Backward-compat entry. Delegates to [`ConfigBuilder::defaults`] +
-    /// [`ConfigBuilder::from_env_layer`] + [`ConfigBuilder::build`] —
-    /// behavior is byte-identical with the prior env-only loader.
-    #[allow(dead_code)]
-    pub fn from_env() -> Result<Self, ConfigError> {
-        ConfigBuilder::defaults().from_env_layer()?.build()
-    }
-
     /// Production entry point: defaults → optional TOML file (when
     /// `PROXILION_CONFIG_FILE` is set) → env vars. Validates via
     /// [`ConfigBuilder::build`].
@@ -132,8 +126,8 @@ impl Config {
 ///
 /// Designed for two usage modes:
 ///
-/// 1. **Production:** `ConfigBuilder::defaults().from_env_layer()?.build()` —
-///    same as `Config::from_env()`.
+/// 1. **Production:** `Config::load()` — wraps
+///    `ConfigBuilder::defaults().from_file(?)?.from_env_layer()?.build()`.
 /// 2. **Embed / test:** `ConfigBuilder::defaults().with_bind_addr(...).with_trust_plane_url(...).build()`.
 #[derive(Debug, Clone)]
 pub struct ConfigBuilder {
@@ -461,8 +455,7 @@ impl ConfigBuilder {
             &self.federation_bridge_url,
         )?;
 
-        // dev_mode = false → cert + key must exist on disk now. This is
-        // the same behavior the prior `from_env` had inline.
+        // dev_mode = false → cert + key must exist on disk now.
         if !self.dev_mode {
             if !self.tls_cert_path.exists() {
                 return Err(ConfigError::MissingCert(self.tls_cert_path));

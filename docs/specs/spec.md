@@ -1383,10 +1383,6 @@ Acceptance:
 
 ### Step 1.5 — PCA chain verification end-to-end
 
----
-
-### Step 1.5 — PCA chain verification end-to-end
-
 **Phase:** M1
 **Goal:** Given a leaf PCA, walk the chain to PCA_0, verify every signature, confirm invariants hold. Surface results in API + dashboard.
 **Why:** PIC's preventative property depends on verification being correct. Verify continuously.

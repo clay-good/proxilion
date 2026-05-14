@@ -121,7 +121,7 @@ After accounting for upstream, the actual surface area of new code Proxilion aut
 2. **SaaS adapters** (`crates/proxy/src/adapters/google_drive.rs`, `google_gmail.rs`, `google_calendar.rs`) — Proxilion-original.
 3. **Read filter / prompt-injection defense** (`crates/proxy/src/filtering/`) — PIC has nothing to say about content; this is our layer.
 4. **Action stream + SIEM forwarder** (`crates/proxy/src/streaming/`, `crates/proxy/src/forwarder/`, `crates/consumer/`) — Proxilion-original.
-5. **Dashboard** (`dashboard/`) — Next.js app that consumes `@provenance/sdk` for PCA inspection and adds the live feed, policy editor, blocked-action queue, and justified-override UX. Proxilion-original.
+5. ~~**Dashboard** (`dashboard/`) — Next.js app for live feed, policy editor, blocked-action queue, justified-override UX.~~ **Removed in the 2026-05-11 ui-less pivot.** Replaced by `proxilion-cli` + Prometheus `/metrics` (consumed by the customer's Grafana via [`ops/grafana/proxilion.json`](../../ops/grafana/proxilion.json)) + Slack/email/webhook approval flows. See [`ui-less-surfaces.md`](./ui-less-surfaces.md) §0 for rationale.
 6. **Policy engine adapter** (`crates/policy-engine/`) — translates Proxilion YAML policies into `Operation` values (provenance-core type) plus Layer-B Rego decisions. Thin shim, not a new policy engine.
 7. **Killswitch** (`crates/proxy/src/api/killswitch.rs`) — thin layer that revokes locally and calls `provenance-plane`'s revoke endpoint.
 8. **Marketing site** (`site/`) — Static site deployed on Cloudflare Pages. Independent of code; directs traffic to GitHub.
@@ -241,7 +241,7 @@ The key thing to notice: **`p_0 = alice` is propagated unchanged through every h
 | `federation-bridge` | **Upstream `provenance-bridge` from clay-good/provenance** | Authenticates the human user via the org's IdP (Okta / Azure AD / OIDC / Google). Issues PCA_0 via the Trust Plane. We do not build this. |
 | `policy-engine` | Rust, embedded Rego eval (`regorus`) | Translates Proxilion YAML policies into ops constraints + read-filter rules. |
 | `action-stream` | NATS JetStream | Real-time pub/sub of every request/response event. |
-| `dashboard` | Next.js 15, React 19, Tailwind, shadcn/ui, `@provenance/sdk` | Web UI. Live feed, blocked-action queue, policy editor, PCA chain explorer. |
+| ~~`dashboard`~~ | ~~Next.js 15, React 19, Tailwind~~ | **Removed.** Replaced by three UI-less surfaces — `/metrics` (Prometheus), `proxilion-cli`, and Slack/email/webhook approvals. See [`ui-less-surfaces.md`](./ui-less-surfaces.md) §8.1. |
 | `killswitch` | Endpoint in `proxy` + Trust Plane integration | Revokes the agent session's right to request successor PCAs. Drains in-flight requests. |
 | `db` | Postgres 16 | Local cache: bearer-to-PCA mappings, blocked-action queue, override attestations, quarantined payloads. PCAs themselves are persisted by the Trust Plane. |
 
@@ -987,11 +987,11 @@ Acceptance:
 
 ---
 
-### Step 0.5 — Dashboard scaffold (Next.js 15)
+### Step 0.5 — Dashboard scaffold (Next.js 15) — **superseded**
 
-*(Same as v0 spec, with addition: install `@provenance/sdk` from the TypeScript SDK in clay-good/provenance for client-side PCA inspection in Step 1.6.)*
+*(Original intent: scaffold a Next.js 15 dashboard with `@provenance/sdk` for client-side PCA inspection in Step 1.6.)*
 
-**Status:** Scaffolded at [dashboard/](../../dashboard/). Next.js 15 app-router, React 19, TypeScript strict, Tailwind 3, server-side fetch of `proxy /healthz` and `trust-plane /v1/federation/info`. The dashboard talks to the proxy's `/api/v1/pca/{id}` and `/api/v1/pca/{id}/verify` endpoints directly; a TypeScript SDK can be added later if upstream publishes `@provenance/sdk` to npm. No live PCA chain inspector yet; that lands in §1.6 per the spec.
+**Status (2026-05-13):** Superseded by [`ui-less-surfaces.md`](./ui-less-surfaces.md) §8.1. Per the 2026-05-11 pivot, Proxilion ships **no dashboard at all** — three UI-less surfaces (Prometheus `/metrics`, `proxilion-cli`, Slack/email/webhook approvals) replace it. The `dashboard/` Next.js scaffold that briefly existed was removed; the slot in this step is held open as a redirect rather than re-bodied so existing links keep resolving. The replacement work is `ui-less-surfaces.md` §10.2 ("M1 redo") — `proxilion-cli actions tail / list / show / export` plus the bundled Grafana dashboard JSON in [`ops/grafana/proxilion.json`](../../ops/grafana/proxilion.json).
 
 ---
 
@@ -999,7 +999,7 @@ Acceptance:
 
 *(Same skeleton as v0, now including trust-plane, federation-bridge, mock-okta, plus the dashboard, proxy, postgres, nats services. The compose file from Step 0.4 is extended here, not replaced.)*
 
-**Status:** Done — [docker-compose.yml](../../docker-compose.yml) now includes `postgres`, `trust-plane`, `mock-okta`, `nats` (JetStream + monitor on 8222), `proxy` (via [docker/proxy.Dockerfile](../../docker/proxy.Dockerfile)), and `dashboard` (via [docker/dashboard.Dockerfile](../../docker/dashboard.Dockerfile)). `docker compose config --services` lists all six. Build contexts are the repo root; upstream `pic-protocol` and `provenance-*` are fetched by Cargo from git during the image builds. The proxy uses `PROXILION_DEV=1` in compose so the container self-issues a dev TLS cert into a named volume on first boot. `federation-bridge` is still deferred (see §0.4 Status); the slot is intentionally left out of compose rather than wired to a stub.
+**Status:** Done — [docker-compose.yml](../../docker-compose.yml) includes `postgres`, `trust-plane`, `mock-okta`, `nats` (JetStream + monitor on 8222), and `proxy` (via [docker/proxy.Dockerfile](../../docker/proxy.Dockerfile)). `docker compose config --services` lists all five. Build contexts are the repo root; upstream `pic-protocol` and `provenance-*` are fetched by Cargo from git during the image builds. The proxy uses `PROXILION_DEV=1` in compose so the container self-issues a dev TLS cert into a named volume on first boot. `federation-bridge` is still deferred (see §0.4 Status); the slot is intentionally left out of compose rather than wired to a stub. The previously-listed `dashboard` service was removed alongside the scaffold (see §0.5 — superseded by [`ui-less-surfaces.md`](./ui-less-surfaces.md) §8.1).
 
 ---
 
@@ -1007,7 +1007,7 @@ Acceptance:
 
 *(Same as v0 spec. Add: include trust-plane and federation-bridge in the smoke test job that runs as part of CI.)*
 
-**Status:** Done — [.github/workflows/ci.yml](../../.github/workflows/ci.yml) with three jobs: `rust` (fmt, `clippy -D warnings`, test, release build with `RUSTFLAGS=-D warnings`), `dashboard` (typecheck, lint, build), and `smoke` (brings up `postgres + trust-plane + mock-okta` via compose, runs [scripts/smoke-pic.sh](../../scripts/smoke-pic.sh), tears down). Upstream `pic-protocol` and `provenance-*` are fetched by Cargo from git (workspace `branch = "main"`, pinned in `Cargo.lock`); no separate `actions/checkout` per upstream is needed. `federation-bridge` is not in the smoke job — same reason as §0.4.
+**Status:** Done — [.github/workflows/ci.yml](../../.github/workflows/ci.yml) with four Rust jobs: `fmt` (`cargo fmt --all -- --check`), `clippy` (`-D warnings`), `test` (`cargo test --workspace`), and `build-release` (`RUSTFLAGS=-D warnings`). Sibling workflows: [coverage.yml](../../.github/workflows/coverage.yml) (qiuth-patterns §6 — 60%/60% floor via `cargo-llvm-cov`), [static-html-no-js.yml](../../.github/workflows/static-html-no-js.yml) (ui-less-surfaces.md §11.5 lint), [supply-chain.yml](../../.github/workflows/supply-chain.yml) (`cargo-deny` per [deny.toml](../../deny.toml)), and [release.yml](../../.github/workflows/release.yml) (multi-arch `proxilion-cli` binaries on `v*.*.*` tags). Upstream `pic-protocol` and `provenance-*` are fetched by Cargo from git (workspace `branch = "main"`, pinned in `Cargo.lock`); no separate `actions/checkout` per upstream is needed. The previously-listed `dashboard` job was removed alongside the scaffold (see §0.5 — superseded by [`ui-less-surfaces.md`](./ui-less-surfaces.md) §8.1); a compose-driven `smoke` job is on the backlog and currently lives only as the local [scripts/smoke-pic.sh](../../scripts/smoke-pic.sh) script.
 
 ---
 

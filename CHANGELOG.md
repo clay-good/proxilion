@@ -29,6 +29,20 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Changed
 
+- **`spec.md` ui-less alignment.** Cleaned up four stale `dashboard/`
+  references in [docs/specs/spec.md](docs/specs/spec.md) that survived
+  the 2026-05-11 ui-less pivot: §3.3 line 124 (component inventory),
+  §5.2 line 244 (architecture component table), §0.5 (status block
+  pointed at the deleted `dashboard/` directory), §0.6 (compose service
+  list claimed `dashboard` was wired in), and §0.7 (CI job list claimed
+  a `dashboard` typecheck/lint/build job that no longer exists). All
+  five sites now redirect to [`ui-less-surfaces.md`](docs/specs/ui-less-surfaces.md)
+  §8.1, which is the canonical "what we deleted" record. The §0.6
+  status block is rewritten to match the actual five compose services
+  (`postgres`, `trust-plane`, `mock-okta`, `nats`, `proxy`); §0.7 is
+  rewritten to match the actual four CI jobs (`fmt`, `clippy`, `test`,
+  `build-release`) plus the four sibling workflows (`coverage`,
+  `static-html-no-js`, `supply-chain`, `release`). No code touched.
 - **`LogFormat` wired through `Config`** (qiuth-patterns.md §2.3
   follow-through). [crates/proxy/src/main.rs](crates/proxy/src/main.rs)
   now loads `Config` before `init_tracing` and passes `cfg.log_format`

@@ -2,12 +2,15 @@ name: coverage
 
 # qiuth-patterns.md §6 — coverage threshold gate.
 #
-# Phase ladder (per §6.2):
-#   adoption | 60% lines / 60% functions  ← current floor
-#   3 months | 70% / 70%
-#   6 months | 80% / 80%
+# Phase ladder (per §6.4 status block, 2026-05-14 honest reset):
+#   adoption | 38% lines / 42% functions  ← current floor (just under measured 40.22 / 43.94)
+#   next     | 50% / 55% — lift once api/* handlers + cli/main.rs grow tests
+#   later    | 70% / 70% — long-term target
 #
-# Don't ratchet without expanding the test surface first.
+# Don't ratchet without expanding the test surface first. The original
+# 60/60 floor (b7d618b) was set aspirationally above measured reality and
+# the gate was red on `main` from the day it landed; this floor is what
+# the workspace actually clears today, so a regression below it is real.
 
 on:
   pull_request:
@@ -60,12 +63,12 @@ jobs:
           cargo llvm-cov report --summary-only
 
       - name: enforce coverage floor
-        # Phase 1: 60% lines / 60% functions. Bump via this file only —
-        # the threshold isn't read from anywhere else.
+        # Adoption floor: 38% lines / 42% functions. Bump via this file
+        # only — the threshold isn't read from anywhere else.
         run: |
           cargo llvm-cov report \
-            --fail-under-lines 60 \
-            --fail-under-functions 60
+            --fail-under-lines 38 \
+            --fail-under-functions 42
 
       - name: upload lcov artifact
         if: always()

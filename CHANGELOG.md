@@ -14,6 +14,21 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ## [Unreleased]
 
+### Changed
+
+- **Coverage gate honest reset — floor lowered from 60% / 60% to 38% lines /
+  42% functions** ([.github/workflows/coverage.yml](.github/workflows/coverage.yml),
+  qiuth-patterns.md §6.4 status block). The original 60/60 adoption floor
+  (b7d618b) was set aspirationally above measured reality; a local
+  `cargo llvm-cov --workspace` run reports `TOTAL 40.22% lines / 43.94%
+  functions`, and the five most recent CI runs of `coverage.yml` on `main`
+  all exited `failure`. The new floor sits just under measured reality so
+  the gate enforces a no-regression line the workspace actually clears.
+  Biggest pull-down sources are the `proxy/api/*` HTTP handlers (0% — no
+  integration tests; `crates/proxy/tests/` is empty), `proxy/server.rs`
+  (0%), and `cli/src/main.rs` (3.91%). Backfilling those is the work that
+  earns the next ratchet (target: 50% / 55%).
+
 ### Added
 
 - **[`config/proxilion.example.toml`](config/proxilion.example.toml)** —

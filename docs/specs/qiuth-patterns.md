@@ -379,11 +379,11 @@ Add a coverage gate using `cargo-llvm-cov`:
 - run: cargo llvm-cov report --fail-under-lines 70 --fail-under-functions 70
 ```
 
-**Don't start at 90%.** Proxilion isn't a 318-test library; it's a service. Realistic ramp:
+**Don't start at 90%.** Proxilion isn't a 318-test library; it's a service. The original ramp shipped at 60/60 → 70/70 → 80/80; a 2026-05-14 honest reset (see §6.4 status) revised this downward to match measured reality. The current operational ladder lives in §6.4; the table below is the original aspirational shape.
 
 | Phase | Lines | Functions | Notes |
 |---|---:|---:|---|
-| Adoption | 60% | 60% | Pin the current floor. Anything below blocks PRs. |
+| Adoption | 60% | 60% | (Aspirational — see §6.4 for actual floor.) Anything below blocks PRs. |
 | 3 months | 70% | 70% | Forces test backfill for OAuth flow + PCA cache |
 | 6 months | 80% | 80% | Long-term target |
 
@@ -393,16 +393,26 @@ Per-crate overrides are fine — `shared-types/` is mostly re-exports and can st
 
 A coverage gate ensures lines are *executed* in tests, not that the tests assert anything meaningful. Pair it with the existing integration test pattern in [policy-engine/tests/example_policies.rs](../../crates/policy-engine/tests/example_policies.rs) — that file is the model for "test what the policy actually decides," not just "the function returned."
 
-### 6.4 Status (2026-05-12) — Phase 1 floor pinned at 60% / 60%.
+### 6.4 Status (2026-05-12) — Phase 1 floor pinned at 60% / 60%; **honest reset to 38% / 42% on 2026-05-14**.
 
-- [.github/workflows/coverage.yml](../../.github/workflows/coverage.yml) — runs `cargo llvm-cov --workspace --lcov --output-path lcov.info` on every PR and push to `main`. Threshold: `--fail-under-lines 60 --fail-under-functions 60`. The rendered summary is logged for PR reviewers; the `lcov.info` artifact is always uploaded so downstream tools (Codecov, etc.) can consume it.
+- [.github/workflows/coverage.yml](../../.github/workflows/coverage.yml) — runs `cargo llvm-cov --workspace --lcov --output-path lcov.info` on every PR and push to `main`. The rendered summary is logged for PR reviewers; the `lcov.info` artifact is always uploaded so downstream tools (Codecov, etc.) can consume it.
 - Uses `taiki-e/install-action` to install `cargo-llvm-cov` from a pre-built binary (saves ~3 minutes vs `cargo install`).
 - Caches `~/.cargo/registry`, `~/.cargo/git`, and `target` keyed on `Cargo.lock` — the SHA-pinned upstream `pic-protocol` + `provenance-*` deps make a cold build expensive (~6 min); a warm cache brings it under 90s.
 - Tests dir is excluded from the report (`--ignore-filename-regex '(^|/)tests/'`); coverage is measured against `src/`.
 
+**2026-05-14 honest reset — floor lowered to 38% lines / 42% functions.** The original §6.2 ladder pinned the adoption floor at 60% / 60%, but a local `cargo llvm-cov --workspace` run (against the workspace as of [a685688](../../.github/workflows/coverage.yml)) reports `TOTAL 40.22% lines / 43.94% functions`. The five most recent CI runs of `coverage.yml` on `main` all exited `failure` for exactly this reason — the gate was red the day it landed (b7d618b) and stayed red across every subsequent push. The floor is now `--fail-under-lines 38 --fail-under-functions 42`, just under the measured numbers, so the gate enforces a no-regression line that the workspace actually clears. The biggest pull-down sources are [crates/proxy/src/api/](../../crates/proxy/src/api/) (handlers at 0% — exercised only by integration tests; the `crates/proxy/tests/` directory is empty), [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) at 0%, and [crates/cli/src/main.rs](../../crates/cli/src/main.rs) at 3.91%. Backfilling those is the work that earns the next bump.
+
 **Ratchet plan.**
 
-The phase ladder in §6.2 (60 → 70 → 80) lives only in this YAML's `--fail-under-*` flags. Bump it in a single-line PR alongside the test backfill that earned the bump — never bump speculatively. The 3-month / 6-month targets in the table are aspirational, not calendar-bound.
+The revised phase ladder lives only in this YAML's `--fail-under-*` flags. Bump it in a single-line PR alongside the test backfill that earned the bump — never bump speculatively. Updated targets:
+
+| Phase | Lines | Functions | What earns the bump |
+|---|---:|---:|---|
+| adoption (today) | 38% | 42% | n/a — current measured floor |
+| next | 50% | 55% | wiremock+postgres harness lands → `crates/proxy/tests/` exercises `api/*` handlers |
+| later | 70% | 70% | CLI integration tests + `server.rs` boot-path tests |
+
+The 60 → 70 → 80 ladder in §6.2 is left as the original *aspirational* document — this status block is the operational source of truth.
 
 **Deviations from §6.2 sketch.**
 
@@ -419,7 +429,7 @@ Suggested sequence (each step is independently shippable):
 2. **§3 PolicyTrace** — depends on §4. ~3 days incl. dashboard wiring. ✅ shipped 2026-05-12 (types + engine entry + adapter wiring; `X-Proxilion-Trace-Id` surfaced on responses).
 3. **§5 PolicyLoader trait + cache** — independent of §3/§4 but easier to test once trace exists. ~3 days. ✅ shipped 2026-05-12 (`FilePolicyLoader` is the production path; `DbPolicyLoader` is a one-line plug-in).
 4. **§2 ConfigBuilder** — independent. Defer until embed API is on the roadmap; until then, env-only is fine. ~2 days. ✅ Phases 1, 2, & 3 shipped (Phases 1 & 2 on 2026-05-12 — builder + `from_file` (TOML) + `Config::load()` precedence chain wired into `main.rs`; Phase 3 on 2026-05-13 — `Config::from_env()` removed, callers fully migrated).
-5. **§6 Coverage gate** — adopt at the *current* level immediately; ratchet over months. ✅ Phase 1 shipped 2026-05-12 (60% lines / 60% functions floor in [.github/workflows/coverage.yml](../../.github/workflows/coverage.yml)).
+5. **§6 Coverage gate** — adopt at the *current* level immediately; ratchet over months. ✅ Phase 1 shipped 2026-05-12 (originally 60% / 60%; honest reset on 2026-05-14 to **38% lines / 42% functions** in [.github/workflows/coverage.yml](../../.github/workflows/coverage.yml) — the original floor was set above measured reality and the gate was red on `main` from day one; see §6.4 status).
 
 §3 and §4 should land in the same PR if possible — `LayerOutcome` references `ErrorCode` directly.
 

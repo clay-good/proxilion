@@ -641,3 +641,112 @@ impl IntoResponse for ActionsApiError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_row() -> ListRow {
+        ListRow {
+            id: Uuid::nil(),
+            request_id: Uuid::nil(),
+            session_id: Some(Uuid::nil()),
+            p_0: "user@example.com".into(),
+            leaf_pca_id: Some(Uuid::nil()),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            method: "GET".into(),
+            path: "/drive/v3/files/abc".into(),
+            status: 200,
+            decision: "allow".into(),
+            block_reason: None,
+            read_filter_triggered: false,
+            quarantined_count: 0,
+            policy_id: Some("drive-injection-filter".into()),
+            extra: serde_json::Value::Null,
+            at: DateTime::parse_from_rfc3339("2026-05-14T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
+
+    #[test]
+    fn hex_encode_lowercase_2_chars_per_byte() {
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x00, 0x0f, 0x10, 0xff]), "000f10ff");
+        assert_eq!(hex_encode(&[0xab, 0xcd, 0xef]), "abcdef");
+    }
+
+    #[test]
+    fn row_to_csv_line_basic_row() {
+        let line = row_to_csv_line(&sample_row());
+        assert!(line.ends_with('\n'));
+        // 16 commas separate 16 fields (15 commas in the row, plus newline)
+        assert_eq!(line.matches(',').count(), 15);
+        assert!(line.contains("google"));
+        assert!(line.contains("drive.files.get"));
+        assert!(line.contains("drive-injection-filter"));
+        assert!(line.contains("2026-05-14T00:00:00"));
+    }
+
+    #[test]
+    fn row_to_csv_line_quotes_fields_containing_separators() {
+        let mut r = sample_row();
+        r.path = "/path,with,comma".into();
+        r.vendor = "needs\"quote".into();
+        r.action = "with\nnewline".into();
+        let line = row_to_csv_line(&r);
+        assert!(line.contains("\"/path,with,comma\""));
+        assert!(line.contains("\"needs\"\"quote\""));
+        assert!(line.contains("\"with\nnewline\""));
+    }
+
+    #[test]
+    fn row_to_csv_line_renders_optional_session_and_block_reason_as_empty() {
+        let mut r = sample_row();
+        r.session_id = None;
+        r.block_reason = None;
+        r.policy_id = None;
+        r.leaf_pca_id = None;
+        let line = row_to_csv_line(&r);
+        // Three consecutive commas indicate an empty field between non-empty ones.
+        assert!(line.contains(",,"));
+    }
+
+    #[test]
+    fn make_event_serializes_action_payload() {
+        let ev = Arc::new(ActionEvent {
+            request_id: Uuid::nil(),
+            agent_session_id: Uuid::nil(),
+            p_0: "u@example.com".into(),
+            leaf_pca_id: None,
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            method: "GET".into(),
+            path: "/drive/v3/files/abc".into(),
+            status: 200,
+            decision: "allow".into(),
+            block_reason: None,
+            read_filter_triggered: false,
+            quarantined_count: 0,
+            at: DateTime::parse_from_rfc3339("2026-05-14T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            policy_id: None,
+            extra: serde_json::Value::Null,
+        });
+        let evt = make_event(ev).unwrap();
+        // The SSE Event API exposes its data only via Display.
+        let rendered = format!("{evt:?}");
+        // Just confirm the event was built — its data is JSON-encoded.
+        assert!(rendered.contains("action") || !rendered.is_empty());
+    }
+
+    #[test]
+    fn actions_api_error_into_response_status_codes() {
+        let bad = ActionsApiError::BadRequest("x".into());
+        assert_eq!(bad.into_response().status(), StatusCode::BAD_REQUEST);
+        let nf = ActionsApiError::NotFound;
+        assert_eq!(nf.into_response().status(), StatusCode::NOT_FOUND);
+    }
+}

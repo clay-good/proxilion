@@ -3088,3 +3088,184 @@ async fn cmd_notifier(
         }
     }
 }
+
+#[cfg(test)]
+mod pure_helper_tests {
+    use super::*;
+
+    #[test]
+    fn format_metric_value_integers_drop_decimal() {
+        assert_eq!(format_metric_value(0.0), "0");
+        assert_eq!(format_metric_value(1.0), "1");
+        assert_eq!(format_metric_value(-7.0), "-7");
+        assert_eq!(format_metric_value(1234567.0), "1234567");
+    }
+
+    #[test]
+    fn format_metric_value_fractions_keep_six_digits() {
+        let s = format_metric_value(1.5);
+        assert!(s.starts_with("1.5"));
+        assert!(s.contains('.'));
+        let s2 = format_metric_value(0.0001);
+        assert!(s2.starts_with("0.000"));
+    }
+
+    #[test]
+    fn parse_since_accepts_rfc3339_and_duration() {
+        parse_since("2026-01-01T00:00:00Z").unwrap();
+        parse_since("5m").unwrap();
+        parse_since("24h").unwrap();
+        parse_since("7d").unwrap();
+        assert!(parse_since("nonsense").is_err());
+    }
+
+    #[test]
+    fn urlencode_preserves_unreserved_chars() {
+        assert_eq!(urlencode("abc-DEF_123.~"), "abc-DEF_123.~");
+    }
+
+    #[test]
+    fn urlencode_percent_encodes_reserved_chars() {
+        assert_eq!(urlencode(" "), "%20");
+        assert_eq!(urlencode("/"), "%2F");
+        assert_eq!(urlencode("&=?"), "%26%3D%3F");
+        assert_eq!(urlencode("a b"), "a%20b");
+    }
+
+    #[test]
+    fn generate_token_format_and_uniqueness() {
+        let t1 = generate_token();
+        let t2 = generate_token();
+        assert!(t1.starts_with(TOKEN_PREFIX));
+        assert_eq!(t1.len(), TOKEN_PREFIX.len() + TOKEN_BODY_LEN);
+        // body chars are base32 alphabet
+        let body = &t1[TOKEN_PREFIX.len()..];
+        assert!(
+            body.chars()
+                .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c))
+        );
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn token_hash_is_sha256_stable_32_bytes() {
+        let h1 = token_hash("foo");
+        let h2 = token_hash("foo");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32);
+        let h3 = token_hash("bar");
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("abc", 10), "abc");
+        assert_eq!(truncate("", 5), "");
+    }
+
+    #[test]
+    fn truncate_long_string_gets_ellipsis() {
+        let s = truncate("abcdef", 4);
+        assert_eq!(s.chars().count(), 4);
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_unicode_counts_chars_not_bytes() {
+        // 6 multi-byte chars; bytes > 6 but chars == 6
+        assert_eq!(truncate("ééééée", 6), "ééééée");
+        let s = truncate("ééééééé", 5);
+        assert_eq!(s.chars().count(), 5);
+    }
+
+    #[test]
+    fn matches_tail_filter_no_filter_always_true() {
+        assert!(matches_tail_filter("{}", None, None, None));
+        assert!(matches_tail_filter("invalid-json", None, None, None));
+    }
+
+    #[test]
+    fn matches_tail_filter_decision_match() {
+        let data = r#"{"decision":"block","vendor":"google","action":"x"}"#;
+        assert!(matches_tail_filter(data, Some("block"), None, None));
+        assert!(!matches_tail_filter(data, Some("allow"), None, None));
+    }
+
+    #[test]
+    fn matches_tail_filter_combines_decision_vendor_action() {
+        let data = r#"{"decision":"allow","vendor":"google","action":"drive.files.get"}"#;
+        assert!(matches_tail_filter(
+            data,
+            Some("allow"),
+            Some("google"),
+            Some("drive.files.get")
+        ));
+        assert!(!matches_tail_filter(
+            data,
+            Some("allow"),
+            Some("google"),
+            Some("gmail.messages.send")
+        ));
+    }
+
+    #[test]
+    fn matches_tail_filter_invalid_json_passes_through() {
+        // Don't drop events we can't parse.
+        assert!(matches_tail_filter("not json", Some("block"), None, None));
+    }
+
+    #[test]
+    fn make_mock_jwt_three_parts_with_decodable_payload() {
+        let payload = serde_json::json!({"sub":"alice","iss":"test"});
+        let jwt = make_mock_jwt(&payload);
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let body_bytes = base64::Engine::decode(&B64URL, parts[1]).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(decoded["sub"], "alice");
+        assert_eq!(decoded["iss"], "test");
+        assert_eq!(parts[2], "signature");
+    }
+
+    #[test]
+    fn field_diff_detects_no_changes_when_identical() {
+        let yaml = "\
+- id: p1
+  vendor: google
+  action: drive.files.get
+  decision: allow
+  required_ops: []
+  pic_mode: audit
+";
+        let docs = policy_engine::yaml::parse_policies(yaml).unwrap();
+        assert!(field_diff(&docs[0], &docs[0]).is_empty());
+    }
+
+    #[test]
+    fn field_diff_flags_vendor_action_and_required_ops_changes() {
+        let before_y = "\
+- id: p1
+  vendor: google
+  action: drive.files.get
+  decision: allow
+  required_ops: []
+  pic_mode: audit
+";
+        let after_y = "\
+- id: p1
+  vendor: github
+  action: drive.files.list
+  decision: allow
+  required_ops:
+    - 'drive:read:file/x'
+  pic_mode: audit
+";
+        let b = &policy_engine::yaml::parse_policies(before_y).unwrap()[0];
+        let a = &policy_engine::yaml::parse_policies(after_y).unwrap()[0];
+        let diffs = field_diff(b, a);
+        let joined = diffs.join("|");
+        assert!(joined.contains("vendor:"));
+        assert!(joined.contains("action:"));
+        assert!(joined.contains("required_ops"));
+    }
+}

@@ -420,3 +420,44 @@ fn slack_err(status: StatusCode, msg: &str) -> Response {
 fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn header_str_reads_ascii_header() {
+        let mut h = HeaderMap::new();
+        h.insert("x-slack-signature", HeaderValue::from_static("v0=abc"));
+        assert_eq!(header_str(&h, "x-slack-signature"), Some("v0=abc"));
+        assert_eq!(header_str(&h, "x-slack-timestamp"), None);
+    }
+
+    #[test]
+    fn header_str_returns_none_for_non_ascii() {
+        let mut h = HeaderMap::new();
+        h.insert("x-custom", HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap());
+        assert!(header_str(&h, "x-custom").is_none());
+    }
+
+    #[tokio::test]
+    async fn slack_ok_message_is_in_channel_replace_original() {
+        let r = slack_ok_message("approved");
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["response_type"], "in_channel");
+        assert_eq!(v["replace_original"], true);
+        assert_eq!(v["text"], "approved");
+    }
+
+    #[tokio::test]
+    async fn slack_err_carries_status_and_message() {
+        let r = slack_err(StatusCode::UNAUTHORIZED, "bad sig");
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "bad sig");
+    }
+}

@@ -147,3 +147,22 @@ fn hex_encode(b: &[u8]) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_encode_lowercase() {
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    #[test]
+    fn api_error_not_found_response() {
+        let r = ApiError::NotFound.into_response();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+}

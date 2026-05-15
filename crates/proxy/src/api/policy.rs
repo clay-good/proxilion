@@ -157,3 +157,85 @@ async fn set_mode(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_listing_extracts_id_vendor_action_mode_pic_mode() {
+        let yaml = r#"- id: gmail-external-send-gate
+  vendor: google
+  action: gmail.users.messages.send
+  mode: enforce
+  pic_mode: audit
+- id: drive-injection-filter
+  vendor: google
+  action: drive.files.get
+  mode: observe
+  pic_mode: enforce
+"#;
+        let out = parse_listing(yaml);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "gmail-external-send-gate");
+        assert_eq!(out[0].vendor, "google");
+        assert_eq!(out[0].action, "gmail.users.messages.send");
+        assert_eq!(out[0].mode, "enforce");
+        assert_eq!(out[0].pic_mode, "audit");
+        assert_eq!(out[1].id, "drive-injection-filter");
+        assert_eq!(out[1].mode, "observe");
+        assert_eq!(out[1].pic_mode, "enforce");
+    }
+
+    #[test]
+    fn parse_listing_applies_defaults_for_missing_optional_fields() {
+        let yaml = "- id: bare-policy\n";
+        let out = parse_listing(yaml);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "bare-policy");
+        assert_eq!(out[0].vendor, "");
+        assert_eq!(out[0].action, "");
+        assert_eq!(out[0].mode, "enforce");
+        assert_eq!(out[0].pic_mode, "audit");
+    }
+
+    #[test]
+    fn parse_listing_skips_entries_without_id() {
+        let yaml = "- vendor: google\n  action: drive.files.get\n- id: ok\n";
+        let out = parse_listing(yaml);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "ok");
+    }
+
+    #[test]
+    fn parse_listing_returns_empty_on_malformed_yaml() {
+        let out = parse_listing("not: valid: yaml: : :");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_listing_empty_input_yields_empty_vec() {
+        assert!(parse_listing("").is_empty());
+    }
+
+    #[test]
+    fn policy_view_serializes_to_json() {
+        let v = PolicyView {
+            id: "p1".into(),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            mode: "enforce".into(),
+            pic_mode: "audit".into(),
+        };
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.contains("\"id\":\"p1\""));
+        assert!(s.contains("\"vendor\":\"google\""));
+        assert!(s.contains("\"pic_mode\":\"audit\""));
+    }
+
+    #[test]
+    fn set_mode_body_deserializes() {
+        let b: SetModeBody = serde_json::from_str(r#"{"mode":"observe"}"#).unwrap();
+        assert_eq!(b.mode, "observe");
+    }
+}

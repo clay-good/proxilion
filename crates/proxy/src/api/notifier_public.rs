@@ -405,6 +405,97 @@ mod tests {
         assert!(escaped.contains("&#39;"));
     }
 
+    fn sample_row(action: &str) -> TokenRow {
+        TokenRow {
+            token_id: Uuid::nil(),
+            blocked_id: Uuid::nil(),
+            action: action.into(),
+            approver_hint: None,
+            issued_by: None,
+            expires_at: Utc::now() + chrono::Duration::minutes(30),
+            consumed_at: None,
+        }
+    }
+
+    fn sample_blocked() -> BlockedSummary {
+        BlockedSummary {
+            p_0: Some("alice@acme.com".into()),
+            vendor: "google".into(),
+            action: "gmail.messages.send".into(),
+            path: "/gmail/v1/users/me/messages/send".into(),
+            policy_id: Some("p1".into()),
+            detail: Some("ext".into()),
+            created_at: Utc::now(),
+            requested_ops: vec!["gmail:send".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn render_error_returns_html_with_escaped_message() {
+        let r = render_error("<bad>");
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("&lt;bad&gt;"));
+        assert!(!html.contains("<bad>"));
+    }
+
+    #[tokio::test]
+    async fn render_form_approve_includes_action_form_and_justification_textarea() {
+        let r = render_form(&sample_row("approve"), &sample_blocked());
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("action=\"/notifier/approve\""));
+        assert!(html.contains("name=\"justification\""));
+        assert!(html.contains("minlength=\"20\""));
+    }
+
+    #[tokio::test]
+    async fn render_form_reject_includes_reason_textarea() {
+        let r = render_form(&sample_row("reject"), &sample_blocked());
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("name=\"reason\""));
+        assert!(html.contains("Reject action"));
+    }
+
+    #[tokio::test]
+    async fn render_form_unknown_action_shows_banner_err() {
+        let r = render_form(&sample_row("weird"), &sample_blocked());
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn render_already_used_renders_consumed_message() {
+        let mut row = sample_row("approve");
+        row.consumed_at = Some(Utc::now());
+        let r = render_already_used(&row, &sample_blocked());
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("Link already used"));
+    }
+
+    #[tokio::test]
+    async fn render_validation_error_includes_back_link() {
+        let row = sample_row("approve");
+        let r = render_validation_error(&row, "too short");
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("too short"));
+        assert!(html.contains("/notifier/approve?t="));
+    }
+
+    #[test]
+    fn fill_template_with_no_blocked_uses_dash_placeholders() {
+        let row = sample_row("approve");
+        let html = fill_template(&row, None, "<p>x</p>");
+        assert!(!html.contains("{{"));
+        assert!(html.contains("(unknown)"));
+    }
+
     #[test]
     fn template_substitutions_fill_all_placeholders() {
         let row = TokenRow {

@@ -91,3 +91,71 @@ impl IntoResponse for ErrorBody {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(self)).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_sets_required_fields_and_leaves_optional_unset() {
+        let body = ErrorBody::new("bad", "bad_request");
+        assert_eq!(body.error, "bad");
+        assert_eq!(body.code, "bad_request");
+        assert!(body.detail.is_none());
+        assert!(body.fix.is_none());
+        assert!(body.docs.is_none());
+        assert!(body.extras.is_null());
+    }
+
+    #[test]
+    fn builders_compose_and_set_individual_fields() {
+        let body = ErrorBody::new("nope", "not_found")
+            .with_detail("row 42 missing")
+            .with_fix("re-run the migration")
+            .with_docs("https://proxilion.com/docs/x")
+            .with_extras(serde_json::json!({"policy_id": "p1"}));
+        assert_eq!(body.detail.as_deref(), Some("row 42 missing"));
+        assert_eq!(body.fix, Some("re-run the migration"));
+        assert_eq!(body.docs, Some("https://proxilion.com/docs/x"));
+        assert_eq!(body.extras["policy_id"], "p1");
+    }
+
+    #[test]
+    fn serializes_only_set_optional_fields() {
+        let body = ErrorBody::new("title", "code1");
+        let s = serde_json::to_value(&body).unwrap();
+        assert_eq!(s["error"], "title");
+        assert_eq!(s["code"], "code1");
+        // Optional fields omitted entirely.
+        assert!(s.get("detail").is_none());
+        assert!(s.get("fix").is_none());
+        assert!(s.get("docs").is_none());
+        assert!(s.get("extras").is_none());
+    }
+
+    #[test]
+    fn serializes_all_fields_when_set() {
+        let body = ErrorBody::new("t", "c")
+            .with_detail("d")
+            .with_fix("f")
+            .with_docs("https://x");
+        let s = serde_json::to_value(&body).unwrap();
+        assert_eq!(s["detail"], "d");
+        assert_eq!(s["fix"], "f");
+        assert_eq!(s["docs"], "https://x");
+    }
+
+    #[tokio::test]
+    async fn into_response_with_status_uses_provided_status() {
+        let r = ErrorBody::new("nope", "not_found").into_response(StatusCode::NOT_FOUND);
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn into_response_default_is_500() {
+        // The blanket IntoResponse impl maps to 500.
+        let body = ErrorBody::new("oops", "internal_error");
+        let r: Response = IntoResponse::into_response(body);
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

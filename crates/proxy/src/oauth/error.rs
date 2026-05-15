@@ -110,3 +110,86 @@ impl IntoResponse for OAuthError {
         self.body().into_response(status)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_codes_match_variant_classification() {
+        assert_eq!(
+            OAuthError::BadRequest("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(OAuthError::UnknownClient.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(OAuthError::PkceFail.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(OAuthError::BadAuthCode.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(OAuthError::SessionGone.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            OAuthError::BridgeRejected("x".into()).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            OAuthError::PicInvariant("x".into()).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            OAuthError::Crypto.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            OAuthError::Internal("x".into()).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn body_carries_stable_error_codes() {
+        assert_eq!(
+            OAuthError::BadRequest("x".into()).body().code,
+            "bad_request"
+        );
+        assert_eq!(OAuthError::UnknownClient.body().code, "unknown_client");
+        assert_eq!(OAuthError::SessionGone.body().code, "session_gone");
+        assert_eq!(
+            OAuthError::BridgeRejected("x".into()).body().code,
+            "bridge_rejected"
+        );
+        assert_eq!(OAuthError::PkceFail.body().code, "pkce_fail");
+        assert_eq!(OAuthError::BadAuthCode.body().code, "bad_auth_code");
+        assert_eq!(
+            OAuthError::PicInvariant("x".into()).body().code,
+            "pic_invariant_violation"
+        );
+        assert_eq!(OAuthError::Crypto.body().code, "internal_error");
+        assert_eq!(
+            OAuthError::Internal("x".into()).body().code,
+            "internal_error"
+        );
+    }
+
+    #[test]
+    fn body_carries_detail_when_variant_has_one() {
+        assert_eq!(
+            OAuthError::BadRequest("missing scope".into()).body().detail,
+            Some("missing scope".to_string())
+        );
+        assert_eq!(
+            OAuthError::PicInvariant("ops exceeded".into())
+                .body()
+                .detail,
+            Some("ops exceeded".to_string())
+        );
+        // Variants without detail don't synthesize one.
+        assert!(OAuthError::UnknownClient.body().detail.is_none());
+        assert!(OAuthError::PkceFail.body().detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn into_response_uses_classification_status() {
+        let r = OAuthError::UnknownClient.into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let r = OAuthError::PicInvariant("x".into()).into_response();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+}

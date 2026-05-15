@@ -86,3 +86,73 @@ impl<'a> BlockedNotification<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blocked::BlockedActionRecord;
+
+    fn sample_record<'a>(ops: &'a [String]) -> BlockedActionRecord<'a> {
+        BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: Some("alice@acme.com"),
+            vendor: "google",
+            action: "gmail.messages.send",
+            method: "POST",
+            path: "/gmail/v1/users/me/messages/send",
+            layer: "policy",
+            policy_id: Some("gmail-external-send-gate"),
+            detail: Some("external recipient"),
+            predecessor_pca_id: Some(Uuid::nil()),
+            requested_ops: ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        }
+    }
+
+    #[test]
+    fn from_record_carries_schema_and_field_passthrough() {
+        let ops = vec!["gmail:send:bob@external.com".to_string()];
+        let r = sample_record(&ops);
+        let id = Uuid::nil();
+        let n = BlockedNotification::from_record(id, &r, "https://proxy.example");
+        assert_eq!(n.schema, BlockedNotification::SCHEMA);
+        assert_eq!(n.schema, "proxilion.blocked_action.v1");
+        assert_eq!(n.blocked_id, id);
+        assert_eq!(n.vendor, "google");
+        assert_eq!(n.action, "gmail.messages.send");
+        assert_eq!(n.method, "POST");
+        assert_eq!(n.layer, "policy");
+        assert_eq!(n.policy_id, Some("gmail-external-send-gate"));
+        assert_eq!(n.detail, Some("external recipient"));
+        assert_eq!(n.requested_ops.len(), 1);
+    }
+
+    #[test]
+    fn from_record_constructs_approve_and_reject_urls() {
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let n = BlockedNotification::from_record(id, &r, "https://proxy.example");
+        assert_eq!(
+            n.approve_url,
+            "https://proxy.example/api/v1/blocked/01234567-89ab-cdef-0123-456789abcdef/approve"
+        );
+        assert_eq!(
+            n.reject_url,
+            "https://proxy.example/api/v1/blocked/01234567-89ab-cdef-0123-456789abcdef/reject"
+        );
+    }
+
+    #[test]
+    fn serializes_to_json_with_schema_field() {
+        let ops = vec!["x".to_string()];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        let j = serde_json::to_value(&n).unwrap();
+        assert_eq!(j["schema"], "proxilion.blocked_action.v1");
+        assert_eq!(j["vendor"], "google");
+        assert_eq!(j["action"], "gmail.messages.send");
+    }
+}

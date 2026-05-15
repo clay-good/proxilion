@@ -1143,3 +1143,82 @@ fn ensure_dev_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
     kf.write_all(cert.key_pair.serialize_pem().as_bytes())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decode_32_round_trips_all_zero_and_all_ff() {
+        let z = hex_decode_32(&"0".repeat(64)).unwrap();
+        assert_eq!(z, [0u8; 32]);
+        let f = hex_decode_32(&"f".repeat(64)).unwrap();
+        assert_eq!(f, [0xffu8; 32]);
+    }
+
+    #[test]
+    fn hex_decode_32_handles_mixed_case() {
+        let hex: String = (0..32).map(|i| format!("{:02X}", i as u8)).collect();
+        let out = hex_decode_32(&hex).unwrap();
+        for (i, b) in out.iter().enumerate() {
+            assert_eq!(*b, i as u8);
+        }
+    }
+
+    #[test]
+    fn hex_decode_32_rejects_wrong_length() {
+        assert!(hex_decode_32("").is_err());
+        assert!(hex_decode_32(&"0".repeat(63)).is_err());
+        assert!(hex_decode_32(&"0".repeat(65)).is_err());
+        assert!(hex_decode_32(&"0".repeat(128)).is_err());
+    }
+
+    #[test]
+    fn hex_decode_32_rejects_non_hex_chars() {
+        // 64 chars, valid length, but one pair is non-hex.
+        let mut s = "0".repeat(62);
+        s.push_str("ZZ");
+        assert!(hex_decode_32(&s).is_err());
+    }
+
+    fn unique_tmp_subdir(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "proxilion-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn ensure_dev_cert_no_op_when_both_files_exist() {
+        let dir = unique_tmp_subdir("noop");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, "pre-existing").unwrap();
+        std::fs::write(&key, "pre-existing").unwrap();
+        ensure_dev_cert(&cert, &key).unwrap();
+        // Pre-existing files must be left untouched.
+        assert_eq!(std::fs::read_to_string(&cert).unwrap(), "pre-existing");
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "pre-existing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_dev_cert_generates_cert_and_key_when_missing() {
+        let dir = unique_tmp_subdir("gen");
+        let cert = dir.join("nested/cert.pem");
+        let key = dir.join("nested/key.pem");
+        ensure_dev_cert(&cert, &key).unwrap();
+        assert!(cert.exists());
+        assert!(key.exists());
+        let cert_pem = std::fs::read_to_string(&cert).unwrap();
+        let key_pem = std::fs::read_to_string(&key).unwrap();
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(key_pem.contains("BEGIN PRIVATE KEY") || key_pem.contains("BEGIN EC PRIVATE KEY"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

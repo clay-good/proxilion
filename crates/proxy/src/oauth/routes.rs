@@ -626,3 +626,118 @@ async fn token(
     };
     Ok((StatusCode::OK, Json(body)).into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pct_encodes_reserved_chars_and_preserves_unreserved() {
+        assert_eq!(pct("abc"), "abc");
+        // NON_ALPHANUMERIC encodes ALL non-alphanumeric chars (no exceptions
+        // for `-`, `_`, `.`, `~`), so even unreserved-per-RFC chars get %xx.
+        let s = pct("foo bar");
+        assert_eq!(s, "foo%20bar");
+        let s = pct("a/b?c=d&e");
+        assert!(s.contains("%2F"));
+        assert!(s.contains("%3F"));
+        assert!(s.contains("%3D"));
+        assert!(s.contains("%26"));
+    }
+
+    #[test]
+    fn oauth_error_class_classifies_denied_vs_error() {
+        assert_eq!(
+            oauth_error_class(&OAuthError::BadRequest("x".into())),
+            "denied"
+        );
+        assert_eq!(oauth_error_class(&OAuthError::UnknownClient), "denied");
+        assert_eq!(oauth_error_class(&OAuthError::SessionGone), "denied");
+        assert_eq!(
+            oauth_error_class(&OAuthError::BridgeRejected("x".into())),
+            "denied"
+        );
+        assert_eq!(oauth_error_class(&OAuthError::PkceFail), "denied");
+        assert_eq!(oauth_error_class(&OAuthError::BadAuthCode), "denied");
+        assert_eq!(
+            oauth_error_class(&OAuthError::PicInvariant("x".into())),
+            "denied"
+        );
+        assert_eq!(oauth_error_class(&OAuthError::Crypto), "error");
+        assert_eq!(
+            oauth_error_class(&OAuthError::Internal("x".into())),
+            "error"
+        );
+    }
+
+    #[test]
+    fn intersect_scope_keeps_only_scopes_with_matching_ops_prefix() {
+        let pca0_ops = vec![
+            "drive:read:file/abc".to_string(),
+            "gmail:send:alice@example.com".to_string(),
+        ];
+        let scope = "https://www.googleapis.com/auth/drive.readonly \
+                     https://www.googleapis.com/auth/gmail.send \
+                     https://www.googleapis.com/auth/calendar.readonly \
+                     openid email";
+        let out = intersect_scope_with_ops(scope, &pca0_ops);
+        // drive.readonly + gmail.send have matching prefixes; calendar
+        // does not; openid/email are always-keep.
+        assert!(out.contains("drive.readonly"));
+        assert!(out.contains("gmail.send"));
+        assert!(!out.contains("calendar"));
+        assert!(out.contains("openid"));
+        assert!(out.contains("email"));
+    }
+
+    #[test]
+    fn intersect_scope_filters_unknown_scopes() {
+        let out = intersect_scope_with_ops(
+            "https://www.googleapis.com/auth/unknown openid",
+            &["drive:read:x".into()],
+        );
+        assert!(!out.contains("unknown"));
+        assert!(out.contains("openid"));
+    }
+
+    #[test]
+    fn narrowed_ops_for_pca1_keeps_only_prefixed_ops() {
+        let pca0_ops = vec![
+            "drive:read:file/abc".to_string(),
+            "drive:write:file/abc".to_string(),
+            "gmail:send:x@example.com".to_string(),
+            "calendar:read:cal/x".to_string(),
+        ];
+        let granted = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/gmail.send";
+        let out = narrowed_ops_for_pca1(&pca0_ops, granted);
+        // `drive.readonly` maps to prefix `drive:` so both drive ops survive;
+        // gmail.send maps to `gmail:send:` so just the send op survives;
+        // calendar is excluded entirely.
+        assert!(out.iter().any(|o| o == "drive:read:file/abc"));
+        assert!(out.iter().any(|o| o == "drive:write:file/abc"));
+        assert!(out.iter().any(|o| o == "gmail:send:x@example.com"));
+        assert!(!out.iter().any(|o| o.starts_with("calendar:")));
+    }
+
+    #[test]
+    fn narrowed_ops_for_pca1_empty_when_no_scope_matches() {
+        let out = narrowed_ops_for_pca1(
+            &["drive:read:file/abc".to_string()],
+            "https://www.googleapis.com/auth/unknown",
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn new_auth_code_is_base32_no_padding_52_chars() {
+        // 32 random bytes → base32 without padding = ceil(32*8/5) = 52 chars.
+        let c1 = new_auth_code();
+        let c2 = new_auth_code();
+        assert_eq!(c1.len(), 52);
+        assert!(
+            c1.chars()
+                .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c))
+        );
+        assert_ne!(c1, c2);
+    }
+}

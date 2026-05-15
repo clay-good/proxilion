@@ -202,3 +202,103 @@ impl Clone for Scenario {
         *self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_scenario() -> Scenario {
+        Scenario {
+            vendor: "google",
+            action: "gmail.messages.send",
+            method: "POST",
+            path_template: "/gmail/v1/users/me/messages/send",
+            decision: "block",
+            status: 403,
+            policy: "gmail-external-send-gate",
+            read_filter_triggered: false,
+            quarantined_count: 0,
+            block_reason: Some("to_domain not in customer_domain"),
+        }
+    }
+
+    fn drive_scenario() -> Scenario {
+        Scenario {
+            vendor: "google",
+            action: "drive.files.get",
+            method: "GET",
+            path_template: "/drive/v3/files/demo-file-",
+            decision: "allow",
+            status: 200,
+            policy: "drive-injection-filter",
+            read_filter_triggered: true,
+            quarantined_count: 1,
+            block_reason: None,
+        }
+    }
+
+    #[test]
+    fn synth_event_passthrough_scenario_fields() {
+        let now = Utc::now();
+        let s = block_scenario();
+        let ev = synth_event(&s, now);
+        assert_eq!(ev.vendor, "google");
+        assert_eq!(ev.action, "gmail.messages.send");
+        assert_eq!(ev.method, "POST");
+        assert_eq!(ev.status, 403);
+        assert_eq!(ev.decision, "block");
+        assert_eq!(ev.policy_id.as_deref(), Some("gmail-external-send-gate"));
+        assert_eq!(
+            ev.block_reason.as_deref(),
+            Some("to_domain not in customer_domain")
+        );
+        assert_eq!(ev.at, now);
+        assert_eq!(ev.extra["demo"], true);
+    }
+
+    #[test]
+    fn synth_event_p0_picks_a_known_demo_user() {
+        let s = drive_scenario();
+        let ev = synth_event(&s, Utc::now());
+        assert!(ev.p_0.starts_with("user:"));
+        assert!(USERS.contains(&ev.p_0.as_str()));
+    }
+
+    #[test]
+    fn synth_event_path_template_ending_in_s_is_used_verbatim() {
+        // `/drive/v3/files` ends in `s` — the path is not suffix-mutated.
+        let mut s = drive_scenario();
+        s.path_template = "/drive/v3/files";
+        let ev = synth_event(&s, Utc::now());
+        assert_eq!(ev.path, "/drive/v3/files");
+    }
+
+    #[test]
+    fn synth_event_path_template_not_ending_in_s_or_slash_gets_6_char_suffix() {
+        let s = drive_scenario(); // `/drive/v3/files/demo-file-`
+        let ev = synth_event(&s, Utc::now());
+        assert!(ev.path.starts_with("/drive/v3/files/demo-file-"));
+        let suffix = &ev.path["/drive/v3/files/demo-file-".len()..];
+        assert_eq!(suffix.len(), 6);
+        assert!(suffix.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn synth_event_request_and_session_ids_are_distinct_uuids() {
+        let s = drive_scenario();
+        let ev = synth_event(&s, Utc::now());
+        assert_ne!(ev.request_id, ev.agent_session_id);
+        assert!(ev.leaf_pca_id.is_some());
+    }
+
+    #[test]
+    fn scenario_set_includes_block_allow_and_require_confirmation_decisions() {
+        // SCENARIOS is the canonical demo set. Pin the decision variety so a
+        // refactor that drops an interesting class is caught.
+        let decisions: std::collections::HashSet<&str> =
+            SCENARIOS.iter().map(|s| s.decision).collect();
+        assert!(decisions.contains("allow"));
+        assert!(decisions.contains("block"));
+        assert!(decisions.contains("require_confirmation"));
+    }
+}

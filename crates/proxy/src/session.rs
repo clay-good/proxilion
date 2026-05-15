@@ -81,3 +81,67 @@ impl IntoResponse for SessionExtractError {
         (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_ctx() -> SessionContext {
+        SessionContext {
+            agent_session_id: Uuid::nil(),
+            bearer_hash: [0u8; 32],
+            p_0: "alice@acme.com".into(),
+            leaf_pca_id: Uuid::nil(),
+            leaf_pca_cbor: vec![1, 2, 3],
+            granted_ops: vec!["drive:read:file/x".into()],
+            google_access_token: "ya29.SUPER_SECRET_TOKEN_VALUE".into(),
+            google_token_scope: "https://www.googleapis.com/auth/drive.readonly".into(),
+        }
+    }
+
+    #[test]
+    fn debug_redacts_google_access_token() {
+        let ctx = sample_ctx();
+        let s = format!("{ctx:?}");
+        assert!(!s.contains("SUPER_SECRET_TOKEN_VALUE"));
+        assert!(s.contains("[redacted]"));
+        // Non-sensitive fields stay visible.
+        assert!(s.contains("alice@acme.com"));
+        assert!(s.contains("drive.readonly"));
+    }
+
+    #[tokio::test]
+    async fn session_extract_error_into_response_is_401() {
+        let r = SessionExtractError.into_response();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+        assert_eq!(&bytes[..], b"unauthorized");
+    }
+
+    #[tokio::test]
+    async fn extractor_returns_err_when_extension_missing() {
+        let req = axum::http::Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, _body) = req.into_parts();
+        let result: Result<SessionCtx, SessionExtractError> =
+            SessionCtx::from_request_parts(&mut parts, &()).await;
+        // SessionExtractError doesn't impl Debug, so match instead of unwrap_err.
+        match result {
+            Err(_) => {}
+            Ok(_) => panic!("expected SessionExtractError"),
+        }
+    }
+
+    #[tokio::test]
+    async fn extractor_returns_ok_when_arc_session_context_present() {
+        let ctx = Arc::new(sample_ctx());
+        let req = axum::http::Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, _body) = req.into_parts();
+        parts.extensions.insert(ctx.clone());
+        let extracted = SessionCtx::from_request_parts(&mut parts, &()).await;
+        let SessionCtx(out) = match extracted {
+            Ok(v) => v,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert!(Arc::ptr_eq(&ctx, &out));
+    }
+}

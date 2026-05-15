@@ -169,6 +169,76 @@ mod tests {
     }
 
     #[test]
+    fn app_error_code_maps_variants_to_canonical_codes() {
+        let pb = AppError::PolicyBlocked {
+            policy_id: Some("p1".into()),
+            reason: "r".into(),
+            override_allowed: true,
+        };
+        assert_eq!(pb.code(), ErrorCode::PolicyBlocked);
+        assert_eq!(
+            AppError::RequireConfirmation("x".into()).code(),
+            ErrorCode::RequireConfirmation
+        );
+        assert_eq!(AppError::RateLimit.code(), ErrorCode::RateLimited);
+        assert_eq!(
+            AppError::PicInvariantViolation("x".into()).code(),
+            ErrorCode::PicInvariantViolation
+        );
+        assert_eq!(
+            AppError::UpstreamTooLarge.code(),
+            ErrorCode::UpstreamTooLarge
+        );
+        assert_eq!(
+            AppError::ReadFilterBlocked.code(),
+            ErrorCode::ReadFilterBlocked
+        );
+        assert_eq!(
+            AppError::Internal("x".into()).code(),
+            ErrorCode::InternalError
+        );
+    }
+
+    #[test]
+    fn app_error_body_carries_policy_id_and_override_allowed_in_extras() {
+        let e = AppError::PolicyBlocked {
+            policy_id: Some("gmail-external-send-gate".into()),
+            reason: "external".into(),
+            override_allowed: true,
+        };
+        let body = e.body();
+        assert_eq!(body.code, "policy_blocked");
+        assert_eq!(body.detail.as_deref(), Some("external"));
+        assert_eq!(body.extras["policy_id"], "gmail-external-send-gate");
+        assert_eq!(body.extras["override_allowed"], true);
+    }
+
+    #[test]
+    fn app_error_status_matches_code_default_status() {
+        // The AppError::status() delegates through ErrorCode::default_status().
+        let s = AppError::PolicyBlocked {
+            policy_id: None,
+            reason: "x".into(),
+            override_allowed: false,
+        }
+        .status();
+        assert_eq!(s.as_u16(), ErrorCode::PolicyBlocked.default_status());
+        assert_eq!(
+            AppError::UpstreamTooLarge.status().as_u16(),
+            ErrorCode::UpstreamTooLarge.default_status()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_error_into_response_uses_code_status() {
+        let r = AppError::ReadFilterBlocked.into_response();
+        assert_eq!(
+            r.status().as_u16(),
+            ErrorCode::ReadFilterBlocked.default_status()
+        );
+    }
+
+    #[test]
     fn upstream_error_kind_invariant_known_buckets() {
         // The function is exhaustive over three labels; pin them as a
         // forward-compatibility guard: if anyone adds a variant, the

@@ -82,3 +82,37 @@ impl CatKeyRegistry {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cat_key_error_display_strings_are_stable() {
+        let s = CatKeyError::Status(503).to_string();
+        assert!(s.contains("503"));
+        assert!(s.contains("Trust Plane"));
+        let d = CatKeyError::Decode("bad b64".into()).to_string();
+        assert!(d.contains("bad b64"));
+        assert!(d.contains("decode"));
+    }
+
+    #[test]
+    fn info_resp_deserializes() {
+        let raw = r#"{"kid":"k1","public_key":"AAA"}"#;
+        let info: InfoResp = serde_json::from_str(raw).unwrap();
+        assert_eq!(info.kid, "k1");
+        assert_eq!(info.public_key, "AAA");
+    }
+
+    #[tokio::test]
+    async fn registry_errors_when_trust_plane_unreachable() {
+        // Black-hole IP (RFC 5737 documentation range); the 5s default
+        // client timeout will eventually fire — we set a shorter one by
+        // talking to an unbound port on localhost which connect-refuses
+        // immediately, no waiting.
+        let reg = CatKeyRegistry::new("http://127.0.0.1:1/".into());
+        let err = reg.get().await.unwrap_err();
+        assert!(matches!(err, CatKeyError::Fetch(_)));
+    }
+}

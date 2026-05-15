@@ -266,3 +266,49 @@ impl IntoResponse for ApiError {
         body.into_response(status)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kill_cache::KillCache;
+
+    #[tokio::test]
+    async fn populate_kill_cache_marks_correctly_sized_rows() {
+        let kc = KillCache::new();
+        let rows = vec![([1u8; 32].to_vec(),), ([2u8; 32].to_vec(),)];
+        populate_kill_cache(&kc, &rows).await;
+        assert!(kc.is_killed(&[1u8; 32]).await);
+        assert!(kc.is_killed(&[2u8; 32]).await);
+        assert!(!kc.is_killed(&[3u8; 32]).await);
+    }
+
+    #[tokio::test]
+    async fn populate_kill_cache_skips_wrong_length_rows() {
+        let kc = KillCache::new();
+        // 31 bytes (too short) + 33 bytes (too long) + 32 bytes (valid).
+        let rows = vec![(vec![9u8; 31],), (vec![8u8; 33],), ([7u8; 32].to_vec(),)];
+        populate_kill_cache(&kc, &rows).await;
+        assert!(kc.is_killed(&[7u8; 32]).await);
+        // The short/long rows can't be queried as [u8; 32]; their absence is
+        // demonstrated by a different 32-byte probe returning false.
+        assert!(!kc.is_killed(&[9u8; 32]).await);
+        assert!(!kc.is_killed(&[8u8; 32]).await);
+    }
+
+    #[tokio::test]
+    async fn populate_kill_cache_empty_input_is_no_op() {
+        let kc = KillCache::new();
+        populate_kill_cache(&kc, &[]).await;
+        assert!(!kc.is_killed(&[0u8; 32]).await);
+    }
+
+    #[tokio::test]
+    async fn api_error_bad_request_is_400_with_detail() {
+        let r = ApiError::BadRequest("missing field".into()).into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "bad_request");
+        assert_eq!(v["detail"], "missing field");
+    }
+}

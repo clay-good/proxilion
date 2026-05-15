@@ -182,3 +182,144 @@ pub enum QuarantineActionCfg {
 pub fn parse_policies(yaml: &str) -> Result<Vec<PolicyDoc>, serde_yaml::Error> {
     serde_yaml::from_str(yaml)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_safe_production_posture() {
+        // ui-less-surfaces.md §2.1 — `enforce` is the default mode so an
+        // operator who forgets the field doesn't silently demote.
+        assert_eq!(default_mode(), Mode::Enforce);
+        // PIC audit-only by default; runtime-gate is opt-in.
+        assert_eq!(default_pic_mode(), PicMode::Audit);
+        // Read-filter default replaces matched bytes with a marker, keeping
+        // the response visible to the agent rather than blocking the call.
+        assert!(matches!(
+            default_quarantine_action(),
+            QuarantineActionCfg::ReplaceWithMarker
+        ));
+    }
+
+    #[test]
+    fn parse_policies_minimal_doc_applies_field_defaults() {
+        let yaml = "\
+- id: p1
+  vendor: google
+  action: drive.files.get
+";
+        let docs = parse_policies(yaml).unwrap();
+        assert_eq!(docs.len(), 1);
+        let d = &docs[0];
+        assert_eq!(d.id, "p1");
+        assert_eq!(d.mode, Mode::Enforce);
+        assert_eq!(d.pic_mode, PicMode::Audit);
+        assert!(d.required_ops.is_empty());
+        assert!(d.read_filter.is_none());
+        assert!(d.notifier_burst.is_none());
+        assert!(d.audit_body.is_none());
+    }
+
+    #[test]
+    fn parse_policies_round_trips_observe_mode_and_runtime_gate() {
+        let yaml = "\
+- id: p1
+  vendor: google
+  action: drive.files.get
+  mode: observe
+  pic_mode: runtime-gate
+";
+        let docs = parse_policies(yaml).unwrap();
+        assert_eq!(docs[0].mode, Mode::Observe);
+        assert_eq!(docs[0].pic_mode, PicMode::RuntimeGate);
+    }
+
+    #[test]
+    fn parse_policies_audit_body_modes() {
+        for (yaml_val, expect) in [
+            ("hash", AuditBodyMode::Hash),
+            ("redact_pii", AuditBodyMode::RedactPii),
+            ("full", AuditBodyMode::Full),
+        ] {
+            let y = format!("- id: p\n  vendor: v\n  action: a\n  audit_body: {yaml_val}\n");
+            let d = &parse_policies(&y).unwrap()[0];
+            assert_eq!(d.audit_body, Some(expect));
+        }
+    }
+
+    #[test]
+    fn parse_policies_rejects_unknown_mode_value() {
+        let yaml = "\
+- id: p1
+  vendor: g
+  action: a
+  mode: paranoid
+";
+        // `Mode` is a closed enum (serde rejects unknown variants by default).
+        assert!(parse_policies(yaml).is_err());
+    }
+
+    #[test]
+    fn recipients_cfg_accepts_string_or_vec() {
+        let yaml = "\
+- id: p1
+  vendor: g
+  action: a
+  notifier_recipients:
+    to: alice@example.com
+    cc:
+      - bob@example.com
+      - carol@example.com
+";
+        let d = &parse_policies(yaml).unwrap()[0];
+        let r = d.notifier_recipients.as_ref().unwrap();
+        assert_eq!(
+            r.to.as_deref(),
+            Some(&["alice@example.com".to_string()][..])
+        );
+        assert_eq!(
+            r.cc.as_deref(),
+            Some(
+                &[
+                    "bob@example.com".to_string(),
+                    "carol@example.com".to_string()
+                ][..]
+            )
+        );
+        assert!(r.bcc.is_none());
+    }
+
+    #[test]
+    fn quarantine_patterns_accept_literal_or_regex() {
+        let yaml = "\
+- id: p1
+  vendor: g
+  action: a
+  read_filter:
+    quarantine_patterns:
+      - ignore previous
+      - regex: '<\\|.*?\\|>'
+";
+        let d = &parse_policies(yaml).unwrap()[0];
+        let pats = &d.read_filter.as_ref().unwrap().quarantine_patterns;
+        assert_eq!(pats.len(), 2);
+        assert!(matches!(pats[0], QuarantinePatternCfg::Literal(_)));
+        assert!(matches!(pats[1], QuarantinePatternCfg::Regex { .. }));
+    }
+
+    #[test]
+    fn burst_cfg_fields_are_each_optional() {
+        // Threshold alone, window alone, both, neither — all valid shapes.
+        for body in [
+            "notifier_burst:\n    threshold: 10",
+            "notifier_burst:\n    window_seconds: 30",
+            "notifier_burst:\n    threshold: 10\n    window_seconds: 30",
+            "",
+        ] {
+            let y = format!("- id: p\n  vendor: g\n  action: a\n  {body}\n");
+            let docs = parse_policies(&y).unwrap();
+            assert_eq!(docs.len(), 1, "yaml: {y}");
+        }
+    }
+}

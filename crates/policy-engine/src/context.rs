@@ -75,3 +75,108 @@ impl RequestContext {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_ctx() -> RequestContext {
+        let mut path = HashMap::new();
+        path.insert("id".into(), "fileA".into());
+        let mut headers = HashMap::new();
+        headers.insert("x-trace-id".into(), "abc123".into());
+        let mut body = HashMap::new();
+        body.insert("subject".into(), json!("hi"));
+        body.insert("to_domains".into(), json!(["example.com", "other.com"]));
+        body.insert("external_recipient".into(), json!(true));
+        body.insert("score".into(), json!(5));
+        body.insert("mixed".into(), json!([1, "two"]));
+        RequestContext {
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            customer_domain: "acme.com".into(),
+            user: UserCtx {
+                email: "alice@acme.com".into(),
+                groups: vec!["eng".into(), "sec".into()],
+            },
+            path,
+            headers,
+            body,
+        }
+    }
+
+    #[test]
+    fn lookup_customer_domain_bare_identifier() {
+        let c = sample_ctx();
+        assert_eq!(c.lookup("customer_domain"), Some("acme.com".into()));
+    }
+
+    #[test]
+    fn lookup_path_and_user_fields() {
+        let c = sample_ctx();
+        assert_eq!(c.lookup("path.id"), Some("fileA".into()));
+        assert_eq!(c.lookup("user.email"), Some("alice@acme.com".into()));
+        // `user.groups` is not exposed via the scalar lookup path.
+        assert_eq!(c.lookup("user.groups"), None);
+    }
+
+    #[test]
+    fn lookup_headers_returns_string() {
+        let c = sample_ctx();
+        assert_eq!(c.lookup("headers.x-trace-id"), Some("abc123".into()));
+        assert_eq!(c.lookup("headers.missing"), None);
+    }
+
+    #[test]
+    fn lookup_body_string_field_is_unquoted() {
+        let c = sample_ctx();
+        // A `Value::String` returns its inner str, not the JSON-quoted form.
+        assert_eq!(c.lookup("body.subject"), Some("hi".into()));
+    }
+
+    #[test]
+    fn lookup_body_non_string_falls_back_to_json_repr() {
+        let c = sample_ctx();
+        assert_eq!(c.lookup("body.score"), Some("5".into()));
+        assert_eq!(c.lookup("body.external_recipient"), Some("true".into()));
+    }
+
+    #[test]
+    fn lookup_unknown_head_returns_none() {
+        let c = sample_ctx();
+        assert!(c.lookup("garbage.field").is_none());
+        // A dotted path with no head separator is also None.
+        assert!(c.lookup("no_dot").is_none());
+    }
+
+    #[test]
+    fn lookup_list_string_array_returns_vec() {
+        let c = sample_ctx();
+        assert_eq!(
+            c.lookup_list("body.to_domains"),
+            Some(vec!["example.com".into(), "other.com".into()])
+        );
+    }
+
+    #[test]
+    fn lookup_list_non_array_returns_none() {
+        let c = sample_ctx();
+        // body.score is a number → None (caller falls back to scalar lookup).
+        assert!(c.lookup_list("body.score").is_none());
+    }
+
+    #[test]
+    fn lookup_list_array_with_non_string_element_returns_none() {
+        let c = sample_ctx();
+        assert!(c.lookup_list("body.mixed").is_none());
+    }
+
+    #[test]
+    fn lookup_list_path_and_headers_always_none() {
+        let c = sample_ctx();
+        // The flat string maps are never list-valued.
+        assert!(c.lookup_list("path.id").is_none());
+        assert!(c.lookup_list("headers.x-trace-id").is_none());
+    }
+}

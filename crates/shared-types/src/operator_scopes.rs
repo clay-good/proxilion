@@ -104,4 +104,57 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn scope_strings_returns_one_per_catalogue_entry() {
+        let strs = scope_strings();
+        assert_eq!(strs.len(), SCOPE_CATALOGUE.len());
+        // The helper preserves catalogue order — operators rendering the
+        // listing should see `*` (admin wildcard) first.
+        assert_eq!(strs.first().copied(), Some("*"));
+    }
+
+    /// Pin the operator-facing scopes the CLI documents. Adding a new
+    /// scope is a wire-contract change — bump this list together with the
+    /// docs that reference the scope.
+    #[test]
+    fn known_scope_set_is_present() {
+        let strs: HashSet<&str> = scope_strings().into_iter().collect();
+        for required in [
+            "*",
+            "policy:read",
+            "policy:write",
+            "blocks:read",
+            "blocks:approve",
+            "killswitch:revoke",
+            "actions:read",
+            "actions:export",
+            "actions:purge",
+            "pca:read",
+            "notifier:read",
+            "notifier:write",
+        ] {
+            assert!(strs.contains(required), "missing scope `{required}`");
+        }
+    }
+
+    #[test]
+    fn every_scope_string_uses_kebab_or_colon_format() {
+        // Cosmetic but worth pinning: every operator scope must be
+        // either `*` or `<group>:<verb>` so the CLI listing reads
+        // consistently. A space or comma would break shell parsing.
+        for (s, _, _) in SCOPE_CATALOGUE {
+            if *s == "*" {
+                continue;
+            }
+            assert!(
+                s.contains(':'),
+                "scope `{s}` doesn't follow group:verb shape"
+            );
+            assert!(
+                !s.contains(' ') && !s.contains(','),
+                "scope `{s}` contains a shell-unsafe char"
+            );
+        }
+    }
 }

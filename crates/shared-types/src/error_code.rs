@@ -125,4 +125,56 @@ mod tests {
         let parsed: ErrorCode = serde_json::from_str("\"policy_blocked\"").unwrap();
         assert_eq!(parsed, ErrorCode::PolicyBlocked);
     }
+
+    /// Snapshot test: locks the stable `(variant → HTTP status)` mapping.
+    /// Recommended statuses are part of the operator contract — a Grafana
+    /// alert keyed on `status="403"` for `code="policy_blocked"` should not
+    /// silently flip class. Add a new variant for new status semantics.
+    #[test]
+    fn default_status_snapshot() {
+        let snapshot: &[(ErrorCode, u16)] = &[
+            (ErrorCode::PicInvariantViolation, 403),
+            (ErrorCode::PolicyBlocked, 403),
+            (ErrorCode::ReadFilterBlocked, 403),
+            (ErrorCode::RequireConfirmation, 428),
+            (ErrorCode::RateLimited, 429),
+            (ErrorCode::UpstreamUnavailable, 502),
+            (ErrorCode::UpstreamTooLarge, 502),
+            (ErrorCode::PolicyEngineError, 500),
+            (ErrorCode::DatabaseError, 500),
+            (ErrorCode::InternalError, 500),
+        ];
+        for (code, expected) in snapshot {
+            assert_eq!(code.default_status(), *expected, "status for {code:?}");
+        }
+    }
+
+    #[test]
+    fn display_uses_wire_string() {
+        assert_eq!(format!("{}", ErrorCode::PolicyBlocked), "policy_blocked");
+        assert_eq!(format!("{}", ErrorCode::RateLimited), "rate_limited");
+        assert_eq!(format!("{}", ErrorCode::InternalError), "internal_error");
+    }
+
+    #[test]
+    fn copy_and_hash_traits_work_at_use_sites() {
+        // The enum derives Copy + Hash; pin both so a future #[derive]
+        // diff doesn't silently drop a trait the wider crate relies on
+        // (HashMap<ErrorCode, _> is a real use pattern).
+        let c = ErrorCode::PolicyBlocked;
+        let _copied = c; // Copy
+        let _again = c;
+        let mut m = std::collections::HashMap::new();
+        m.insert(ErrorCode::PolicyBlocked, "blocked");
+        m.insert(ErrorCode::RateLimited, "limited");
+        assert_eq!(m.get(&ErrorCode::PolicyBlocked), Some(&"blocked"));
+    }
+
+    #[test]
+    fn unknown_wire_string_fails_deserialize() {
+        // `#[non_exhaustive]` is a Rust-side affordance; the wire enum is
+        // still closed at deserialize time (serde rejects unknown variants).
+        let r: Result<ErrorCode, _> = serde_json::from_str("\"banhammer\"");
+        assert!(r.is_err());
+    }
 }

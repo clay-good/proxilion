@@ -244,6 +244,84 @@ mod tests {
         assert_eq!(c.as_deref(), Some(v1.as_str()));
     }
 
+    #[test]
+    fn policy_load_error_display_renders_each_variant() {
+        // Operator-facing strings — log filters and Grafana alerts key on
+        // the `io error:` / `source not found:` / `backend error:` prefixes,
+        // so a future variant rename must be a conscious wire-shape change.
+        assert_eq!(
+            PolicyLoadError::Io("perm denied".into()).to_string(),
+            "io error: perm denied",
+        );
+        assert_eq!(
+            PolicyLoadError::NotFound("/etc/proxilion/policy.yaml".into()).to_string(),
+            "source not found: /etc/proxilion/policy.yaml",
+        );
+        assert_eq!(
+            PolicyLoadError::Backend("pg connection refused".into()).to_string(),
+            "backend error: pg connection refused",
+        );
+    }
+
+    #[test]
+    fn policy_bundle_equality_ignores_neither_yaml_nor_version() {
+        let a = PolicyBundle {
+            yaml: "[]".into(),
+            version: "v1".into(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let c = PolicyBundle {
+            yaml: "[]".into(),
+            version: "v2".into(),
+        };
+        assert_ne!(a, c, "version diff alone breaks equality");
+        let d = PolicyBundle {
+            yaml: "- id: x".into(),
+            version: "v1".into(),
+        };
+        assert_ne!(a, d, "yaml diff alone breaks equality");
+    }
+
+    #[test]
+    fn file_loader_path_and_source_label_round_trip() {
+        let l = FilePolicyLoader::new("/tmp/proxilion-doesnt-matter.yaml");
+        assert_eq!(
+            l.path().to_string_lossy(),
+            "/tmp/proxilion-doesnt-matter.yaml"
+        );
+        assert_eq!(l.source_label(), "/tmp/proxilion-doesnt-matter.yaml");
+    }
+
+    #[tokio::test]
+    async fn file_loader_version_token_sync_matches_async_load() {
+        let tmp = tempfile_for_test();
+        std::fs::write(&tmp.path, "[]\n").unwrap();
+        let l = FilePolicyLoader::new(&tmp.path);
+        let sync_token = l.version_token_sync().expect("sync token");
+        assert!(sync_token.starts_with("mtime:"));
+        let async_token = l.load().await.unwrap().version;
+        assert_eq!(sync_token, async_token);
+    }
+
+    #[test]
+    fn file_loader_version_token_sync_reports_not_found() {
+        let l = FilePolicyLoader::new("/definitely/not/here/proxilion.yaml");
+        let e = l.version_token_sync().unwrap_err();
+        assert!(
+            matches!(e, PolicyLoadError::NotFound(_)),
+            "expected NotFound, got {e:?}",
+        );
+    }
+
+    #[test]
+    fn static_loader_with_label_overrides_default_source_label() {
+        let l = StaticPolicyLoader::new("[]");
+        assert_eq!(l.source_label(), "static");
+        let l = StaticPolicyLoader::new("[]").with_label("inline-test");
+        assert_eq!(l.source_label(), "inline-test");
+    }
+
     struct Tmp {
         path: PathBuf,
         file: std::fs::File,

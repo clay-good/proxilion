@@ -58,21 +58,31 @@ jobs:
       - name: run coverage
         # Skip the perf-test that's #[cfg_attr(debug_assertions, ignore)] —
         # llvm-cov runs against the test profile (debug), so the perf test
-        # would no-op anyway.
+        # would no-op anyway. Emit both lcov (for downstream uploaders)
+        # and JSON (for the per-crate gate below).
         run: |
           cargo llvm-cov --workspace --lcov --output-path lcov.info \
             --ignore-filename-regex '(^|/)tests/' \
             --no-fail-fast
+          cargo llvm-cov report --json --output-path coverage.json \
+            --ignore-filename-regex '(^|/)tests/'
           # Render the summary so PR reviewers see numbers in the log.
           cargo llvm-cov report --summary-only
 
-      - name: enforce coverage floor
-        # 45% lines / 55% functions. Bump via this file only — the
-        # threshold isn't read from anywhere else.
+      - name: enforce workspace coverage floor
+        # 45% lines / 55% functions. The workspace floor is the wider
+        # safety net; the per-crate gate below catches narrower drops
+        # (e.g. shared-types or policy-engine regressing alone).
         run: |
           cargo llvm-cov report \
             --fail-under-lines 45 \
             --fail-under-functions 55
+
+      - name: enforce per-crate coverage floors
+        # Locks the well-covered crates (shared-types, policy-engine) so
+        # they can't slip while the workspace average masks the loss.
+        # Floor values live in the script — bump alongside test backfill.
+        run: ./scripts/coverage-per-crate.sh coverage.json
 
       - name: upload lcov artifact
         if: always()

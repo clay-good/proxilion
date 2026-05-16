@@ -248,4 +248,87 @@ mod tests {
             assert!(matches!(label, "timeout" | "network" | "other"));
         }
     }
+
+    #[test]
+    fn app_error_body_require_confirmation_carries_reason_and_fix() {
+        // `RequireConfirmation(detail)` surfaces the detail to the agent
+        // (so it can prompt the human with context) AND a fix hint that
+        // names the `X-Proxilion-Confirmation:` resubmission header. Pin
+        // both — a regression that dropped the header name from the fix
+        // would leave the agent guessing how to resume.
+        let body = AppError::RequireConfirmation("user must accept terms".into()).body();
+        assert_eq!(body.code, "require_confirmation");
+        assert_eq!(body.detail.as_deref(), Some("user must accept terms"));
+        let fix = body.fix.expect("fix present");
+        assert!(fix.contains("X-Proxilion-Confirmation"));
+    }
+
+    #[test]
+    fn app_error_body_rate_limit_has_no_detail_but_carries_fix() {
+        // RateLimit is intentionally low-info (the rate-limit policy text
+        // would leak server state into a hot retry loop). Pin no-detail
+        // but yes-fix so a regression that started leaking detail would
+        // surface here.
+        let body = AppError::RateLimit.body();
+        assert_eq!(body.code, "rate_limited");
+        assert!(body.detail.is_none());
+        let fix = body.fix.expect("fix present");
+        assert!(fix.contains("back off") || fix.contains("Back off"));
+    }
+
+    #[test]
+    fn app_error_body_pic_invariant_violation_surfaces_detail_to_dashboard() {
+        // The PIC invariant detail is what the dashboard's
+        // "operation exceeds session authority" panel renders verbatim —
+        // operators read the missing-ops list directly off this string.
+        let body =
+            AppError::PicInvariantViolation("ops not subset: missing [drive:write:secret]".into())
+                .body();
+        assert_eq!(body.code, "pic_invariant_violation");
+        assert_eq!(
+            body.detail.as_deref(),
+            Some("ops not subset: missing [drive:write:secret]"),
+        );
+        assert!(body.docs.unwrap().contains("/policy/ops"));
+    }
+
+    #[test]
+    fn app_error_body_upstream_too_large_carries_size_hint() {
+        // The fix text names the 10MB cap and the `fields=` mitigation —
+        // both substrings the docs page keys on. A regression that dropped
+        // one of the two would leave operators chasing the cap by hand.
+        let body = AppError::UpstreamTooLarge.body();
+        let fix = body.fix.expect("fix present");
+        assert!(fix.contains("10MB") || fix.contains("10 MB"));
+        assert!(fix.contains("fields=") || fix.contains("fields"));
+    }
+
+    #[test]
+    fn app_error_body_db_and_internal_collapse_to_internal_error_envelope() {
+        // Both Db and Internal map to the same operator-visible body — the
+        // proxy intentionally does NOT leak DB error text to the agent
+        // (it can include schema names / row counts). Pin code + docs link
+        // for both, plus that no `detail` is set.
+        let body = AppError::Internal("integer overflow at adapter".into()).body();
+        assert_eq!(body.code, "internal_error");
+        assert!(body.detail.is_none(), "must not leak internal reason");
+        assert!(body.docs.unwrap().contains("troubleshooting"));
+
+        // Db variant requires a real sqlx::Error to construct; use RowNotFound.
+        let body = AppError::Db(sqlx::Error::RowNotFound).body();
+        assert_eq!(body.code, "internal_error");
+        assert!(body.detail.is_none(), "must not leak DB error string");
+    }
+
+    #[test]
+    fn app_error_body_read_filter_blocked_has_no_detail_but_dashboard_hint() {
+        // ReadFilterBlocked is intentionally generic to the agent — the
+        // matched pattern lives in `/admin/` (Live feed → row). Pin
+        // detail-absence + the docs/fix substrings the operator UI links.
+        let body = AppError::ReadFilterBlocked.body();
+        assert_eq!(body.code, "read_filter_blocked");
+        assert!(body.detail.is_none());
+        let fix = body.fix.expect("fix present");
+        assert!(fix.contains("Live feed") || fix.contains("/admin"));
+    }
 }

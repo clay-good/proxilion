@@ -299,6 +299,64 @@ mod tests {
     }
 
     #[test]
+    fn truncate_helper_keeps_short_unchanged_and_ellipsizes_long() {
+        assert_eq!(truncate("short", 10), "short");
+        // Boundary: exactly the limit is unchanged (no ellipsis).
+        assert_eq!(truncate("abcde", 5), "abcde");
+        let long: String = "a".repeat(20);
+        let out = truncate(&long, 5);
+        assert_eq!(out.chars().count(), 6); // 5 + ellipsis char
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_uses_char_count_not_byte_len() {
+        // 6 multi-byte chars, well under the 10-char limit but > 10 bytes.
+        let s = "αβγδεζ";
+        assert!(s.len() > 10, "precondition: byte len > char limit");
+        assert_eq!(truncate(s, 10), s);
+        assert_eq!(truncate(s, 3), "αβγ…");
+    }
+
+    #[test]
+    fn should_scan_decides_by_content_type() {
+        assert!(should_scan(None), "no content-type defaults to scan");
+        assert!(should_scan(Some("application/json")));
+        assert!(should_scan(Some("application/json; charset=utf-8")));
+        assert!(should_scan(Some("APPLICATION/JSON"))); // case-insensitive
+        assert!(should_scan(Some("application/xml")));
+        assert!(should_scan(Some("text/html")));
+        assert!(should_scan(Some("text/plain; charset=ascii")));
+        assert!(!should_scan(Some("application/octet-stream")));
+        assert!(!should_scan(Some("image/png")));
+        assert!(!should_scan(Some("application/pdf")));
+    }
+
+    #[test]
+    fn merge_overlapping_collapses_touching_and_overlapping_ranges() {
+        // Disjoint stays separate.
+        assert_eq!(merge_overlapping(&[(0, 3), (5, 8)]), vec![(0, 3), (5, 8)]);
+        // Overlapping merges to max end.
+        assert_eq!(merge_overlapping(&[(0, 5), (3, 8)]), vec![(0, 8)]);
+        // Touching (end == next start) is treated as overlapping per `last.1 >= s`.
+        assert_eq!(merge_overlapping(&[(0, 5), (5, 10)]), vec![(0, 10)]);
+        // Nested inner range absorbed.
+        assert_eq!(merge_overlapping(&[(0, 10), (3, 5)]), vec![(0, 10)]);
+        // Empty input.
+        assert_eq!(merge_overlapping(&[]), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn splice_replaces_ranges_and_preserves_surroundings() {
+        assert_eq!(splice("hello world", &[(6, 11)], "X"), "hello X");
+        assert_eq!(splice("abcdef", &[(0, 2), (4, 6)], "_"), "_cd_");
+        // No ranges -> identity.
+        assert_eq!(splice("unchanged", &[], "X"), "unchanged");
+        // Whole-string replacement.
+        assert_eq!(splice("abc", &[(0, 3)], "Z"), "Z");
+    }
+
+    #[test]
     fn regexset_short_circuits_clean_bodies() {
         let f = build(
             QuarantineAction::ReplaceWithMarker,

@@ -172,4 +172,62 @@ mod tests {
         assert!(s.contains("layer_a=pic_invariant_violation"));
         assert!(s.contains("layer_b=ok"));
     }
+
+    #[test]
+    fn mark_read_filter_blocked_sets_failed_with_code() {
+        let mut t = fresh_trace();
+        mark_read_filter(&mut t, true, Some("p-secret".into()), "hit".into());
+        let rf = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::ReadFilter)
+            .unwrap();
+        assert!(!rf.passed);
+        assert_eq!(rf.error_code, Some(ErrorCode::ReadFilterBlocked));
+        assert_eq!(rf.matched_rule_id.as_deref(), Some("p-secret"));
+        assert_eq!(rf.detail.as_deref(), Some("hit"));
+    }
+
+    #[test]
+    fn mark_read_filter_replaces_existing_entry() {
+        let mut t = fresh_trace();
+        mark_read_filter(&mut t, false, Some("p1".into()), "first pass".into());
+        // Second call must replace, not append a duplicate ReadFilter entry.
+        mark_read_filter(&mut t, true, Some("p2".into()), "second hit".into());
+        let rf: Vec<_> = t
+            .layers
+            .iter()
+            .filter(|l| l.layer == PolicyLayer::ReadFilter)
+            .collect();
+        assert_eq!(rf.len(), 1, "ReadFilter must not duplicate");
+        assert!(!rf[0].passed);
+        assert_eq!(rf[0].matched_rule_id.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn set_layer_appends_when_layer_absent() {
+        let mut t = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+        set_layer(
+            &mut t,
+            PolicyLayer::LayerB,
+            LayerOutcome::passed(PolicyLayer::LayerB),
+        );
+        assert_eq!(t.layers.len(), 1);
+        assert_eq!(t.layers[0].layer, PolicyLayer::LayerB);
+    }
+
+    #[test]
+    fn summary_renders_read_filter_label_and_empty_layers() {
+        let empty = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+        assert_eq!(summary(&empty), "");
+
+        let mut t = fresh_trace();
+        mark_read_filter(&mut t, true, None, "x".into());
+        let s = summary(&t);
+        // Verify each layer label string (the wire contract operators key
+        // structured-log filters on) is correct.
+        assert!(s.contains("layer_a=ok"));
+        assert!(s.contains("layer_b=ok"));
+        assert!(s.contains("read_filter=read_filter_blocked"));
+    }
 }

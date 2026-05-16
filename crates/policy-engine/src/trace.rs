@@ -231,4 +231,73 @@ mod tests {
         assert_eq!(v.action, "read");
         assert_eq!(v.object, "file/abc");
     }
+
+    #[test]
+    fn policy_layer_serializes_snake_case() {
+        let cases = [
+            (PolicyLayer::LayerA, "\"layer_a\""),
+            (PolicyLayer::LayerB, "\"layer_b\""),
+            (PolicyLayer::ReadFilter, "\"read_filter\""),
+        ];
+        for (variant, wire) in cases {
+            let s = serde_json::to_string(&variant).unwrap();
+            assert_eq!(s, wire, "snake_case wire for {variant:?}");
+            let back: PolicyLayer = serde_json::from_str(wire).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn policy_eval_mode_default_is_fail_fast() {
+        assert_eq!(PolicyEvalMode::default(), PolicyEvalMode::FailFast);
+    }
+
+    #[test]
+    fn trace_not_allowed_when_decision_is_block_even_if_layers_pass() {
+        let t = PolicyTrace::new(
+            vec![
+                LayerOutcome::passed(PolicyLayer::LayerA),
+                LayerOutcome::passed(PolicyLayer::LayerB),
+            ],
+            Decision::Block {
+                reason: "policy".into(),
+                override_allowed: false,
+            },
+            vec![],
+        );
+        assert!(!t.allowed());
+    }
+
+    #[test]
+    fn layer_outcome_json_omits_none_fields_via_explicit_serialize() {
+        let passed = LayerOutcome::passed(PolicyLayer::LayerB);
+        let json = serde_json::to_value(&passed).unwrap();
+        assert_eq!(json["layer"], "layer_b");
+        assert_eq!(json["passed"], true);
+        // None fields serialize as JSON null (no skip_serializing_if), so an
+        // operator consuming the wire shape sees the key with null — pin
+        // that so a future schema migration is a conscious choice.
+        assert!(json["matched_rule_id"].is_null());
+        assert!(json["error_code"].is_null());
+        assert!(json["detail"].is_null());
+    }
+
+    #[test]
+    fn policy_trace_json_carries_trace_id_and_layers() {
+        let t = PolicyTrace::new(
+            vec![LayerOutcome::passed(PolicyLayer::LayerA)],
+            Decision::Allow,
+            vec![OpsAtomView {
+                scheme: "drive".into(),
+                action: "read".into(),
+                object: "file/x".into(),
+            }],
+        );
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json["trace_id"].is_string());
+        assert!(json["evaluated_at"].is_string());
+        assert_eq!(json["duration_micros"], 0);
+        assert_eq!(json["layers"].as_array().unwrap().len(), 1);
+        assert_eq!(json["required_ops"][0]["scheme"], "drive");
+    }
 }

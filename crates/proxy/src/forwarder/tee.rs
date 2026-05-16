@@ -114,4 +114,37 @@ mod tests {
         assert_eq!(primary.0.lock().unwrap().len(), 1);
         assert_eq!(tee.sink_count(), 0);
     }
+
+    #[test]
+    fn sink_count_tracks_with_sink_chaining() {
+        let primary = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary);
+        assert_eq!(tee.sink_count(), 0);
+        let tee = tee.with_sink(Arc::new(Collector::default()));
+        assert_eq!(tee.sink_count(), 1);
+        let tee = tee.with_sink(Arc::new(Collector::default()));
+        assert_eq!(tee.sink_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn each_sink_receives_independent_clone() {
+        // The fan-out clones the event per sink — each sink must see every
+        // field intact (not a default-filled placeholder from a moved value).
+        let primary = Arc::new(Collector::default());
+        let s1 = Arc::new(Collector::default());
+        let s2 = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary.clone())
+            .with_sink(s1.clone())
+            .with_sink(s2.clone());
+        let ev = sample();
+        let expected_req = ev.request_id;
+        let expected_vendor = ev.vendor.clone();
+        tee.publish(ev).await;
+        for c in [&primary, &s1, &s2] {
+            let v = c.0.lock().unwrap();
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].request_id, expected_req);
+            assert_eq!(v[0].vendor, expected_vendor);
+        }
+    }
 }

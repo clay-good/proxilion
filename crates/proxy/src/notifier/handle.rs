@@ -137,4 +137,62 @@ mod tests {
         n.webhook.replace(Some(mk_webhook("https://x.example")));
         assert!(n.any_configured());
     }
+
+    #[test]
+    fn cloned_handle_sees_replace_via_other_clone() {
+        // `Handle::clone` shares the underlying `Arc<ArcSwap<_>>` — the
+        // hot-swap design relies on this so the `/api/v1/notifier/config`
+        // endpoint can replace the inner notifier without forcing every
+        // request handler to plumb the new handle through. Pin that a
+        // replace through clone-A is visible to clone-B.
+        let a: NotifierHandle = Handle::new(None);
+        let b = a.clone();
+        assert!(b.current().is_none());
+        a.replace(Some(mk_webhook("https://shared.example")));
+        assert!(
+            b.current().is_some(),
+            "swap through one clone must be visible to the other",
+        );
+        a.replace(None);
+        assert!(b.current().is_none(), "clear is visible too");
+    }
+
+    #[test]
+    fn bundle_clone_shares_handles_with_original() {
+        // `Notifiers` derives `Clone`; each field is an `Arc`-backed Handle
+        // (or `Option<BurstSuppressor>`). A clone that accidentally
+        // deep-copied the ArcSwap would break the hot-swap design — the
+        // dashboard endpoint holds one bundle, the request handlers hold a
+        // clone, both must see the same notifier after a replace.
+        let n = Notifiers::empty();
+        let m = n.clone();
+        n.webhook
+            .replace(Some(mk_webhook("https://shared.example")));
+        assert!(m.webhook.current().is_some());
+        assert!(m.any_configured());
+    }
+
+    #[test]
+    fn any_configured_triggers_on_slack_alone() {
+        // Symmetric coverage to `bundle_any_configured_when_webhook_set`.
+        // The OR-chain is easy to break with a copy-paste typo (`||
+        // self.webhook.current()` repeated twice instead of also reading
+        // `slack` / `email`); pinning the Slack branch independently
+        // catches that.
+        use crate::notifier::{SlackNotifier, SlackSigningSecret};
+        let slack = Arc::new(
+            SlackNotifier::new(
+                "https://hooks.slack.com/services/T/B/C".into(),
+                SlackSigningSecret::new("00112233445566778899aabbccddeeff"),
+                "https://proxy.local".into(),
+            )
+            .unwrap(),
+        );
+        let n = Notifiers::empty();
+        assert!(!n.any_configured());
+        n.slack.replace(Some(slack));
+        assert!(n.any_configured());
+        n.slack.replace(None);
+        assert!(!n.any_configured());
+    }
 }

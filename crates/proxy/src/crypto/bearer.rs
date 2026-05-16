@@ -123,4 +123,85 @@ mod tests {
             "Bearer Debug must not leak the token"
         );
     }
+
+    #[test]
+    fn parse_rejects_length_below_and_above_token_len() {
+        // Off-by-one boundaries on either side of TOKEN_LEN. A future
+        // refactor that loosened the length check to `>=` or `>` would
+        // surface here as a regression rather than silently widening the
+        // accept set.
+        let one_short = format!("{PREFIX}{}", "A".repeat(51));
+        assert!(Bearer::parse(&one_short).is_none(), "51-char body rejected");
+        let one_long = format!("{PREFIX}{}", "A".repeat(53));
+        assert!(Bearer::parse(&one_long).is_none(), "53-char body rejected");
+    }
+
+    #[test]
+    fn parse_rejects_digits_outside_base32_alphabet() {
+        // RFC 4648 base32 omits `0` / `1` / `8` / `9` (visually similar to
+        // O/I/B/g). Pin each — a sloppy alphabet check that admitted all
+        // ascii digits would surface here.
+        for bad in ['0', '1', '8', '9'] {
+            let body: String = std::iter::once(bad)
+                .chain(std::iter::repeat_n('A', 51))
+                .collect();
+            let s = format!("{PREFIX}{body}");
+            assert!(
+                Bearer::parse(&s).is_none(),
+                "digit {bad} should not parse but did",
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_hash_as_bytes_returns_full_32_byte_view() {
+        // The killswitch + audit paths take `as_bytes()` and hand it to
+        // sqlx for the `bearer_sha256 = $1` predicate. Pin both the length
+        // and the back-to-back equality with the raw `[u8; 32]` so a future
+        // refactor that returned a hex string (or truncated head) would
+        // surface here.
+        let h = BearerHash::of("pxl_live_AAAA");
+        let bytes = h.as_bytes();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes, &h.0);
+    }
+
+    #[test]
+    fn bearer_hash_debug_truncates_to_short_prefix() {
+        // The Debug impl is what shows up in tracing fields for
+        // correlation. A regression that printed the full 64-char hex
+        // would let log aggregators store rotatable secrets in plain text.
+        let h = BearerHash::of("pxl_live_AAAA");
+        let dbg = format!("{h:?}");
+        let full_hex: String = h.0.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(dbg.contains("BearerHash("));
+        assert!(!dbg.contains(&full_hex), "Debug must not include full hash",);
+        // The 4-byte prefix (8 hex chars) IS visible — that's the design.
+        let head: String = h.0[..4].iter().map(|b| format!("{b:02x}")).collect();
+        assert!(dbg.contains(&head));
+    }
+
+    #[test]
+    fn two_generated_bearers_are_distinct() {
+        // 256 bits of entropy per token — collision probability is
+        // negligible at scale 2, so a regression that hard-coded a sample
+        // value or reset the RNG would surface immediately.
+        let a = Bearer::generate();
+        let b = Bearer::generate();
+        assert_ne!(a.as_str(), b.as_str());
+        assert_ne!(a.hash(), b.hash());
+    }
+
+    #[test]
+    fn bearer_hash_partial_eq_distinguishes_different_inputs() {
+        // BearerHash derives PartialEq+Eq; pin both axes — equal inputs hash
+        // equal, distinct inputs hash distinct. The middleware uses Eq to
+        // detect a hash-already-revoked condition; a future refactor that
+        // broke it would silently miss every match.
+        let a = BearerHash::of("pxl_live_AAAA");
+        let b = BearerHash::of("pxl_live_AAAA");
+        let c = BearerHash::of("pxl_live_BBBB");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
 }

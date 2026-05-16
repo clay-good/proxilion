@@ -311,4 +311,62 @@ mod tests {
         assert_eq!(v["code"], "bad_request");
         assert_eq!(v["detail"], "missing field");
     }
+
+    #[tokio::test]
+    async fn api_error_db_collapses_to_500_internal_error_envelope() {
+        // The only ApiError arm besides BadRequest. Operator alerts key on
+        // `status="500" code="internal_error"` for a real Postgres outage —
+        // a future variant rename here would silently re-classify the alert.
+        let r = ApiError::Db(sqlx::Error::RowNotFound).into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "internal_error");
+        assert_eq!(v["error"], "database error");
+        // detail surfaces the sqlx string verbatim — this is operator-facing
+        // and never reaches the agent (killswitch is operator-only-gated).
+        assert!(!v["detail"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kill_response_serializes_with_stable_field_names() {
+        // The dashboard's killswitch confirmation toast keys on every field
+        // below — a future rename (e.g. `bearers_revoked` → `revoked_count`)
+        // would silently break the UI.
+        let r = KillResponse {
+            record_id: Uuid::nil(),
+            scope: "session",
+            target: "abc".into(),
+            bearers_revoked: 3,
+            at: Utc::now(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("record_id").is_some());
+        assert_eq!(v["scope"], "session");
+        assert_eq!(v["target"], "abc");
+        assert_eq!(v["bearers_revoked"], 3);
+        assert!(v.get("at").is_some());
+    }
+
+    #[test]
+    fn kill_body_defaults_when_empty_object_is_posted() {
+        // operator-cli posts `{}` for /killswitch/session/<id> when no reason
+        // is provided. The handler's `body.unwrap_or_default()` path depends
+        // on every field being Option<_> with a `Default` impl.
+        let body: KillBody = serde_json::from_str("{}").unwrap();
+        assert!(body.reason.is_none());
+        assert!(body.operator_subject.is_none());
+        assert!(body.confirm.is_none());
+    }
+
+    #[test]
+    fn kill_body_accepts_confirm_yes_for_kill_all() {
+        // /killswitch/all rejects without `confirm: "yes"` — pin that the
+        // deserializer accepts the field (vs. an accidental rename in serde
+        // that would silently make confirm always None and a typed BadRequest
+        // bypass impossible).
+        let body: KillBody = serde_json::from_str(r#"{"confirm":"yes","reason":"drill"}"#).unwrap();
+        assert_eq!(body.confirm.as_deref(), Some("yes"));
+        assert_eq!(body.reason.as_deref(), Some("drill"));
+    }
 }

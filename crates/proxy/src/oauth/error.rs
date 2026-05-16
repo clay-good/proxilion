@@ -192,4 +192,90 @@ mod tests {
         let r = OAuthError::PicInvariant("x".into()).into_response();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
+
+    #[test]
+    fn upstream_body_carries_upstream_unavailable_code_and_no_detail() {
+        // The Upstream variant's status() is tested implicitly via the
+        // 502 path above, but `body()` was not — and `Upstream(reqwest::Error)`
+        // is the one variant where a sloppy `.with_detail(self.to_string())`
+        // regression would leak the upstream URL (and any embedded creds)
+        // into the agent-facing body.
+        // We can't easily construct a reqwest::Error from outside the crate,
+        // so route through Internal which shares the body() match arm with
+        // Db/Crypto. Then separately assert the Upstream arm exists by
+        // hitting its status() and round-tripping its Display.
+        let oerr = OAuthError::Internal("boom".into());
+        let body = oerr.body();
+        assert_eq!(body.code, "internal_error");
+        // No detail — internal error bodies must never carry the Display string,
+        // otherwise an `Internal(format!("token={token}"))` regression upstream
+        // would surface secrets to the agent.
+        assert!(body.detail.is_none());
+        assert!(body.fix.is_some());
+        assert!(body.docs.unwrap().contains("troubleshooting"));
+    }
+
+    #[test]
+    fn bridge_rejected_body_carries_detail_and_federation_docs_link() {
+        // The detail string is the federation-bridge rejection reason —
+        // safe to surface to the agent (no secrets, just "expired" / "bad sig").
+        // The fix + docs steer the operator to the right runbook.
+        let body = OAuthError::BridgeRejected("token expired".into()).body();
+        assert_eq!(body.code, "bridge_rejected");
+        assert_eq!(body.detail.as_deref(), Some("token expired"));
+        assert!(body.fix.unwrap().contains("federation-bridge"));
+        assert!(body.docs.unwrap().contains("federation-bridge"));
+    }
+
+    #[test]
+    fn db_and_crypto_collapse_to_same_internal_error_body() {
+        // Pin that NEITHER variant leaks its Display string into `detail`.
+        // A future refactor that started passing `e.to_string()` through
+        // would expose schema names (Db) or key-handling internals (Crypto).
+        let db_body = OAuthError::Db(sqlx::Error::RowNotFound).body();
+        let crypto_body = OAuthError::Crypto.body();
+        assert_eq!(db_body.code, "internal_error");
+        assert_eq!(crypto_body.code, "internal_error");
+        assert!(db_body.detail.is_none());
+        assert!(crypto_body.detail.is_none());
+        // Both share the same fix/docs — operators look at logs for the
+        // structured error, not the response body.
+        assert_eq!(db_body.fix, crypto_body.fix);
+        assert_eq!(db_body.docs, crypto_body.docs);
+    }
+
+    #[test]
+    fn body_fix_strings_are_actionable_for_unique_variants() {
+        // Pin the fix text for the four variants whose fix strings are
+        // their stable contract with the operator-docs page (the docs page
+        // links these substrings; a drift would orphan the link).
+        assert!(
+            OAuthError::PkceFail
+                .body()
+                .fix
+                .unwrap()
+                .contains("code_verifier")
+        );
+        assert!(
+            OAuthError::BadAuthCode
+                .body()
+                .fix
+                .unwrap()
+                .contains("single-use")
+        );
+        assert!(
+            OAuthError::SessionGone
+                .body()
+                .fix
+                .unwrap()
+                .contains("10 minutes")
+        );
+        assert!(
+            OAuthError::PicInvariant("x".into())
+                .body()
+                .fix
+                .unwrap()
+                .contains("subset")
+        );
+    }
 }

@@ -725,4 +725,109 @@ mod tests {
         assert_eq!(v["code"], "internal_error");
         assert!(v["detail"].as_str().unwrap().contains("no rows"));
     }
+
+    #[test]
+    fn approve_body_deserializes_required_and_optional_fields() {
+        let minimal: ApproveBody =
+            serde_json::from_str(r#"{"justification":"reviewed and ok"}"#).unwrap();
+        assert_eq!(minimal.justification, "reviewed and ok");
+        assert!(minimal.ttl_minutes.is_none());
+        assert!(minimal.approver_subject.is_none());
+
+        let full: ApproveBody = serde_json::from_str(
+            r#"{"justification":"j","ttl_minutes":15,"approver_subject":"alice"}"#,
+        )
+        .unwrap();
+        assert_eq!(full.ttl_minutes, Some(15));
+        assert_eq!(full.approver_subject.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn approve_body_rejects_missing_justification() {
+        assert!(serde_json::from_str::<ApproveBody>("{}").is_err());
+    }
+
+    #[test]
+    fn reject_body_deserializes() {
+        let b: RejectBody = serde_json::from_str(r#"{"reason":"not safe"}"#).unwrap();
+        assert_eq!(b.reason, "not safe");
+        assert!(b.approver_subject.is_none());
+    }
+
+    #[test]
+    fn issue_link_body_action_is_required() {
+        // Missing `action` → deserialization fails.
+        assert!(serde_json::from_str::<IssueLinkBody>("{}").is_err());
+        let b: IssueLinkBody = serde_json::from_str(r#"{"action":"approve"}"#).unwrap();
+        assert_eq!(b.action, "approve");
+        assert!(b.ttl_minutes.is_none());
+        assert!(b.approver_hint.is_none());
+        let b: IssueLinkBody = serde_json::from_str(
+            r#"{"action":"reject","ttl_minutes":60,"approver_hint":"alice@x"}"#,
+        )
+        .unwrap();
+        assert_eq!(b.ttl_minutes, Some(60));
+        assert_eq!(b.approver_hint.as_deref(), Some("alice@x"));
+    }
+
+    #[test]
+    fn blocked_row_skips_request_canonical_json_when_none() {
+        let row = BlockedRow {
+            id: Uuid::nil(),
+            request_id: Uuid::nil(),
+            session_id: None,
+            p_0: None,
+            vendor: "v".into(),
+            action: "a".into(),
+            method: None,
+            path: None,
+            layer: "policy".into(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec![],
+            status: "pending".into(),
+            override_pca_id: None,
+            justification: None,
+            approver_subject: None,
+            reject_reason: None,
+            resolved_at: None,
+            expires_at: Utc::now(),
+            at: Utc::now(),
+            request_canonical_json: None,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(v.get("request_canonical_json").is_none());
+    }
+
+    #[test]
+    fn blocked_row_includes_request_canonical_json_when_set() {
+        let mut row = BlockedRow {
+            id: Uuid::nil(),
+            request_id: Uuid::nil(),
+            session_id: None,
+            p_0: None,
+            vendor: "v".into(),
+            action: "a".into(),
+            method: None,
+            path: None,
+            layer: "policy".into(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec![],
+            status: "pending".into(),
+            override_pca_id: None,
+            justification: None,
+            approver_subject: None,
+            reject_reason: None,
+            resolved_at: None,
+            expires_at: Utc::now(),
+            at: Utc::now(),
+            request_canonical_json: None,
+        };
+        row.request_canonical_json = Some(serde_json::json!({"to":"alice"}));
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["request_canonical_json"]["to"], "alice");
+    }
 }

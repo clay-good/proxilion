@@ -725,4 +725,28 @@ mod tests {
         let req: TestRequest = serde_json::from_str(r#"{"driver":"slack"}"#).unwrap();
         assert_eq!(req.driver.as_deref(), Some("slack"));
     }
+
+    #[test]
+    fn redact_url_preserves_scheme_only_uri() {
+        // No `://` separator — return as-is. Defensive: callers should
+        // pass a real URL, but the helper shouldn't panic on garbage.
+        assert_eq!(redact_url("just-a-token"), "just-a-token");
+    }
+
+    #[test]
+    fn set_config_body_round_trips() {
+        let raw = r#"{"driver":"webhook","enabled":true,"config":{"url":"https://x"}}"#;
+        let b: SetConfigBody = serde_json::from_str(raw).unwrap();
+        assert_eq!(b.driver, "webhook");
+        assert_eq!(b.enabled, Some(true));
+        assert_eq!(b.config["url"], "https://x");
+    }
+
+    #[test]
+    fn set_config_body_enabled_defaults_via_unwrap_or_true() {
+        // The handler unwraps `enabled.unwrap_or(true)`, but the field
+        // itself is `Option<bool>` and must accept absent.
+        let b: SetConfigBody = serde_json::from_str(r#"{"driver":"slack","config":{}}"#).unwrap();
+        assert!(b.enabled.is_none());
+    }
 }

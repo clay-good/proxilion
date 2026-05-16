@@ -572,4 +572,42 @@ mod tests {
             .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/x")
             .expect("lazy pool builds")
     }
+
+    fn mbox(s: &str) -> Mailbox {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn parse_or_fallback_returns_parsed_list_on_success() {
+        let fallback = vec![mbox("fallback@example.com")];
+        let list = vec![
+            "alice@example.com".to_string(),
+            "Bob <bob@example.com>".to_string(),
+        ];
+        let out = parse_or_fallback(&list, &fallback, "to");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].email.to_string(), "alice@example.com");
+        assert_eq!(out[1].email.to_string(), "bob@example.com");
+    }
+
+    #[test]
+    fn parse_or_fallback_returns_fallback_when_any_addr_malformed() {
+        // Per the helper's contract: ONE bad address kicks the whole list
+        // back to the fallback (rather than silently dropping the bad one).
+        let fallback = vec![mbox("fallback@example.com")];
+        let list = vec![
+            "alice@example.com".to_string(),
+            "not an address".to_string(),
+        ];
+        let out = parse_or_fallback(&list, &fallback, "to");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].email.to_string(), "fallback@example.com");
+    }
+
+    #[test]
+    fn parse_or_fallback_empty_input_returns_empty() {
+        let fallback = vec![mbox("fallback@example.com")];
+        let out = parse_or_fallback(&[], &fallback, "to");
+        assert!(out.is_empty());
+    }
 }

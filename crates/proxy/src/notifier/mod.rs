@@ -155,4 +155,66 @@ mod tests {
         assert_eq!(j["vendor"], "google");
         assert_eq!(j["action"], "gmail.messages.send");
     }
+
+    #[test]
+    fn schema_constant_is_versioned_string_consumers_key_on() {
+        // The schema string is a stable contract — webhook receivers route
+        // on `schema == "proxilion.blocked_action.v1"` and may parse
+        // differently for `v2`. Pin both the value and the .vN suffix shape.
+        assert_eq!(BlockedNotification::SCHEMA, "proxilion.blocked_action.v1");
+        assert!(BlockedNotification::SCHEMA.starts_with("proxilion."));
+        assert!(BlockedNotification::SCHEMA.ends_with(".v1"));
+    }
+
+    #[test]
+    fn from_record_passes_none_fields_through_unchanged() {
+        // `p_0`, `policy_id`, `detail`, `predecessor_pca_id` are all
+        // Optional — when the source record carries None, the notification
+        // must too, not synthesize a placeholder string. Downstream
+        // receivers test key-presence; a stray "" or "(none)" would
+        // mis-classify the blocked row as having a policy.
+        let ops: Vec<String> = vec![];
+        let r = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "g",
+            action: "a",
+            method: "POST",
+            path: "/p",
+            layer: "invariant",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        assert!(n.p_0.is_none());
+        assert!(n.policy_id.is_none());
+        assert!(n.detail.is_none());
+        assert!(n.predecessor_pca_id.is_none());
+        // And the JSON keeps them as JSON null (not absent — the struct
+        // has no `skip_serializing_if`, so key-presence is part of the
+        // contract receivers can rely on).
+        let j = serde_json::to_value(&n).unwrap();
+        assert!(j.get("p_0").is_some_and(|v| v.is_null()));
+        assert!(j.get("policy_id").is_some_and(|v| v.is_null()));
+    }
+
+    #[test]
+    fn from_record_carries_empty_requested_ops_slice() {
+        // The PIC layer sometimes blocks without a discrete ops list
+        // (e.g. a monotonicity refusal where the upstream body didn't
+        // surface atoms). `requested_ops` must come through as an empty
+        // slice, not be elided — Slack templates iterate it and expect
+        // either content or an explicit "(none)" rendering at template time.
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        assert!(n.requested_ops.is_empty());
+        let j = serde_json::to_value(&n).unwrap();
+        assert_eq!(j["requested_ops"], serde_json::json!([]));
+    }
 }

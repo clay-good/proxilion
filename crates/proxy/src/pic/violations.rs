@@ -116,4 +116,38 @@ mod tests {
     fn parse_atoms_handles_empty_list() {
         assert!(parse_missing_atoms("missing []").is_empty());
     }
+
+    #[test]
+    fn parse_atoms_single_value_no_comma() {
+        // The Trust Plane sometimes emits a single missing atom (no
+        // separator). Pin that the splitter on `,` still produces one
+        // entry rather than zero.
+        assert_eq!(
+            parse_missing_atoms("missing [drive:read:secret.docx]"),
+            vec!["drive:read:secret.docx".to_string()],
+        );
+    }
+
+    #[test]
+    fn parse_atoms_handles_unclosed_bracket() {
+        // Malformed input — opening bracket but no close. Must not panic
+        // and must return empty (rather than reading off the end). The
+        // raw `detail` is persisted elsewhere; this helper is best-effort.
+        assert!(parse_missing_atoms("missing [a, b, c").is_empty());
+    }
+
+    #[test]
+    fn parse_atoms_trims_whitespace_and_drops_empty_segments() {
+        // The upstream body sometimes has spaces around commas
+        // (`"[a, b,  c]"`) and sometimes a trailing comma (`"[a,b,]"`).
+        // Pin both: whitespace is trimmed, empty segments are dropped.
+        assert_eq!(
+            parse_missing_atoms("[  a:1 ,  b:2 ,c:3]"),
+            vec!["a:1".to_string(), "b:2".to_string(), "c:3".to_string()],
+        );
+        assert_eq!(
+            parse_missing_atoms("[a:1,b:2,]"),
+            vec!["a:1".to_string(), "b:2".to_string()],
+        );
+    }
 }

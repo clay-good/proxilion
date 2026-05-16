@@ -107,4 +107,41 @@ mod tests {
             assert!(kc.is_killed(h).await);
         }
     }
+
+    #[tokio::test]
+    async fn default_constructor_yields_empty_cache() {
+        // `Default` is what `AppState` calls when no killswitch backend is
+        // wired in tests — pinning that it behaves as a fresh `new()` (no
+        // false-positive kills carried over from some shared static).
+        let kc: KillCache = Default::default();
+        assert!(!kc.is_killed(&[1u8; 32]).await);
+        assert!(!kc.is_killed(&[2u8; 32]).await);
+        kc.mark([1u8; 32]).await;
+        assert!(kc.is_killed(&[1u8; 32]).await);
+        assert!(!kc.is_killed(&[2u8; 32]).await);
+    }
+
+    #[tokio::test]
+    async fn two_cache_instances_do_not_share_state() {
+        // Per-process design — pin that two `new()` invocations build
+        // independent caches. A future refactor accidentally moving the
+        // moka `Cache` into a `lazy_static` global would surface here.
+        let a = KillCache::new();
+        let b = KillCache::new();
+        let h = [9u8; 32];
+        a.mark(h).await;
+        assert!(a.is_killed(&h).await);
+        assert!(!b.is_killed(&h).await);
+    }
+
+    #[tokio::test]
+    async fn mark_many_with_empty_iterator_is_noop() {
+        // `mark_many` is called from killswitch handlers in a loop over
+        // UPDATE's RETURNING; if the UPDATE matched zero rows the iterator
+        // is empty. Pin that this path doesn't panic and leaves the cache
+        // untouched.
+        let kc = KillCache::new();
+        kc.mark_many(std::iter::empty()).await;
+        assert!(!kc.is_killed(&[0u8; 32]).await);
+    }
 }

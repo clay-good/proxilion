@@ -303,6 +303,97 @@ mod tests {
         assert!(WebhookSecret::from_hex("dead").is_err());
     }
 
+    #[test]
+    fn secret_from_hex_distinguishes_each_failure_branch_by_message() {
+        // Each branch surfaces a distinct, operator-facing message — the
+        // CLI / setup page reads `NotifierBuildError(...)` and prints it
+        // verbatim, so a future merge of two branches into "invalid hex"
+        // would lose the actionable hint. (WebhookSecret intentionally
+        // has no Debug, so we match on the Result rather than unwrap_err.)
+        fn err(hex: &str) -> NotifierBuildError {
+            match WebhookSecret::from_hex(hex) {
+                Err(e) => e,
+                Ok(_) => panic!("expected error for {hex:?}"),
+            }
+        }
+        assert!(err("").0.contains("empty"));
+        assert!(err("aaa").0.contains("even"));
+        assert!(err("aabb").0.contains("16 bytes"));
+        // Non-hex char at the 17th byte (well past the length gate).
+        assert!(
+            err("0011223344556677889900112233gg00")
+                .0
+                .contains("invalid hex"),
+        );
+    }
+
+    #[test]
+    fn signature_is_lowercase_hex_with_sha256_prefix() {
+        // Receivers verify by stripping the `sha256=` prefix and hex-
+        // decoding the rest. A regression that emitted uppercase, or
+        // dropped the prefix, would surface here. Length is fixed at 64
+        // hex chars for SHA-256.
+        let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let sig = s.sign(b"some body");
+        let suffix = sig.strip_prefix("sha256=").expect("starts with sha256=");
+        assert_eq!(suffix.len(), 64);
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "signature suffix must be lowercase hex: {suffix}",
+        );
+    }
+
+    #[test]
+    fn webhook_notifier_with_burst_attaches_suppressor_and_burst_accessor_reads_it() {
+        // `with_burst` is the fluent setter; `burst()` is the read path
+        // (intended for /api/v1/notifier/test in a future round). Pin
+        // both ends of the contract — a future refactor that renamed the
+        // private `burst` field but missed the accessor would surface
+        // here as None where the fluent path just set Some.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(
+            "http://localhost:9/hook".into(),
+            secret,
+            "https://proxy.local".into(),
+        )
+        .unwrap();
+        assert!(n.burst().is_none(), "fresh notifier has no suppressor");
+        let n = n.with_burst(crate::notifier::BurstSuppressor::new(
+            crate::notifier::BurstConfig::default(),
+        ));
+        assert!(n.burst().is_some(), "with_burst attaches");
+    }
+
+    #[test]
+    fn notifier_build_error_display_contains_inner_reason() {
+        // The error is a tuple struct with `#[error("notifier build: {0}")]`
+        // — operator-facing setup-status path uses Display directly. Pin
+        // the prefix + inner pass-through so a future variant rename
+        // surfaces here rather than at the dashboard.
+        let e = NotifierBuildError("hmac secret hex length must be even".into());
+        let s = e.to_string();
+        assert!(s.starts_with("notifier build:"));
+        assert!(s.contains("hmac secret hex length must be even"));
+    }
+
+    #[test]
+    fn webhook_proxy_public_url_round_trips_through_accessor() {
+        // The approve-URL builder reads this back to construct the
+        // `proxy_public_url/api/v1/blocked/{id}/approve` strings — a
+        // future refactor that returned the *upstream* webhook URL by
+        // mistake would point operators at the wrong place.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(
+            "https://webhook.example/hook".into(),
+            secret,
+            "https://proxy.example".into(),
+        )
+        .unwrap();
+        assert_eq!(n.proxy_public_url(), "https://proxy.example");
+    }
+
     #[tokio::test]
     async fn posts_with_signature_and_schema_headers() {
         let server = MockServer::start().await;

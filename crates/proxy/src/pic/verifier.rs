@@ -559,4 +559,122 @@ mod tests {
             "got {err:?}"
         );
     }
+
+    #[test]
+    fn invariant_kind_labels_are_bounded_and_stable() {
+        // Bounded label cardinality is the load-bearing property — the
+        // `proxilion_pca_verify_failures_total{kind=...}` metric uses
+        // these as labels, and a Prometheus cardinality explosion would
+        // surface as an OOM. Pin every kind to its stable string.
+        let dummy_id = Uuid::nil();
+        assert_eq!(
+            invariant_kind(&VerifierError::ContinuityBroken {
+                child: dummy_id,
+                parent: dummy_id,
+            }),
+            "continuity",
+        );
+        assert_eq!(
+            invariant_kind(&VerifierError::Monotonicity {
+                missing: "x".into(),
+            }),
+            "monotonicity",
+        );
+        assert_eq!(
+            invariant_kind(&VerifierError::P0Mismatch {
+                child_p0: "a".into(),
+                parent_p0: "b".into(),
+            }),
+            "p0",
+        );
+        assert_eq!(
+            invariant_kind(&VerifierError::HopOrder {
+                child: 2,
+                parent: 0,
+            }),
+            "hop",
+        );
+        assert_eq!(
+            invariant_kind(&VerifierError::BadCatSignature(dummy_id)),
+            "signature",
+        );
+        assert_eq!(invariant_kind(&VerifierError::Missing(dummy_id)), "missing");
+        assert_eq!(invariant_kind(&VerifierError::Decode("x".into())), "decode",);
+        assert_eq!(
+            invariant_kind(&VerifierError::CatKey("x".into())),
+            "cat_key",
+        );
+    }
+
+    #[test]
+    fn err_to_result_pins_broken_at_to_named_pca_when_known() {
+        // The dashboard's chain-walker UI keys on `broken_at` to highlight
+        // the failed link. Three variants carry an explicit id —
+        // `Missing`, `BadCatSignature`, `ContinuityBroken` — and must
+        // surface that, not the leaf id. The rest fall back to the leaf.
+        let leaf = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let r = err_to_result(leaf, &VerifierError::Missing(other));
+        assert_eq!(r.broken_at, Some(other));
+        let r = err_to_result(leaf, &VerifierError::BadCatSignature(other));
+        assert_eq!(r.broken_at, Some(other));
+        let r = err_to_result(
+            leaf,
+            &VerifierError::ContinuityBroken {
+                child: other,
+                parent: leaf,
+            },
+        );
+        assert_eq!(
+            r.broken_at,
+            Some(other),
+            "ContinuityBroken surfaces the child id, not parent or leaf",
+        );
+        // Fallback path: Monotonicity has no id, so we report the leaf.
+        let r = err_to_result(
+            leaf,
+            &VerifierError::Monotonicity {
+                missing: "x".into(),
+            },
+        );
+        assert_eq!(r.broken_at, Some(leaf));
+    }
+
+    #[test]
+    fn err_to_result_marks_chain_not_intact_and_carries_reason_string() {
+        // Every error path must produce `intact=false` and a non-empty
+        // `reason` — the dashboard surfaces both. A regression that
+        // returned `intact=true` with a reason would mislead operators.
+        let leaf = Uuid::new_v4();
+        let r = err_to_result(leaf, &VerifierError::Decode("bad cbor".into()));
+        assert!(!r.intact);
+        assert_eq!(r.links_verified, 0);
+        assert!(r.p_0.is_none());
+        let reason = r.reason.expect("reason present");
+        assert!(
+            reason.contains("decoding signed PCA bytes"),
+            "reason carries Display: {reason}",
+        );
+        assert!(reason.contains("bad cbor"));
+    }
+
+    #[test]
+    fn verifier_error_display_carries_named_field_values() {
+        // The `reason` field in VerificationResult is `e.to_string()` —
+        // every error variant must surface its named-field values so the
+        // dashboard can render them without re-walking the chain. Pin
+        // the two structured variants that thiserror's `{field}` syntax
+        // is load-bearing for.
+        let e = VerifierError::Monotonicity {
+            missing: "drive:write:bob/*".into(),
+        };
+        assert!(e.to_string().contains("drive:write:bob/*"));
+        let e = VerifierError::HopOrder {
+            child: 3,
+            parent: 1,
+        };
+        let s = e.to_string();
+        assert!(s.contains("3"));
+        assert!(s.contains("1"));
+    }
 }

@@ -174,4 +174,51 @@ mod tests {
         assert!(s.starts_with("postgres:"));
         assert!(s.contains("no rows"));
     }
+
+    #[test]
+    fn cached_pca_is_clone_with_disjoint_buffers() {
+        // The PCA cache hands out owned `CachedPca` values; the verifier
+        // walks the chain by cloning each row. Pin that mutating a clone
+        // doesn't tug the original (an accidental `Cow`/`Rc` field would
+        // surface here).
+        let a = CachedPca::new(
+            Uuid::nil(),
+            vec![1, 2, 3],
+            "alice@acme.com".into(),
+            vec!["drive:read:file/x".into()],
+            0,
+            None,
+        );
+        let mut b = a.clone();
+        b.cbor.push(4);
+        b.ops.push("drive:write:file/y".into());
+        assert_eq!(a.cbor, vec![1, 2, 3], "original cbor unchanged");
+        assert_eq!(a.ops.len(), 1, "original ops unchanged");
+        assert_eq!(b.cbor.len(), 4);
+        assert_eq!(b.ops.len(), 2);
+    }
+
+    #[test]
+    fn cached_pca_new_starts_with_empty_signature() {
+        // The `new()` constructor defers signature population to a later
+        // `mint` step. Pin the empty-on-construction default so a future
+        // refactor that pre-fills with a sentinel byte (e.g. for a "not
+        // yet signed" marker) doesn't sneak through.
+        let pca = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 0, None);
+        assert!(pca.signature.is_empty());
+    }
+
+    #[test]
+    fn cache_error_from_sqlx_via_question_mark() {
+        // `?`-conversion is what the public `insert` / `get` methods use;
+        // pin the `#[from]` blanket-impl path so a future refactor that
+        // drops `#[from]` would surface here as a compile error rather
+        // than as a silent string-formatting regression downstream.
+        fn maybe() -> Result<(), CacheError> {
+            Err::<(), sqlx::Error>(sqlx::Error::RowNotFound)?;
+            Ok(())
+        }
+        let e = maybe().unwrap_err();
+        assert!(matches!(e, CacheError::Db(_)));
+    }
 }

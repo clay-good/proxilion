@@ -111,4 +111,75 @@ mod tests {
             Err(CipherError::BadKeyLen(16))
         ));
     }
+
+    #[test]
+    fn tampered_ciphertext_rejected_by_gcm_tag() {
+        // The GCM auth tag is appended to the ciphertext by `aes-gcm`; a
+        // single-byte flip anywhere in `bytes` must surface CipherError::Aead
+        // rather than yielding garbage plaintext. This is the AEAD contract —
+        // a future refactor that switched to CTR-only would silently pass.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let mut ct = c.encrypt(b"some secret plaintext").unwrap();
+        ct.bytes[0] ^= 1;
+        let err = c.decrypt(&ct).unwrap_err();
+        assert!(matches!(err, CipherError::Aead));
+    }
+
+    #[test]
+    fn wrong_nonce_length_rejected_without_aead_call() {
+        // The decrypt path pre-checks nonce.len() == 12 before handing to
+        // aes-gcm. A persisted row with a corrupt nonce column would
+        // otherwise panic inside `Nonce::from_slice` (which expects exactly
+        // 12 bytes). Pin both the short and long cases.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let pt = c.encrypt(b"hi").unwrap();
+        let short = Ciphertext {
+            nonce: vec![0u8; 11],
+            bytes: pt.bytes.clone(),
+        };
+        assert!(matches!(c.decrypt(&short), Err(CipherError::Aead)));
+        let long = Ciphertext {
+            nonce: vec![0u8; 13],
+            bytes: pt.bytes,
+        };
+        assert!(matches!(c.decrypt(&long), Err(CipherError::Aead)));
+    }
+
+    #[test]
+    fn ciphertext_clone_yields_independent_buffer() {
+        // `Ciphertext` is `Clone` so the encryption helper can persist one
+        // copy and hand another to the metrics path. Pin that the clone
+        // owns its bytes (no shared backing storage that a later mutation
+        // would corrupt across).
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let a = c.encrypt(b"value").unwrap();
+        let mut b = a.clone();
+        b.bytes[0] ^= 0xff;
+        assert_ne!(a.bytes[0], b.bytes[0], "clone must own its buffer");
+        assert!(c.decrypt(&a).is_ok(), "original still decrypts");
+    }
+
+    #[test]
+    fn bad_key_len_error_display_includes_actual_length() {
+        // Operators routinely paste a 16-byte hex string thinking it's a
+        // 32-byte key (or a 64-char hex string forgetting to hex-decode).
+        // The error message must surface the actual length so the
+        // troubleshooting docs page can point at "expected 32, got N".
+        let e = CipherError::BadKeyLen(17).to_string();
+        assert!(e.contains("32"), "must mention required length");
+        assert!(e.contains("17"), "must surface actual length");
+    }
+
+    #[test]
+    fn empty_key_rejected_with_zero_length() {
+        // Boundary: a missing env var sometimes shows up as an empty byte
+        // slice. The variant must carry `0`, not panic on the indexing path.
+        // (TokenCipher intentionally has no Debug impl — it holds the
+        // master key — so we match on the result rather than `unwrap_err`.)
+        match TokenCipher::from_bytes(&[]) {
+            Err(CipherError::BadKeyLen(0)) => {}
+            Err(e) => panic!("expected BadKeyLen(0), got {e:?}"),
+            Ok(_) => panic!("expected error for empty key"),
+        }
+    }
 }

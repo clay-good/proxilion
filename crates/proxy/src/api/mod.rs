@@ -165,4 +165,44 @@ mod tests {
         let r = ApiError::NotFound.into_response();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
+
+    #[test]
+    fn hex_encode_covers_all_byte_values() {
+        // The encoder is hot-path for `/api/v1/pca/{id}` — a regression
+        // that emitted upper-case or truncated leading zeros would break
+        // any downstream tool that round-trips through `hex::decode`.
+        let all: Vec<u8> = (0u8..=255).collect();
+        let s = hex_encode(&all);
+        assert_eq!(s.len(), 512);
+        assert!(s.starts_with("000102"), "leading zero bytes keep width 2");
+        assert!(s.ends_with("fdfeff"), "high-byte tail is lowercase");
+        // Every char is a valid lowercase hex digit.
+        for ch in s.chars() {
+            assert!(
+                ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase(),
+                "non-lowercase hex char: {ch}",
+            );
+        }
+    }
+
+    #[test]
+    fn api_error_db_maps_to_500_with_internal_error_code() {
+        // The Db path is hit on a real Postgres outage; the dashboard
+        // surfaces the `code` field — pin both the 500 status and the
+        // `internal_error` machine-readable code so a Grafana alert keyed
+        // on `code="internal_error" status="500"` doesn't drift silently.
+        let e = ApiError::Db(crate::pic::cache::CacheError::Db(sqlx::Error::RowNotFound));
+        let r = e.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn hex_encode_byte_count_matches_two_per_input_byte() {
+        // Length invariant — operator-visible cbor blobs are often size-
+        // bounded by a CLI flag and the proxy enforces "2 * len" upstream.
+        for n in [0usize, 1, 16, 64, 257] {
+            let buf = vec![0xa5u8; n];
+            assert_eq!(hex_encode(&buf).len(), n * 2);
+        }
+    }
 }

@@ -125,3 +125,53 @@ impl PcaCache {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_pic_profile_is_stable_v1_string() {
+        // Pinned: a deliberate change here implies a migration story for
+        // every cached row (spec.md §15 #11). Don't loosen casually.
+        assert_eq!(CURRENT_PIC_PROFILE, "proxilion.v1");
+    }
+
+    #[test]
+    fn cached_pca_new_defaults_pic_profile_to_current() {
+        let id = Uuid::nil();
+        let pca = CachedPca::new(
+            id,
+            vec![1, 2, 3],
+            "alice@acme.com".into(),
+            vec!["drive:read:file/x".into()],
+            0,
+            None,
+        );
+        assert_eq!(pca.pca_id, id);
+        assert_eq!(pca.cbor, vec![1, 2, 3]);
+        assert_eq!(pca.p_0, "alice@acme.com");
+        assert_eq!(pca.ops, vec!["drive:read:file/x".to_string()]);
+        assert_eq!(pca.hop, 0);
+        assert!(pca.predecessor_id.is_none());
+        assert!(pca.signature.is_empty());
+        assert_eq!(pca.pic_profile, CURRENT_PIC_PROFILE);
+    }
+
+    #[test]
+    fn cached_pca_new_carries_predecessor_when_present() {
+        let pred = Uuid::new_v4();
+        let pca = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 1, Some(pred));
+        assert_eq!(pca.predecessor_id, Some(pred));
+        assert_eq!(pca.hop, 1);
+    }
+
+    #[test]
+    fn cache_error_display_passes_through_db_message() {
+        // sqlx::Error::RowNotFound has a deterministic Display string.
+        let e = CacheError::Db(sqlx::Error::RowNotFound);
+        let s = e.to_string();
+        assert!(s.starts_with("postgres:"));
+        assert!(s.contains("no rows"));
+    }
+}

@@ -663,3 +663,66 @@ impl IntoResponse for ApiError {
         body.into_response(status)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn body_json(r: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(r.into_body(), 8 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_error_not_found_is_404() {
+        let r = ApiError::NotFound.into_response();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let v = body_json(r).await;
+        assert_eq!(v["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn api_error_bad_request_carries_detail() {
+        let r = ApiError::BadRequest("missing field".into()).into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(r).await;
+        assert_eq!(v["code"], "bad_request");
+        assert_eq!(v["detail"], "missing field");
+    }
+
+    #[tokio::test]
+    async fn api_error_conflict_is_409() {
+        let r = ApiError::Conflict("already overridden".into()).into_response();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        let v = body_json(r).await;
+        assert_eq!(v["code"], "conflict");
+        assert_eq!(v["detail"], "already overridden");
+    }
+
+    #[tokio::test]
+    async fn api_error_pic_refused_is_422_with_fix_hint() {
+        let r = ApiError::PicRefused("ops not subset".into()).into_response();
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = body_json(r).await;
+        assert_eq!(v["code"], "pic_invariant");
+        assert_eq!(v["detail"], "ops not subset");
+        assert!(v["fix"].as_str().unwrap().contains("monotonicity"));
+    }
+
+    #[tokio::test]
+    async fn api_error_internal_is_500() {
+        let r = ApiError::Internal("oops".into()).into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let v = body_json(r).await;
+        assert_eq!(v["code"], "internal_error");
+    }
+
+    #[tokio::test]
+    async fn api_error_db_is_500_with_detail() {
+        let r = ApiError::Db(sqlx::Error::RowNotFound).into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let v = body_json(r).await;
+        assert_eq!(v["code"], "internal_error");
+        assert!(v["detail"].as_str().unwrap().contains("no rows"));
+    }
+}

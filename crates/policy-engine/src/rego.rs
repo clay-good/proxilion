@@ -424,3 +424,190 @@ fn compile_read_filter(cfg: &ReadFilterCfg) -> Result<ReadFilter, Error> {
         },
     })
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use crate::yaml::{PolicyDoc, QuarantineActionCfg, QuarantinePatternCfg, ReadFilterCfg};
+
+    fn doc_with_decision(yaml_decision: &str) -> PolicyDoc {
+        let y =
+            format!("id: p1\nvendor: v\naction: a\ndecision: {yaml_decision}\nrequired_ops: []\n");
+        serde_yaml::from_str(&y).unwrap()
+    }
+
+    #[test]
+    fn observe_demote_allow_is_passthrough() {
+        let (d, label) = observe_demote(Decision::Allow);
+        assert_eq!(d, Decision::Allow);
+        assert!(label.is_none());
+    }
+
+    #[test]
+    fn observe_demote_block_records_observe_block_label() {
+        let (d, label) = observe_demote(Decision::Block {
+            reason: "r".into(),
+            override_allowed: false,
+        });
+        assert_eq!(d, Decision::Allow);
+        assert_eq!(label.as_deref(), Some("observe_block"));
+    }
+
+    #[test]
+    fn observe_demote_require_confirmation_records_label() {
+        let (d, label) = observe_demote(Decision::RequireConfirmation { reason: "r".into() });
+        assert_eq!(d, Decision::Allow);
+        assert_eq!(label.as_deref(), Some("observe_require_confirmation"));
+    }
+
+    #[test]
+    fn observe_demote_rate_limit_records_label() {
+        let (d, label) = observe_demote(Decision::RateLimit {
+            burst: 10,
+            per_seconds: 60,
+        });
+        assert_eq!(d, Decision::Allow);
+        assert_eq!(label.as_deref(), Some("observe_rate_limit"));
+    }
+
+    #[test]
+    fn parse_decision_allow_string() {
+        let d = parse_decision(&doc_with_decision("allow")).unwrap();
+        assert_eq!(d, Decision::Allow);
+    }
+
+    #[test]
+    fn parse_decision_null_yaml_is_allow() {
+        let p = doc_with_decision("~"); // YAML null
+        let d = parse_decision(&p).unwrap();
+        assert_eq!(d, Decision::Allow);
+    }
+
+    #[test]
+    fn parse_decision_block_string_carries_policy_id_reason() {
+        let p = doc_with_decision("block");
+        match parse_decision(&p).unwrap() {
+            Decision::Block {
+                reason,
+                override_allowed,
+            } => {
+                assert!(reason.contains("p1"));
+                // No `override: requires_justification` set on doc → false.
+                assert!(!override_allowed);
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_decision_block_string_respects_override_field() {
+        let y = "id: p1\nvendor: v\naction: a\ndecision: block\noverride: requires_justification\nrequired_ops: []\n";
+        let p: PolicyDoc = serde_yaml::from_str(y).unwrap();
+        match parse_decision(&p).unwrap() {
+            Decision::Block {
+                override_allowed, ..
+            } => assert!(override_allowed),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_decision_require_confirmation_string() {
+        let d = parse_decision(&doc_with_decision("require_confirmation")).unwrap();
+        assert!(matches!(d, Decision::RequireConfirmation { .. }));
+    }
+
+    #[test]
+    fn parse_decision_unknown_string_errors() {
+        let p = doc_with_decision("banhammer");
+        let err = parse_decision(&p).unwrap_err();
+        assert!(matches!(err, Error::BadDecision(_)));
+        assert!(err.to_string().contains("banhammer"));
+    }
+
+    #[test]
+    fn parse_decision_rate_limit_map() {
+        let y = "id: p1\nvendor: v\naction: a\ndecision:\n  rate_limit:\n    burst: 5\n    per_seconds: 10\nrequired_ops: []\n";
+        let p: PolicyDoc = serde_yaml::from_str(y).unwrap();
+        match parse_decision(&p).unwrap() {
+            Decision::RateLimit { burst, per_seconds } => {
+                assert_eq!(burst, 5);
+                assert_eq!(per_seconds, 10);
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_decision_rate_limit_missing_field_errors() {
+        let y = "id: p1\nvendor: v\naction: a\ndecision:\n  rate_limit:\n    burst: 5\nrequired_ops: []\n";
+        let p: PolicyDoc = serde_yaml::from_str(y).unwrap();
+        let err = parse_decision(&p).unwrap_err();
+        assert!(err.to_string().contains("per_seconds"));
+    }
+
+    #[test]
+    fn parse_decision_block_map_carries_custom_reason() {
+        let y = "id: p1\nvendor: v\naction: a\ndecision:\n  block:\n    reason: external recipient\nrequired_ops: []\n";
+        let p: PolicyDoc = serde_yaml::from_str(y).unwrap();
+        match parse_decision(&p).unwrap() {
+            Decision::Block { reason, .. } => assert_eq!(reason, "external recipient"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_read_filter_literal_and_regex_round_trip() {
+        let cfg = ReadFilterCfg {
+            quarantine_patterns: vec![
+                QuarantinePatternCfg::Literal("ignore previous".into()),
+                QuarantinePatternCfg::Regex {
+                    regex: r"<\|.*?\|>".into(),
+                },
+            ],
+            quarantine_action: QuarantineActionCfg::ReplaceWithMarker,
+        };
+        let rf = compile_read_filter(&cfg).unwrap();
+        assert_eq!(rf.quarantine_patterns.len(), 2);
+        assert!(matches!(rf.quarantine_patterns[0], Pattern::Literal(_)));
+        assert!(matches!(rf.quarantine_patterns[1], Pattern::Regex(_)));
+        assert_eq!(rf.quarantine_action, QuarantineAction::ReplaceWithMarker);
+    }
+
+    #[test]
+    fn compile_read_filter_each_quarantine_action_maps_through() {
+        for (cfg_var, expect) in [
+            (
+                QuarantineActionCfg::ReplaceWithMarker,
+                QuarantineAction::ReplaceWithMarker,
+            ),
+            (
+                QuarantineActionCfg::StripSilently,
+                QuarantineAction::StripSilently,
+            ),
+            (
+                QuarantineActionCfg::BlockRequest,
+                QuarantineAction::BlockRequest,
+            ),
+        ] {
+            let cfg = ReadFilterCfg {
+                quarantine_patterns: vec![],
+                quarantine_action: cfg_var,
+            };
+            let rf = compile_read_filter(&cfg).unwrap();
+            assert_eq!(rf.quarantine_action, expect);
+        }
+    }
+
+    #[test]
+    fn compile_read_filter_bad_regex_errors() {
+        let cfg = ReadFilterCfg {
+            quarantine_patterns: vec![QuarantinePatternCfg::Regex {
+                regex: "(unbalanced".into(),
+            }],
+            quarantine_action: QuarantineActionCfg::ReplaceWithMarker,
+        };
+        let err = compile_read_filter(&cfg).unwrap_err();
+        assert!(matches!(err, Error::BadRegex { .. }));
+    }
+}

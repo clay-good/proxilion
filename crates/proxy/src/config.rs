@@ -688,4 +688,136 @@ operator_auth_enforced = false
         assert_eq!(c.database_url.as_deref(), Some("postgres://localhost/test"));
         assert_eq!(c.policy_path.unwrap().to_string_lossy(), "/tmp/p.yaml");
     }
+
+    #[test]
+    fn check_http_url_accepts_http_and_https() {
+        // Both schemes are allowed — operators commonly run http:// inside
+        // a trust boundary (compose network, k8s service mesh) and https://
+        // when terminating at an external load balancer. Pin both.
+        assert!(check_http_url("X", "http://internal.svc:8080").is_ok());
+        assert!(check_http_url("X", "https://trust.example.com").is_ok());
+    }
+
+    #[test]
+    fn check_http_url_rejects_other_schemes_and_surfaces_field_name() {
+        // The field name is what the operator-facing error message
+        // surfaces — pin that `field` round-trips through the error
+        // variant unchanged (Grafana / setup-status keys on `field`).
+        for bad in &["ftp://x", "file:///etc/passwd", "ws://host", "just-a-host"] {
+            let err = check_http_url("PROXILION_X", bad).unwrap_err();
+            match err {
+                ConfigError::InvalidValue { field, reason } => {
+                    assert_eq!(field, "PROXILION_X");
+                    assert!(reason.contains("http://"), "reason: {reason}");
+                    assert!(reason.contains(bad), "reason: {reason}");
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_rejects_non_http_federation_bridge_url() {
+        // Symmetric to the trust-plane URL test — both URLs must pass the
+        // http(s) shape check. A regression that only ran the check on
+        // the trust-plane URL would let an `ftp://` bridge URL slip
+        // through.
+        let r = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .with_federation_bridge_url("ftp://nope")
+            .build();
+        let err = r.unwrap_err();
+        match err {
+            ConfigError::InvalidValue { field, .. } => {
+                assert_eq!(field, "PROXILION_FEDERATION_BRIDGE_URL");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_token_encryption_key_with_non_hex_chars() {
+        // Length is right (64 chars) but two are not hex — operators
+        // sometimes paste a base64-encoded value by mistake. Pin that
+        // the alphabet check fails alongside the length check.
+        let mut s = "0".repeat(62);
+        s.push_str("ZZ");
+        let err = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .with_token_encryption_key_hex(s)
+            .build()
+            .unwrap_err();
+        match err {
+            ConfigError::InvalidValue { field, reason } => {
+                assert_eq!(field, "PROXILION_TOKEN_ENCRYPTION_KEY");
+                // The reason mentions length even on non-hex input
+                // (the check is `len != 64 || !is_hex`); pin the cap.
+                assert!(reason.contains("64"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_requires_key_when_only_cert_exists_in_prod_mode() {
+        // Symmetric to `build_requires_cert_when_not_dev_mode`. The cert
+        // file path defaults to `./certs/cert.pem`, the key path to
+        // `./certs/key.pem`. Create the cert but not the key under a
+        // temp dir; the build must surface MissingKey, not MissingCert.
+        let dir = std::env::temp_dir().join(format!("proxilion-cfg-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, "fake cert").unwrap();
+        // Use the file-load path to inject the temp paths since the
+        // builder doesn't expose `with_tls_*` setters directly.
+        let toml_path = dir.join("c.toml");
+        std::fs::write(
+            &toml_path,
+            format!(
+                "tls_cert_path = {:?}\ntls_key_path = {:?}\ndev_mode = false\n",
+                cert.display().to_string(),
+                key.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let err = ConfigBuilder::defaults()
+            .from_file(&toml_path)
+            .unwrap()
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::MissingKey(_)), "got {err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_error_display_strings_include_field_or_path_context() {
+        // Operator-facing error messages — the setup-status path renders
+        // these verbatim. Pin the substrings the docs page keys on.
+        let e = ConfigError::InvalidValue {
+            field: "PROXILION_TRUST_PLANE_URL",
+            reason: "bad scheme".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("PROXILION_TRUST_PLANE_URL"));
+        assert!(s.contains("bad scheme"));
+
+        let e = ConfigError::MissingCert(std::path::PathBuf::from("/etc/certs/cert.pem"));
+        let s = e.to_string();
+        assert!(s.contains("TLS cert"));
+        assert!(s.contains("/etc/certs/cert.pem"));
+
+        let e = ConfigError::MissingKey(std::path::PathBuf::from("/etc/certs/key.pem"));
+        let s = e.to_string();
+        assert!(s.contains("TLS key"));
+        assert!(s.contains("/etc/certs/key.pem"));
+
+        let e = ConfigError::FileLoad {
+            path: std::path::PathBuf::from("/tmp/proxilion.toml"),
+            reason: "syntax error at line 3".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("/tmp/proxilion.toml"));
+        assert!(s.contains("syntax error at line 3"));
+    }
 }

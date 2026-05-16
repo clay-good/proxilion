@@ -115,4 +115,41 @@ mod tests {
         let err = reg.get().await.unwrap_err();
         assert!(matches!(err, CatKeyError::Fetch(_)));
     }
+
+    #[test]
+    fn cat_key_error_status_display_carries_code_only() {
+        // Operator-facing strings — the Status variant intentionally surfaces
+        // only the upstream HTTP code, never a response body (which could
+        // include error detail from the Trust Plane that we don't want
+        // pasted into a user-visible 500). Pin both shape and absence-of-body.
+        let s = CatKeyError::Status(429).to_string();
+        assert!(s.contains("429"));
+        assert!(s.contains("non-success"));
+        assert!(!s.to_lowercase().contains("body"));
+    }
+
+    #[test]
+    fn cat_key_registry_clones_share_underlying_oncecell() {
+        // `CatKeyRegistry` derives `Clone` over `Arc<Inner>` — every clone
+        // sees the same `OnceCell<PublicKey>`, so two clones independently
+        // calling `get()` against a real Trust Plane only fetch once.
+        // A regression that deep-copied the OnceCell would cause every
+        // clone to re-fetch (visible as duplicate `proxilion_oauth_*`
+        // counters in production).
+        let a = CatKeyRegistry::new("http://127.0.0.1:1/".into());
+        let b = a.clone();
+        assert!(Arc::ptr_eq(&a.inner, &b.inner));
+    }
+
+    #[test]
+    fn info_resp_ignores_unknown_fields_for_forward_compat() {
+        // The Trust Plane may add fields to `/v1/federation/info` over time
+        // (e.g. `next_kid`). Pin that the deserializer ignores unknown
+        // fields rather than refusing the whole document — required for
+        // forward compatibility with a newer Trust Plane.
+        let raw = r#"{"kid":"k1","public_key":"AAA","next_rotation":"2026-09-01"}"#;
+        let info: InfoResp = serde_json::from_str(raw).expect("ignores unknown fields");
+        assert_eq!(info.kid, "k1");
+        assert_eq!(info.public_key, "AAA");
+    }
 }

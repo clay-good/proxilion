@@ -485,4 +485,84 @@ mod tests {
         let b = c.lock_for([2u8; 32]).await;
         assert!(!Arc::ptr_eq(&a, &b));
     }
+
+    #[tokio::test]
+    async fn unauthorized_helper_returns_401_with_plain_body() {
+        // The 401 body is intentionally generic: never leak which check
+        // failed (bearer missing? revoked? PCA tampered?). Pin the
+        // status, the `text/plain` body shape, and the exact byte
+        // payload — operators have alerting keyed on this 401 rate as
+        // the "agent traffic broken" signal.
+        let r = unauthorized();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(r.into_body(), 64).await.unwrap();
+        assert_eq!(&bytes[..], b"unauthorized");
+    }
+
+    #[test]
+    fn auth_fail_display_strings_are_stable_for_log_filters() {
+        // Tracing emits `reason = %why` for every rejection. The substrings
+        // below are what Grafana / Loki filters key on. A future variant
+        // rename or message tweak must be a conscious wire-shape change.
+        assert_eq!(AuthFail::BadFormat.to_string(), "bearer format invalid");
+        assert_eq!(AuthFail::NotFound.to_string(), "bearer not found / revoked");
+        assert_eq!(AuthFail::Decrypt.to_string(), "google token decrypt failed");
+        assert!(
+            AuthFail::Refresh("network timeout".into())
+                .to_string()
+                .contains("network timeout"),
+        );
+        assert_eq!(
+            AuthFail::PcaTampered.to_string(),
+            "PCA signature verification failed",
+        );
+        assert!(
+            AuthFail::CatKey("trust plane 503".into())
+                .to_string()
+                .contains("trust plane 503"),
+        );
+        assert!(
+            AuthFail::Other("unexpected".into())
+                .to_string()
+                .contains("unexpected"),
+        );
+    }
+
+    #[test]
+    fn auth_fail_pca_cache_miss_message_explains_upstream_gap() {
+        // The PcaCacheMiss variant carries a pinned message that points
+        // at spec.md §1.2 (no upstream GET /v1/pca/{id} yet). Operators
+        // who hit this in logs need the explanation, not just an opaque
+        // variant name. Pin the substring.
+        let s = AuthFail::PcaCacheMiss.to_string();
+        assert!(s.contains("PCA cache miss"));
+        assert!(s.contains("/v1/pca/"));
+    }
+
+    #[test]
+    fn auth_fail_from_sqlx_via_question_mark() {
+        // `?` conversion is the public path the middleware uses to bubble
+        // DB errors up out of the JOIN. Pin the `#[from]` blanket-impl —
+        // dropping `#[from]` later would surface here as a compile error
+        // rather than as a silent string-format regression downstream.
+        fn maybe() -> Result<(), AuthFail> {
+            Err::<(), sqlx::Error>(sqlx::Error::RowNotFound)?;
+            Ok(())
+        }
+        let e = maybe().unwrap_err();
+        assert!(matches!(e, AuthFail::Db(_)));
+        assert_eq!(e.to_string(), "database error");
+    }
+
+    #[tokio::test]
+    async fn refresh_coordinator_default_starts_empty_then_populates() {
+        // `Default` builds an empty moka cache; the first `lock_for` is
+        // what populates it. Pin both halves — a regression that pre-warmed
+        // the cache with a sentinel would surface as the first lookup
+        // returning a leftover Arc rather than a fresh one.
+        let c = RefreshCoordinator::default();
+        let a = c.lock_for([5u8; 32]).await;
+        let b = c.lock_for([5u8; 32]).await;
+        assert!(Arc::ptr_eq(&a, &b), "second lookup returns the same Arc");
+    }
 }

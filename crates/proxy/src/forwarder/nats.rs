@@ -123,4 +123,38 @@ mod tests {
         assert_eq!(sanitize_token("a*b>c d"), "a_b_c_d");
         assert_eq!(sanitize_token("drive.files.get"), "drive.files.get");
     }
+
+    #[test]
+    fn sanitize_preserves_hyphens_underscores_and_alphanum() {
+        // Hyphen + underscore are valid in NATS subjects and must pass
+        // through. Vendor / action enums sometimes carry them (e.g. a
+        // future `gmail-beta` vendor label) — silently `_`-replacing them
+        // would split wildcard subscriptions.
+        assert_eq!(sanitize_token("gmail-beta_v2.0"), "gmail-beta_v2.0");
+        assert_eq!(sanitize_token("ABCdef123"), "ABCdef123");
+    }
+
+    #[test]
+    fn sanitize_empty_returns_empty() {
+        assert!(sanitize_token("").is_empty());
+    }
+
+    #[test]
+    fn sanitize_replaces_unicode_with_underscore() {
+        // Non-ASCII chars are not part of the allowed subject alphabet.
+        // The classifier collapses them all to `_` so multibyte input
+        // never breaks subject parsing on the subscriber side.
+        let s = sanitize_token("café→x");
+        assert!(s.starts_with("ca"));
+        assert!(s.ends_with("x"));
+        assert!(s.contains('_'));
+    }
+
+    #[test]
+    fn connect_error_display_contains_reason() {
+        let e = ConnectError("connection refused".into());
+        let s = format!("{e}");
+        assert!(s.contains("connection refused"));
+        assert!(s.contains("nats connect failed"));
+    }
 }

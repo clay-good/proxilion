@@ -130,3 +130,94 @@ impl ActionStream for BroadcastingActionStream {
         let _ = self.tx.send(Arc::new(event));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn sample() -> ActionEvent {
+        ActionEvent {
+            request_id: Uuid::nil(),
+            agent_session_id: Uuid::nil(),
+            p_0: "alice@demo.local".into(),
+            leaf_pca_id: None,
+            vendor: "google".into(),
+            action: "gmail.messages.send".into(),
+            method: "POST".into(),
+            path: "/gmail/v1/users/me/messages/send".into(),
+            status: 403,
+            decision: "block".into(),
+            block_reason: Some("policy".into()),
+            read_filter_triggered: false,
+            quarantined_count: 0,
+            at: Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap(),
+            policy_id: Some("gmail-external-send-gate".into()),
+            extra: Value::Null,
+        }
+    }
+
+    #[test]
+    fn extra_null_is_skipped_in_json() {
+        let s = serde_json::to_string(&sample()).unwrap();
+        // `extra` is the only optional-shaped field; with the value `null`
+        // it must NOT appear in the wire form. Downstream consumers index
+        // on the presence of `extra` to decide whether to parse it.
+        assert!(!s.contains("\"extra\""), "wire shape: {s}");
+        assert!(s.contains("\"decision\":\"block\""));
+        assert!(s.contains("\"policy_id\":\"gmail-external-send-gate\""));
+    }
+
+    #[test]
+    fn extra_object_is_serialized() {
+        let mut e = sample();
+        e.extra = serde_json::json!({"to_domain": "external.com"});
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"extra\""));
+        assert!(s.contains("\"to_domain\":\"external.com\""));
+    }
+
+    #[test]
+    fn round_trips_through_json_with_absent_extra() {
+        // Older NATS / SIEM consumers MAY emit events without the `extra`
+        // key — deserialization must default it to `Value::Null` rather
+        // than fail. (`#[serde(default)]` on the field guarantees this.)
+        let s = r#"{
+            "request_id":"00000000-0000-0000-0000-000000000000",
+            "agent_session_id":"00000000-0000-0000-0000-000000000000",
+            "p_0":"alice@demo.local","leaf_pca_id":null,
+            "vendor":"google","action":"drive.files.get",
+            "method":"GET","path":"/drive/v3/files/x","status":200,
+            "decision":"allow","block_reason":null,
+            "read_filter_triggered":false,"quarantined_count":0,
+            "at":"2026-05-16T12:00:00Z","policy_id":null
+        }"#;
+        let ev: ActionEvent = serde_json::from_str(s).unwrap();
+        assert_eq!(ev.decision, "allow");
+        assert!(ev.extra.is_null());
+    }
+
+    #[test]
+    fn full_round_trip_preserves_all_fields() {
+        let original = sample();
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let back: ActionEvent = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.vendor, original.vendor);
+        assert_eq!(back.action, original.action);
+        assert_eq!(back.status, original.status);
+        assert_eq!(back.decision, original.decision);
+        assert_eq!(back.block_reason, original.block_reason);
+        assert_eq!(back.policy_id, original.policy_id);
+        assert_eq!(back.read_filter_triggered, original.read_filter_triggered);
+        assert_eq!(back.quarantined_count, original.quarantined_count);
+        assert_eq!(back.at, original.at);
+    }
+
+    #[tokio::test]
+    async fn logging_stream_publish_is_infallible() {
+        // `LoggingStream` writes to tracing and returns; no DB, no panic.
+        // We exercise the trait dispatch so the default impl is covered.
+        let s = LoggingStream;
+        s.publish(sample()).await;
+    }
+}

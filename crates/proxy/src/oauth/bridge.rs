@@ -139,6 +139,84 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_jwt_missing_parts() {
+        // No dots → split yields one token, second/third are None.
+        let err = validate_federation_token("not-a-jwt").unwrap_err();
+        match err {
+            OAuthError::BridgeRejected(m) => assert!(m.contains("malformed")),
+            other => panic!("expected BridgeRejected, got {other:?}"),
+        }
+        // Two parts only — same path.
+        let err = validate_federation_token("header.payload").unwrap_err();
+        assert!(matches!(err, OAuthError::BridgeRejected(_)));
+    }
+
+    #[test]
+    fn rejects_bad_base64_in_payload() {
+        // Header is valid base64, payload uses non-URL-safe `+/` and an
+        // odd length so `URL_SAFE_NO_PAD` decode errors.
+        let header = B64URL.encode(br#"{"alg":"none"}"#);
+        let jwt = format!("{header}.@@@bad-base64@@@.sig");
+        let err = validate_federation_token(&jwt).unwrap_err();
+        match err {
+            OAuthError::BridgeRejected(m) => assert!(m.contains("bad base64")),
+            other => panic!("expected BridgeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_future_issued_token() {
+        let now = chrono::Utc::now().timestamp();
+        // iat is more than 60s in the future — clock-skew guard fires.
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "abc",
+            "iat": now + 3600,
+            "exp": now + 7200,
+        }));
+        let err = validate_federation_token(&jwt).unwrap_err();
+        match err {
+            OAuthError::BridgeRejected(m) => assert!(m.contains("future")),
+            other => panic!("expected BridgeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claims_iss_round_trips_through_payload() {
+        // The `iss` field is `Option<String>` and `#[serde(default)]` — a
+        // production federation bridge MUST round-trip it through so the
+        // callback metric's `idp` label is correct. Bridge stubs may omit
+        // it (default = None).
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "s",
+            "iat": now,
+            "exp": now + 60,
+            "iss": "https://login.microsoftonline.com/abc/v2.0",
+        }));
+        let claims = validate_federation_token(&jwt).unwrap();
+        assert_eq!(infer_idp(claims.iss.as_deref()), "azure");
+    }
+
+    #[test]
+    fn infer_idp_covers_secondary_substrings() {
+        // Per the docstring on `infer_idp`, googleapis.com and windows.net
+        // are alternate substrings that still classify as google / azure.
+        // The primary-substring test covers okta.com / microsoftonline.com /
+        // accounts.google.com — this fills the OR branch.
+        assert_eq!(
+            infer_idp(Some("https://oauth2.googleapis.com/token")),
+            "google"
+        );
+        assert_eq!(infer_idp(Some("https://sts.windows.net/abc/v2.0")), "azure");
+    }
+
+    #[test]
     fn accepts_fresh_token() {
         let now = chrono::Utc::now().timestamp();
         let jwt = make_jwt(&serde_json::json!({

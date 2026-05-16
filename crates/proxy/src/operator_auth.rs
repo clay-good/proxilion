@@ -466,4 +466,89 @@ mod tests {
         // 32 bytes.
         assert_eq!(hash(t).len(), 32);
     }
+
+    #[test]
+    fn hash_differs_across_tokens() {
+        let a = "pxl_operator_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "pxl_operator_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        assert_ne!(hash(a), hash(b));
+    }
+
+    #[test]
+    fn generate_returns_distinct_well_formed_tokens() {
+        let a = generate();
+        let b = generate();
+        assert_ne!(a, b);
+        assert!(parse_token(&a).is_some());
+        assert!(parse_token(&b).is_some());
+    }
+
+    #[test]
+    fn scope_error_message_carries_required() {
+        let p = OperatorPrincipal {
+            token_id: Uuid::new_v4(),
+            name: "n".into(),
+            scopes: Arc::new(vec!["policy:read".into()]),
+            last_used_at: None,
+        };
+        let err = p.require_scope("killswitch:revoke").unwrap_err();
+        assert_eq!(err.required, "killswitch:revoke");
+        assert_eq!(err.have, vec!["policy:read".to_string()]);
+        let msg = err.to_string();
+        assert!(msg.contains("killswitch:revoke"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_is_401_with_plain_body() {
+        let r = unauthorized("missing");
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(r.into_body(), 256).await.unwrap();
+        assert_eq!(&bytes[..], b"unauthorized");
+    }
+
+    #[tokio::test]
+    async fn require_scope_helper_returns_principal_on_match() {
+        let p = OperatorPrincipal {
+            token_id: Uuid::new_v4(),
+            name: "n".into(),
+            scopes: Arc::new(vec!["policy:read".into()]),
+            last_used_at: None,
+        };
+        let mut req = Request::new(Body::empty());
+        req.extensions_mut().insert(p.clone());
+        let out = require_scope(&req, "policy:read").expect("principal returned");
+        assert_eq!(out.token_id, p.token_id);
+    }
+
+    #[tokio::test]
+    async fn require_scope_helper_403_with_required_and_have_on_miss() {
+        let p = OperatorPrincipal {
+            token_id: Uuid::new_v4(),
+            name: "n".into(),
+            scopes: Arc::new(vec!["actions:read".into()]),
+            last_used_at: None,
+        };
+        let mut req = Request::new(Body::empty());
+        req.extensions_mut().insert(p);
+        let r = require_scope(&req, "policy:write").expect_err("must deny");
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "scope_denied");
+        assert_eq!(v["required"], "policy:write");
+        assert!(
+            v["have"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x == "actions:read")
+        );
+    }
+
+    #[tokio::test]
+    async fn require_scope_helper_401_when_no_principal() {
+        let req = Request::new(Body::empty());
+        let r = require_scope(&req, "policy:read").expect_err("no principal");
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
 }

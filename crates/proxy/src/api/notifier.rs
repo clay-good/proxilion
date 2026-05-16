@@ -749,4 +749,58 @@ mod tests {
         let b: SetConfigBody = serde_json::from_str(r#"{"driver":"slack","config":{}}"#).unwrap();
         assert!(b.enabled.is_none());
     }
+
+    #[test]
+    fn redact_url_no_path_keeps_full_host() {
+        // The host+scheme form (no path segment after the host) must NOT
+        // gain a trailing `/...` — the redacted shape should look like
+        // the original. A regression that always appended `/...` would
+        // mis-display "the URL is bare" in the dashboard's notifier list.
+        assert_eq!(redact_url("https://hooks.example"), "https://hooks.example",);
+        // With a custom port — still no `/`, still pass-through.
+        assert_eq!(redact_url("http://localhost:9100"), "http://localhost:9100",);
+    }
+
+    #[test]
+    fn redact_url_keeps_scheme_when_host_has_trailing_slash_only() {
+        // `https://host/` → first path segment is empty, so the redacted
+        // form is `https://host/...`. Pin this so a future fast-path
+        // that returned the bare host wouldn't accidentally surface a
+        // path-containing URL as path-less.
+        assert_eq!(
+            redact_url("https://example.com/"),
+            "https://example.com/...",
+        );
+    }
+
+    #[test]
+    fn set_config_body_rejects_missing_driver_field() {
+        // `driver` is non-Option — required by the operator contract.
+        // The dashboard validates first, but a hand-rolled curl that
+        // forgets the field must surface as a 400, not as a silent
+        // routing into the `_` arm (which would emit a less specific
+        // error). Pin that deserialization fails for the missing case.
+        let res: Result<SetConfigBody, _> = serde_json::from_str(r#"{"config":{}}"#);
+        assert!(res.is_err(), "missing driver must fail to deserialize");
+    }
+
+    #[test]
+    fn set_config_body_rejects_missing_config_field() {
+        // Symmetric to driver — `config` is the per-driver payload and
+        // the handlers index into it; absence here would surface as a
+        // confusing serde error inside the driver branch. Pin the early
+        // failure at the envelope layer.
+        let res: Result<SetConfigBody, _> = serde_json::from_str(r#"{"driver":"webhook"}"#);
+        assert!(res.is_err(), "missing config must fail to deserialize");
+    }
+
+    #[test]
+    fn set_config_body_accepts_explicit_enabled_false() {
+        // The disable path — `enabled: false` is how operators turn a
+        // configured-but-paused driver off. Pin that the field round-trips
+        // as `Some(false)` (not coerced to None or unwrapped to true).
+        let raw = r#"{"driver":"webhook","enabled":false,"config":{}}"#;
+        let b: SetConfigBody = serde_json::from_str(raw).unwrap();
+        assert_eq!(b.enabled, Some(false));
+    }
 }

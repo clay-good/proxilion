@@ -451,4 +451,122 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ExecutorError::Invariant(_)), "got: {err:?}");
     }
+
+    #[test]
+    fn dev_ephemeral_yields_distinct_kids_per_call() {
+        // The dev-ephemeral constructor builds a fresh random kid each
+        // call. Pin distinctness so a future regression that re-seeded the
+        // RNG with the process pid (or some other fixed value) would
+        // surface here. The kid prefix is operator-visible — both must
+        // start with `proxy-dev-`.
+        let a = PicExecutor::dev_ephemeral("http://127.0.0.1:1/".into()).unwrap();
+        let b = PicExecutor::dev_ephemeral("http://127.0.0.1:1/".into()).unwrap();
+        assert_ne!(a.executor_kid(), b.executor_kid());
+        assert!(a.executor_kid().starts_with("proxy-dev-"));
+        assert!(b.executor_kid().starts_with("proxy-dev-"));
+    }
+
+    #[test]
+    fn pic_executor_new_round_trips_kid_through_executor_kid_accessor() {
+        // Production callers pass a stable kid (the PROXY_EXECUTOR_KEY
+        // env's matching kid string) and read it back via `executor_kid()`
+        // to put on every PoC's executor_binding. A regression that
+        // generated a fresh kid in `new()` and ignored the parameter
+        // would silently break chain attribution downstream.
+        let seed = [7u8; 32];
+        let exec =
+            PicExecutor::new("http://127.0.0.1:1/".into(), "proxy-prod-1".into(), &seed).unwrap();
+        assert_eq!(exec.executor_kid(), "proxy-prod-1");
+    }
+
+    #[test]
+    fn executor_error_display_strings_carry_named_field_values() {
+        // The middleware + adapter layers log `error = %e` for each path.
+        // Pin the structured `Upstream { status, body }` variant's
+        // thiserror substitution — a regression that dropped one of the
+        // fields would silently lose troubleshooting context.
+        let s = ExecutorError::Upstream {
+            status: 503,
+            body: "trust plane down".into(),
+        }
+        .to_string();
+        assert!(s.contains("503"));
+        assert!(s.contains("trust plane down"));
+
+        // Invariant carries an opaque body. Pin the prefix so a future
+        // variant rename surfaces here, plus pass-through of the inner
+        // string (the dashboard renders this verbatim).
+        let s = ExecutorError::Invariant("ops not subset".into()).to_string();
+        assert!(s.contains("invariant violation"));
+        assert!(s.contains("ops not subset"));
+
+        let s = ExecutorError::Core("cbor encode".into()).to_string();
+        assert!(s.contains("provenance-core"));
+        assert!(s.contains("cbor encode"));
+    }
+
+    #[test]
+    fn issue_pca_response_deserializes_with_optional_exp_absent() {
+        // Trust Plane omits `exp` on long-lived PCAs. Pin both the
+        // success-with-exp and the success-without-exp variants —
+        // `#[serde(default)]` on the field is load-bearing for forward
+        // compat with PCAs that never expire.
+        let raw = r#"{"pca":"b64bytes","hop":1,"p_0":"alice@demo.local","ops":["drive:read:x"]}"#;
+        let resp: IssuePcaResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.hop, 1);
+        assert_eq!(resp.p_0, "alice@demo.local");
+        assert_eq!(resp.ops, vec!["drive:read:x".to_string()]);
+        assert!(resp.exp.is_none());
+
+        let raw_with_exp =
+            r#"{"pca":"b64","hop":0,"p_0":"alice","ops":[],"exp":"2027-01-01T00:00:00Z"}"#;
+        let resp: IssuePcaResponse = serde_json::from_str(raw_with_exp).unwrap();
+        assert_eq!(resp.exp.as_deref(), Some("2027-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn process_poc_response_round_trips_ops_and_hop() {
+        // Symmetric to IssuePcaResponse but on the successor-mint path.
+        // `ops` is the *narrowed* set — pin that the array round-trip
+        // preserves order (downstream PicVerifier compares element-wise).
+        let raw = r#"{"pca":"b64","hop":2,"p_0":"bob","ops":["a:read:x","b:write:y"]}"#;
+        let resp: ProcessPocResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.hop, 2);
+        assert_eq!(resp.p_0, "bob");
+        assert_eq!(
+            resp.ops,
+            vec!["a:read:x".to_string(), "b:write:y".to_string()],
+        );
+    }
+
+    #[test]
+    fn register_executor_request_serializes_to_snake_case_pair() {
+        // Trust Plane's `POST /v1/keys/executor` expects `kid` + `public_key`
+        // — the wire field names are part of the upstream contract. Pin both
+        // so a future rename (e.g. `executor_kid` / `verifying_key`) would
+        // surface here as a wire-shape regression.
+        let req = RegisterExecutorRequest {
+            kid: "proxy-prod-1".into(),
+            public_key: "base64-encoded-bytes".into(),
+        };
+        let j = serde_json::to_value(&req).unwrap();
+        assert_eq!(j["kid"], "proxy-prod-1");
+        assert_eq!(j["public_key"], "base64-encoded-bytes");
+        assert_eq!(
+            j.as_object().unwrap().len(),
+            2,
+            "only the two contract fields",
+        );
+    }
+
+    #[test]
+    fn pic_executor_clone_shares_inner_arc() {
+        // `Clone` is part of the design contract — adapters hold a
+        // per-handler clone of the executor, and the `OnceCell<()>` for
+        // registration must be shared so two adapters don't both
+        // re-register on first use. Pin Arc-sharing.
+        let a = PicExecutor::dev_ephemeral("http://127.0.0.1:1/".into()).unwrap();
+        let b = a.clone();
+        assert!(Arc::ptr_eq(&a.inner, &b.inner));
+    }
 }

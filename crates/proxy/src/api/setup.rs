@@ -187,3 +187,73 @@ impl IntoResponse for SetupError {
             .into_response(StatusCode::INTERNAL_SERVER_ERROR)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_item_serializes_with_stable_field_names() {
+        let item = CheckItem {
+            id: "database",
+            title: "Database",
+            ok: true,
+            detail: "connected".into(),
+            fix: None,
+            docs: "https://proxilion.com/docs/install",
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        // Stable wire shape — admin UI keys on these names.
+        assert_eq!(v["id"], "database");
+        assert_eq!(v["title"], "Database");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["detail"], "connected");
+        assert!(v["fix"].is_null());
+        assert_eq!(v["docs"], "https://proxilion.com/docs/install");
+    }
+
+    #[test]
+    fn check_item_failure_serializes_fix_hint() {
+        let item = CheckItem {
+            id: "google_credentials",
+            title: "Google OAuth credentials",
+            ok: false,
+            detail: "GOOGLE_CLIENT_ID/SECRET not set".into(),
+            fix: Some("Set GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET."),
+            docs: "https://proxilion.com/docs/install/google",
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["fix"].as_str().unwrap().contains("GOOGLE_CLIENT_ID"));
+    }
+
+    #[test]
+    fn setup_status_envelope_contains_items_and_readiness() {
+        let s = SetupStatus {
+            ready_for_traffic: false,
+            items: vec![CheckItem {
+                id: "database",
+                title: "Database",
+                ok: false,
+                detail: "unreachable".into(),
+                fix: Some("Set DATABASE_URL."),
+                docs: "https://proxilion.com/docs/install",
+            }],
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["ready_for_traffic"], false);
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["items"][0]["id"], "database");
+    }
+
+    #[tokio::test]
+    async fn setup_error_into_response_is_500_with_docs_link() {
+        let e = SetupError::Db(sqlx::Error::RowNotFound);
+        let r = e.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "internal_error");
+        assert!(v["docs"].as_str().unwrap().contains("troubleshooting"));
+    }
+}

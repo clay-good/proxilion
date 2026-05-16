@@ -371,6 +371,84 @@ mod canonical_request_json_tests {
         assert_eq!(v["action"], "gmail.messages.send");
     }
 
+    /// OwnedBlockedNotification round-trips a borrowed
+    /// `BlockedNotification` through owned strings and back, preserving
+    /// every field. The `spawn`'d notifier path depends on this so
+    /// adapters that go out of scope before the notifier finishes don't
+    /// dangle borrowed pointers.
+    #[test]
+    fn owned_notification_round_trips_through_borrowed() {
+        let ops = vec!["gmail:send:bob@external.com".to_string()];
+        let approve_url = "https://proxy.example/api/v1/blocked/abc/approve".to_string();
+        let reject_url = "https://proxy.example/api/v1/blocked/abc/reject".to_string();
+        let id = Uuid::new_v4();
+        let req = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let pred = Uuid::new_v4();
+        let original = BlockedNotification {
+            schema: BlockedNotification::SCHEMA,
+            blocked_id: id,
+            request_id: req,
+            session_id: session,
+            p_0: Some("alice@acme.com"),
+            vendor: "google",
+            action: "gmail.messages.send",
+            method: "POST",
+            path: "/gmail/v1/users/me/messages/send",
+            layer: "policy",
+            policy_id: Some("gmail-external-send-gate"),
+            detail: Some("external recipient"),
+            predecessor_pca_id: Some(pred),
+            requested_ops: &ops,
+            approve_url: approve_url.clone(),
+            reject_url: reject_url.clone(),
+        };
+        let owned = OwnedBlockedNotification::from(&original);
+        let borrowed = owned.as_borrowed();
+        assert_eq!(borrowed.schema, BlockedNotification::SCHEMA);
+        assert_eq!(borrowed.blocked_id, id);
+        assert_eq!(borrowed.request_id, req);
+        assert_eq!(borrowed.session_id, session);
+        assert_eq!(borrowed.p_0, Some("alice@acme.com"));
+        assert_eq!(borrowed.vendor, "google");
+        assert_eq!(borrowed.action, "gmail.messages.send");
+        assert_eq!(borrowed.method, "POST");
+        assert_eq!(borrowed.layer, "policy");
+        assert_eq!(borrowed.policy_id, Some("gmail-external-send-gate"));
+        assert_eq!(borrowed.detail, Some("external recipient"));
+        assert_eq!(borrowed.predecessor_pca_id, Some(pred));
+        assert_eq!(borrowed.requested_ops.len(), 1);
+        assert_eq!(borrowed.approve_url, approve_url);
+        assert_eq!(borrowed.reject_url, reject_url);
+    }
+
+    #[test]
+    fn owned_notification_clone_yields_independent_views() {
+        let ops: Vec<String> = vec![];
+        let n = BlockedNotification {
+            schema: BlockedNotification::SCHEMA,
+            blocked_id: Uuid::nil(),
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "/p",
+            layer: "policy",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            approve_url: "u/approve".into(),
+            reject_url: "u/reject".into(),
+        };
+        let a = OwnedBlockedNotification::from(&n);
+        let b = a.clone();
+        assert_eq!(a.approve_url, b.approve_url);
+        assert_eq!(a.as_borrowed().vendor, b.as_borrowed().vendor);
+    }
+
     /// Path params land under `path_params` exactly as the adapter
     /// surfaced them (no transformation). Two calls with the same
     /// inputs produce byte-equal output — the `request_canonical_json`

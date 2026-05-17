@@ -494,6 +494,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn burst_config_default_pins_documented_threshold_window_and_flush() {
+        // The doc-comment commits to "defaults to threshold=50, window=60s,
+        // flush_interval=30s" — operators who omit the env override read
+        // these numbers out of the troubleshooting docs. A regression that
+        // bumped the threshold to 100 (a tempting "more headroom" change)
+        // would silently change suppression behavior for every existing
+        // install on next restart.
+        let c = BurstConfig::default();
+        assert_eq!(c.threshold, 50);
+        assert_eq!(c.window, Duration::from_secs(60));
+        assert_eq!(c.flush_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn burst_summary_schema_is_versioned_string_consumers_key_on() {
+        // Webhook / Slack receivers route on the schema string and may
+        // parse v2 differently — the `.v1` suffix is the forward-compat
+        // axis. A regression that bumped without coordinating downstream
+        // would silently drop summary deliveries.
+        assert_eq!(BurstSummary::SCHEMA, "proxilion.blocked_action_burst.v1");
+        assert!(BurstSummary::SCHEMA.ends_with(".v1"));
+    }
+
+    #[test]
+    fn burst_summary_json_skips_empty_details_url_via_serde_attr() {
+        // `#[serde(skip_serializing_if = "String::is_empty")]` on
+        // `details_url` is load-bearing — receivers test key-presence to
+        // decide whether to render the "Open full list" button. A drift
+        // to always-serialize would silently render a button pointing at
+        // the empty string for test fixtures / installs without a public
+        // URL configured.
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 1,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(
+            v.get("details_url").is_none(),
+            "empty url must be elided: {v}"
+        );
+        // Symmetric: non-empty url survives.
+        let s2 = BurstSummary {
+            details_url: "https://x/y".into(),
+            ..s
+        };
+        let v2 = serde_json::to_value(&s2).unwrap();
+        assert_eq!(v2["details_url"], "https://x/y");
+    }
+
+    #[test]
+    fn details_url_collapses_multiple_trailing_slashes_in_base() {
+        // `trim_end_matches('/')` strips ALL trailing slashes — an
+        // operator who configures `https://proxy.local///` (a common
+        // typo when concatenating environment-variable fragments)
+        // must still produce a single-slash join, not `///api/v1/...`.
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 1,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        }
+        .with_details_url("https://proxy.local///");
+        assert_eq!(
+            s.details_url,
+            "https://proxy.local/api/v1/blocked?policy_id=p"
+        );
+    }
+
+    #[test]
+    fn flush_interval_round_trips_through_getter() {
+        // The `spawn_flush_loop` task drives its ticker off this value —
+        // a regression that hard-coded a default inside the getter
+        // (instead of returning the configured one) would silently make
+        // per-install flush-interval overrides no-ops.
+        let s = BurstSuppressor::new(BurstConfig {
+            threshold: 1,
+            window: Duration::from_secs(60),
+            flush_interval: Duration::from_secs(7),
+        });
+        assert_eq!(s.flush_interval(), Duration::from_secs(7));
+    }
+
+    #[tokio::test]
+    async fn burst_suppressor_clone_shares_bucket_state() {
+        // Clones must share the underlying `Arc<Mutex<HashMap<…>>>` so
+        // both the notifier (which calls `admit`) and the flush loop
+        // (which calls `drain_summaries`) see the same buckets. A
+        // regression that deep-copied the buckets would leave the flush
+        // loop forever empty even as suppression accrued on the notifier
+        // side.
+        let s = BurstSuppressor::new(BurstConfig {
+            threshold: 1,
+            window: Duration::from_secs(60),
+            flush_interval: Duration::from_secs(30),
+        });
+        let s2 = s.clone();
+        let now = Instant::now();
+        let ops: Vec<String> = vec![];
+        let n = notification("p", "alice@acme.com", &ops);
+        // Fire admit on the original, drain on the clone.
+        assert!(s.admit(&n, now).await);
+        assert!(!s.admit(&n, now).await); // suppressed
+        let summaries = s2.drain_summaries().await;
+        assert_eq!(summaries.len(), 1, "clone must see same buckets");
+        assert_eq!(summaries[0].suppressed_count, 1);
+    }
+
     #[tokio::test]
     async fn summary_carries_exemplar() {
         let s = BurstSuppressor::new(BurstConfig {

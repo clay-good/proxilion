@@ -224,3 +224,48 @@ pub async fn spawn(db: PgPool, tick_interval: Duration, email: EmailHandle) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_tick_interval_pinned_at_60_seconds() {
+        // Operator alerts on "blocked rows that should have expired" key
+        // off a 60–120s response time. A regression that loosened this
+        // to 5 minutes would silently widen that window without anyone
+        // noticing until a complaint. The constant is `pub const` so any
+        // direct `DEFAULT_TICK_INTERVAL` import must move in lockstep.
+        assert_eq!(DEFAULT_TICK_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn expiry_sweep_report_default_is_zero_and_clone_independent() {
+        // `Default + Clone + Debug` are the three traits the sweeper
+        // task relies on. Default must be `0` (not some sentinel like
+        // u64::MAX) so the no-overdue-rows branch can construct a
+        // report without an explicit `0` literal scattered through the
+        // code. Clone must yield an independent value (a future
+        // refactor to `Arc<u64>` would surface here as failing the
+        // mutation test below).
+        let r: ExpirySweepReport = ExpirySweepReport::default();
+        assert_eq!(r.expired_rows, 0);
+        let mut c = r.clone();
+        c.expired_rows = 42;
+        // Original unaffected.
+        assert_eq!(r.expired_rows, 0);
+        assert_eq!(c.expired_rows, 42);
+        // Debug includes the field name (operator-facing log shape).
+        assert!(format!("{r:?}").contains("expired_rows"));
+    }
+
+    #[test]
+    fn escalation_sweep_report_default_is_zero_and_debug_carries_field() {
+        let r: EscalationSweepReport = EscalationSweepReport::default();
+        assert_eq!(r.escalated_rows, 0);
+        assert!(format!("{r:?}").contains("escalated_rows"));
+        // Clone equivalence on the symmetric report.
+        let c = r.clone();
+        assert_eq!(c.escalated_rows, 0);
+    }
+}

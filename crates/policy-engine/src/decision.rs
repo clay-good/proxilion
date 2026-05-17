@@ -138,6 +138,69 @@ mod tests {
     /// (operator dashboards key off them). Renaming a variant must
     /// fail this snapshot loudly.
     #[test]
+    fn quarantine_action_copy_and_eq_traits_work_at_use_sites() {
+        // The read-filter dispatcher matches on the variant by value
+        // (not by reference) — `Copy` lets the per-pattern processor
+        // pass the action down without explicit `.clone()`. A regression
+        // that dropped `Copy` would surface here as a compile error
+        // rather than confusing failures at the dispatcher call site.
+        let a = QuarantineAction::ReplaceWithMarker;
+        let a2 = a; // Copy
+        assert_eq!(a, a2);
+        assert_ne!(
+            QuarantineAction::ReplaceWithMarker,
+            QuarantineAction::StripSilently
+        );
+        assert_ne!(
+            QuarantineAction::StripSilently,
+            QuarantineAction::BlockRequest
+        );
+        assert_ne!(
+            QuarantineAction::ReplaceWithMarker,
+            QuarantineAction::BlockRequest
+        );
+    }
+
+    #[test]
+    fn read_filter_clone_carries_patterns_and_action_independently() {
+        // `ReadFilter` is `Clone` so the per-request engine snapshot can
+        // hand a copy to the response-body scanner without giving up
+        // ownership. Pin that the clone is shape-equivalent (same
+        // pattern count) and that mutating one side's `Vec` doesn't
+        // touch the other (no `Rc`/`Arc` smuggled into the inner vec).
+        let f = ReadFilter {
+            quarantine_patterns: vec![
+                Pattern::Literal("ignore previous".into()),
+                Pattern::Regex(regex::Regex::new(r"(?i)system prompt").unwrap()),
+            ],
+            quarantine_action: QuarantineAction::ReplaceWithMarker,
+        };
+        let mut c = f.clone();
+        assert_eq!(c.quarantine_patterns.len(), 2);
+        assert_eq!(c.quarantine_action, f.quarantine_action);
+        c.quarantine_patterns.push(Pattern::Literal("extra".into()));
+        // Original unchanged.
+        assert_eq!(f.quarantine_patterns.len(), 2);
+        assert_eq!(c.quarantine_patterns.len(), 3);
+    }
+
+    #[test]
+    fn literal_pattern_matches_empty_haystack_against_empty_needle_only() {
+        // The literal arm uses `str::contains`, which returns true for
+        // the empty-needle case against any haystack — that's the
+        // standard Rust semantic. A future refactor to a hand-rolled
+        // matcher that gated on `needle.is_empty()` would change this
+        // and silently break a policy that uses the empty string as a
+        // catch-all marker. (Unusual, but documenting current behaviour.)
+        let empty = Pattern::Literal(String::new());
+        assert!(empty.is_match(""));
+        assert!(empty.is_match("any text"));
+        // Non-empty needle against empty haystack — must NOT match.
+        let p = Pattern::Literal("needle".into());
+        assert!(!p.is_match(""));
+    }
+
+    #[test]
     fn decision_kind_wire_strings_are_stable() {
         let cases: &[(Decision, &str)] = &[
             (Decision::Allow, "allow"),

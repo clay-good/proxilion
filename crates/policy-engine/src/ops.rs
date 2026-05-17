@@ -263,6 +263,134 @@ mod tests {
     }
 
     #[test]
+    fn ops_atom_parse_rejects_each_malformed_shape() {
+        // Four distinct malformed shapes — each must surface
+        // `OpsParseError::Malformed`. A future refactor that collapsed
+        // the colon-counting + empty-segment checks into one would lose
+        // the ability to test these independently.
+        assert!(matches!(
+            OpsAtom::parse("no-colon").unwrap_err(),
+            OpsParseError::Malformed
+        ));
+        assert!(matches!(
+            OpsAtom::parse("only:one-colon").unwrap_err(),
+            OpsParseError::Malformed
+        ));
+        assert!(matches!(
+            OpsAtom::parse(":missing:scheme").unwrap_err(),
+            OpsParseError::Malformed
+        ));
+        assert!(matches!(
+            OpsAtom::parse("scheme::missing-action").unwrap_err(),
+            OpsParseError::Malformed
+        ));
+        assert!(matches!(
+            OpsAtom::parse("scheme:action:").unwrap_err(),
+            OpsParseError::Malformed
+        ));
+    }
+
+    #[test]
+    fn ops_atom_parse_keeps_extra_colons_and_slashes_in_object() {
+        // Object is everything after the second colon — slashes and
+        // additional colons are part of the identifier (the
+        // `gmail:send:user@host:to:domain` shape used in templates needs
+        // this). A regression that split on every colon would silently
+        // truncate Gmail ops.
+        let a = OpsAtom::parse("gmail:send:alice@acme.com:to:evil.example").unwrap();
+        assert_eq!(a.scheme, "gmail");
+        assert_eq!(a.action, "send");
+        assert_eq!(a.object, "alice@acme.com:to:evil.example");
+        let b = OpsAtom::parse("drive:read:file/abc/with/slashes").unwrap();
+        assert_eq!(b.object, "file/abc/with/slashes");
+    }
+
+    #[test]
+    fn ops_atom_to_canonical_round_trips_through_parse() {
+        // `to_canonical()` is the inverse of `parse()` — the proxy uses
+        // this round-trip to normalize PCA ops before chain comparison.
+        // A drift in the format (e.g. URL-encoding the object) would
+        // silently break leaf-ops matching.
+        let original = "gmail:send:bob@external.com:to:external.com";
+        let parsed = OpsAtom::parse(original).unwrap();
+        assert_eq!(parsed.to_canonical(), original);
+        // Symmetric: a hand-built atom round-trips too.
+        let a = OpsAtom {
+            scheme: "drive".into(),
+            action: "read".into(),
+            object: "file/x".into(),
+        };
+        let s = a.to_canonical();
+        assert_eq!(OpsAtom::parse(&s).unwrap(), a);
+    }
+
+    #[test]
+    fn ops_parse_error_display_strings_carry_operator_facing_hints() {
+        // Both variants render a distinct operator-facing prefix the
+        // troubleshooting docs key on; pin both.
+        let m: OpsParseError = OpsParseError::Malformed;
+        assert!(m.to_string().contains("scheme:action:object"));
+        let u: OpsParseError = OpsParseError::UnknownVar("path.missing".into());
+        assert!(u.to_string().contains("path.missing"));
+        assert!(u.to_string().contains("template variable"));
+    }
+
+    #[test]
+    fn missing_ops_display_surfaces_each_missing_atom() {
+        // The adapter's 422 response body reads from `Display`; pin that
+        // every missing atom appears in the rendered string so operators
+        // can diagnose chain-walker faults without parsing `Debug`.
+        let err = MissingOps {
+            missing: vec![
+                OpsAtom::parse("drive:read:file/xyz").unwrap(),
+                OpsAtom::parse("drive:read:file/abc").unwrap(),
+            ],
+        };
+        let s = err.to_string();
+        assert!(s.contains("file/xyz"), "{s}");
+        assert!(s.contains("file/abc"), "{s}");
+        assert!(s.contains("missing"), "{s}");
+    }
+
+    #[test]
+    fn is_satisfied_by_empty_required_is_ok_against_any_leaf() {
+        // A policy with empty `required_ops` always passes Layer-A —
+        // common for vendor.action pairs that are policy-gated only on
+        // Layer-B (e.g. block-by-rule). A regression that errored on
+        // empty would mass-deny these.
+        let exp = OpsExpression::default();
+        assert!(exp.is_satisfied_by(&[]).is_ok());
+        assert!(
+            exp.is_satisfied_by(&[OpsAtom::parse("drive:read:file/x").unwrap()])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn collect_vars_returns_each_var_in_left_to_right_order() {
+        // `expand_template` iterates `vars` to find the list-valued one;
+        // order isn't load-bearing today but the doc-comment commits to
+        // left-to-right discovery and a future refactor to a HashSet
+        // would silently lose the order (and the ability to surface the
+        // *first* offending var in a Cartesian-product error).
+        let vars = collect_vars("${a}:${body.b}:${user.email}").unwrap();
+        assert_eq!(vars, vec!["a", "body.b", "user.email"]);
+        // No vars in a literal template → empty.
+        assert!(collect_vars("plain:literal:token").unwrap().is_empty());
+    }
+
+    #[test]
+    fn substitute_passes_literal_through_and_rejects_unclosed_var() {
+        // Literal template with no `${...}` survives byte-exact.
+        let out = substitute("plain:literal", &ctx()).unwrap();
+        assert_eq!(out, "plain:literal");
+        // Unclosed `${...` errors with the remainder as the var name —
+        // operator-facing, so they can spot the missing brace.
+        let err = substitute("drive:read:${path.id", &ctx()).unwrap_err();
+        assert!(matches!(err, OpsParseError::UnknownVar(ref v) if v.starts_with("path.id")));
+    }
+
+    #[test]
     fn missing_ops_lists_atoms() {
         let exp = OpsExpression {
             required: vec![

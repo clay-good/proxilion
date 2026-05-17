@@ -749,4 +749,118 @@ mod tests {
         let nf = ActionsApiError::NotFound;
         assert_eq!(nf.into_response().status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn actions_api_error_db_maps_to_500_internal_error_envelope() {
+        // The Db arm fires on a real Postgres outage. Operator alerts key on
+        // `code="internal_error"` — pin both the 500 status AND the machine
+        // code so a future ErrorBody refactor doesn't silently re-classify.
+        let r = ActionsApiError::Db(sqlx::Error::RowNotFound).into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "internal_error");
+        assert_eq!(v["error"], "database error");
+        assert!(v["fix"].as_str().unwrap().contains("/healthz"));
+        assert!(v["docs"].as_str().unwrap().contains("troubleshooting"));
+    }
+
+    #[tokio::test]
+    async fn actions_api_error_cache_maps_to_500_with_pca_cache_error_label() {
+        // Distinct from Db on the operator-facing axis: the `error` title is
+        // `pca cache error` so a dashboard filter on `error="pca cache error"`
+        // shows the chain-walker faults separately from generic DB faults.
+        // Both still collapse to `code="internal_error"` (no leak surface).
+        let r = ActionsApiError::Cache(crate::pic::cache::CacheError::Db(sqlx::Error::RowNotFound))
+            .into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "internal_error");
+        assert_eq!(v["error"], "pca cache error");
+        assert!(v["fix"].as_str().unwrap().contains("pca_cache"));
+    }
+
+    #[tokio::test]
+    async fn actions_api_error_not_found_envelope_carries_docs_link_and_fix() {
+        // `not_found` is the only `404` shape here; operator-cli surfaces the
+        // `fix` hint when a stale action_event id is queried, so pin the
+        // substring it keys on.
+        let r = ActionsApiError::NotFound.into_response();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "not_found");
+        assert!(v["fix"].as_str().unwrap().contains("aged out"));
+        assert!(v["docs"].as_str().unwrap().contains("admin/actions"));
+    }
+
+    #[test]
+    fn purge_request_dry_run_defaults_to_false_when_omitted() {
+        // `dry_run` is `#[serde(default)]` — operator-cli posts
+        // `{"older_than": "..."}` for the destructive path and the handler's
+        // `if req.dry_run { ... }` branch depends on the False default.
+        let req: PurgeRequest =
+            serde_json::from_str(r#"{"older_than":"2026-05-14T00:00:00Z"}"#).unwrap();
+        assert!(!req.dry_run);
+    }
+
+    #[test]
+    fn purge_request_dry_run_explicit_true_round_trips() {
+        let req: PurgeRequest =
+            serde_json::from_str(r#"{"older_than":"2026-05-14T00:00:00Z","dry_run":true}"#)
+                .unwrap();
+        assert!(req.dry_run);
+    }
+
+    #[test]
+    fn purge_response_serializes_with_stable_field_names() {
+        // The CLI's purge confirmation renders `deleted` verbatim; a future
+        // rename to `affected_rows` would silently break the formatter.
+        let r = PurgeResponse {
+            older_than: DateTime::parse_from_rfc3339("2026-05-14T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            dry_run: true,
+            deleted: 42,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("older_than").is_some());
+        assert_eq!(v["dry_run"], true);
+        assert_eq!(v["deleted"], 42);
+    }
+
+    #[test]
+    fn list_response_envelope_carries_rows_and_nullable_next_before() {
+        // Pin the pagination envelope: `next_before` is `Option<DateTime>` and
+        // serializes as `null` (no `skip_serializing_if`) when the page was
+        // shorter than `limit`. The dashboard JS keys on key-presence to
+        // decide whether to show "Load more".
+        let env = ListResponse {
+            rows: vec![sample_row()],
+            next_before: None,
+        };
+        let v = serde_json::to_value(&env).unwrap();
+        assert!(v["rows"].is_array());
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+        // Present + null — not absent (struct has no skip_serializing_if).
+        assert!(v.get("next_before").is_some());
+        assert!(v["next_before"].is_null());
+    }
+
+    #[test]
+    fn list_params_filters_default_to_none_when_query_string_empty() {
+        // Axum's `Query<ListParams>` deserializer is the entry point for the
+        // operator-dashboard filter chips. Pin that every filter field is
+        // `Option<_>` so an empty query string round-trips to all-None and
+        // the handler's NULL-bound SQL takes the unfiltered branch.
+        let p: ListParams = serde_urlencoded::from_str("").unwrap();
+        assert!(p.limit.is_none());
+        assert!(p.before.is_none());
+        assert!(p.decision.is_none());
+        assert!(p.p_0.is_none());
+        assert!(p.vendor.is_none());
+        assert!(p.action.is_none());
+        assert!(p.session_id.is_none());
+    }
 }

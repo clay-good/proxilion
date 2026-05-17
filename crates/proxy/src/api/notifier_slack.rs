@@ -460,4 +460,52 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"], "bad sig");
     }
+
+    #[test]
+    fn header_str_is_case_insensitive_per_http_spec() {
+        // HTTP header names are case-insensitive per RFC 7230 §3.2 —
+        // axum's HeaderMap normalizes on insert, so a lookup against
+        // any case must succeed. Pin this here because the call sites
+        // pass lower-case literals (`"x-slack-signature"`) but Slack's
+        // SDKs sometimes send mixed case (`"X-Slack-Signature"`). A
+        // refactor that bypassed HeaderMap's normalization (e.g. by
+        // iterating raw bytes) would silently miss the header from
+        // Slack's Go SDK.
+        let mut h = HeaderMap::new();
+        h.insert("X-Slack-Signature", HeaderValue::from_static("v0=abc"));
+        // Looked up via lower-case (the call-site shape) — must hit.
+        assert_eq!(header_str(&h, "x-slack-signature"), Some("v0=abc"));
+    }
+
+    #[tokio::test]
+    async fn slack_err_emits_500_for_internal_error_path() {
+        // The signature-mismatch + bad-payload paths use 4xx; the
+        // (rare) DB-failure path during trigger_id claim falls back
+        // to slack_err with 500. Pin that the helper accepts any
+        // status — a regression that hardcoded UNAUTHORIZED (the
+        // common case) would silently downgrade every 500 to a 401
+        // and break the operator dashboard's "Slack delivery health"
+        // panel keyed on 5xx counts.
+        let r = slack_err(StatusCode::INTERNAL_SERVER_ERROR, "db down");
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "db down");
+    }
+
+    #[tokio::test]
+    async fn slack_ok_message_carries_empty_text_through_to_wire() {
+        // Edge: the synthesized success message can be empty in the
+        // future if a feature flag elides per-action text. Pin that
+        // `slack_ok_message("")` returns a 200 with `text: ""` rather
+        // than panicking on a `.unwrap()` against an empty string —
+        // the helper does NOT validate its input.
+        let r = slack_ok_message("");
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["text"], "");
+        assert_eq!(v["response_type"], "in_channel");
+        assert_eq!(v["replace_original"], true);
+    }
 }

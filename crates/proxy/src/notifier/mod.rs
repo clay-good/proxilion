@@ -204,6 +204,81 @@ mod tests {
     }
 
     #[test]
+    fn approve_url_handles_trailing_slash_in_proxy_public_url() {
+        // Operators sometimes paste their public URL with a trailing
+        // slash. The current implementation does NOT strip it — the
+        // resulting URL has a double slash before `/api/v1/...`. Pin
+        // this exact behavior so a "fix the double slash" refactor
+        // surfaces alongside the docs that tell operators to omit the
+        // trailing slash. (HTTP routers normalize the double slash,
+        // so this is currently functional — but the wire shape is
+        // part of operator-facing observability.)
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://proxy.example/");
+        assert!(
+            n.approve_url
+                .starts_with("https://proxy.example//api/v1/blocked/"),
+            "got: {}",
+            n.approve_url,
+        );
+    }
+
+    #[test]
+    fn from_record_carries_multi_op_slice_through_serialize() {
+        // The PIC layer can produce multi-atom missing-ops lists. Pin
+        // that all three atoms make it through `from_record` AND
+        // through `serde_json::to_value` as a 3-element JSON array
+        // — a regression that flattened the slice into a comma-joined
+        // string (matching the Slack template's iteration shape) would
+        // break webhook receivers that iterate the JSON array.
+        let ops = vec![
+            "drive:read:bob/secret.docx".to_string(),
+            "drive:write:bob/*".to_string(),
+            "gmail:send:bob@external.com".to_string(),
+        ];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        assert_eq!(n.requested_ops.len(), 3);
+        let j = serde_json::to_value(&n).unwrap();
+        let arr = j["requested_ops"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], "drive:read:bob/secret.docx");
+        assert_eq!(arr[2], "gmail:send:bob@external.com");
+    }
+
+    #[test]
+    fn from_record_invariant_layer_round_trips_through_json() {
+        // The `layer` field distinguishes "policy" blocks from
+        // "invariant" blocks (PIC monotonicity refusals). The PIC path
+        // sets `layer = "invariant"`, the policy path sets
+        // `layer = "policy"` — pin that the value passes through to
+        // the wire JSON verbatim so a Slack mrkdwn template's
+        // `*Layer:* {{layer}}` render is byte-stable for both paths.
+        let ops: Vec<String> = vec![];
+        let r = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "google",
+            action: "drive.files.get",
+            method: "GET",
+            path: "/drive/v3/files/x",
+            layer: "invariant",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        assert_eq!(n.layer, "invariant");
+        let j = serde_json::to_value(&n).unwrap();
+        assert_eq!(j["layer"], "invariant");
+    }
+
+    #[test]
     fn from_record_carries_empty_requested_ops_slice() {
         // The PIC layer sometimes blocks without a discrete ops list
         // (e.g. a monotonicity refusal where the upstream body didn't

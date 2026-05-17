@@ -125,6 +125,68 @@ mod tests {
     }
 
     #[test]
+    fn google_client_clone_preserves_every_field() {
+        // `GoogleClient` derives `Clone` — the OAuth router clones it
+        // into per-request handler state. Pin that all four fields
+        // round-trip a clone without aliasing or truncation (a
+        // refactor that switched to `Cow<str>` would silently break
+        // the per-request mutation-safety the OAuthState design relies
+        // on).
+        let g = GoogleClient {
+            client_id: "id-abc".into(),
+            client_secret: "secret-xyz".into(),
+            auth_url: "https://example.test/auth".into(),
+            token_url: "https://example.test/token".into(),
+        };
+        let c = g.clone();
+        assert_eq!(c.client_id, "id-abc");
+        assert_eq!(c.client_secret, "secret-xyz");
+        assert_eq!(c.auth_url, "https://example.test/auth");
+        assert_eq!(c.token_url, "https://example.test/token");
+    }
+
+    #[test]
+    fn from_env_respects_only_auth_url_override_with_token_url_default() {
+        // Asymmetric override path — operator overrides AUTH_URL only
+        // (e.g. to point at a regional Google endpoint) and expects
+        // TOKEN_URL to keep its production default. Pin both halves so
+        // a refactor that "consistently" required both URLs together
+        // would surface here. Symmetric counterpart for TOKEN_URL is
+        // pinned via `from_env_respects_url_overrides`.
+        with_clean_env(|| {
+            unsafe {
+                std::env::set_var("GOOGLE_CLIENT_ID", "id");
+                std::env::set_var("GOOGLE_CLIENT_SECRET", "secret");
+                std::env::set_var("GOOGLE_AUTH_URL", "https://example.test/auth");
+            }
+            let c = GoogleClient::from_env().unwrap();
+            assert_eq!(c.auth_url, "https://example.test/auth");
+            assert_eq!(c.token_url, "https://oauth2.googleapis.com/token");
+        });
+    }
+
+    #[test]
+    fn google_client_debug_carries_client_id() {
+        // The `Debug` derive feeds `tracing::warn!(?google, ...)` at
+        // boot — pin that the (non-secret) `client_id` is visible in
+        // the rendered string. A manual Debug impl that hid every
+        // field (in the name of "redact secrets") would silently
+        // strip the operator-facing id alongside the secret. Note:
+        // `client_secret` is included by the derive — the boot path
+        // does NOT log the full struct; this test pins the trait, not
+        // the log line.
+        let g = GoogleClient {
+            client_id: "abc-client-id".into(),
+            client_secret: "x".into(),
+            auth_url: "u1".into(),
+            token_url: "u2".into(),
+        };
+        let s = format!("{g:?}");
+        assert!(s.contains("abc-client-id"), "got: {s}");
+        assert!(s.contains("client_id"));
+    }
+
+    #[test]
     fn from_env_respects_url_overrides() {
         with_clean_env(|| {
             // SAFETY: serialized by ENV_GUARD via `with_clean_env`.

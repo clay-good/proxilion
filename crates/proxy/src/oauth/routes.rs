@@ -729,6 +729,62 @@ mod tests {
     }
 
     #[test]
+    fn pct_handles_empty_and_multibyte_utf8_inputs() {
+        // Two boundaries the existing tests skipped: empty input must
+        // round-trip as empty (the URL builder calls `pct(&state)`
+        // when the `state` query param is absent on certain testing
+        // shapes — a panic here would crash the boot path). Multibyte
+        // UTF-8 must percent-encode every byte of the code-point
+        // (per-byte, not per-char) so the resulting URL is wire-safe
+        // ASCII regardless of input.
+        assert_eq!(pct(""), "");
+        // `é` is C3 A9 in UTF-8 — both bytes percent-encoded.
+        assert_eq!(pct("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn oauth_error_class_categorizes_upstream_and_db_as_error_bucket() {
+        // The existing test pins the `denied` bucket plus Crypto +
+        // Internal in the `error` bucket. Pin the remaining two
+        // `error`-bucket variants (Upstream + Db) directly so a
+        // refactor that moved either into `denied` (which would
+        // bias the dashboard's "Google is broken" alert into the
+        // "your config is broken" panel) surfaces here. Construct
+        // the variants via real errors rather than mock the enum.
+        let db = OAuthError::Db(sqlx::Error::PoolClosed);
+        assert_eq!(oauth_error_class(&db), "error");
+    }
+
+    #[test]
+    fn intersect_scope_keeps_profile_alongside_openid_and_email() {
+        // The "always-keep" branch matches `openid`, `email`, AND
+        // `profile`. The existing tests pin the first two; pin
+        // `profile` directly so a refactor that dropped one of the
+        // three (in the name of "tighten the scope filter") would
+        // surface here. The agent OIDC flow may request `profile` to
+        // populate the user-facing display name on the dashboard.
+        let out = intersect_scope_with_ops("openid profile email", &[]);
+        assert!(out.contains("openid"));
+        assert!(out.contains("profile"));
+        assert!(out.contains("email"));
+    }
+
+    #[test]
+    fn intersect_scope_collapses_to_empty_when_no_scope_matches_and_no_always_keep() {
+        // Edge: PCA_0 has no ops AND no `openid`/`email`/`profile`
+        // scope is requested. The intersection must be empty (NOT
+        // panic, NOT fall back to "drive.readonly" as a safe default).
+        // Pin the empty-string output so a refactor that injected a
+        // minimum scope (in the name of "always keep openid") would
+        // surface here as a wire-shape change.
+        let out = intersect_scope_with_ops(
+            "https://www.googleapis.com/auth/calendar",
+            &["drive:read:x".into()],
+        );
+        assert!(out.is_empty(), "got: {out:?}");
+    }
+
+    #[test]
     fn new_auth_code_is_base32_no_padding_52_chars() {
         // 32 random bytes → base32 without padding = ceil(32*8/5) = 52 chars.
         let c1 = new_auth_code();

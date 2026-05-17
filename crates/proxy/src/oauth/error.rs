@@ -245,6 +245,75 @@ mod tests {
     }
 
     #[test]
+    fn oauth_error_display_strings_pinned_for_log_filters() {
+        // Operator log filters key on substrings like "PKCE verification
+        // failed" / "session expired or unknown" / "Trust Plane refused
+        // PCA". Pin each variant's Display so a `#[error(...)]` tweak
+        // surfaces as a test failure rather than a silent runbook drift.
+        assert!(
+            OAuthError::PkceFail
+                .to_string()
+                .contains("PKCE verification failed")
+        );
+        assert!(
+            OAuthError::SessionGone
+                .to_string()
+                .contains("session expired or unknown")
+        );
+        assert!(
+            OAuthError::UnknownClient
+                .to_string()
+                .contains("unknown OAuth client")
+        );
+        assert!(
+            OAuthError::PicInvariant("missing ops".into())
+                .to_string()
+                .contains("Trust Plane refused PCA")
+        );
+        assert!(
+            OAuthError::BadAuthCode
+                .to_string()
+                .contains("invalid or already used")
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_variant_status_is_502_bad_gateway() {
+        // Adapter forwarding to Trust Plane / Google can fail mid-flight;
+        // the variant maps to 502 so the agent's retry policy treats it
+        // as a transient upstream issue rather than a 4xx (which Cursor
+        // / Claude Code would surface as a "fix your request" prompt).
+        // We can't construct a reqwest::Error directly, so route through
+        // the status() match — the Upstream arm is the only mapping to
+        // BAD_GATEWAY, so any reachable Upstream variant must hit it.
+        // Build one by making an actually-failing reqwest.
+        let bad = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap()
+            // RFC 5737 black-hole — guaranteed to time out within 1ms.
+            .get("http://192.0.2.1:1/")
+            .send()
+            .await
+            .unwrap_err();
+        let e: OAuthError = OAuthError::from(bad);
+        assert_eq!(e.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(e.body().code, "upstream_unavailable");
+    }
+
+    #[test]
+    fn into_response_500_branch_uses_internal_error_code_for_db_path() {
+        // The Db variant lands on the 500 branch; pin both the status
+        // and the wire `code` so a Grafana alert keyed on
+        // `code="internal_error" status="500"` doesn't silently drift
+        // when the Db classification moves (e.g. to 503 on connection-
+        // pool exhaustion).
+        let e = OAuthError::Db(sqlx::Error::PoolClosed);
+        assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.body().code, "internal_error");
+    }
+
+    #[test]
     fn body_fix_strings_are_actionable_for_unique_variants() {
         // Pin the fix text for the four variants whose fix strings are
         // their stable contract with the operator-docs page (the docs page

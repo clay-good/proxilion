@@ -173,6 +173,58 @@ mod tests {
     }
 
     #[test]
+    fn empty_bundle_has_none_for_burst_suppressors() {
+        // The two `Option<BurstSuppressor>` fields default to None for
+        // tests + empty bundles per the doc comment. Pin both — a
+        // refactor that pre-built default `BurstSuppressor` instances
+        // would silently activate burst suppression on every test
+        // fixture (and change the semantics of "empty bundle") without
+        // touching this assertion.
+        let n = Notifiers::empty();
+        assert!(n.webhook_burst.is_none());
+        assert!(n.slack_burst.is_none());
+    }
+
+    #[test]
+    fn replace_to_none_after_some_clears_for_all_clones() {
+        // Symmetric to `replace_to_none_clears` but pinned across a
+        // clone fan-out — the hot-swap contract is "every clone sees
+        // the same current() value at every moment", so a regression
+        // that deep-copied the swap on `replace(None)` would surface
+        // here. Two clones, one replace-Some, observed-Some on both,
+        // one replace-None, observed-None on both.
+        let a: NotifierHandle = Handle::new(None);
+        let b = a.clone();
+        let c = a.clone();
+        a.replace(Some(mk_webhook("https://example.com")));
+        assert!(b.current().is_some());
+        assert!(c.current().is_some());
+        b.replace(None);
+        assert!(a.current().is_none());
+        assert!(c.current().is_none());
+    }
+
+    #[test]
+    fn handle_new_with_initial_some_carries_through_first_current_call() {
+        // Boot path: `server::run` builds a fresh Handle with the
+        // pre-configured notifier (loaded from DB or env). Pin that
+        // the first `current()` call after `Handle::new(Some(_))`
+        // returns the same notifier — a regression to a lazy
+        // initialization scheme would silently delay the first
+        // notify-fire by one request.
+        let w = mk_webhook("https://example.com/initial");
+        let h: NotifierHandle = Handle::new(Some(w.clone()));
+        let got = h
+            .current()
+            .expect("initial Some must surface on first read");
+        // Pointer equality — `Handle::new(Some(arc))` must NOT clone
+        // the underlying `T`. Pin this so a refactor to
+        // `Handle::new(Some(Arc::new(_clone_of_inner)))` would surface
+        // here as a different Arc pointer.
+        assert!(Arc::ptr_eq(&w, &got));
+    }
+
+    #[test]
     fn any_configured_triggers_on_slack_alone() {
         // Symmetric coverage to `bundle_any_configured_when_webhook_set`.
         // The OR-chain is easy to break with a copy-paste typo (`||

@@ -309,6 +309,125 @@ mod tests {
     }
 
     #[test]
+    fn mode_wire_strings_pin_snake_case_per_variant() {
+        // The dashboard's policy-mode toggle posts these exact strings;
+        // a future variant rename without coordinated dashboard work
+        // would silently drop the mode flip. Pin both directions
+        // (serialize + deserialize round-trip).
+        for (variant, wire) in [
+            (Mode::Enforce, "\"enforce\""),
+            (Mode::Observe, "\"observe\""),
+            (Mode::Disabled, "\"disabled\""),
+        ] {
+            let s = serde_json::to_string(&variant).unwrap();
+            assert_eq!(s, wire, "{variant:?}");
+            let back: Mode = serde_json::from_str(wire).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn pic_mode_serializes_kebab_case_not_snake_case() {
+        // `runtime-gate` (kebab) is the wire shape — a regression to
+        // `runtime_gate` would silently break every existing policy YAML
+        // (deserialize would error) and every dashboard PIC-mode toggle
+        // (serialize would mismatch). This is the single highest-risk
+        // wire-shape pin in this module — kebab/snake confusion is the
+        // classic serde renaming bug.
+        assert_eq!(
+            serde_json::to_string(&PicMode::RuntimeGate).unwrap(),
+            "\"runtime-gate\""
+        );
+        assert_eq!(serde_json::to_string(&PicMode::Audit).unwrap(), "\"audit\"");
+        // Symmetric deserialize.
+        let back: PicMode = serde_json::from_str("\"runtime-gate\"").unwrap();
+        assert_eq!(back, PicMode::RuntimeGate);
+        // Snake-case must NOT deserialize (closed enum).
+        assert!(serde_json::from_str::<PicMode>("\"runtime_gate\"").is_err());
+    }
+
+    #[test]
+    fn audit_body_mode_wire_strings_are_snake_case() {
+        // Operator dashboards read these strings as labels; a rename
+        // without coordinated UI work would break the audit-body
+        // selector. Note: `RedactPii` → `redact_pii` (snake), NOT
+        // `redact-pii` (kebab) — different scheme from PicMode above,
+        // so this guard catches an accidental copy-paste between the
+        // two attribute lines.
+        for (v, wire) in [
+            (AuditBodyMode::Hash, "\"hash\""),
+            (AuditBodyMode::RedactPii, "\"redact_pii\""),
+            (AuditBodyMode::Full, "\"full\""),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), wire);
+            let back: AuditBodyMode = serde_json::from_str(wire).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn quarantine_action_cfg_wire_strings_are_snake_case() {
+        // The wire-shape contract for ReadFilterCfg's action field;
+        // mirrored from the engine-internal `QuarantineAction` (in
+        // decision.rs) but kept as a separate type so the YAML schema
+        // can evolve independently. Pin all three variants.
+        for (v, wire) in [
+            (
+                QuarantineActionCfg::ReplaceWithMarker,
+                "\"replace_with_marker\"",
+            ),
+            (QuarantineActionCfg::StripSilently, "\"strip_silently\""),
+            (QuarantineActionCfg::BlockRequest, "\"block_request\""),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), wire, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn deserialize_string_or_vec_opt_accepts_none_string_and_array() {
+        // Covers all three shapes the helper handles, plus the None case
+        // (absent field). The previous `recipients_cfg_accepts_string_or_vec`
+        // test only exercised one of these per field; pinning all three
+        // shapes side-by-side documents the contract for the helper itself.
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default, deserialize_with = "deserialize_string_or_vec_opt")]
+            v: Option<Vec<String>>,
+        }
+        let none: Wrap = serde_yaml::from_str("{}").unwrap();
+        assert!(none.v.is_none());
+        let single: Wrap = serde_yaml::from_str("v: alice@x.com").unwrap();
+        assert_eq!(single.v.as_deref(), Some(&["alice@x.com".to_string()][..]));
+        let many: Wrap = serde_yaml::from_str("v:\n  - a@x\n  - b@x\n").unwrap();
+        assert_eq!(
+            many.v.as_deref(),
+            Some(&["a@x".to_string(), "b@x".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn read_filter_cfg_minimal_yields_empty_patterns_and_default_action() {
+        // A `read_filter:` block with NO fields must deserialize cleanly
+        // — both inner fields have `#[serde(default)]`. The default
+        // action is `replace_with_marker` (the safe production posture).
+        // A regression that made either field required would break every
+        // existing policy with a stub read_filter block.
+        let yaml = "\
+- id: p
+  vendor: v
+  action: a
+  read_filter: {}
+";
+        let d = &parse_policies(yaml).unwrap()[0];
+        let rf = d.read_filter.as_ref().unwrap();
+        assert!(rf.quarantine_patterns.is_empty());
+        assert!(matches!(
+            rf.quarantine_action,
+            QuarantineActionCfg::ReplaceWithMarker
+        ));
+    }
+
+    #[test]
     fn burst_cfg_fields_are_each_optional() {
         // Threshold alone, window alone, both, neither — all valid shapes.
         for body in [

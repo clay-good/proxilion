@@ -478,4 +478,146 @@ mod canonical_request_json_tests {
         let v: serde_json::Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["path_params"]["id"], "file-123");
     }
+
+    /// Truncation envelope MUST NOT carry `body` or `path_params` — those
+    /// are the fields that caused the bloat, and re-serializing them
+    /// inside the truncation envelope would defeat the whole point. The
+    /// approver still gets the (method, path, vendor, action) triple.
+    #[test]
+    fn truncation_envelope_elides_body_and_path_params() {
+        let mut path_params = HashMap::new();
+        path_params.insert("id".into(), "file-123".into());
+        let mut body = HashMap::new();
+        body.insert("blob".into(), serde_json::Value::String("y".repeat(8192)));
+        let s = canonical_request_json(
+            "POST",
+            "/drive/v3/files/abc",
+            "google",
+            "drive.files.create",
+            &path_params,
+            &body,
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["truncated"], true);
+        // Identification fields survive.
+        assert_eq!(v["method"], "POST");
+        assert_eq!(v["path"], "/drive/v3/files/abc");
+        assert_eq!(v["vendor"], "google");
+        assert_eq!(v["action"], "drive.files.create");
+        // The bloat sources are absent — a regression that re-included
+        // body/path_params would inflate every truncated row in the audit
+        // log and reintroduce the size-cap problem this envelope solves.
+        assert!(
+            v["body"].is_null(),
+            "body must be absent in truncation envelope: {s}"
+        );
+        assert!(
+            v["path_params"].is_null(),
+            "path_params must be absent in truncation envelope: {s}"
+        );
+    }
+
+    /// Just-below the cap: a body that renders to ~4090 bytes passes
+    /// through unmodified (no truncation envelope). The boundary check
+    /// is `s.len() <= MAX`, so a regression to `<` would silently start
+    /// truncating exact-at-limit rows that fit fine today.
+    #[test]
+    fn just_below_cap_passes_through_unchanged() {
+        let path_params = HashMap::new();
+        let mut body = HashMap::new();
+        // Conservatively undersized so envelope overhead + alphabetic
+        // key sort don't push it over without us noticing.
+        body.insert("blob".into(), serde_json::Value::String("a".repeat(3900)));
+        let s = canonical_request_json("POST", "/x", "google", "a", &path_params, &body);
+        assert!(
+            s.len() <= CANONICAL_REQUEST_MAX_LEN,
+            "{} > {}",
+            s.len(),
+            CANONICAL_REQUEST_MAX_LEN
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(
+            v["truncated"].is_null(),
+            "must not be a truncation envelope"
+        );
+        // The body field survives unsummarized — operators can read it.
+        assert_eq!(v["body"]["blob"].as_str().unwrap().len(), 3900);
+    }
+
+    /// Nested keys are sorted alphabetically by serde_json — the audit
+    /// log is reproducible across map orderings (Rust's HashMap iteration
+    /// order is randomized per process, so without sort the same logical
+    /// request would render differently across restarts and break
+    /// deterministic-diff workflows the approver UI depends on).
+    #[test]
+    fn nested_body_keys_render_in_alphabetical_order() {
+        let path_params = HashMap::new();
+        // Insert in non-alphabetical order to exercise the sort.
+        let mut body = HashMap::new();
+        body.insert("zebra".into(), serde_json::Value::String("z".into()));
+        body.insert("alpha".into(), serde_json::Value::String("a".into()));
+        body.insert("mango".into(), serde_json::Value::String("m".into()));
+        let s = canonical_request_json("GET", "/x", "v", "a", &path_params, &body);
+        // Locate each key's position in the rendered string — they MUST
+        // appear in `alpha < mango < zebra` order regardless of insertion.
+        let a = s.find("\"alpha\"").expect("alpha key present");
+        let m = s.find("\"mango\"").expect("mango key present");
+        let z = s.find("\"zebra\"").expect("zebra key present");
+        assert!(
+            a < m && m < z,
+            "keys must be sorted: alpha={a} mango={m} zebra={z}"
+        );
+    }
+
+    /// The empty-maps case is the most common shape (read endpoints with
+    /// no path params and no exposed body fields). It must produce
+    /// `body: {}` + `path_params: {}` (not `null`), so the approver UI
+    /// can distinguish "adapter opted into 0 fields" from "field absent
+    /// because schema is older."
+    #[test]
+    fn empty_maps_render_as_empty_objects_not_null() {
+        let (path_params, body) = empty_maps();
+        let s = canonical_request_json("GET", "/x", "v", "a", &path_params, &body);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(
+            v["body"].is_object(),
+            "body must be an object, got {:?}",
+            v["body"]
+        );
+        assert_eq!(v["body"].as_object().unwrap().len(), 0);
+        assert!(v["path_params"].is_object());
+        assert_eq!(v["path_params"].as_object().unwrap().len(), 0);
+    }
+
+    /// `BlockedActionRecord` is `Clone` so adapters can hand a snapshot
+    /// to the spawned notifier task without giving up ownership of the
+    /// original. Pin both that the derive exists and that lifetime'd
+    /// references survive cloning (a future refactor to `Cow<'a, str>`
+    /// would surface here).
+    #[test]
+    fn blocked_action_record_clone_preserves_borrowed_fields() {
+        let ops = vec!["gmail:send:bob@external.com".to_string()];
+        let r = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: Some("alice@acme.com"),
+            vendor: "google",
+            action: "gmail.messages.send",
+            method: "POST",
+            path: "/gmail/v1/users/me/messages/send",
+            layer: "policy",
+            policy_id: Some("p1"),
+            detail: Some("d"),
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            escalation_after_minutes: Some(15),
+            request_canonical_json: Some("{}".into()),
+        };
+        let c = r.clone();
+        assert_eq!(c.vendor, "google");
+        assert_eq!(c.p_0, Some("alice@acme.com"));
+        assert_eq!(c.requested_ops.len(), 1);
+        assert_eq!(c.escalation_after_minutes, Some(15));
+        assert_eq!(c.request_canonical_json.as_deref(), Some("{}"));
+    }
 }

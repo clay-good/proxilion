@@ -157,4 +157,56 @@ mod tests {
         assert!(s.contains("connection refused"));
         assert!(s.contains("nats connect failed"));
     }
+
+    #[test]
+    fn sanitize_replaces_whitespace_tab_and_newline_with_underscore() {
+        // NATS subject parser splits on ASCII whitespace; an unsanitized
+        // tab or newline would silently fork the subject into two tokens
+        // and break wildcard subscriptions. Pin each whitespace variant
+        // — a refactor that hardcoded only `' '` would let `\t` / `\n`
+        // through to the wire.
+        assert_eq!(sanitize_token("a b"), "a_b");
+        assert_eq!(sanitize_token("a\tb"), "a_b");
+        assert_eq!(sanitize_token("a\nb"), "a_b");
+        assert_eq!(sanitize_token("a\rb"), "a_b");
+    }
+
+    #[test]
+    fn sanitize_replaces_nats_wildcard_chars_star_and_gt() {
+        // `*` and `>` are NATS subject wildcards — a vendor / action
+        // string accidentally carrying them would let an attacker craft
+        // a publish that overlaps a subscription it shouldn't (e.g. an
+        // adversarial filename of `*` matching `actions.google.*`).
+        // Pin both replacements explicitly so the regex hardening can
+        // never silently regress.
+        assert_eq!(sanitize_token("*"), "_");
+        assert_eq!(sanitize_token(">"), "_");
+        assert_eq!(sanitize_token("a*b>c"), "a_b_c");
+    }
+
+    #[test]
+    fn sanitize_dot_passthrough_preserves_subject_hierarchy() {
+        // `.` is the NATS subject separator. The sanitizer MUST let it
+        // through so a multi-token vendor like `drive.files.get` lands
+        // as the three-token subject suffix the spec.md §3.1 wildcard
+        // examples expect (`actions.google.drive.files.>`). A refactor
+        // that filtered `.` would collapse every multi-token action
+        // into a single token and silently break wildcards.
+        assert_eq!(sanitize_token("a.b.c"), "a.b.c");
+        assert_eq!(sanitize_token(".leading"), ".leading");
+        assert_eq!(sanitize_token("trailing."), "trailing.");
+    }
+
+    #[test]
+    fn connect_error_debug_includes_struct_name_for_grep() {
+        // The `#[derive(Debug)]` on `ConnectError` feeds `?e` in
+        // `tracing::warn!(?e, "nats connect failed")` at the boot path
+        // — pin that the struct name AND the wrapped reason both
+        // appear so an operator grep for `ConnectError` lands the
+        // log line.
+        let e = ConnectError("dns failure".into());
+        let s = format!("{e:?}");
+        assert!(s.contains("ConnectError"), "got: {s}");
+        assert!(s.contains("dns failure"));
+    }
 }

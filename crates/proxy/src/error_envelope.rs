@@ -151,6 +151,61 @@ mod tests {
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 
+    #[test]
+    fn extras_null_omitted_extras_object_included_on_wire() {
+        // `#[serde(skip_serializing_if = "serde_json::Value::is_null")]`
+        // on the `extras` field is load-bearing: downstream operator
+        // tooling indexes on the presence of `extras` to decide whether
+        // to parse it. A refactor that swapped the skip-predicate for
+        // `Option::is_none` (the more "consistent" choice) would land
+        // an `extras: null` literal on every error body and break the
+        // is_present-implies-parse contract.
+        let bare = ErrorBody::new("t", "c");
+        let s = serde_json::to_value(&bare).unwrap();
+        assert!(s.get("extras").is_none(), "null extras must be omitted");
+
+        let with = ErrorBody::new("t", "c")
+            .with_extras(serde_json::json!({"policy_id": "p1", "override_allowed": true}));
+        let s = serde_json::to_value(&with).unwrap();
+        assert_eq!(s["extras"]["policy_id"], "p1");
+        assert_eq!(s["extras"]["override_allowed"], true);
+    }
+
+    #[test]
+    fn docs_base_constant_pinned_to_canonical_root_url() {
+        // `DOCS_BASE` is referenced by future call sites and by docs
+        // pages telling operators "your error body's `docs` field
+        // begins with…". Pin the canonical root so a typo regression
+        // (proxilion.io vs proxilion.com) doesn't slip past review.
+        assert_eq!(DOCS_BASE, "https://proxilion.com/docs");
+    }
+
+    #[test]
+    fn error_body_debug_includes_code_for_grep() {
+        // The `Debug` derive feeds operator-facing `tracing::warn!(?body, ...)`
+        // call sites — pin that the `code` field is visible in the
+        // rendered string. A manual Debug impl that hid the field (in
+        // the name of "don't log internal codes") would silently break
+        // operator triage.
+        let b = ErrorBody::new("title", "policy_blocked").with_detail("specific reason");
+        let s = format!("{b:?}");
+        assert!(s.contains("policy_blocked"), "got: {s}");
+        assert!(s.contains("specific reason"));
+    }
+
+    #[test]
+    fn with_detail_accepts_string_and_str_via_into() {
+        // `with_detail(impl Into<String>)` must accept both `&str` and
+        // `String` — pin both call shapes so a refactor to a stricter
+        // signature (e.g. `&'static str` for symmetry with `with_fix`)
+        // surfaces here. Adapter sites build dynamic detail strings
+        // (`format!(...)`) and rely on the `String` path.
+        let owned = ErrorBody::new("t", "c").with_detail(String::from("dynamic"));
+        assert_eq!(owned.detail.as_deref(), Some("dynamic"));
+        let borrowed = ErrorBody::new("t", "c").with_detail("static");
+        assert_eq!(borrowed.detail.as_deref(), Some("static"));
+    }
+
     #[tokio::test]
     async fn into_response_default_is_500() {
         // The blanket IntoResponse impl maps to 500.

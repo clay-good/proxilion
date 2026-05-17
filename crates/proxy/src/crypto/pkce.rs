@@ -94,6 +94,54 @@ mod tests {
     }
 
     #[test]
+    fn empty_verifier_rejected_as_length_not_mismatch() {
+        // The fail-closed contract: an empty string MUST trip the
+        // length check before any SHA-256 work. A regression that
+        // swapped the order (compute digest first, then check length)
+        // would burn cycles on every malformed inbound request — and
+        // potentially expose timing-side channels through the
+        // SHA-256 cost variance. Pin VerifierLength on `""`.
+        let err = verify_pkce_s256("", "anything").unwrap_err();
+        assert!(matches!(err, PkceError::VerifierLength));
+    }
+
+    #[test]
+    fn challenge_comparison_is_case_sensitive() {
+        // base64url is case-sensitive — a refactor that lower-cased
+        // both sides "for robustness" would silently weaken the PKCE
+        // guarantee against a downgrade attack. Compute the real
+        // challenge from a 43-char verifier, then upper-case it and
+        // assert Mismatch (NOT Ok). The verifier itself stays valid
+        // (passes the length check), isolating the case-sensitivity
+        // contract on the challenge side.
+        let verifier = "a".repeat(43);
+        let digest = Sha256::digest(verifier.as_bytes());
+        let real = URL_SAFE_NO_PAD.encode(digest);
+        // Sanity: the real challenge matches.
+        assert!(verify_pkce_s256(&verifier, &real).is_ok());
+        // ASCII-upper variant must NOT match.
+        let upper = real.to_ascii_uppercase();
+        assert_ne!(real, upper, "test invariant: real must have a case to flip");
+        assert!(matches!(
+            verify_pkce_s256(&verifier, &upper).unwrap_err(),
+            PkceError::Mismatch,
+        ));
+    }
+
+    #[test]
+    fn pkce_error_implements_std_error_trait_for_anyhow_chains() {
+        // Adapter call sites bubble PkceError through `anyhow::Error`
+        // chains for structured logging — pin that the `thiserror`
+        // derive lands the `std::error::Error` impl so a refactor
+        // that dropped `#[derive(Error)]` would surface at the trait-
+        // object cast below rather than only at the call-site type
+        // mismatch (which can be far from this file).
+        let e: PkceError = PkceError::Mismatch;
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(dyn_err.to_string().contains("PKCE"));
+    }
+
+    #[test]
     fn error_display_strings_are_stable_for_log_filters() {
         // Operator log filters key on the substring "PKCE check" /
         // "length must be 43..=128". A future variant rename or message

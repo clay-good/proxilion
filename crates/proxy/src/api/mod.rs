@@ -196,6 +196,72 @@ mod tests {
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    #[tokio::test]
+    async fn api_error_db_body_carries_fix_and_docs_hints() {
+        // The Db-error 500 envelope must surface BOTH the curl /healthz
+        // hint AND the troubleshooting docs link — these are the
+        // operator's first 30 seconds during a postgres outage. Pin
+        // both so a refactor that dropped `.with_fix(...)` or
+        // `.with_docs(...)` doesn't silently regress.
+        let e = ApiError::Db(crate::pic::cache::CacheError::Db(sqlx::Error::PoolClosed));
+        let r = e.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "internal_error");
+        assert!(v["fix"].as_str().unwrap().contains("curl /healthz"));
+        assert!(v["docs"].as_str().unwrap().contains("troubleshooting"));
+    }
+
+    #[tokio::test]
+    async fn api_error_not_found_body_includes_fix_and_pca_cache_docs_link() {
+        // NotFound is hit on a chain that was evicted or never landed.
+        // The operator-onboarding contract: the response body must
+        // explain WHY (eviction + the "Trust Plane has no GET endpoint
+        // yet" surrounding context) and link to the admin pca-cache
+        // docs. Pin both so a future tightening that hid the detail
+        // (in the name of "minimal 404 body") doesn't silently degrade
+        // the operator triage path.
+        let r = ApiError::NotFound.into_response();
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "not_found");
+        assert!(v["fix"].as_str().unwrap().contains("Trust Plane"));
+        assert!(v["docs"].as_str().unwrap().contains("pca-cache"));
+    }
+
+    #[test]
+    fn pca_view_serializes_with_stable_field_names() {
+        // The `/api/v1/pca/{id}` response shape is consumed by the
+        // dashboard's chain-walker — pin every public field by name
+        // (not by value) so a Serde rename or field reorder surfaces
+        // here rather than as a silent UI break.
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: "alice@demo.local".into(),
+            ops: vec!["drive:read:file/x".into()],
+            hop: 3,
+            predecessor_id: Some(Uuid::nil()),
+            pic_profile: "proxilion.v1".into(),
+            cbor_hex: "deadbeef".into(),
+        };
+        let s = serde_json::to_value(&v).unwrap();
+        for key in [
+            "pca_id",
+            "p_0",
+            "ops",
+            "hop",
+            "predecessor_id",
+            "pic_profile",
+            "cbor_hex",
+        ] {
+            assert!(s.get(key).is_some(), "missing wire key: {key}");
+        }
+        assert_eq!(s["pic_profile"], "proxilion.v1");
+        assert_eq!(s["hop"], 3);
+        assert_eq!(s["cbor_hex"], "deadbeef");
+    }
+
     #[test]
     fn hex_encode_byte_count_matches_two_per_input_byte() {
         // Length invariant — operator-visible cbor blobs are often size-

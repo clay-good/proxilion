@@ -209,6 +209,49 @@ mod tests {
     }
 
     #[test]
+    fn cached_pca_new_round_trips_hop_at_i32_max_without_overflow() {
+        // `hop: i32` is the chain depth — Postgres stores it as int4 so
+        // the proxy domain is bounded at i32::MAX. Pin both boundaries
+        // (0 and i32::MAX) so a refactor to `u32` (which would land in
+        // postgres as int8 + need a migration) surfaces here rather than
+        // silently when chain depths cross 2^31.
+        let p0 = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 0, None);
+        assert_eq!(p0.hop, 0);
+        let pmax = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], i32::MAX, None);
+        assert_eq!(pmax.hop, i32::MAX);
+    }
+
+    #[test]
+    fn cached_pca_debug_includes_pca_id_for_operator_log_grep() {
+        // The `Debug` derive feeds every `tracing::warn!(?pca, ...)`
+        // call site in the verifier — pin that the pca_id is visible in
+        // the rendered string. A refactor that swapped `Debug` for a
+        // manual impl elidng the id (in the name of "don't log secrets")
+        // would silently break operator chain-verification triage.
+        let id = Uuid::new_v4();
+        let pca = CachedPca::new(id, vec![1], "p".into(), vec![], 0, None);
+        let s = format!("{pca:?}");
+        assert!(s.contains(&id.to_string()), "got: {s}");
+        assert!(s.contains("pca_id"));
+    }
+
+    #[test]
+    fn cached_pca_carries_large_ops_vec_through_clone() {
+        // The PCA cache row's `ops` is a JSONB column with no schema-
+        // imposed cap; the verifier hands the whole vec into the policy
+        // engine for the Layer-A subset check. Pin that a Clone over a
+        // multi-thousand-element ops list preserves every entry (so a
+        // future micro-optimization that switched to `Cow<[String]>` —
+        // and dropped the deep-copy semantic — surfaces here).
+        let ops: Vec<String> = (0..2048).map(|i| format!("drive:read:file/{i}")).collect();
+        let pca = CachedPca::new(Uuid::nil(), vec![], "p".into(), ops, 0, None);
+        let c = pca.clone();
+        assert_eq!(c.ops.len(), 2048);
+        assert_eq!(c.ops[0], "drive:read:file/0");
+        assert_eq!(c.ops[2047], "drive:read:file/2047");
+    }
+
+    #[test]
     fn cache_error_from_sqlx_via_question_mark() {
         // `?`-conversion is what the public `insert` / `get` methods use;
         // pin the `#[from]` blanket-impl path so a future refactor that

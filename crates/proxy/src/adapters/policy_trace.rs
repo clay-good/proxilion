@@ -217,6 +217,84 @@ mod tests {
     }
 
     #[test]
+    fn set_layer_replaces_only_matching_layer_leaving_siblings_intact() {
+        // The replace-or-append helper is the only mutation primitive
+        // — pin that replacing one layer does NOT disturb its
+        // neighbors' order or content. A refactor that scanned the
+        // Vec with `iter().enumerate()` and called `Vec::swap_remove`
+        // would silently scramble ordering. The downstream `summary`
+        // helper renders in Vec order, so an order swap would flip
+        // the comma-joined string the operator log filters key on.
+        let mut t = PolicyTrace::new(
+            vec![
+                LayerOutcome::passed(PolicyLayer::LayerA),
+                LayerOutcome::passed(PolicyLayer::LayerB),
+                LayerOutcome::passed(PolicyLayer::ReadFilter),
+            ],
+            Decision::Allow,
+            vec![],
+        );
+        set_layer(
+            &mut t,
+            PolicyLayer::LayerB,
+            LayerOutcome::failed(
+                PolicyLayer::LayerB,
+                ErrorCode::PolicyBlocked,
+                Some("p1".into()),
+                Some("explicit".into()),
+            ),
+        );
+        assert_eq!(t.layers.len(), 3);
+        assert_eq!(t.layers[0].layer, PolicyLayer::LayerA);
+        assert!(t.layers[0].passed);
+        assert_eq!(t.layers[1].layer, PolicyLayer::LayerB);
+        assert!(!t.layers[1].passed);
+        assert_eq!(t.layers[2].layer, PolicyLayer::ReadFilter);
+        assert!(t.layers[2].passed);
+    }
+
+    #[test]
+    fn summary_join_uses_comma_and_preserves_layer_order() {
+        // The comma-separator and the Vec-order rendering together
+        // form the wire-shape operator log filters parse. Pin BOTH:
+        // an alphabetical-sort regression ("clean up the summary")
+        // would put `layer_a` before `layer_b` even when LayerB
+        // landed first; a tab/space separator regression would break
+        // every Grafana log-derived metric keyed on the canonical
+        // form. The trace below puts ReadFilter FIRST to make the
+        // order assertion meaningful (alphabetical would put `layer_a`
+        // first).
+        let t = PolicyTrace::new(
+            vec![
+                LayerOutcome::passed(PolicyLayer::ReadFilter),
+                LayerOutcome::passed(PolicyLayer::LayerA),
+            ],
+            Decision::Allow,
+            vec![],
+        );
+        let s = summary(&t);
+        assert_eq!(s, "read_filter=ok,layer_a=ok", "got: {s}");
+    }
+
+    #[test]
+    fn emit_does_not_panic_on_allowed_and_denied_traces() {
+        // `emit` is `tracing`-only — it never returns a value. The
+        // operator-visible contract is "single structured event per
+        // request, INFO on allow / WARN on deny, never panics". Pin
+        // the don't-panic invariant on both paths (the alternative is
+        // a request that successfully gates but then panics in the
+        // trace emitter, which would crash the worker). The fallback-
+        // serialization path (`<trace serialization failed>`) is hard
+        // to trigger without a custom Serialize impl that errors —
+        // accepted; this test pins the happy paths only.
+        let t = fresh_trace();
+        emit(&t, uuid::Uuid::new_v4(), "google", "drive.files.get");
+        let mut denied = fresh_trace();
+        mark_layer_a_failed(&mut denied, "missing".into());
+        emit(&denied, uuid::Uuid::new_v4(), "google", "drive.files.get");
+    }
+
+    #[test]
     fn summary_renders_read_filter_label_and_empty_layers() {
         let empty = PolicyTrace::new(vec![], Decision::Allow, vec![]);
         assert_eq!(summary(&empty), "");

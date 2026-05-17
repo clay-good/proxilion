@@ -193,6 +193,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_empty_string_and_prefix_only() {
+        // Two boundaries the existing tests skipped: an empty string
+        // (auth middleware sometimes receives this from a header
+        // present with no value) and the prefix alone (length 9, no
+        // body). Both must reject — pin the `len != TOKEN_LEN` check
+        // catching them on the fast path rather than falling through
+        // to the alphabet scan.
+        assert!(Bearer::parse("").is_none());
+        assert!(Bearer::parse(PREFIX).is_none());
+        // Half-typed bearer (prefix + 26 chars of body) — must also
+        // reject. A regression that loosened the length check to a
+        // minimum bound would surface here.
+        let half = format!("{PREFIX}{}", "A".repeat(26));
+        assert!(Bearer::parse(&half).is_none());
+    }
+
+    #[test]
+    fn parse_returns_input_slice_byte_for_byte_when_valid() {
+        // `parse` returns `Some(input)` — the same slice it was handed.
+        // Pin the byte-for-byte identity so a future refactor that
+        // normalized the body (e.g. ToAscii) would surface here. The
+        // auth middleware passes the parsed slice into a SHA-256
+        // hasher; any normalization would silently invalidate every
+        // bearer hash already in the database.
+        let b = Bearer::generate();
+        let parsed = Bearer::parse(b.as_str()).unwrap();
+        assert_eq!(parsed.as_bytes(), b.as_str().as_bytes());
+        assert_eq!(parsed.len(), TOKEN_LEN);
+    }
+
+    #[test]
+    fn bearer_hash_clone_yields_independent_array() {
+        // `BearerHash` is `Clone` so the killswitch path can stash a
+        // copy in the kill_cache without consuming the original. Pin
+        // that the clone owns its `[u8; 32]` (arrays are Copy, so this
+        // is trivially true today — but a refactor to `Box<[u8; 32]>`
+        // would change the semantic and could land an Rc-shared
+        // buffer through the wrong constructor).
+        let a = BearerHash::of("pxl_live_AAAA");
+        let mut b = a.clone();
+        // Mutate b — a must be unaffected.
+        b.0[0] ^= 0xff;
+        assert_ne!(a.0[0], b.0[0]);
+    }
+
+    #[test]
     fn bearer_hash_partial_eq_distinguishes_different_inputs() {
         // BearerHash derives PartialEq+Eq; pin both axes — equal inputs hash
         // equal, distinct inputs hash distinct. The middleware uses Eq to

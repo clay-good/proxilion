@@ -171,6 +171,51 @@ mod tests {
     }
 
     #[test]
+    fn empty_plaintext_round_trips_with_nonzero_ciphertext() {
+        // The Google OAuth refresh-token field is optional — when the
+        // upstream omits it, the proxy still encrypts an empty byte
+        // slice to keep the schema's NOT NULL ciphertext column
+        // satisfied (the Option wrapper lives one level up). Pin that
+        // an empty plaintext yields a non-empty ciphertext (the GCM
+        // auth tag is 16 bytes), and that decrypt round-trips it
+        // back to empty.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let ct = c.encrypt(b"").unwrap();
+        assert!(!ct.bytes.is_empty(), "GCM auth tag must be present");
+        assert_eq!(ct.bytes.len(), 16, "empty PT + 16-byte tag");
+        let pt = c.decrypt(&ct).unwrap();
+        assert!(pt.is_empty());
+    }
+
+    #[test]
+    fn large_plaintext_round_trips_through_encrypt_decrypt() {
+        // OAuth ID tokens can be a few KB; pin that the cipher handles
+        // a payload larger than the AES block size + nonce/tag overhead
+        // without truncation. The fixed-size buffer scenario this
+        // catches is a refactor that allocated a small `[u8; N]` for
+        // the ciphertext instead of letting `aes-gcm` size the Vec.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let pt: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let ct = c.encrypt(&pt).unwrap();
+        assert_eq!(ct.bytes.len(), pt.len() + 16, "GCM tag overhead");
+        let back = c.decrypt(&ct).unwrap();
+        assert_eq!(back, pt);
+    }
+
+    #[test]
+    fn aead_error_display_is_stable_for_log_filters() {
+        // Operator log filters key on the substring "AES-GCM operation
+        // failed" for tamper / corrupt-row / wrong-key alerting.
+        // The Display impl comes from `#[error("AES-GCM operation
+        // failed")]` — pin it here so a future tweak ("AEAD failed",
+        // "decryption failed") moves in lockstep with the alerting
+        // rules. The BadKeyLen Display already has its actual-length
+        // pinned elsewhere; this fills in the Aead arm.
+        let s = CipherError::Aead.to_string();
+        assert_eq!(s, "AES-GCM operation failed");
+    }
+
+    #[test]
     fn empty_key_rejected_with_zero_length() {
         // Boundary: a missing env var sometimes shows up as an empty byte
         // slice. The variant must carry `0`, not panic on the indexing path.

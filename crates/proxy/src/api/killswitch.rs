@@ -360,6 +360,56 @@ mod tests {
     }
 
     #[test]
+    fn kill_response_with_zero_bearers_revoked_serializes_cleanly() {
+        // A /killswitch/user call where the p_0 has no live bearers
+        // returns `bearers_revoked: 0` — pin that this lands on the
+        // wire as the integer 0 (not omitted, not stringified, not
+        // null). The dashboard's "no-op" toast keys on `>= 0`, so a
+        // refactor that switched the field to `Option<i64>` (in the
+        // name of "only emit when non-zero") would silently break
+        // the operator-visible "killswitch ran, nothing to revoke"
+        // confirmation.
+        let r = KillResponse {
+            record_id: Uuid::nil(),
+            scope: "user",
+            target: "alice@demo.local".into(),
+            bearers_revoked: 0,
+            at: Utc::now(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["bearers_revoked"], 0);
+        assert!(v.get("bearers_revoked").unwrap().is_number());
+    }
+
+    #[test]
+    fn kill_body_rejects_unknown_field_via_deny_or_passes_through_today() {
+        // The struct does NOT carry `#[serde(deny_unknown_fields)]`.
+        // Pin the forward-compat path so the CLI can add fields
+        // (e.g. `notify_email`) without 400ing every existing proxy.
+        // A refactor that added the deny attribute would surface
+        // here as a wire-shape break the upgrade ladder must
+        // address.
+        let body: KillBody = serde_json::from_str(
+            r#"{"reason":"r","operator_subject":"op","confirm":"yes","future_field":42}"#,
+        )
+        .unwrap();
+        assert_eq!(body.reason.as_deref(), Some("r"));
+        assert_eq!(body.operator_subject.as_deref(), Some("op"));
+        assert_eq!(body.confirm.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn api_error_bad_request_display_carries_inner_message() {
+        // The `#[error("{0}")]` shape on BadRequest means Display ==
+        // the inner string verbatim. Pin this so a future shape
+        // (`#[error("bad request: {0}")]` — symmetric with the other
+        // ApiError modules) is a conscious wire-shape change. The
+        // CLI's killswitch error renderer parses on the bare message.
+        let e = ApiError::BadRequest("/killswitch/all needs confirm".into());
+        assert_eq!(e.to_string(), "/killswitch/all needs confirm");
+    }
+
+    #[test]
     fn kill_body_accepts_confirm_yes_for_kill_all() {
         // /killswitch/all rejects without `confirm: "yes"` — pin that the
         // deserializer accepts the field (vs. an accidental rename in serde

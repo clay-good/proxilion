@@ -283,6 +283,76 @@ mod tests {
     }
 
     #[test]
+    fn allowed_returns_true_for_empty_layers_with_allow_decision() {
+        // Edge: a trace with zero layers + `Decision::Allow` satisfies
+        // `.all(passed)` vacuously and `matches!(... Allow)` — so
+        // `allowed()` is true. Pin this so a refactor that added a
+        // "must have at least one layer" guard surfaces here. The
+        // engine path always emits Layer A + Layer B stubs, but
+        // mocks / dashboard replay paths sometimes construct empty
+        // traces.
+        let t = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+        assert!(t.allowed());
+    }
+
+    #[test]
+    fn allowed_false_when_first_layer_passes_but_a_later_layer_fails() {
+        // The `.all(passed)` short-circuit must NOT stop at the first
+        // pass — a single failed layer anywhere in the Vec must flip
+        // `allowed()` to false. Pin the iteration ordering invariant.
+        let t = PolicyTrace::new(
+            vec![
+                LayerOutcome::passed(PolicyLayer::LayerA),
+                LayerOutcome::passed(PolicyLayer::LayerB),
+                LayerOutcome::failed(
+                    PolicyLayer::ReadFilter,
+                    ErrorCode::ReadFilterBlocked,
+                    None,
+                    None,
+                ),
+            ],
+            Decision::Allow,
+            vec![],
+        );
+        assert!(!t.allowed());
+    }
+
+    #[test]
+    fn duration_micros_starts_zero_and_supports_post_construction_mutation() {
+        // `PolicyTrace::new` initializes `duration_micros: 0`; the
+        // engine measures the eval time and stamps the field after.
+        // Pin both the zero-on-construct contract AND that the field
+        // is `pub` (allowing post-construction mutation). A refactor
+        // that made the field private would force the engine to
+        // route the duration through a builder method.
+        let mut t = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+        assert_eq!(t.duration_micros, 0);
+        t.duration_micros = 1234;
+        assert_eq!(t.duration_micros, 1234);
+    }
+
+    #[test]
+    fn ops_atom_view_serializes_with_all_three_fields_present() {
+        // Wire contract — the trace's `required_ops` is consumed by
+        // the adapter's Trust-Plane request builder. Pin all three
+        // field names (`scheme`, `action`, `object`) are present and
+        // serialize as bare strings. A serde rename to camelCase (the
+        // common "tidy up the wire shape" refactor) would silently
+        // break Trust Plane's parse.
+        let v = OpsAtomView {
+            scheme: "drive".into(),
+            action: "read".into(),
+            object: "file/abc".into(),
+        };
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["scheme"], "drive");
+        assert_eq!(j["action"], "read");
+        assert_eq!(j["object"], "file/abc");
+        // No extra fields snuck in.
+        assert_eq!(j.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
     fn policy_trace_json_carries_trace_id_and_layers() {
         let t = PolicyTrace::new(
             vec![LayerOutcome::passed(PolicyLayer::LayerA)],

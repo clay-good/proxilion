@@ -201,6 +201,68 @@ mod tests {
     }
 
     #[test]
+    fn decision_partial_eq_distinguishes_block_variants_by_reason_and_override() {
+        // The dashboard's diff-view keys on `Decision == Decision`
+        // before re-rendering — pin that two `Block { reason, ..}`
+        // with different reasons are NOT equal (otherwise a policy-
+        // edit changing the reason text would render as unchanged).
+        let a = Decision::Block {
+            reason: "external".into(),
+            override_allowed: true,
+        };
+        let b = Decision::Block {
+            reason: "external".into(),
+            override_allowed: true,
+        };
+        let c = Decision::Block {
+            reason: "internal".into(),
+            override_allowed: true,
+        };
+        let d = Decision::Block {
+            reason: "external".into(),
+            override_allowed: false,
+        };
+        assert_eq!(a, b, "identical Block variants must compare equal");
+        assert_ne!(a, c, "Block with different reason must NOT be equal");
+        assert_ne!(
+            a, d,
+            "Block with different override_allowed must NOT be equal",
+        );
+    }
+
+    #[test]
+    fn rate_limit_round_trips_burst_and_per_seconds_separately() {
+        // The two integer fields must each round-trip independently —
+        // a serde field-rename or accidental swap (a `(per_seconds,
+        // burst)` reorder during a refactor) would silently flip the
+        // operator-facing rate-limit semantics. Use distinct values
+        // so an accidental swap surfaces.
+        let d = Decision::RateLimit {
+            burst: 7,
+            per_seconds: 42,
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains(r#""burst":7"#));
+        assert!(s.contains(r#""per_seconds":42"#));
+        let back: Decision = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn regex_pattern_clone_preserves_compiled_state() {
+        // `Pattern::Regex` wraps `regex::Regex`, which is `Clone`. Pin
+        // that cloning a compiled regex preserves the match behavior
+        // (a refactor that switched to `Cow<'static, str>` and
+        // re-compiled-on-match would silently re-pay the compile cost
+        // per request on the hot path — and could fail on bad patterns
+        // at a non-startup time).
+        let p = Pattern::Regex(regex::Regex::new(r"(?i)secret").unwrap());
+        let c = p.clone();
+        assert!(c.is_match("a SECRET document"));
+        assert!(!c.is_match("nothing to see"));
+    }
+
+    #[test]
     fn decision_kind_wire_strings_are_stable() {
         let cases: &[(Decision, &str)] = &[
             (Decision::Allow, "allow"),

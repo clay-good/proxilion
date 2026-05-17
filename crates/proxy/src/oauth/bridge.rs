@@ -217,6 +217,115 @@ mod tests {
     }
 
     #[test]
+    fn accepts_token_at_exact_60s_clock_skew_boundary() {
+        // The clock-skew guard is `claims.iat > now + 60` — pin the
+        // boundary inclusively. `iat == now + 60` must STILL accept
+        // (the 60-second allowance is a permissive equality, not a
+        // strict less-than). A refactor that flipped the comparison
+        // to `>=` would silently shrink the allowance by one second
+        // and surface as flaky federation flow tests under skewed
+        // clocks. Symmetric pin at `now + 61` rejects.
+        let now = chrono::Utc::now().timestamp();
+        let jwt_ok = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "s",
+            "iat": now + 60,
+            "exp": now + 120,
+        }));
+        assert!(validate_federation_token(&jwt_ok).is_ok());
+        let jwt_bad = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "s",
+            "iat": now + 61,
+            "exp": now + 120,
+        }));
+        assert!(matches!(
+            validate_federation_token(&jwt_bad).unwrap_err(),
+            OAuthError::BridgeRejected(_)
+        ));
+    }
+
+    #[test]
+    fn federation_claims_round_trip_pca_cbor_b64_optional() {
+        // `pca_0_cbor_b64` is `Option<String>` with `#[serde(default)]`
+        // — a production bridge that pre-fetches the PCA bytes from
+        // Trust Plane MUST be able to round-trip them through the JWT
+        // body so the proxy can cache without an extra round-trip.
+        // Stub bridges omit it (None). Pin both shapes — the
+        // `#[serde(default)]` is load-bearing because absent-field
+        // would otherwise error the whole claims parse.
+        let now = chrono::Utc::now().timestamp();
+        let with = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "s",
+            "iat": now,
+            "exp": now + 60,
+            "pca_0_cbor_b64": "AAECAwQF",
+        }));
+        let c = validate_federation_token(&with).unwrap();
+        assert_eq!(c.pca_0_cbor_b64.as_deref(), Some("AAECAwQF"));
+
+        let without = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "s",
+            "iat": now,
+            "exp": now + 60,
+        }));
+        let c = validate_federation_token(&without).unwrap();
+        assert!(c.pca_0_cbor_b64.is_none());
+    }
+
+    #[test]
+    fn federation_claims_clone_preserves_every_field() {
+        // The router clones `FederationClaims` into the per-request
+        // OAuthState before persisting `pca_0_id` to the session row.
+        // Pin that the Clone derive carries every field — a refactor
+        // that switched a String to Cow<str> would surface here as a
+        // borrow-checker rewrite of the call site.
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:bob@demo.local",
+            "ops": ["drive:read:engineering/*", "gmail:send:alice@external.com"],
+            "state": "abc",
+            "iat": now,
+            "exp": now + 60,
+            "iss": "https://acme.okta.com",
+        }));
+        let c = validate_federation_token(&jwt).unwrap();
+        let dup = c.clone();
+        assert_eq!(dup.p_0, "user:bob@demo.local");
+        assert_eq!(dup.ops.len(), 2);
+        assert_eq!(dup.state, "abc");
+        assert_eq!(dup.iat, now);
+        assert_eq!(dup.exp, now + 60);
+        assert_eq!(dup.iss.as_deref(), Some("https://acme.okta.com"));
+    }
+
+    #[test]
+    fn infer_idp_case_insensitive_against_mixed_case_issuers() {
+        // The `to_ascii_lowercase()` step is load-bearing — IdPs
+        // sometimes emit the host portion in mixed case. Pin the
+        // classifier collapses these to the same bucket as the
+        // canonical-case form so a metric label split doesn't appear
+        // for the same upstream IdP.
+        assert_eq!(infer_idp(Some("https://Acme.OKTA.com")), "okta");
+        assert_eq!(
+            infer_idp(Some("https://Login.MicrosoftOnline.com/abc/v2.0")),
+            "azure"
+        );
+        assert_eq!(infer_idp(Some("https://Accounts.Google.com")), "google");
+    }
+
+    #[test]
     fn accepts_fresh_token() {
         let now = chrono::Utc::now().timestamp();
         let jwt = make_jwt(&serde_json::json!({

@@ -813,4 +813,127 @@ mod tests {
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap().contains("no policy file"));
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Pure-helper coverage for the private YAML parser the `set_mode`
+    // line-walker delegates to. These were only exercised end-to-end
+    // before — pinning them directly keeps a future refactor of
+    // `edit_mode_in_yaml` from silently shifting behaviour on the
+    // boundary cases the public tests don't reach.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_eol_removes_trailing_newline_only_when_present() {
+        // A naked-string (no trailing '\n') round-trips unchanged — the
+        // line walker uses `split_inclusive('\n')` which leaves the last
+        // line newline-less, and the rewrite must rejoin byte-exact.
+        assert_eq!(strip_eol("abc\n"), "abc");
+        assert_eq!(strip_eol("abc"), "abc");
+        assert_eq!(strip_eol(""), "");
+        // Carriage-return is NOT stripped (CRLF inputs aren't a supported
+        // shape for policy YAML; the line walker would mis-align indent
+        // calculations if we silently dropped the '\r').
+        assert_eq!(strip_eol("abc\r\n"), "abc\r");
+    }
+
+    #[test]
+    fn leading_ws_len_counts_spaces_and_tabs_mixed() {
+        // The `field_indent` computation depends on a byte-accurate count
+        // (mixed-tab YAML survives intact because the rewrite preserves
+        // the original lead bytes — but the length must match the source).
+        assert_eq!(leading_ws_len(""), 0);
+        assert_eq!(leading_ws_len("abc"), 0);
+        assert_eq!(leading_ws_len("  abc"), 2);
+        assert_eq!(leading_ws_len("\t\tabc"), 2);
+        assert_eq!(leading_ws_len(" \t abc"), 3);
+        // Non-leading whitespace is not counted.
+        assert_eq!(leading_ws_len("ab cd"), 0);
+    }
+
+    #[test]
+    fn parse_id_value_extracts_bare_and_quoted_scalars() {
+        assert_eq!(parse_id_value("id: alpha"), Some("alpha"));
+        // Trailing whitespace trimmed.
+        assert_eq!(parse_id_value("id: alpha   "), Some("alpha"));
+        // Double-quoted scalar — quotes stripped.
+        assert_eq!(
+            parse_id_value(r#"id: "with-spaces and stuff""#),
+            Some("with-spaces and stuff")
+        );
+        // Single-quoted scalar — quotes stripped.
+        assert_eq!(parse_id_value("id: 'beta'"), Some("beta"));
+    }
+
+    #[test]
+    fn parse_id_value_rejects_missing_space_after_colon_to_avoid_pid_match() {
+        // `pid: foo` lines must not match `id:` — the colon-without-space
+        // gate is what stops the line walker hijacking sibling fields.
+        assert_eq!(parse_id_value("id:foo"), None);
+        // `pid: foo` doesn't even start with `id:` so it's caught earlier,
+        // but we pin the dense form here as a regression sentinel.
+        assert_eq!(parse_id_value("pid: foo"), None);
+        // A tab between colon and value is accepted (YAML allows it).
+        assert_eq!(parse_id_value("id:\tx"), Some("x"));
+    }
+
+    #[test]
+    fn parse_id_value_returns_none_for_empty_or_comment_only_value() {
+        // Empty value after `id:` is not a valid policy block anchor.
+        assert_eq!(parse_id_value("id: "), None);
+        // Quoted-empty: stripped quotes leave empty string → None.
+        assert_eq!(parse_id_value(r#"id: """#), None);
+        // Value composed entirely of a trailing comment after the space is
+        // also empty after stripping (the comment-finder fires on the
+        // post-space byte).
+        assert_eq!(parse_id_value("id:  # placeholder"), None);
+    }
+
+    #[test]
+    fn find_inline_comment_requires_preceding_whitespace() {
+        // The `#` must be at column 0 OR have a whitespace byte before it.
+        // This stops URLs (e.g. `https://foo#frag`) from being mistaken for
+        // inline comments — important because policy `match:` rules carry
+        // user-supplied strings that may include `#`.
+        assert_eq!(find_inline_comment("abc # comment"), Some(4));
+        assert_eq!(find_inline_comment("# leading"), Some(0));
+        assert_eq!(find_inline_comment("https://x#frag"), None);
+        assert_eq!(find_inline_comment("nohash"), None);
+        // Tab before `#` also counts as whitespace.
+        assert_eq!(find_inline_comment("abc\t#x"), Some(4));
+    }
+
+    #[test]
+    fn set_mode_error_display_strings_are_stable_for_log_filters() {
+        // Each variant emits a distinct operator-facing prefix the
+        // troubleshooting docs page keys on; pin both prefix and that the
+        // carried payload (id / parse message / reload reason) appears in
+        // the rendered text.
+        assert_eq!(
+            SetModeError::NotFound("alpha".into()).to_string(),
+            "policy `alpha` not found"
+        );
+        assert_eq!(
+            SetModeError::Parse("scanner error at line 7".into()).to_string(),
+            "yaml parse: scanner error at line 7"
+        );
+        assert_eq!(
+            SetModeError::Reload("schema mismatch on key X".into()).to_string(),
+            "reload after mutation: schema mismatch on key X"
+        );
+    }
+
+    #[test]
+    fn set_mode_via_serde_fallback_round_trips_when_yaml_is_a_flow_mapping() {
+        // The line-oriented walker only recognizes block-style YAML; an
+        // operator who hand-edits to flow style would otherwise hit
+        // `NotFound` even though the policy exists. The serde fallback
+        // path catches this — pin it here on a flow-mapping input where
+        // the line walker wouldn't have found the anchor.
+        let yaml = "- {id: gamma, vendor: google, action: drive.files.get, decision: allow, required_ops: []}\n";
+        let out = set_mode_via_serde(yaml, "gamma", Mode::Observe).expect("serde fallback ok");
+        // The output is reformatted (comment loss is documented), but the
+        // policy must now carry `mode: observe`.
+        assert!(out.contains("mode: observe"), "rewritten: {out}");
+        assert!(out.contains("id: gamma"));
+    }
 }

@@ -335,6 +335,78 @@ mod tests {
     }
 
     #[test]
+    fn scenario_decision_status_pairs_match_http_class_per_arm() {
+        // Each SCENARIOS entry pairs a decision with an HTTP status.
+        // The pairing is a wire contract operator dashboards alert on
+        // (a 403 on a `decision="allow"` row would surface as data
+        // corruption). Pin all three real pairs:
+        //   allow                 → 200
+        //   block                 → 403
+        //   require_confirmation  → 428
+        // A refactor that mistyped one of the status codes (e.g. block
+        // → 400 by copy-paste) would silently break the demo
+        // dashboard's "decision-class color coding" and the
+        // installer-doc claim that "the demo timeline shows realistic
+        // status codes". Walk every SCENARIO and assert the pairing.
+        for s in SCENARIOS {
+            match s.decision {
+                "allow" => assert_eq!(
+                    s.status, 200,
+                    "allow scenario must use 200, got {}",
+                    s.status
+                ),
+                "block" => assert_eq!(
+                    s.status, 403,
+                    "block scenario must use 403, got {}",
+                    s.status
+                ),
+                "require_confirmation" => assert_eq!(
+                    s.status, 428,
+                    "require_confirmation must use 428, got {}",
+                    s.status
+                ),
+                other => panic!("unknown demo decision: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn synth_event_leaf_pca_id_is_always_some_for_demo_chain_visibility() {
+        // The demo dashboard's chain-walker panel requires every
+        // synthetic row to carry a `leaf_pca_id` so the "click row →
+        // walk PCA chain" UX surfaces non-empty data. A regression
+        // that defaulted to None (e.g. "leaf_pca_id is optional, why
+        // bother") would silently break the demo's most-visible feature
+        // — pin Some on every scenario.
+        for s in SCENARIOS {
+            let ev = synth_event(s, Utc::now());
+            assert!(
+                ev.leaf_pca_id.is_some(),
+                "scenario {}/{} produced None leaf_pca_id",
+                s.vendor,
+                s.action
+            );
+        }
+    }
+
+    #[test]
+    fn synth_event_status_field_round_trips_scenario_status_verbatim() {
+        // The status field is `scenario.status` cast to u16 with no
+        // transformation — a refactor that started normalizing it
+        // (e.g. "round all to nearest 100") would silently break the
+        // demo dashboard's exact-status display. Pin all four
+        // scenarios' status codes round-trip into the emitted event.
+        for s in SCENARIOS {
+            let ev = synth_event(s, Utc::now());
+            assert_eq!(
+                ev.status, s.status,
+                "status not round-tripped for {}/{}",
+                s.vendor, s.action
+            );
+        }
+    }
+
+    #[test]
     fn scenario_set_includes_block_allow_and_require_confirmation_decisions() {
         // SCENARIOS is the canonical demo set. Pin the decision variety so a
         // refactor that drops an interesting class is caught.

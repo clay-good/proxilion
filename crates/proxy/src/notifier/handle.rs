@@ -242,6 +242,40 @@ mod tests {
         assert!(h.current().is_none());
     }
 
+    #[tokio::test]
+    async fn any_configured_triggers_on_email_alone_as_third_or_chain_branch() {
+        // Symmetric coverage to `bundle_any_configured_when_webhook_set`
+        // and `any_configured_triggers_on_slack_alone`. The OR-chain
+        // has three branches; both prior tests pinned webhook + slack,
+        // but the email branch was unpinned. A copy-paste typo in the
+        // `|| self.email.current().is_some()` line (e.g. duplicating
+        // the slack check) would only surface here. Builds a real
+        // EmailNotifier so the type-system checks the Handle wiring
+        // (Arc<EmailNotifier> → EmailHandle) at the call site too.
+        use crate::notifier::EmailNotifier;
+        use sqlx::postgres::PgPoolOptions;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/__notifier_handle_email_test")
+            .expect("lazy connect builds");
+        let email = Arc::new(
+            EmailNotifier::new(
+                "smtp://localhost:25",
+                "sec@x.com",
+                &["a@x.com".into()],
+                "https://proxy.local".into(),
+                pool,
+            )
+            .expect("EmailNotifier::new builds"),
+        );
+        let n = Notifiers::empty();
+        assert!(!n.any_configured());
+        n.email.replace(Some(email));
+        assert!(n.any_configured(), "email-only must trigger any_configured");
+        n.email.replace(None);
+        assert!(!n.any_configured());
+    }
+
     #[test]
     fn any_configured_triggers_on_slack_alone() {
         // Symmetric coverage to `bundle_any_configured_when_webhook_set`.

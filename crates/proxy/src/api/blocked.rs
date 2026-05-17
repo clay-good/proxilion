@@ -843,6 +843,43 @@ mod tests {
     }
 
     #[test]
+    fn approve_body_accepts_unknown_extra_fields_for_forward_compat() {
+        // The CLI may send forward-compat fields (e.g. a future
+        // `notify_email: true` flag) that older proxies don't know
+        // about. The current `ApproveBody` does NOT carry
+        // `#[serde(deny_unknown_fields)]`, so unknown fields are
+        // silently ignored. Pin this contract — a refactor that
+        // tightened to deny-unknown would force every CLI shape
+        // change to be a coordinated proxy upgrade and 400 every
+        // forward-compat field.
+        let b: ApproveBody = serde_json::from_str(
+            r#"{"justification":"reviewed","ttl_minutes":15,"future_flag":"notify"}"#,
+        )
+        .unwrap();
+        assert_eq!(b.justification, "reviewed");
+        assert_eq!(b.ttl_minutes, Some(15));
+    }
+
+    #[test]
+    fn reject_body_accepts_optional_approver_subject_when_set() {
+        // The existing `reject_body_deserializes` test pins the
+        // minimal shape (reason only, approver_subject None). Pin
+        // the with-subject path so a refactor that made the field
+        // required would surface here as a parse error, AND a
+        // refactor that changed the field name would surface as the
+        // assertion below failing rather than as a missed-field
+        // silent default. The handler distinguishes a Some-subject
+        // (operator-driven reject) from None (system-driven reject)
+        // for audit attribution.
+        let b: RejectBody = serde_json::from_str(
+            r#"{"reason":"not safe","approver_subject":"alice@operator.com"}"#,
+        )
+        .unwrap();
+        assert_eq!(b.reason, "not safe");
+        assert_eq!(b.approver_subject.as_deref(), Some("alice@operator.com"));
+    }
+
+    #[test]
     fn blocked_row_includes_request_canonical_json_when_set() {
         let mut row = BlockedRow {
             id: Uuid::nil(),

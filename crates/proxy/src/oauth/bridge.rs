@@ -326,6 +326,79 @@ mod tests {
     }
 
     #[test]
+    fn validate_federation_token_at_exact_exp_boundary_accepts_inclusive() {
+        // The exp check is `if now > claims.exp` — strict greater. So
+        // a token with `exp == now` MUST still pass (not reject). Pin
+        // the inclusive boundary; a refactor that flipped to `>=` would
+        // silently shrink the validity window by one second and make
+        // federation flows flaky around the wall-clock boundary. We
+        // construct `exp` exactly at `now` via a tight chain: read now,
+        // pin exp = now, decode. (There's a 1-microsecond race against
+        // `Utc::now()` inside `validate_federation_token` advancing —
+        // unlikely to flake but accepted.)
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "s",
+            "iat": now - 10,
+            "exp": now,
+        }));
+        // `exp == now` → strict-greater check `now > exp` is false → accept.
+        assert!(
+            validate_federation_token(&jwt).is_ok(),
+            "exp == now must accept (strict-greater check, not >=)"
+        );
+    }
+
+    #[test]
+    fn validate_federation_token_with_b64_valid_but_json_invalid_carries_bad_claims_msg() {
+        // The third failure mode after malformed-JWT and bad-base64:
+        // header + signature parts present, payload is valid base64,
+        // but the decoded bytes don't deserialize to FederationClaims
+        // (e.g. missing required field `pca_0_id`). Pin the operator-
+        // facing message contains `"bad claims"` so a refactor that
+        // collapsed the three error messages would lose actionable
+        // triage signal. (Operator log filters key on the substring.)
+        let header = B64URL.encode(br#"{"alg":"none"}"#);
+        // Payload is valid base64 of valid JSON, but missing every
+        // required field of FederationClaims (no pca_0_id, no p_0,
+        // etc.) — serde will surface a missing-field error.
+        let payload = B64URL.encode(br#"{"unrelated":true}"#);
+        let jwt = format!("{header}.{payload}.sig");
+        let err = validate_federation_token(&jwt).unwrap_err();
+        match err {
+            OAuthError::BridgeRejected(m) => {
+                assert!(
+                    m.contains("bad claims"),
+                    "missing `bad claims` substring: {m}"
+                );
+            }
+            other => panic!("expected BridgeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn infer_idp_returns_oidc_bucket_for_non_well_known_https_issuer_variants() {
+        // The fallback `oidc` bucket is the catch-all for generic OIDC
+        // IdPs (Keycloak, Auth0, custom). Pin three distinct shapes so a
+        // refactor that tightened the fallback (e.g. requiring an
+        // `https://` prefix) would surface here. Operator dashboards
+        // panel on `idp=oidc` rate as a "non-named-IdP traffic" signal;
+        // shrinking the bucket would silently hide it under "unknown".
+        assert_eq!(
+            infer_idp(Some("https://auth.example.com/realms/main")),
+            "oidc"
+        );
+        assert_eq!(infer_idp(Some("https://login.acme.dev")), "oidc");
+        assert_eq!(
+            infer_idp(Some("https://keycloak.internal/auth/realms/main")),
+            "oidc"
+        );
+    }
+
+    #[test]
     fn accepts_fresh_token() {
         let now = chrono::Utc::now().timestamp();
         let jwt = make_jwt(&serde_json::json!({

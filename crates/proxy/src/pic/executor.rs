@@ -618,6 +618,93 @@ mod tests {
     }
 
     #[test]
+    fn executor_error_transport_and_base64_display_strings_carry_distinct_prefixes() {
+        // The Display strings for Upstream/Invariant/Core were pinned
+        // already; the two remaining variants (Transport via #[from]
+        // reqwest::Error, Base64 via #[from] base64::DecodeError) had
+        // no direct coverage. Pin both prefixes — operator log filters
+        // split "transport flake" from "encoded-bytes corruption" on
+        // these substrings; a refactor that collapsed the messages
+        // would silently break the triage split.
+        // Transport: construct a real reqwest::Error via a 1ms-timeout
+        // against an RFC 5737 black-hole IP (immediate connect-refuse
+        // on localhost:1; no waiting).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let reqwest_err = rt.block_on(async {
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(1))
+                .build()
+                .unwrap()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("must error")
+        });
+        let e = ExecutorError::from(reqwest_err);
+        let s = e.to_string();
+        assert!(s.starts_with("Trust Plane request failed:"), "got: {s}");
+        // Base64: construct via a real DecodeError from a non-b64 input.
+        let b64_err = base64::engine::general_purpose::STANDARD
+            .decode("@@@")
+            .expect_err("non-b64 must error");
+        let e = ExecutorError::from(b64_err);
+        let s = e.to_string();
+        assert!(s.starts_with("base64:"), "got: {s}");
+    }
+
+    #[test]
+    fn successor_outcome_debug_includes_issued_variant_name_for_audit_trail() {
+        // The symmetric pin to `successor_outcome_debug_carries_variant_name_and_detail`
+        // (which only covered AuditFallback). The adapter logs
+        // `?outcome` for every chain-issuance — pin that the Issued
+        // arm's variant name shows up in the rendered Debug string so
+        // operator audit trails can grep for "Issued" vs
+        // "AuditFallback" to bucket runtime-gate vs audit-mode
+        // outcomes.
+        let resp = ProcessPocResponse {
+            pca: "base64-blob".into(),
+            hop: 2,
+            p_0: "user:alice@demo.local".into(),
+            ops: vec!["drive:read:engineering/*".into()],
+            exp: None,
+        };
+        let out = SuccessorOutcome::Issued(resp);
+        let s = format!("{out:?}");
+        assert!(s.contains("Issued"), "missing Issued variant name: {s}");
+        // The inner ProcessPocResponse's Debug derive must surface
+        // through too — pin one of its fields (hop) as a sanity check.
+        assert!(
+            s.contains("hop"),
+            "inner ProcessPocResponse fields lost: {s}"
+        );
+    }
+
+    #[test]
+    fn executor_error_implements_std_error_trait_for_anyhow_chains() {
+        // Adapter call sites bubble ExecutorError through anyhow chains
+        // for structured logging; the `thiserror` derive must land the
+        // `std::error::Error` impl. Pin via a trait-object cast so a
+        // refactor that dropped `#[derive(Error)]` would surface as a
+        // compile error here rather than as a confusing trait-bound
+        // failure at a distant call site. All five variants must
+        // satisfy the trait (the derive is per-enum, not per-variant,
+        // so testing one is sufficient — pick Invariant since it's the
+        // most common operator-facing surface).
+        let e: ExecutorError = ExecutorError::Invariant("ops not subset".into());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(dyn_err.to_string().contains("invariant violation"));
+        // Also pin the Upstream arm directly — distinct construction
+        // path (no #[from], just named fields) so the trait must work
+        // on both shapes.
+        let e: ExecutorError = ExecutorError::Upstream {
+            status: 500,
+            body: "trust plane internal".into(),
+        };
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(dyn_err.to_string().contains("500"));
+    }
+
+    #[test]
     fn pic_executor_clone_shares_inner_arc() {
         // `Clone` is part of the design contract — adapters hold a
         // per-handler clone of the executor, and the `OnceCell<()>` for

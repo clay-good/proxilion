@@ -795,6 +795,52 @@ mod tests {
     }
 
     #[test]
+    fn redact_url_handles_userinfo_segment_without_panic() {
+        // `https://user:pass@host/path` puts a `@` in `rest`'s
+        // pre-first-`/` segment. The current split-on-`/` helper
+        // treats the entire `user:pass@host` as the host and emits
+        // `https://user:pass@host/...`. Pin this so a future
+        // tightening that explicitly stripped userinfo (the
+        // operator-facing improvement) is a conscious wire-shape
+        // change.
+        assert_eq!(
+            redact_url("https://user:pass@host.example/path/to/thing"),
+            "https://user:pass@host.example/...",
+        );
+    }
+
+    #[test]
+    fn redact_url_keeps_ftp_and_unusual_schemes_intact() {
+        // The helper is scheme-agnostic — it splits on `://` and
+        // preserves whatever came before. Pin a non-https scheme so
+        // a refactor that hardcoded `https`/`http` recognition would
+        // surface here (operators sometimes configure file:// for
+        // testing, or a future v2 mqtt:// driver).
+        assert_eq!(
+            redact_url("ftp://files.example/x/y"),
+            "ftp://files.example/..."
+        );
+        assert_eq!(
+            redact_url("mqtt://broker.local/topic"),
+            "mqtt://broker.local/..."
+        );
+    }
+
+    #[test]
+    fn test_request_defaults_via_default_impl_on_optional_driver() {
+        // Empty object → `driver: None`. The handler then `unwrap_or(\"all\")`s.
+        // Pin both halves so a serde refactor that swapped to a required
+        // field (or to a non-Option default) would surface here as a
+        // wire-shape change rather than as a 400-on-empty-body.
+        let req: TestRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.driver.is_none());
+        // Forward-compat — extra fields ignored.
+        let req: TestRequest =
+            serde_json::from_str(r#"{"driver":"all","future":"value"}"#).unwrap();
+        assert_eq!(req.driver.as_deref(), Some("all"));
+    }
+
+    #[test]
     fn set_config_body_accepts_explicit_enabled_false() {
         // The disable path — `enabled: false` is how operators turn a
         // configured-but-paused driver off. Pin that the field round-trips

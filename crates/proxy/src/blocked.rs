@@ -595,6 +595,55 @@ mod canonical_request_json_tests {
     /// references survive cloning (a future refactor to `Cow<'a, str>`
     /// would surface here).
     #[test]
+    fn canonical_request_json_renders_nested_object_body_field() {
+        // Adapters sometimes surface a parsed sub-object (e.g. the
+        // gmail message's `headers` map) to the policy engine. Pin
+        // that a nested JSON object lands intact in the canonical
+        // form — a regression that stringified nested values would
+        // break the audit-log shape operators key on for forensic
+        // detail.
+        let path_params = HashMap::new();
+        let mut body = HashMap::new();
+        body.insert(
+            "headers".into(),
+            serde_json::json!({"from": "alice@acme.com", "to": "bob@external"}),
+        );
+        let s = canonical_request_json("POST", "/x", "google", "a", &path_params, &body);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v["body"]["headers"].is_object());
+        assert_eq!(v["body"]["headers"]["from"], "alice@acme.com");
+        assert_eq!(v["body"]["headers"]["to"], "bob@external");
+    }
+
+    #[test]
+    fn canonical_request_json_with_empty_method_and_path_still_serializes() {
+        // Defensive: an adapter that accidentally passed empty strings
+        // for method/path (a refactor mid-flight) must not panic and
+        // must still produce valid JSON with the four identification
+        // fields present (as empty strings) so the audit row is parseable.
+        let path_params = HashMap::new();
+        let body = HashMap::new();
+        let s = canonical_request_json("", "", "", "", &path_params, &body);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["method"], "");
+        assert_eq!(v["path"], "");
+        assert_eq!(v["vendor"], "");
+        assert_eq!(v["action"], "");
+        assert!(v["truncated"].is_null());
+    }
+
+    #[test]
+    fn canonical_request_max_len_constant_pinned_at_4_kib() {
+        // The 4 KiB cap is the spec.md §2.1 dev 3 wire contract — the
+        // truncation envelope kicks in above this. A refactor that
+        // bumped the constant (in the name of "give operators more
+        // context") would silently widen audit-row sizes across every
+        // existing deployment and could break downstream SIEM
+        // ingestors keyed on the bounded shape. Pin the literal value.
+        assert_eq!(CANONICAL_REQUEST_MAX_LEN, 4096);
+    }
+
+    #[test]
     fn blocked_action_record_clone_preserves_borrowed_fields() {
         let ops = vec!["gmail:send:bob@external.com".to_string()];
         let r = BlockedActionRecord {

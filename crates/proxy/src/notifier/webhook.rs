@@ -379,6 +379,50 @@ mod tests {
     }
 
     #[test]
+    fn secret_sign_distinguishes_single_byte_difference_in_body() {
+        // The HMAC-SHA256 avalanche property is what guarantees a
+        // tampered body produces a different signature. Pin this on
+        // a single-byte flip — a regression that switched to a
+        // checksum (e.g. CRC32) would silently let the receiver
+        // accept tampered payloads. The signature space is 2^256,
+        // so accidental collision on a single-byte flip is
+        // astronomically improbable.
+        let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let a = s.sign(b"payload-A");
+        let b = s.sign(b"payload-B");
+        assert_ne!(a, b);
+        // Pin same-length too — only the content differs.
+        let c = s.sign(b"payload-C");
+        assert_eq!(a.len(), c.len());
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn secret_distinct_keys_produce_distinct_signatures_for_same_body() {
+        // Symmetric to the body-flip test — pin that two different
+        // secrets sign the same body to different MACs. A refactor
+        // that accidentally hard-coded a key (e.g. via a `lazy_static`
+        // fixture in a test path that leaked into prod) would surface
+        // here as identical signatures across distinct WebhookSecret
+        // instances.
+        let s1 = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let s2 = WebhookSecret::from_hex("ffeeddccbbaa99887766554433221100").unwrap();
+        let body = b"identical payload bytes";
+        assert_ne!(s1.sign(body), s2.sign(body));
+    }
+
+    #[test]
+    fn secret_clone_yields_same_signature_as_original() {
+        // `WebhookSecret` is `Clone` — the bundle hands a clone into
+        // each driver build. Pin that the cloned secret signs to the
+        // SAME MAC as the original (no per-instance salt or RNG
+        // smuggled in via the clone path).
+        let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let c = s.clone();
+        assert_eq!(s.sign(b"x"), c.sign(b"x"));
+    }
+
+    #[test]
     fn webhook_proxy_public_url_round_trips_through_accessor() {
         // The approve-URL builder reads this back to construct the
         // `proxy_public_url/api/v1/blocked/{id}/approve` strings — a

@@ -314,6 +314,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn static_loader_initial_version_is_rev_zero() {
+        // Pin the initial revision token shape — `"rev:0"`. The
+        // proxy bootstraps the policy handle with this token, and a
+        // refactor that started at `"rev:1"` (or a UUID) would make
+        // every first reload tick fire an unnecessary engine rebuild
+        // because the handle's pinned-zero would mismatch.
+        let l = StaticPolicyLoader::new("[]");
+        let v = l.load().await.unwrap().version;
+        assert_eq!(v, "rev:0");
+    }
+
+    #[tokio::test]
+    async fn static_loader_changed_since_uses_default_impl_correctly() {
+        // The `StaticPolicyLoader` does NOT override `changed_since`,
+        // so it inherits the trait default (which polls `load()` and
+        // compares versions). Pin the default-impl path end-to-end:
+        // initial → no change, after set_yaml → change reported.
+        let l = StaticPolicyLoader::new("[]");
+        let v0 = l.load().await.unwrap().version;
+        let same = l.changed_since(&v0).await.unwrap();
+        assert!(same.is_none(), "no edits → no change");
+        l.set_yaml("- id: a\n  vendor: g\n  action: a\n  decision: allow\n  required_ops: []\n");
+        let changed = l.changed_since(&v0).await.unwrap();
+        assert!(changed.is_some(), "set_yaml must surface as a change");
+        assert_eq!(changed.as_deref(), Some("rev:1"));
+    }
+
+    #[tokio::test]
+    async fn static_loader_set_yaml_bumps_revision_monotonically() {
+        // Each set_yaml call MUST bump the revision counter exactly
+        // once (atomic fetch_add). Pin five successive bumps so a
+        // refactor to `swap` (which would reset on every call) or to
+        // a non-atomic store (where two concurrent set_yamls could
+        // land the same revision) would surface here.
+        let l = StaticPolicyLoader::new("[]");
+        for expected in 1..=5 {
+            l.set_yaml(format!("rev: {expected}"));
+            let v = l.load().await.unwrap().version;
+            assert_eq!(v, format!("rev:{expected}"));
+        }
+    }
+
     #[test]
     fn static_loader_with_label_overrides_default_source_label() {
         let l = StaticPolicyLoader::new("[]");

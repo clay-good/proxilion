@@ -173,6 +173,64 @@ mod tests {
     }
 
     #[test]
+    fn lookup_body_missing_key_returns_none_distinct_from_null_value() {
+        // Two boundaries: a missing body key returns None; a body key
+        // present but valued `json!(null)` returns Some("null") via
+        // the json-repr fallback. The distinction matters because
+        // the OpsExpression resolver uses `None` to fall through to
+        // the bare-template form (no substitution), whereas a string
+        // `"null"` would produce a literal `ops:atom:null` atom on
+        // the wire.
+        let mut c = sample_ctx();
+        assert!(c.lookup("body.absent").is_none());
+        c.body.insert("nullable".into(), json!(null));
+        assert_eq!(c.lookup("body.nullable"), Some("null".into()));
+    }
+
+    #[test]
+    fn lookup_list_empty_string_array_returns_empty_vec_not_none() {
+        // The OpsExpression substitution path treats `Some(vec)` as
+        // "expand into N atoms" — an empty Vec must yield zero atoms
+        // (the request has no recipients, no domains, etc.), NOT fall
+        // back to the scalar path. Pin the empty-array → empty-Vec
+        // contract here; a future refactor that conflated empty-array
+        // with None would silently inject the bare template into
+        // required_ops.
+        let mut c = sample_ctx();
+        c.body
+            .insert("empty_list".into(), json!(Vec::<String>::new()));
+        let got = c.lookup_list("body.empty_list");
+        assert_eq!(got, Some(Vec::<String>::new()));
+    }
+
+    #[test]
+    fn lookup_user_email_with_empty_string_returns_some_empty() {
+        // `UserCtx::email` is `String` (not `Option<String>`); a
+        // missing email defaults to "". Pin that `lookup("user.email")`
+        // returns `Some("")` (not None) so policy authors who write
+        // `user.email == ""` as a "no user" sentinel get the expected
+        // match. A refactor to `Option<String>` would need to flip
+        // this contract.
+        let mut c = sample_ctx();
+        c.user.email.clear();
+        assert_eq!(c.lookup("user.email"), Some(String::new()));
+    }
+
+    #[test]
+    fn lookup_customer_domain_carries_through_clone() {
+        // The engine clones the context once per evaluation; pin
+        // that customer_domain (the most-used template variable per
+        // spec.md §9) survives a Clone. A `Cow<str>` refactor would
+        // surface as a borrow-checker rewrite of the call site, not
+        // a silent semantic shift, but pinning the trait still
+        // catches a hand-written Clone impl that elided the field.
+        let c = sample_ctx();
+        let d = c.clone();
+        assert_eq!(d.customer_domain, "acme.com");
+        assert_eq!(d.lookup("customer_domain"), Some("acme.com".into()));
+    }
+
+    #[test]
     fn lookup_list_path_and_headers_always_none() {
         let c = sample_ctx();
         // The flat string maps are never list-valued.

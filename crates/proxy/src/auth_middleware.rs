@@ -555,6 +555,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_coordinator_distinct_hashes_produce_independent_locks() {
+        // Two distinct bearer hashes must yield independent mutexes
+        // so one bearer's refresh doesn't block another's. Pin the
+        // lock-disjointness by holding lock A's guard and successfully
+        // acquiring lock B's — a regression that collapsed all
+        // bearers to one mutex would deadlock on the second acquire
+        // (we use try_lock to surface that as a clear failure rather
+        // than a hang).
+        let c = RefreshCoordinator::default();
+        let a = c.lock_for([1u8; 32]).await;
+        let b = c.lock_for([2u8; 32]).await;
+        let _guard_a = a.lock().await;
+        // While holding A, B must still be acquirable — different mutexes.
+        let try_b = b.try_lock();
+        assert!(try_b.is_ok(), "distinct hashes must be independent mutexes");
+    }
+
+    #[test]
+    fn auth_fail_decrypt_does_not_carry_cipher_internals_in_message() {
+        // The Decrypt variant has NO inner field — pin that Display
+        // returns the fixed string with no embedded payload. A future
+        // refactor that wrapped a `CipherError` and surfaced its
+        // Display (which mentions key length) could leak operational
+        // detail in 4xx-shaped log lines that get pasted into tickets.
+        assert_eq!(AuthFail::Decrypt.to_string(), "google token decrypt failed");
+        // Three calls return the SAME string — proof there's no
+        // counter / nonce mixed in.
+        assert_eq!(AuthFail::Decrypt.to_string(), AuthFail::Decrypt.to_string());
+    }
+
+    #[test]
+    fn auth_state_is_clone_for_axum_state_propagation() {
+        // `AuthState` is `#[derive(Clone)]` and stamped into Axum's
+        // `State<AuthState>` extractor — every middleware invocation
+        // clones it. Pin the trait so a refactor that introduced a
+        // !Clone field (e.g. `Mutex<T>` direct, not behind Arc) would
+        // surface here rather than at hundreds of axum-router build
+        // sites. The trait is enough — we don't need to instantiate
+        // the struct (it requires a PgPool).
+        fn require_clone<T: Clone>() {}
+        require_clone::<AuthState>();
+    }
+
+    #[tokio::test]
     async fn refresh_coordinator_default_starts_empty_then_populates() {
         // `Default` builds an empty moka cache; the first `lock_for` is
         // what populates it. Pin both halves — a regression that pre-warmed

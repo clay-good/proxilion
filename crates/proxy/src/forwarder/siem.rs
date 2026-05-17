@@ -623,6 +623,62 @@ mod tests {
         fwd.flush_batch().await;
     }
 
+    #[test]
+    fn with_max_retries_is_consuming_self_fluent_setter() {
+        // Pin the `(mut self, n) -> Self` builder shape so a refactor
+        // to `&mut self` (which would force every call site to bind
+        // the forwarder to a local before chaining) surfaces here as
+        // a compile error rather than as confusing build breaks across
+        // server.rs / tests. The retry-count itself doesn't have an
+        // observable accessor — pin via successful chaining + a no-op
+        // sanity round trip that asserts the value didn't poison the
+        // surrounding state (batch still disabled, etc).
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let fwd = SiemForwarder::new("https://example.invalid/siem".into(), key)
+            .unwrap()
+            .with_max_retries(7);
+        assert!(
+            !fwd.batching_enabled(),
+            "with_max_retries must not enable batching as a side effect"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "max_batch_size must be > 0")]
+    fn with_batching_panics_on_zero_max_batch_size() {
+        // The `assert!(max_batch_size > 0)` invariant is load-bearing —
+        // a `Vec::with_capacity(0)` buffer that then size-triggers on
+        // `len >= 0` would flush after every publish (defeating the
+        // batching purpose silently). Pin the fail-fast posture so a
+        // refactor to `if n == 0 { default }` (silent vs panic-on-
+        // misconfig) surfaces here. The operator hits this only via
+        // explicit env-var override (the per-driver config layer
+        // already pre-validates), so a panic is the right contract.
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let _ = SiemForwarder::new("https://example.invalid/siem".into(), key)
+            .unwrap()
+            .with_batching(0, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn batching_enabled_is_false_by_default_and_true_after_with_batching() {
+        // Pin both axes of the predicate that server.rs uses to decide
+        // whether to spawn the flush loop: a fresh forwarder is in
+        // per-event mode (false); after `.with_batching(...)` it flips
+        // to true. A refactor that inverted the default (e.g. "always
+        // batch") would silently change every operator's default
+        // delivery shape on next restart — operators reading the
+        // troubleshooting docs would still expect per-event behavior.
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let fwd = SiemForwarder::new("https://example.invalid/siem".into(), key).unwrap();
+        assert!(!fwd.batching_enabled(), "default must be per-event");
+        let fwd = fwd.with_batching(10, Duration::from_secs(30));
+        assert!(
+            fwd.batching_enabled(),
+            "with_batching must flip the predicate"
+        );
+    }
+
     #[tokio::test]
     async fn flush_batch_is_noop_when_buffer_empty() {
         let server = MockServer::start().await;

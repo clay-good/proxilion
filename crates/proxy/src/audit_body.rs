@@ -381,6 +381,72 @@ mod tests {
     }
 
     #[test]
+    fn sha256_hex_distinct_inputs_yield_distinct_digests() {
+        // Beyond the same-input-determinism the existing test pins, the
+        // hash function MUST surface different outputs for different
+        // inputs — pin two concrete known-divergent inputs so a
+        // regression that hashed a constant (the natural shape of a
+        // mock-leaks-into-production refactor) would surface here. The
+        // request_hash column in audit rows is used as a JOIN key
+        // across replays — a constant-output regression would silently
+        // collapse every replay onto the same group.
+        let a = sha256_hex(b"hello");
+        let b = sha256_hex(b"world");
+        assert_ne!(
+            a, b,
+            "hash function returned same digest for distinct inputs"
+        );
+        // Single-bit differences must also separate (avalanche check).
+        let c = sha256_hex(b"hellp");
+        assert_ne!(a, c, "single-char diff produced colliding digest");
+    }
+
+    #[test]
+    fn base64_encode_alphabet_includes_plus_and_slash_not_url_safe_chars() {
+        // The encoder uses the STANDARD alphabet (RFC 4648 §4) — the
+        // 62nd / 63rd chars are `+` and `/`, NOT URL_SAFE's `-` and `_`.
+        // The audit pipeline persists base64-encoded request bodies to
+        // postgres jsonb; replay tools downstream invoke STANDARD-
+        // alphabet decoders. A switch to URL_SAFE would silently
+        // corrupt every existing replay (URL_SAFE-encoded `+` and `/`
+        // payloads would decode to wrong bytes). Pin via a payload that
+        // forces both chars on the wire.
+        // `>>>` (3 bytes of 0x3E) encodes to `Pj4+` — surfaces `+`.
+        let plus_emitter = b">>>";
+        let s = base64_encode(plus_emitter);
+        assert!(s.contains('+'), "STANDARD alphabet must use '+', got: {s}");
+        // 0xFF 0xFF 0xFF encodes to `////` — surfaces `/`.
+        let slash_emitter = &[0xFF, 0xFF, 0xFF][..];
+        let s2 = base64_encode(slash_emitter);
+        assert!(
+            s2.contains('/'),
+            "STANDARD alphabet must use '/', got: {s2}"
+        );
+        // Negative: URL_SAFE's `-` and `_` must NOT appear for these
+        // inputs (those alphabets emit different bytes for the same
+        // input).
+        assert!(!s.contains('-'), "URL_SAFE leak '-': {s}");
+        assert!(!s2.contains('_'), "URL_SAFE leak '_': {s2}");
+    }
+
+    #[test]
+    fn redact_pii_text_credit_card_in_text_surroundings_still_redacts() {
+        // The existing `redacts_credit_card_shaped` test pins a
+        // standalone CC number; pin the surrounded case (CC adjacent
+        // to non-digit context — the most common shape in a real
+        // email-body PII leak: "card: 4111 1111 1111 1111 ok"). A
+        // regression in the `\b` word-boundary semantics — e.g. a
+        // refactor to `(?:^|\s)` that broke on punctuation-bounded
+        // CCs — would surface here.
+        let s = redact_pii_text("card: 4111-1111-1111-1111 ok");
+        assert!(s.contains("<REDACTED_CC>"), "missing CC redaction: {s}");
+        assert!(!s.contains("4111-1111-1111-1111"), "CC leaked: {s}");
+        // Surroundings preserved.
+        assert!(s.starts_with("card: "), "prefix lost: {s}");
+        assert!(s.ends_with(" ok"), "suffix lost: {s}");
+    }
+
+    #[test]
     fn redact_pii_text_empty_input_yields_empty_output() {
         // No-pii passthrough at the trivial boundary — a regression that
         // appended a sentinel ("<EMPTY>") would surface here.

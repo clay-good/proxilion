@@ -849,6 +849,111 @@ mod tests {
     }
 
     #[test]
+    fn row_to_csv_line_excludes_extra_jsonb_field_from_wire() {
+        // The `extra` jsonb column is intentionally NOT exported in the
+        // CSV — the contract is the 16 named fields. The existing
+        // `row_to_csv_line_basic_row` test pins the 15-comma count
+        // (16 fields) but never specifically that `extra` is absent.
+        // A "for completeness" refactor that appended `extra` to the
+        // format string would silently break every operator's
+        // spreadsheet template (column count + headers no longer
+        // match the documented export schema). Pin the negative:
+        // even when `extra` carries distinctive bytes, those bytes
+        // do NOT appear in the rendered line.
+        let mut r = sample_row();
+        r.extra = serde_json::json!({"sentinel_marker_xyz": "ZZZZ-CSV-LEAK-CANARY"});
+        let line = row_to_csv_line(&r);
+        assert!(
+            !line.contains("sentinel_marker_xyz"),
+            "extra leaked: {line}"
+        );
+        assert!(
+            !line.contains("ZZZZ-CSV-LEAK-CANARY"),
+            "extra leaked: {line}"
+        );
+        // Sanity: comma count still equals 15 (16 fields) — extra
+        // didn't sneak in as a 17th by some other path.
+        assert_eq!(line.matches(',').count(), 15);
+    }
+
+    #[test]
+    fn row_to_csv_line_renders_read_filter_triggered_and_quarantined_count_when_nonzero() {
+        // The two numeric fields (read_filter_triggered: bool,
+        // quarantined_count: u32) are formatted via `{}` rather than
+        // `esc(...)` since they're not strings. A refactor that
+        // accidentally pushed them through `esc` would silently
+        // quote the values (`"true"` instead of `true`) and break
+        // CSV consumers that parse them as bool/int. Pin the
+        // non-default values directly so the `false`/`0` baseline
+        // tests don't mask a regression on the active branch.
+        let mut r = sample_row();
+        r.read_filter_triggered = true;
+        r.quarantined_count = 17;
+        let line = row_to_csv_line(&r);
+        // Both values appear unquoted (`,true,` not `,"true",`).
+        assert!(line.contains(",true,"), "missing unquoted true: {line}");
+        assert!(line.contains(",17,"), "missing unquoted 17: {line}");
+        // Negative — quoted forms must NOT appear.
+        assert!(!line.contains(",\"true\","), "quoted bool leaked: {line}");
+        assert!(!line.contains(",\"17\","), "quoted int leaked: {line}");
+    }
+
+    #[test]
+    fn purge_response_serializes_dry_run_false_as_explicit_false_not_absent() {
+        // The existing `purge_response_serializes_with_stable_field_names`
+        // test pins `dry_run: true` round-trip. Pin the symmetric `false`
+        // case — dry_run defaults to false on the destructive path, and
+        // receivers MUST distinguish "false (the destructive run happened)"
+        // from "absent (older proxy didn't know about the field)". A
+        // future `#[serde(skip_serializing_if = "is_false")]` micro-opt
+        // would silently flip the semantics — operator dashboards keying
+        // on key-presence to render the "DESTRUCTIVE" banner would stop
+        // rendering it.
+        let r = PurgeResponse {
+            older_than: DateTime::parse_from_rfc3339("2026-05-14T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            dry_run: false,
+            deleted: 7,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(
+            v.get("dry_run").is_some(),
+            "dry_run must be present even when false: {v}"
+        );
+        assert_eq!(v["dry_run"], false);
+        assert_eq!(v["deleted"], 7);
+    }
+
+    #[test]
+    fn list_params_partial_query_string_sets_only_named_filters_keeping_others_none() {
+        // The existing test pins the all-empty case. Pin the partial
+        // case: setting one filter must NOT accidentally set the others
+        // (a regression that defaulted unset fields to `Some(String::new())`
+        // — the natural shape of a serde change from `Option<String>` to
+        // `String` with `#[serde(default)]` — would silently change every
+        // operator-cli "filter by vendor only" query into "filter by
+        // vendor AND empty-string p_0", which would match no rows.
+        let p: ListParams = serde_urlencoded::from_str("vendor=google&limit=25").unwrap();
+        assert_eq!(p.vendor.as_deref(), Some("google"));
+        assert_eq!(p.limit, Some(25));
+        // The other five filter fields must stay None — not Some("").
+        assert!(
+            p.decision.is_none(),
+            "decision leaked to Some: {:?}",
+            p.decision
+        );
+        assert!(p.p_0.is_none(), "p_0 leaked to Some: {:?}", p.p_0);
+        assert!(p.action.is_none(), "action leaked to Some: {:?}", p.action);
+        assert!(
+            p.session_id.is_none(),
+            "session_id leaked to Some: {:?}",
+            p.session_id
+        );
+        assert!(p.before.is_none(), "before leaked to Some: {:?}", p.before);
+    }
+
+    #[test]
     fn list_params_filters_default_to_none_when_query_string_empty() {
         // Axum's `Query<ListParams>` deserializer is the entry point for the
         // operator-dashboard filter chips. Pin that every filter field is

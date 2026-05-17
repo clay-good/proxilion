@@ -610,6 +610,112 @@ mod tests {
         assert_eq!(summaries[0].suppressed_count, 1);
     }
 
+    #[test]
+    fn urlencoding_encode_percent_encodes_non_alphanumeric_bytes_per_byte() {
+        // The helper powers `details_url`'s query-value escaping; the
+        // existing `details_url_round_trip` test exercises it indirectly
+        // via the full URL, but the per-byte contract (NON_ALPHANUMERIC
+        // alphabet — every non-A-Za-z0-9 byte encodes, including `-`
+        // `.` `_` that some encoder alphabets pass through) is the
+        // load-bearing invariant. A refactor that switched to
+        // `CONTROLS` or `PATH` would silently leak commas / colons
+        // into the query string and break receivers that key on the
+        // exact percent-encoded shape. Pin three distinct boundary
+        // shapes here directly.
+        // 1. Alphanumeric passes through unchanged (the unreserved
+        //    subset of NON_ALPHANUMERIC).
+        assert_eq!(urlencoding_encode("abc123XYZ"), "abc123XYZ");
+        // 2. Common policy-id punctuation `-` `.` `_` `:` `@` all
+        //    percent-encoded (NON_ALPHANUMERIC encodes everything
+        //    outside `[A-Za-z0-9]`, including ASCII unreserved).
+        assert_eq!(urlencoding_encode("a-b.c_d:e@f"), "a%2Db%2Ec%5Fd%3Ae%40f");
+        // 3. Multibyte UTF-8 encodes per-byte, not per-codepoint —
+        //    `é` (C3 A9) → `%C3%A9` so a future internationalized
+        //    policy id is wire-safe ASCII regardless of input.
+        assert_eq!(urlencoding_encode("é"), "%C3%A9");
+    }
+
+    #[tokio::test]
+    async fn resolver_threshold_none_keeps_default_window_override() {
+        // The third resolver shape `(None, Some(w))` keeps the global
+        // threshold and overrides only the window. Existing tests
+        // cover `(Some(t), None)` and `(Some(t), Some(0))` but the
+        // window-only branch — operationally useful when an operator
+        // wants the same suppression cap but a longer / shorter
+        // settling period for a noisy policy — was never directly
+        // pinned. A refactor that "unified" the two arms (e.g. via
+        // a single `.unwrap_or(default_window)` path that bypassed
+        // the threshold-keep branch) would surface here.
+        let resolver: BurstResolver = Arc::new(|_| Some((None, Some(0))));
+        // Global default threshold = 50; resolver narrows window to 0.
+        let s = BurstSuppressor::new(BurstConfig::default()).with_resolver(resolver);
+        let ops: Vec<String> = vec![];
+        let n = notification("p", "alice@acme.com", &ops);
+        // With window=0 every prior timestamp is immediately pruned,
+        // so each call resets the bucket — the threshold of 50 is
+        // never exceeded. Fire 60 events; all admit.
+        let t0 = Instant::now();
+        for i in 0..60 {
+            let t = t0 + Duration::from_millis(i);
+            assert!(s.admit(&n, t).await, "event {i} unexpectedly suppressed");
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_summaries_initially_empty_returns_empty_vec() {
+        // Boundary: a fresh suppressor that has never admitted an event
+        // must drain to an empty Vec. The existing `suppresses_above_threshold`
+        // test covers post-drain (after the first drain clears state)
+        // but never the pre-first-call case — the `b.suppressed == 0`
+        // skip branch is the only thing standing between a no-op flush
+        // tick and a spurious notification fan-out. A regression that
+        // emitted a synthetic "(no events)" summary on every flush would
+        // silently spam every operator's webhook receiver with empty
+        // bursts.
+        let s = BurstSuppressor::new(BurstConfig::default());
+        let summaries = s.drain_summaries().await;
+        assert!(
+            summaries.is_empty(),
+            "fresh suppressor must drain empty, got: {summaries:?}"
+        );
+    }
+
+    #[test]
+    fn burst_summary_exemplar_some_serializes_with_stable_struct_keys() {
+        // The existing serialization tests pin `details_url` key
+        // presence/absence but the `exemplar` field's nested struct
+        // shape (`SuppressedEvent { policy_id, p_0, vendor, action,
+        // layer }`) was never directly asserted on the wire. Webhook
+        // / Slack receivers render the exemplar block as a 5-field
+        // preview — a rename of any inner field would silently break
+        // the template. Pin the full key set so a future field rename
+        // surfaces here as a wire-shape change.
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: Some("alice@acme.com".into()),
+            suppressed_count: 9,
+            window_seconds: 60,
+            exemplar: Some(SuppressedEvent {
+                policy_id: "p".into(),
+                p_0: Some("alice@acme.com".into()),
+                vendor: "google".into(),
+                action: "gmail.messages.send".into(),
+                layer: "policy".into(),
+            }),
+            details_url: String::new(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let ex = v["exemplar"].as_object().expect("exemplar must be object");
+        assert!(ex.contains_key("policy_id"));
+        assert!(ex.contains_key("p_0"));
+        assert!(ex.contains_key("vendor"));
+        assert!(ex.contains_key("action"));
+        assert!(ex.contains_key("layer"));
+        assert_eq!(ex["vendor"], "google");
+        assert_eq!(ex["action"], "gmail.messages.send");
+    }
+
     #[tokio::test]
     async fn summary_carries_exemplar() {
         let s = BurstSuppressor::new(BurstConfig {

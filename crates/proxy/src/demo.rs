@@ -292,6 +292,49 @@ mod tests {
     }
 
     #[test]
+    fn synth_event_extra_carries_demo_marker_for_audit_filter_exclusion() {
+        // The `extra.demo = true` marker is the load-bearing field for
+        // operator audit queries — every real audit dashboard filters
+        // `extra ? 'demo' AND extra->>'demo' = 'true'` to exclude the
+        // synthetic ticker rows. A regression that dropped the marker
+        // (or renamed it) would silently pollute every real audit query
+        // with demo data. Pin both the presence and the true value.
+        let ev = synth_event(&drive_scenario(), Utc::now());
+        assert!(ev.extra.is_object());
+        assert_eq!(ev.extra["demo"], true);
+    }
+
+    #[test]
+    fn users_constant_has_three_distinct_demo_principals() {
+        // The USERS array is the canonical demo principal set. Pin
+        // length + distinctness so a refactor that consolidated them
+        // (e.g. removing carol) would surface as a UI regression where
+        // the demo timeline shows only one or two faces — operators
+        // expect a multi-user view for the "live demo" experience.
+        assert_eq!(USERS.len(), 3, "demo user set count");
+        let unique: std::collections::HashSet<&str> = USERS.iter().copied().collect();
+        assert_eq!(unique.len(), USERS.len(), "USERS entries must be distinct");
+        for u in USERS {
+            assert!(u.starts_with("user:"), "non-canonical p_0 shape: {u}");
+            assert!(u.contains("@demo.local"), "non-demo principal: {u}");
+        }
+    }
+
+    #[test]
+    fn synth_event_path_template_ending_in_slash_is_used_verbatim() {
+        // Path templates can end in `/` (a directory-like template) —
+        // pin the `/` branch of the trailing-char check separately from
+        // the `s` branch (the existing test covered `s`). A regression
+        // that broke the OR-chain (only checks `s`) would silently start
+        // appending a 6-char suffix to `/drive/v3/files/` and break
+        // upstream Google routing.
+        let mut s = drive_scenario();
+        s.path_template = "/some/path/";
+        let ev = synth_event(&s, Utc::now());
+        assert_eq!(ev.path, "/some/path/");
+    }
+
+    #[test]
     fn scenario_set_includes_block_allow_and_require_confirmation_decisions() {
         // SCENARIOS is the canonical demo set. Pin the decision variety so a
         // refactor that drops an interesting class is caught.

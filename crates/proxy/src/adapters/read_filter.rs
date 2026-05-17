@@ -357,6 +357,55 @@ mod tests {
     }
 
     #[test]
+    fn should_scan_rejects_image_video_audio_top_level_types() {
+        // The content-type allow-list is `application/json | application/xml
+        // | text/*`. Pin three common binary top-levels reject — a
+        // refactor that switched to a startswith("application/") would
+        // silently scan image/png + audio/mpeg payloads (waste of cycles
+        // + false-positive risk on binary patterns).
+        assert!(!should_scan(Some("image/jpeg")));
+        assert!(!should_scan(Some("audio/mpeg")));
+        assert!(!should_scan(Some("video/mp4")));
+        // And `multipart/form-data` — neither text/ nor whitelisted
+        // application/* — must reject.
+        assert!(!should_scan(Some("multipart/form-data; boundary=foo")));
+    }
+
+    #[test]
+    fn splice_handles_empty_replacement_string() {
+        // Strip-silently mode uses `repl = ""`. Pin that the splice
+        // helper preserves boundaries correctly when the replacement is
+        // empty (a regression that erroneously dropped a surrounding
+        // byte would silently truncate non-matched neighborhood text).
+        assert_eq!(splice("hello world", &[(6, 11)], ""), "hello ");
+        assert_eq!(splice("abcdef", &[(0, 2), (4, 6)], ""), "cd");
+        // Whole-string strip.
+        assert_eq!(splice("abc", &[(0, 3)], ""), "");
+    }
+
+    #[test]
+    fn merge_overlapping_preserves_input_order_for_disjoint_sorted_input() {
+        // The function ASSUMES the input is sorted by start position
+        // (caller invariant). Pin that for already-sorted disjoint
+        // input the output IS the input — a refactor that re-sorted
+        // internally would mask a caller-side bug (unsorted input)
+        // rather than letting it surface.
+        let input: Vec<(usize, usize)> = vec![(0, 1), (3, 5), (10, 12), (20, 25)];
+        assert_eq!(merge_overlapping(&input), input);
+    }
+
+    #[test]
+    fn truncate_zero_length_limit_returns_just_the_ellipsis() {
+        // Edge case: `n=0` on a non-empty string. `.take(0).collect`
+        // yields empty, then `+ "…"` appends only the ellipsis. Pin
+        // this so a refactor that special-cased `n==0` to "" (which
+        // would lose the truncation marker) would surface here.
+        assert_eq!(truncate("anything", 0), "…");
+        // And for an empty input the early-return preserves "".
+        assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
     fn regexset_short_circuits_clean_bodies() {
         let f = build(
             QuarantineAction::ReplaceWithMarker,

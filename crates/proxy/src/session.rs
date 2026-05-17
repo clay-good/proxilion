@@ -178,6 +178,57 @@ mod tests {
         assert_eq!(&bytes[..], b"unauthorized");
     }
 
+    #[test]
+    fn session_context_carries_multi_op_granted_set_through_construction() {
+        // The bearer middleware copies the cached PCA's ops into
+        // `granted_ops` verbatim. Pin a multi-op set (`drive:read` +
+        // `gmail:send` + `calendar:read`) so a refactor that switched
+        // to a single-op field (in the name of "every adapter only
+        // cares about one") would surface here.
+        let mut ctx = sample_ctx();
+        ctx.granted_ops = vec![
+            "drive:read:engineering/*".into(),
+            "gmail:send:alice@demo.local".into(),
+            "calendar:read:primary".into(),
+        ];
+        assert_eq!(ctx.granted_ops.len(), 3);
+        assert_eq!(ctx.granted_ops[0], "drive:read:engineering/*");
+        assert_eq!(ctx.granted_ops[2], "calendar:read:primary");
+        // And the Debug renders them all — pin so a refactor that
+        // truncated for log brevity surfaces here.
+        let s = format!("{ctx:?}");
+        assert!(s.contains("calendar:read:primary"));
+    }
+
+    #[test]
+    fn session_context_with_empty_granted_ops_still_constructs() {
+        // The empty case fires when an OAuth flow grants zero scopes
+        // that map to ops (e.g. `openid email` only). Pin that the
+        // proxy doesn't reject an empty `granted_ops` at construction
+        // — the policy engine's Layer A handles "no ops" upstream of
+        // the adapter call.
+        let mut ctx = sample_ctx();
+        ctx.granted_ops.clear();
+        assert!(ctx.granted_ops.is_empty());
+        // Debug still renders — pin no panic on the empty slice.
+        let s = format!("{ctx:?}");
+        assert!(s.contains("granted_ops"));
+        assert!(s.contains("[]"));
+    }
+
+    #[tokio::test]
+    async fn session_extract_error_status_helper_returns_unauthorized_constant() {
+        // The 401 status is a wire-contract constant — pin via the
+        // axum constant, not the integer literal, so a refactor to a
+        // different status (e.g. 403 for "auth ran but failed") would
+        // surface here as a wire-contract change. The body byte test
+        // already covers the payload shape; this pins the status side
+        // of the contract with a name-not-number assertion.
+        let r = SessionExtractError.into_response();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(r.status().as_u16(), 401);
+    }
+
     #[tokio::test]
     async fn extractor_returns_ok_when_arc_session_context_present() {
         let ctx = Arc::new(sample_ctx());

@@ -800,6 +800,48 @@ mod tests {
         assert!(v.get("request_canonical_json").is_none());
     }
 
+    #[tokio::test]
+    async fn api_error_pic_refused_fix_mentions_re_root_chain_hint() {
+        // The 422 PIC-refused envelope's `fix` hint steers the
+        // operator to re-root the chain at a broader PCA_0 — that's
+        // the spec.md §6.6 escape hatch for genuine monotonicity
+        // violations the operator wants to permit. Pin the exact
+        // hint substring so a refactor that softened the message
+        // ("review the chain", say) surfaces here.
+        let r = ApiError::PicRefused("missing [drive:write:secret]".into()).into_response();
+        let v = body_json(r).await;
+        let fix = v["fix"].as_str().unwrap();
+        assert!(
+            fix.contains("re-root") || fix.contains("broader PCA_0"),
+            "missing re-root hint in: {fix}",
+        );
+    }
+
+    #[test]
+    fn approve_body_accepts_zero_ttl_minutes_as_explicit_no_ttl_marker() {
+        // `ttl_minutes: Option<i64>` accepts 0 — the handler later
+        // interprets 0 as "no TTL", distinct from `None` which falls
+        // through to the default. Pin the deserialization of the 0
+        // sentinel so a refactor to `Option<u32>` (which would still
+        // accept 0) AND a refactor to `i64` with NonZero would both
+        // surface here.
+        let b: ApproveBody =
+            serde_json::from_str(r#"{"justification":"reviewed","ttl_minutes":0}"#).unwrap();
+        assert_eq!(b.ttl_minutes, Some(0));
+    }
+
+    #[test]
+    fn issue_link_body_with_negative_ttl_still_deserializes() {
+        // `ttl_minutes: Option<i64>` — pin that negative values
+        // pass deserialization (the handler clamps / rejects at the
+        // semantic boundary, not the parse boundary). A refactor to
+        // `Option<u64>` would surface here as a parse-time rejection
+        // and signal that the validation moved layers.
+        let b: IssueLinkBody =
+            serde_json::from_str(r#"{"action":"approve","ttl_minutes":-5}"#).unwrap();
+        assert_eq!(b.ttl_minutes, Some(-5));
+    }
+
     #[test]
     fn blocked_row_includes_request_canonical_json_when_set() {
         let mut row = BlockedRow {

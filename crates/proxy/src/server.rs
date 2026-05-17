@@ -1208,6 +1208,84 @@ mod tests {
     }
 
     #[test]
+    fn hex_decode_32_preserves_leading_zeros_within_pairs() {
+        // `from_str_radix(.., 16)` of "0a" must yield 0x0a, not 0xa
+        // (length-stripped) — pin this so a refactor that switched
+        // to a digit-pair concatenation (a common "tidy up" shape)
+        // doesn't lose the leading nibble. Build a hex string with
+        // a leading-zero pair at each byte and assert the bytes
+        // come back as 0..=31.
+        let hex: String = (0..32).map(|i| format!("{:02x}", i)).collect();
+        let out = hex_decode_32(&hex).unwrap();
+        for (i, b) in out.iter().enumerate() {
+            assert_eq!(*b, i as u8);
+        }
+        // And the all-zeros boundary specifically — every byte is 0.
+        assert_eq!(hex_decode_32(&"0".repeat(64)).unwrap()[0], 0);
+    }
+
+    #[test]
+    fn check_serializes_with_stable_three_field_shape() {
+        // `Check` is the per-probe wire shape `/healthz` emits. Pin
+        // the three fields (`ok`, `detail`, `latency_ms`) so a refactor
+        // that added a sibling field would surface here. The `/healthz`
+        // body shape feeds Cloudflare uptime alerts that key on
+        // `checks.trust_plane.ok` — a wire-shape change breaks them.
+        let c = Check {
+            ok: false,
+            detail: Some("connection refused".into()),
+            latency_ms: 42,
+        };
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 3);
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["detail"], "connection refused");
+        assert_eq!(v["latency_ms"], 42);
+    }
+
+    #[test]
+    fn healthz_envelope_serializes_with_ready_version_and_checks() {
+        // The `Healthz` shape is the public contract — pin all three
+        // top-level fields. A refactor that nested `version` under a
+        // `meta` key (a common "tidy" shape) would break operator
+        // dashboards. Use a synthetic checks map to drive serialization.
+        let mut checks = std::collections::BTreeMap::new();
+        checks.insert(
+            "trust_plane",
+            Check {
+                ok: true,
+                detail: Some("http 200".into()),
+                latency_ms: 17,
+            },
+        );
+        let h = Healthz {
+            ready: true,
+            version: "0.1.0",
+            checks,
+        };
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["ready"], true);
+        assert_eq!(v["version"], "0.1.0");
+        assert!(v["checks"]["trust_plane"]["ok"].as_bool().unwrap());
+        assert_eq!(v["checks"]["trust_plane"]["latency_ms"], 17);
+    }
+
+    #[test]
+    fn hex_decode_32_rejects_pair_with_one_valid_and_one_invalid_char() {
+        // A pair like `0Z` is valid at position 0 but rejected by
+        // `from_str_radix`. Pin this boundary — a refactor that
+        // pre-validated only the first char of each pair would let
+        // `0Z00...` slip through with a silent zero in slot 0. Two
+        // distinct positions covered.
+        let mut s = String::from("0Z");
+        s.push_str(&"0".repeat(62));
+        assert!(hex_decode_32(&s).is_err());
+        let mut s = "0".repeat(62);
+        s.push_str("Z0");
+        assert!(hex_decode_32(&s).is_err());
+    }
+
+    #[test]
     fn ensure_dev_cert_generates_cert_and_key_when_missing() {
         let dir = unique_tmp_subdir("gen");
         let cert = dir.join("nested/cert.pem");

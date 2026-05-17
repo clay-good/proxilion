@@ -839,6 +839,78 @@ mod tests {
         assert!(v["docs"].as_str().is_some(), "docs must be present");
     }
 
+    #[test]
+    fn enforce_pre_request_decision_preserves_none_policy_id_on_block() {
+        // The Layer-B path can produce a Block where `matched_policy_id`
+        // is None (e.g. a default-deny fall-through). Pin that the
+        // PolicyBlocked variant surfaces the None — a refactor that
+        // injected "(none)" placeholder would silently break the
+        // dashboard's "show matched policy" filter that keys on
+        // is_some.
+        let mut o = outcome(Decision::Block {
+            reason: "default-deny".into(),
+            override_allowed: false,
+        });
+        o.matched_policy_id = None;
+        let err = enforce_pre_request_decision(&o).unwrap_err();
+        match err {
+            AppError::PolicyBlocked {
+                policy_id,
+                override_allowed,
+                ..
+            } => {
+                assert!(policy_id.is_none(), "must NOT inject placeholder");
+                assert!(!override_allowed);
+            }
+            other => panic!("expected PolicyBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_proxy_headers_renders_uuid_as_lowercase_hyphenated_form() {
+        // The two Uuid headers must render in the canonical
+        // hyphenated lowercase form (`xxxxxxxx-xxxx-...`). Downstream
+        // operators grep on this form across logs + headers. A
+        // refactor that switched to `Uuid::simple()` (no hyphens) or
+        // uppercase would silently break the grep contract.
+        let mut h = HeaderMap::new();
+        let req_id = Uuid::new_v4();
+        let pca_id = Uuid::new_v4();
+        insert_proxy_headers(&mut h, req_id, &outcome(Decision::Allow), pca_id);
+        let req_str = h.get("x-proxilion-request-id").unwrap().to_str().unwrap();
+        let pca_str = h.get("x-proxilion-pca-id").unwrap().to_str().unwrap();
+        // Hyphenated shape: 8-4-4-4-12 segments separated by `-`.
+        assert_eq!(req_str.matches('-').count(), 4);
+        assert_eq!(pca_str.matches('-').count(), 4);
+        // Lowercase: no uppercase hex digit appears in either.
+        assert!(req_str.chars().all(|c| !c.is_ascii_uppercase()));
+        assert!(pca_str.chars().all(|c| !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn outcome_helper_round_trips_required_ops_default() {
+        // The test-fixture `outcome()` helper builds the most common
+        // shape — `required_ops: OpsExpression::default()`. Pin that
+        // the default is an empty expression (Layer A has no required
+        // atoms when the helper is used). A refactor that changed
+        // `OpsExpression::default` to a sentinel "deny all" would
+        // silently flip the meaning of every test fixture in this
+        // module.
+        let o = outcome(Decision::Allow);
+        assert!(o.matched_policy_id.is_some());
+        assert!(matches!(o.decision, Decision::Allow));
+        // OpsExpression::default has `required: vec![]` — the Layer-A
+        // check is a zero-atom subset check, which is trivially
+        // satisfied by any leaf. A refactor that changed Default to a
+        // sentinel ("require *") would silently flip the meaning of
+        // every test fixture in this module.
+        assert!(
+            o.required_ops.required.is_empty(),
+            "default OpsExpression must have zero required atoms",
+        );
+        assert!(matches!(o.pic_mode, PicMode::Audit));
+    }
+
     #[tokio::test]
     async fn pic_invariant_violation_serializes_to_403() {
         let err = AppError::PicInvariantViolation(

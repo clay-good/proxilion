@@ -337,6 +337,73 @@ mod tests {
         assert!(!v["fix"].as_str().unwrap().is_empty());
     }
 
+    #[test]
+    fn setup_status_with_zero_items_serializes_as_empty_array_not_null() {
+        // Boundary: a SetupStatus constructed with no items (a
+        // hypothetical "checks disabled" mode, or any future "lazy"
+        // status that returns early) must round-trip `items: []` on the
+        // wire, NOT `items: null`. The admin UI's checklist render
+        // iterates `items.length` — a null value would crash the
+        // `.length` access while `[]` collapses cleanly to a "no checks
+        // pending" empty state. Pin the `Vec<_> → []` serde guarantee.
+        let s = SetupStatus {
+            ready_for_traffic: true,
+            items: vec![],
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(
+            v["items"].is_array(),
+            "items must serialize as array, got: {v}"
+        );
+        assert_eq!(v["items"].as_array().unwrap().len(), 0);
+        assert!(!v["items"].is_null());
+    }
+
+    #[test]
+    fn check_item_long_detail_string_serializes_intact_with_no_truncation() {
+        // The `detail` field is a `String` (no length cap) — the
+        // `first_pca` check renders `format!("{count} PCA(s) in cache")`
+        // which can carry a 20+ digit count on a long-running install.
+        // Pin a 4 KiB detail round-trip so a future refactor that
+        // truncated the field at the serializer (e.g. "for log
+        // hygiene") would surface here as a length mismatch rather
+        // than as a silent drop on the operator's PCA-cache panel.
+        let big = "x".repeat(4096);
+        let item = CheckItem {
+            id: "first_pca",
+            title: "First successful PCA",
+            ok: true,
+            detail: big.clone(),
+            fix: None,
+            docs: "d",
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["detail"].as_str().unwrap().len(), 4096);
+        assert_eq!(v["detail"], big);
+    }
+
+    #[test]
+    fn setup_error_from_impl_works_for_distinct_sqlx_variants() {
+        // The `#[from] sqlx::Error` on `SetupError::Db` is the
+        // load-bearing conversion the `?`-operator uses at every
+        // `sqlx::query_*().await?` call site in `status(...)`. A
+        // refactor that dropped the `#[from]` (e.g. moved to a named
+        // map_err) would surface here at compile time. Pin three
+        // distinct sqlx error variants so the conversion path itself
+        // is exercised on each (not just the constructor on one
+        // variant) — verifies the blanket-impl over `sqlx::Error`'s
+        // own variant set is intact.
+        for inner in [
+            sqlx::Error::PoolClosed,
+            sqlx::Error::RowNotFound,
+            sqlx::Error::WorkerCrashed,
+        ] {
+            let e: SetupError = inner.into();
+            let s = format!("{e}");
+            assert!(s.starts_with("database error: "), "got: {s}");
+        }
+    }
+
     #[tokio::test]
     async fn setup_error_response_body_carries_fix_and_docs_hints() {
         // The 500 envelope must surface the troubleshooting link AND a

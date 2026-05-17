@@ -542,4 +542,84 @@ mod tests {
         assert_eq!(v["response_type"], "in_channel");
         assert_eq!(v["replace_original"], true);
     }
+
+    #[tokio::test]
+    async fn slack_err_body_omits_slack_shaped_response_keys() {
+        // The error envelope must NOT carry `response_type` or
+        // `replace_original` — those are Slack's in-channel-message
+        // routing keys, and emitting them on a 4xx/5xx would make Slack
+        // attempt to replace the operator's original button click with
+        // the error JSON as the new message body (rendering raw JSON to
+        // the channel). The two helpers (slack_err vs slack_ok_message)
+        // intentionally produce DIFFERENT envelopes — pin the
+        // distinction so a future "unify the helpers" refactor surfaces.
+        let r = slack_err(StatusCode::BAD_REQUEST, "missing payload");
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("response_type").is_none(), "got: {v}");
+        assert!(v.get("replace_original").is_none(), "got: {v}");
+    }
+
+    #[tokio::test]
+    async fn slack_err_escapes_special_chars_in_msg_via_serde_json() {
+        // The helper builds the body via `serde_json::json!` rather than
+        // raw `format!` — pin that double-quotes and newlines in the
+        // message round-trip through serde escape rules (resulting in
+        // `\"` and `\n` on the wire), NOT raw concatenation that would
+        // produce invalid JSON. A refactor that switched to a `format!`
+        // template "for simplicity" would surface here as a parse error
+        // and break every Slack receiver that depends on valid JSON.
+        let r = slack_err(
+            StatusCode::BAD_REQUEST,
+            "bad payload: \"quote\" and\nnewline",
+        );
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        // Must be valid JSON (unwrap surfaces the regression).
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // And the message itself must round-trip back as the original
+        // string (not a corrupted approximation).
+        assert_eq!(v["error"], "bad payload: \"quote\" and\nnewline");
+    }
+
+    #[tokio::test]
+    async fn slack_ok_message_body_has_exactly_three_keys() {
+        // The success envelope is documented as the three-key Slack
+        // shape: `response_type`, `replace_original`, `text`. A future
+        // refactor that started appending a `ts` (thread-stamp) or a
+        // `blocks` array unconditionally would silently change every
+        // operator-facing button-click response shape. Pin the exact
+        // top-level key set so any addition is a conscious wire-shape
+        // bump rather than an accidental drift.
+        let r = slack_ok_message("hello");
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let obj = v.as_object().expect("body must be a JSON object");
+        assert_eq!(
+            obj.len(),
+            3,
+            "got keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert!(obj.contains_key("response_type"));
+        assert!(obj.contains_key("replace_original"));
+        assert!(obj.contains_key("text"));
+    }
+
+    #[test]
+    fn header_str_returns_some_empty_for_empty_header_value() {
+        // Boundary: an HTTP header with an empty value is legal
+        // (`X-Slack-Signature:` with no value after the colon). The
+        // helper must surface `Some("")`, NOT `None` — the latter would
+        // collapse "header absent" and "header present-but-empty" into
+        // the same code path, and the bearer / signature middleware
+        // distinguishes them (an empty signature is a signed-request
+        // attempt with a bug; an absent header is an unsigned attempt
+        // that should bypass signature checks entirely).
+        let mut h = HeaderMap::new();
+        h.insert("x-slack-signature", HeaderValue::from_static(""));
+        assert_eq!(header_str(&h, "x-slack-signature"), Some(""));
+        // The absent-header path still returns None — pin both axes so
+        // a refactor that conflated them surfaces in this one test.
+        assert_eq!(header_str(&h, "x-other"), None);
+    }
 }

@@ -785,6 +785,69 @@ mod tests {
     }
 
     #[test]
+    fn narrowed_ops_for_pca1_calendar_full_scope_keeps_all_calendar_prefixes() {
+        // The full calendar scope (`https://.../auth/calendar`) maps to
+        // the bare `calendar:` prefix — every `calendar:*` op survives.
+        // Existing tests pin `drive:` (full) + `gmail:send:` (narrow) +
+        // unknown-scope-empty but never directly exercise calendar's
+        // prefix mapping. A copy-paste regression that pointed the
+        // calendar arm at `calendar:read:` (the readonly mapping) would
+        // silently narrow every calendar PCA to read-only ops.
+        let pca0_ops = vec![
+            "calendar:read:cal/abc".to_string(),
+            "calendar:write:event/xyz".to_string(),
+            "calendar:delete:event/xyz".to_string(),
+            "drive:read:file/q".to_string(),
+        ];
+        let granted = "https://www.googleapis.com/auth/calendar";
+        let out = narrowed_ops_for_pca1(&pca0_ops, granted);
+        assert!(out.iter().any(|o| o == "calendar:read:cal/abc"));
+        assert!(out.iter().any(|o| o == "calendar:write:event/xyz"));
+        assert!(out.iter().any(|o| o == "calendar:delete:event/xyz"));
+        // Drive ops are excluded — the scope was calendar-only.
+        assert!(!out.iter().any(|o| o.starts_with("drive:")));
+    }
+
+    #[test]
+    fn narrowed_ops_for_pca1_calendar_readonly_keeps_only_calendar_read_subset() {
+        // Asymmetry guard: the `calendar.readonly` scope maps to the
+        // narrower `calendar:read:` prefix only — write/delete ops MUST
+        // be filtered out even though they share the `calendar:` head.
+        // A regression that mapped readonly to the bare `calendar:`
+        // prefix (matching the symmetric drive case) would silently
+        // grant write access via a readonly OAuth scope — a privilege
+        // escalation surface. Pin the asymmetry directly here.
+        let pca0_ops = vec![
+            "calendar:read:cal/abc".to_string(),
+            "calendar:write:event/xyz".to_string(),
+            "calendar:delete:event/xyz".to_string(),
+        ];
+        let granted = "https://www.googleapis.com/auth/calendar.readonly";
+        let out = narrowed_ops_for_pca1(&pca0_ops, granted);
+        assert_eq!(out, vec!["calendar:read:cal/abc".to_string()]);
+    }
+
+    #[test]
+    fn narrowed_ops_for_pca1_empty_pca0_ops_returns_empty_vec_for_any_scope() {
+        // Boundary: when PCA_0 carries no ops (a stub bootstrap
+        // session, never expected in production but constructible via
+        // the embed API), the narrowed set must be empty regardless of
+        // granted scope. A panic on `.iter().any(...)` against an empty
+        // slice would be the natural shape of a refactor that assumed
+        // a non-empty input, so pin the empty-pca0 path against three
+        // distinct scope shapes (single known, multi known, empty
+        // string) — all must collapse to an empty Vec.
+        for granted in [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/gmail.send",
+            "",
+        ] {
+            let out = narrowed_ops_for_pca1(&[], granted);
+            assert!(out.is_empty(), "granted={granted:?} yielded {out:?}");
+        }
+    }
+
+    #[test]
     fn new_auth_code_is_base32_no_padding_52_chars() {
         // 32 random bytes → base32 without padding = ceil(32*8/5) = 52 chars.
         let c1 = new_auth_code();

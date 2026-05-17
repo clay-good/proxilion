@@ -841,6 +841,74 @@ mod tests {
     }
 
     #[test]
+    fn redact_url_empty_string_returns_empty_without_panic() {
+        // Boundary: an operator-cli call that passes a missing notifier
+        // URL (the `Option::unwrap_or_default()` shape on a non-required
+        // field) lands here as `""`. The helper must surface `""` rather
+        // than panic on `split_once`, since the show / setup-status
+        // endpoints render every configured driver's URL through
+        // redact_url before logging — a panic on one notifier's empty
+        // URL would crash the entire setup-status response.
+        assert_eq!(redact_url(""), "");
+    }
+
+    #[test]
+    fn redact_url_preserves_host_port_in_authority_segment() {
+        // The authority segment (host[:port]) is everything between
+        // `://` and the first `/`. A `:port` suffix is part of the
+        // authority and must survive — a regression that split on `:`
+        // (to strip "credentials" from a userinfo-shaped authority)
+        // would silently drop the port and break the operator's
+        // ability to distinguish `siem.local:8080/...` from a different
+        // service on `siem.local:9090/...` in the redacted log line.
+        assert_eq!(
+            redact_url("https://siem.local:8080/ingest?token=secret"),
+            "https://siem.local:8080/..."
+        );
+        // The no-path-with-port case must also survive (mirrors the
+        // no-path-no-port `redact_url_no_path_keeps_full_host` test).
+        assert_eq!(
+            redact_url("https://siem.local:8080"),
+            "https://siem.local:8080"
+        );
+    }
+
+    #[test]
+    fn set_config_body_accepts_extra_unknown_fields_for_forward_compat() {
+        // Symmetric to `test_request_defaults_via_default_impl_on_optional_driver`'s
+        // forward-compat pin: SetConfigBody must accept (and ignore)
+        // unknown fields so the operator CLI can add forward-compat
+        // shaped fields (e.g. a future `tags: [...]` field) without
+        // breaking older proxies. A regression that added
+        // `#[serde(deny_unknown_fields)]` to SetConfigBody would
+        // force every CLI shape change to be a coordinated proxy
+        // upgrade — surfacing here as a parse error.
+        let raw = r#"{"driver":"webhook","enabled":true,"config":{"url":"https://x"},"future_field":"ignored"}"#;
+        let b: SetConfigBody = serde_json::from_str(raw).unwrap();
+        assert_eq!(b.driver, "webhook");
+        assert_eq!(b.enabled, Some(true));
+        assert_eq!(b.config["url"], "https://x");
+    }
+
+    #[test]
+    fn set_config_body_with_slack_driver_round_trips_distinct_from_webhook() {
+        // The existing round-trip test pins the `driver: "webhook"`
+        // shape. Pin the `driver: "slack"` shape directly so a refactor
+        // that hardcoded the deserializer to expect a webhook-style
+        // `url` field inside `config` (rather than slack's
+        // `bot_token` + `signing_secret`) would surface here. The
+        // SetConfigBody is driver-agnostic at the envelope layer —
+        // each driver's per-driver handler validates its own `config`
+        // payload.
+        let raw = r#"{"driver":"slack","enabled":false,"config":{"bot_token":"xoxb-AAA","signing_secret":"abc"}}"#;
+        let b: SetConfigBody = serde_json::from_str(raw).unwrap();
+        assert_eq!(b.driver, "slack");
+        assert_eq!(b.enabled, Some(false));
+        assert_eq!(b.config["bot_token"], "xoxb-AAA");
+        assert_eq!(b.config["signing_secret"], "abc");
+    }
+
+    #[test]
     fn set_config_body_accepts_explicit_enabled_false() {
         // The disable path — `enabled: false` is how operators turn a
         // configured-but-paused driver off. Pin that the field round-trips

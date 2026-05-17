@@ -139,6 +139,57 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_carries_at_least_twelve_entries_per_documented_spec() {
+        // The catalogue's length is the operator-facing surface — the
+        // CLI's `tokens scopes` rendering keys on it. A regression
+        // that accidentally deleted an entry (e.g. during a search-
+        // and-replace cleanup) would silently drop a scope from the
+        // catalogue while still passing the per-scope substring tests
+        // above. Pin a minimum count (currently 12) so a deletion
+        // surfaces as a test failure rather than as an operator
+        // calling support.
+        assert!(
+            SCOPE_CATALOGUE.len() >= 12,
+            "catalogue shrunk to {} entries — verify intent",
+            SCOPE_CATALOGUE.len(),
+        );
+    }
+
+    #[test]
+    fn every_non_wildcard_endpoint_field_mentions_api_v1_route() {
+        // Each scope's `endpoints` field is the operator-facing
+        // "which routes need this" hint rendered in the CLI. Every
+        // non-wildcard entry must mention an `/api/v1/` route (the
+        // proxy's only public versioned namespace) so the CLI output
+        // reads consistently. The wildcard entry is exempt — it
+        // documents "all `/api/v1/*` endpoints" as a class, not a
+        // single route.
+        for (s, _, endpoints) in SCOPE_CATALOGUE {
+            assert!(
+                endpoints.contains("/api/v1/"),
+                "scope `{s}` endpoints field doesn't mention /api/v1/: {endpoints}",
+            );
+        }
+    }
+
+    #[test]
+    fn scope_strings_preserves_catalogue_order_end_to_end() {
+        // The helper returns scope strings in catalogue order; the
+        // existing test only pins `*` first. Pin the full sequence
+        // index-by-index so a refactor that sorted alphabetically (a
+        // common "tidy up" mistake) would surface here — the CLI's
+        // rendered order matters for operator muscle memory.
+        let strs = scope_strings();
+        for (i, (cat_scope, _, _)) in SCOPE_CATALOGUE.iter().enumerate() {
+            assert_eq!(
+                strs[i], *cat_scope,
+                "position {i} differs: helper={} catalogue={}",
+                strs[i], cat_scope,
+            );
+        }
+    }
+
+    #[test]
     fn every_scope_string_uses_kebab_or_colon_format() {
         // Cosmetic but worth pinning: every operator scope must be
         // either `*` or `<group>:<verb>` so the CLI listing reads

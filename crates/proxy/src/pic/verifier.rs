@@ -659,6 +659,91 @@ mod tests {
     }
 
     #[test]
+    fn verification_result_serializes_with_stable_wire_field_names() {
+        // The dashboard chain-walker keys on every field below — pin
+        // the seven-key shape. A serde rename or field reorder would
+        // silently break the UI. The `intact + links_verified + p_0 +
+        // broken_at + reason + pic_profile + pic_profile_mismatch_at`
+        // tuple is the wire contract for `GET /api/v1/pca/{id}/verify`.
+        let r = VerificationResult {
+            intact: true,
+            links_verified: 3,
+            p_0: Some("alice@demo.local".into()),
+            broken_at: None,
+            reason: None,
+            pic_profile: Some("proxilion.v1".into()),
+            pic_profile_mismatch_at: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        for key in [
+            "intact",
+            "links_verified",
+            "p_0",
+            "broken_at",
+            "reason",
+            "pic_profile",
+            "pic_profile_mismatch_at",
+        ] {
+            assert!(v.get(key).is_some(), "missing wire key: {key}");
+        }
+        assert_eq!(v["intact"], true);
+        assert_eq!(v["links_verified"], 3);
+        assert_eq!(v["pic_profile"], "proxilion.v1");
+    }
+
+    #[test]
+    fn invariant_kind_for_decode_and_missing_matches_bounded_label_set() {
+        // The two out-of-contract buckets (`missing`, `decode`, `cat_key`)
+        // are explicitly outside spec.md §3.2's named enum but pin them
+        // here so a refactor that collapsed them into "unknown" (which
+        // would lose chain-walker triage signal — was the row missing
+        // from cache, or was its CBOR corrupt?) surfaces as a test
+        // failure. The full set is covered in the existing
+        // `invariant_kind_labels_are_bounded_and_stable`; this test
+        // pins each bucket's distinct label individually to catch a
+        // copy-paste that aliased two buckets to the same string.
+        assert_ne!(
+            invariant_kind(&VerifierError::Missing(Uuid::nil())),
+            invariant_kind(&VerifierError::Decode("x".into())),
+            "missing and decode must NOT alias",
+        );
+        assert_ne!(
+            invariant_kind(&VerifierError::Decode("x".into())),
+            invariant_kind(&VerifierError::CatKey("x".into())),
+            "decode and cat_key must NOT alias",
+        );
+        assert_ne!(
+            invariant_kind(&VerifierError::Missing(Uuid::nil())),
+            invariant_kind(&VerifierError::CatKey("x".into())),
+            "missing and cat_key must NOT alias",
+        );
+    }
+
+    #[test]
+    fn err_to_result_for_hop_order_pins_broken_at_to_leaf_id() {
+        // HopOrder carries `{child, parent}` u32 fields, no Uuid — so
+        // `err_to_result` falls through to the leaf id. Pin this so
+        // a refactor that added a `pca_id` field to HopOrder (the
+        // natural fix to make broken_at more precise) would surface
+        // here as a wire-shape change rather than as a silently
+        // misleading dashboard rendering.
+        let leaf = Uuid::new_v4();
+        let r = err_to_result(
+            leaf,
+            &VerifierError::HopOrder {
+                child: 5,
+                parent: 2,
+            },
+        );
+        assert_eq!(r.broken_at, Some(leaf));
+        assert!(!r.intact);
+        // The hop integers must surface in the reason for triage.
+        let reason = r.reason.expect("reason present");
+        assert!(reason.contains('5'));
+        assert!(reason.contains('2'));
+    }
+
+    #[test]
     fn verifier_error_display_carries_named_field_values() {
         // The `reason` field in VerificationResult is `e.to_string()` —
         // every error variant must surface its named-field values so the

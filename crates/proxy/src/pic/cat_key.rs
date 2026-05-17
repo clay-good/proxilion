@@ -142,6 +142,52 @@ mod tests {
     }
 
     #[test]
+    fn cat_key_error_decode_display_carries_inner_detail() {
+        // The Decode variant is the operator-actionable boundary —
+        // when Trust Plane returns a malformed public-key, the
+        // wrapped message is what tells the operator whether the
+        // upstream is mis-configured (key length wrong), the b64
+        // decoder rejected it, or our parser rejected it. Pin three
+        // distinct inner messages so a refactor that collapsed them
+        // into one Display surfaces here.
+        for inner in ["bad b64 char", "expected 32 bytes", "curve point invalid"] {
+            let s = CatKeyError::Decode(inner.into()).to_string();
+            assert!(s.contains(inner), "missing inner detail in: {s}");
+            assert!(s.to_lowercase().contains("decode"));
+        }
+    }
+
+    #[test]
+    fn cat_key_registry_url_with_trailing_slash_still_constructs() {
+        // The URL is concatenated as `{base}/v1/federation/info`. A
+        // trailing-slash base produces `{base}//v1/...` which most HTTP
+        // routers normalize; pin that the constructor itself doesn't
+        // panic / reject the input. A future tightening that stripped
+        // trailing slashes (the cleaner choice) would surface as a
+        // conscious wire-shape change.
+        let r = CatKeyRegistry::new("http://127.0.0.1:1/".into());
+        // Just constructing it shouldn't panic; clone-then-check-shape
+        // gets us coverage on the Arc::new path without an HTTP roundtrip.
+        let c = r.clone();
+        assert!(Arc::ptr_eq(&r.inner, &c.inner));
+    }
+
+    #[test]
+    fn cat_key_error_status_variants_distinguish_4xx_and_5xx_codes() {
+        // The status variant is generic over u16 — operator filters
+        // bucket 4xx vs 5xx differently (4xx → "Trust Plane refused
+        // our request", 5xx → "Trust Plane is broken"). Pin that the
+        // Display carries the raw code without bucketing — the
+        // operator's log filter is responsible for the bucket logic.
+        // A refactor that classified into named arms ("client_error" /
+        // "server_error") would silently lose the precise code.
+        for code in [403u16, 404, 500, 503] {
+            let s = CatKeyError::Status(code).to_string();
+            assert!(s.contains(&code.to_string()), "missing code {code} in: {s}");
+        }
+    }
+
+    #[test]
     fn info_resp_ignores_unknown_fields_for_forward_compat() {
         // The Trust Plane may add fields to `/v1/federation/info` over time
         // (e.g. `next_kid`). Pin that the deserializer ignores unknown

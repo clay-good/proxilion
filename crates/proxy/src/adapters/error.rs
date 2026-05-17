@@ -321,6 +321,50 @@ mod tests {
     }
 
     #[test]
+    fn app_error_pic_invariant_violation_carries_detail_through_to_wire() {
+        // The Layer-A break is operator-actionable — the upstream
+        // refusal body explains what ops weren't a subset. Pin that
+        // `detail` is set (unlike Internal/Db which hide it) and
+        // that the `pic_invariant_violation` wire code is stable for
+        // the agent-side retry classifier.
+        let body = AppError::PicInvariantViolation("missing [drive:write:secret]".into()).body();
+        assert_eq!(body.code, "pic_invariant_violation");
+        assert_eq!(body.detail.as_deref(), Some("missing [drive:write:secret]"),);
+        // Authority docs link points operators at the ops-mapping page.
+        assert!(body.docs.unwrap().contains("policy/ops"));
+    }
+
+    #[test]
+    fn app_error_rate_limit_status_is_429_and_carries_no_detail() {
+        // RateLimit is the canonical 429 path. Pin both status (via
+        // the ErrorCode default) and the no-detail contract — the
+        // current-window remaining count is intentionally not
+        // surfaced in the response body (the operator dashboard has
+        // the live metric; leaking it to the agent would help abusers
+        // pace requests under the limit).
+        let e = AppError::RateLimit;
+        assert_eq!(e.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = e.body();
+        assert_eq!(body.code, "rate_limited");
+        assert!(body.detail.is_none());
+    }
+
+    #[test]
+    fn app_error_require_confirmation_status_is_428_with_token_hint() {
+        // The 428 Precondition Required path is the §3.2 contract for
+        // human-in-the-loop confirmation. Pin status + the fix hint
+        // mentioning the `X-Proxilion-Confirmation` header — the
+        // agent SDK reads this hint to surface the right retry shape.
+        let e = AppError::RequireConfirmation("external recipient".into());
+        assert_eq!(e.status(), StatusCode::PRECONDITION_REQUIRED);
+        let body = e.body();
+        assert_eq!(body.code, "require_confirmation");
+        assert_eq!(body.detail.as_deref(), Some("external recipient"));
+        let fix = body.fix.expect("fix present");
+        assert!(fix.contains("X-Proxilion-Confirmation"));
+    }
+
+    #[test]
     fn app_error_body_read_filter_blocked_has_no_detail_but_dashboard_hint() {
         // ReadFilterBlocked is intentionally generic to the agent — the
         // matched pattern lives in `/admin/` (Live feed → row). Pin

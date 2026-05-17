@@ -171,6 +171,66 @@ mod tests {
     }
 
     #[test]
+    fn database_error_and_internal_error_share_wire_string_by_design() {
+        // The `DatabaseError` variant exists in Rust for type-level
+        // dispatch (the adapter sees a sqlx::Error and maps to it),
+        // but on the wire both DatabaseError and InternalError emit
+        // the same `"internal_error"` string. Pin this two-into-one
+        // contract here — a refactor that gave DatabaseError its own
+        // `"database_error"` wire string would silently leak a "your
+        // postgres is sick" signal to the agent (the proxy
+        // intentionally hides that). A refactor that did want to
+        // split the wire codes would need to update operator
+        // dashboards in lockstep with this assertion.
+        assert_eq!(
+            ErrorCode::DatabaseError.as_str(),
+            ErrorCode::InternalError.as_str(),
+            "DatabaseError and InternalError must share the internal_error wire string",
+        );
+        assert_eq!(ErrorCode::DatabaseError.as_str(), "internal_error");
+    }
+
+    #[test]
+    fn default_status_for_two_upstream_variants_share_502_class() {
+        // UpstreamUnavailable and UpstreamTooLarge both bucket under
+        // 502 — Cloudflare's terminology calls 502 "Bad Gateway"
+        // generically, and agents retry on it. Pin both arms — a
+        // refactor that bumped UpstreamTooLarge to 413 (Payload Too
+        // Large) would change the retry semantics on every agent's
+        // HTTP client.
+        assert_eq!(ErrorCode::UpstreamUnavailable.default_status(), 502);
+        assert_eq!(ErrorCode::UpstreamTooLarge.default_status(), 502);
+    }
+
+    #[test]
+    fn error_code_serde_round_trip_via_value_for_every_variant() {
+        // Snapshot tests pin one-way `to_string`, but the wire is
+        // bidirectional — operators paste a JSON blob into a CLI
+        // tool and deserialize. Pin round-trip via `serde_json::Value`
+        // (not just String) for every variant so a `rename_all`
+        // attribute drift would surface here on both directions.
+        let cases: &[ErrorCode] = &[
+            ErrorCode::PicInvariantViolation,
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RequireConfirmation,
+            ErrorCode::RateLimited,
+            ErrorCode::ReadFilterBlocked,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::UpstreamTooLarge,
+            ErrorCode::PolicyEngineError,
+            // Skip the two that alias to internal_error — deserialize
+            // is non-deterministic across the alias. Pinned separately
+            // in `database_error_and_internal_error_share_wire_string_by_design`.
+        ];
+        for c in cases {
+            let v = serde_json::to_value(c).unwrap();
+            assert!(v.is_string());
+            let back: ErrorCode = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(back, *c, "round-trip mismatch for {c:?}");
+        }
+    }
+
+    #[test]
     fn unknown_wire_string_fails_deserialize() {
         // `#[non_exhaustive]` is a Rust-side affordance; the wire enum is
         // still closed at deserialize time (serde rejects unknown variants).

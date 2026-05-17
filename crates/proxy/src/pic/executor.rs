@@ -560,6 +560,64 @@ mod tests {
     }
 
     #[test]
+    fn successor_outcome_debug_carries_variant_name_and_detail() {
+        // `SuccessorOutcome` derives Debug; the adapter call site
+        // logs `?outcome` for chain-issuance audit. Pin both the
+        // variant name and the `detail` field on the AuditFallback
+        // arm so a manual Debug impl that hid the detail would
+        // surface here (the audit trail loses signal otherwise).
+        let af = SuccessorOutcome::AuditFallback {
+            detail: "ops not subset of predecessor: missing [drive:write:secret]".into(),
+        };
+        let s = format!("{af:?}");
+        assert!(s.contains("AuditFallback"));
+        assert!(s.contains("ops not subset"));
+    }
+
+    #[test]
+    fn process_poc_request_serializes_to_single_wire_field() {
+        // Trust Plane's `POST /v1/poc/process` accepts exactly one
+        // field: `poc` (base64-encoded signed PoC bytes). Pin the
+        // single-field shape so a refactor that added a sibling
+        // field (e.g. `requested_ops`) would surface as a wire-shape
+        // change. The contract is "the PoC carries everything."
+        let req = ProcessPocRequest {
+            poc: "base64-encoded-bytes".into(),
+        };
+        let j = serde_json::to_value(&req).unwrap();
+        assert_eq!(j["poc"], "base64-encoded-bytes");
+        assert_eq!(
+            j.as_object().unwrap().len(),
+            1,
+            "only the single `poc` field is on the wire",
+        );
+    }
+
+    #[test]
+    fn issue_pca_request_serializes_with_four_wire_fields() {
+        // Trust Plane's `POST /v1/pca/issue` accepts four fields:
+        // `credential`, `credential_type`, `ops`, `executor_binding`.
+        // Pin all four by name + count so a future refactor that
+        // renamed `credential_type` to `cred_type` (a common
+        // shortening) would surface here as a wire-shape break.
+        let req = IssuePcaRequest {
+            credential: "the-jwt".into(),
+            credential_type: "federation_token".into(),
+            ops: vec!["drive:read:x".into()],
+            executor_binding: std::collections::HashMap::from([
+                ("service".to_string(), "proxilion-proxy".to_string()),
+                ("kid".to_string(), "proxy-prod-1".to_string()),
+            ]),
+        };
+        let j = serde_json::to_value(&req).unwrap();
+        for key in ["credential", "credential_type", "ops", "executor_binding"] {
+            assert!(j.get(key).is_some(), "missing wire key: {key}");
+        }
+        assert_eq!(j.as_object().unwrap().len(), 4);
+        assert_eq!(j["credential_type"], "federation_token");
+    }
+
+    #[test]
     fn pic_executor_clone_shares_inner_arc() {
         // `Clone` is part of the design contract — adapters hold a
         // per-handler clone of the executor, and the `OnceCell<()>` for

@@ -716,6 +716,92 @@ mod tests {
         assert_eq!(ex["action"], "gmail.messages.send");
     }
 
+    #[test]
+    fn bucket_prune_drops_only_timestamps_outside_window_keeps_boundary_inclusive() {
+        // `Bucket::prune` is the private helper `admit` calls on every
+        // hot-path arrival. The boundary contract is `now - t <= window`
+        // (inclusive on the window upper bound) — a regression to strict
+        // `<` would silently shrink the window by one tick on every
+        // suppressor and start passing through events that should have
+        // been counted in the prior window. Existing tests exercised the
+        // overall window-expiry path via admit() with sleeps; this test
+        // calls prune directly with constructed Instants so the boundary
+        // is checked deterministically without thread-timing flake.
+        let window = Duration::from_secs(60);
+        let now = Instant::now();
+        let mut b = Bucket {
+            timestamps: vec![
+                now - Duration::from_secs(120), // outside window: drop
+                now - Duration::from_secs(61),  // outside window (just): drop
+                now - Duration::from_secs(60),  // boundary inclusive: keep
+                now - Duration::from_secs(30),  // inside: keep
+                now,                            // present moment: keep
+            ],
+            suppressed: 0,
+            first_suppressed: None,
+        };
+        b.prune(now, window);
+        assert_eq!(
+            b.timestamps.len(),
+            3,
+            "60s boundary must be inclusive; 61s and 120s must be dropped",
+        );
+    }
+
+    #[test]
+    fn config_for_with_no_resolver_returns_default_unchanged() {
+        // `config_for` is called per-admit; the no-resolver branch is the
+        // most-common production shape (no per-policy YAML override). The
+        // existing resolver tests cover both override axes but never assert
+        // that the default config flows through verbatim when no resolver
+        // is attached — a regression that pre-populated a "safe" override
+        // here would silently shadow operator-configured defaults.
+        let default = BurstConfig {
+            threshold: 7,
+            window: Duration::from_secs(13),
+            flush_interval: Duration::from_secs(17),
+        };
+        let s = BurstSuppressor::new(default);
+        let resolved = s.config_for("any-policy-id");
+        assert_eq!(resolved.threshold, 7);
+        assert_eq!(resolved.window, Duration::from_secs(13));
+        assert_eq!(resolved.flush_interval, Duration::from_secs(17));
+    }
+
+    #[test]
+    fn with_details_url_url_encodes_reserved_chars_in_policy_id_and_p_0() {
+        // The percent-encoding happens via `urlencoding_encode` which uses
+        // NON_ALPHANUMERIC — round 64 pinned the helper directly, but the
+        // composed `with_details_url` path never round-tripped a
+        // reserved-char-bearing policy_id + p_0 pair through to the wire
+        // URL. A regression that bypassed the encoder for either segment
+        // (e.g. switched to `format!("{policy_id}")` for "readability")
+        // would silently break every deep link with a `&` or `?` in the
+        // policy id (real-world: composed policy ids like
+        // "team-a/share?audit" used by tenants that name policies after
+        // owning team + intent).
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "team-a/share?audit".into(),
+            p_0: Some("alice+suffix@acme.com".into()),
+            suppressed_count: 1,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        }
+        .with_details_url("https://proxy.local");
+        assert!(
+            s.details_url.contains("policy_id=team%2Da%2Fshare%3Faudit"),
+            "policy_id reserved chars must be percent-encoded: {}",
+            s.details_url,
+        );
+        assert!(
+            s.details_url.contains("p_0=alice%2Bsuffix%40acme%2Ecom"),
+            "p_0 reserved chars must be percent-encoded: {}",
+            s.details_url,
+        );
+    }
+
     #[tokio::test]
     async fn summary_carries_exemplar() {
         let s = BurstSuppressor::new(BurstConfig {

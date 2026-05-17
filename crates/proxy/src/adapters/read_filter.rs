@@ -451,6 +451,56 @@ mod tests {
     }
 
     #[test]
+    fn truncate_at_exact_n_returns_unchanged_no_ellipsis_appended() {
+        // The `truncate` helper uses `<= n` for the no-truncate predicate.
+        // The exact-equal boundary (chars == n) must return the input
+        // verbatim with NO ellipsis suffix — a refactor to strict `<`
+        // would silently append "…" on every body that happened to land
+        // on the limit (in the audit pipeline this would silently corrupt
+        // every `truncate(snippet, 200)` whose snippet hit exactly 200
+        // chars). Pin both the ascii and multibyte forms of the boundary.
+        let ascii: String = "x".repeat(10);
+        assert_eq!(truncate(&ascii, 10), ascii);
+        // Multibyte: 5 codepoints, each 2 bytes — char count is what
+        // matters, not byte count.
+        let multibyte = "αβγδε";
+        assert_eq!(multibyte.chars().count(), 5);
+        assert_eq!(truncate(multibyte, 5), multibyte);
+        // Just-over: at n+1 chars, the ellipsis appears.
+        let over: String = "x".repeat(11);
+        let t = truncate(&over, 10);
+        assert!(t.ends_with('…'));
+        assert_eq!(t.chars().count(), 11); // 10 + ellipsis
+    }
+
+    #[test]
+    fn merge_overlapping_empty_input_returns_empty_vec() {
+        // Boundary: empty input must round-trip as empty output without
+        // panicking on the `out.last_mut()` initial-`None` arm. The
+        // existing tests cover disjoint + overlapping + nested + a
+        // single-element input but never the zero-element case — the
+        // caller (`apply`) hits this whenever the regex set matches but
+        // every per-pattern `find_iter` returns zero ranges (a refactor
+        // that didn't pre-empt the early-return on `!hits.matched_any()`
+        // would land here as a panic rather than as the expected no-op).
+        let out = merge_overlapping(&[]);
+        assert!(out.is_empty(), "empty input must yield empty output");
+    }
+
+    #[test]
+    fn should_scan_explicitly_accepts_text_plain_via_text_prefix() {
+        // The `text/*` branch uses `starts_with("text/")` — the existing
+        // tests pin text/html in the case-insensitive test but never
+        // assert text/plain (the most common log-fixture content type)
+        // separately. A refactor that narrowed the accept-list to a
+        // closed set (`{text/html, text/xml}`) for "performance" would
+        // silently stop scanning every text/plain agent payload.
+        assert!(should_scan(Some("text/plain")));
+        assert!(should_scan(Some("text/csv")));
+        assert!(should_scan(Some("text/markdown")));
+    }
+
+    #[test]
     fn regexset_short_circuits_clean_bodies() {
         let f = build(
             QuarantineAction::ReplaceWithMarker,

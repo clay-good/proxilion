@@ -726,6 +726,44 @@ mod tests {
         assert!(!secret.verify("abcdef0123", &ts, b"x"));
     }
 
+    #[test]
+    fn truncate_at_exact_n_passes_through_without_appending_ellipsis() {
+        // The `truncate` helper uses strict `> n` for the append-ellipsis
+        // predicate. The exact-equal boundary (chars == n) must return
+        // the prefix verbatim with NO ellipsis suffix. Different shape
+        // from the read_filter sibling helper (which uses `<= n` on the
+        // no-truncate branch); the symmetric pin here catches a "harmonize
+        // the two helpers" refactor that flipped one direction without
+        // updating the other — the 140-char context-block budget the
+        // `block_kit_payload` site depends on relies on this exact
+        // boundary not eating the final visible char.
+        let s: String = "x".repeat(140);
+        assert_eq!(truncate(&s, 140), s);
+        assert!(!truncate(&s, 140).ends_with('…'));
+        // Just-over by one char surfaces the ellipsis.
+        let over: String = "x".repeat(141);
+        let t = truncate(&over, 140);
+        assert!(t.ends_with('…'));
+        assert_eq!(t.chars().count(), 141); // 140 prefix + ellipsis
+    }
+
+    #[test]
+    fn plural_pluralizes_word_that_already_ends_in_s_naively() {
+        // The `plural` helper is a naive "append s" formatter — it does
+        // NOT know about English plurals (`box` → `boxes`, `query` →
+        // `queries`). Pin the current naive shape so a future "smart
+        // pluralizer" refactor would surface here as a wire-shape change
+        // (operator-facing message rendering) rather than silently
+        // changing every burst-summary subject line. The boundary that
+        // matters is the `word == s` case: `1 block` (good), `2 blocks`
+        // (good), `2 blockss` would be wrong but only the boundary on a
+        // word ending in `s` produces the visibly-awkward `processs`. We
+        // pin the naive behavior across both 1 (singular) and many.
+        assert_eq!(plural(1, "process"), "1 process");
+        assert_eq!(plural(2, "process"), "2 processs");
+        assert_eq!(plural(0, "block"), "0 blocks");
+    }
+
     /// Silence unused-import warnings on the no-test build paths.
     #[allow(dead_code)]
     fn _used(_: chrono::DateTime<Utc>) {}

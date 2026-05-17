@@ -299,4 +299,28 @@ mod tests {
         n.slack.replace(None);
         assert!(!n.any_configured());
     }
+
+    #[test]
+    fn empty_bundle_starts_with_none_for_email_handle_too() {
+        // The `webhook_burst` and `slack_burst` Option<BurstSuppressor>
+        // fields had their default-None pin (`empty_bundle_has_none_for_burst_suppressors`),
+        // but the three Handle fields (webhook/slack/email) were only
+        // collectively asserted via `bundle_starts_empty` which goes
+        // through the `any_configured` OR chain — a regression that
+        // pre-populated the email handle alone wouldn't show up there
+        // because the OR short-circuits on the webhook check. Pin the
+        // email branch's initial-None directly so an `Arc::new(default_email)`
+        // pre-fill regression in `empty()` surfaces here as the wrong
+        // default rather than as a phantom email driver firing at boot.
+        let n = Notifiers::empty();
+        assert!(n.email.current().is_none(), "email handle must start None");
+        // Symmetric pin for webhook + slack — defends against the
+        // reverse copy-paste (a regression that pre-filled the OTHER two
+        // would pass the email check above but fail here).
+        assert!(
+            n.webhook.current().is_none(),
+            "webhook handle must start None"
+        );
+        assert!(n.slack.current().is_none(), "slack handle must start None");
+    }
 }

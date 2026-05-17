@@ -441,4 +441,79 @@ mod tests {
             assert_eq!(docs.len(), 1, "yaml: {y}");
         }
     }
+
+    #[test]
+    fn recipients_cfg_round_trips_escalation_after_minutes_field() {
+        // The `escalation_after_minutes` field on `RecipientsCfg` is the
+        // per-policy escalation deadline the expiry sweeper reads (ui-less
+        // §5.7 dev 2). Rounds 32+33 pinned the string/list union on to/cc/bcc
+        // but never the deserialize round-trip on this u32 field, despite
+        // the sweeper's `escalation_at = blocked_at + N min` SQL update
+        // depending on it being present as `Some(_)` rather than collapsing
+        // to None. A regression that dropped `#[serde(default)]` would
+        // surface here as a missing-field deserialize error; a regression
+        // that retyped to a different integer width would surface as an
+        // overflow on the boundary inputs below.
+        let y = "- id: p\n  vendor: g\n  action: a\n  notifier_recipients:\n    to: ops@acme.com\n    escalation_after_minutes: 240\n";
+        let docs = parse_policies(y).unwrap();
+        let r = docs[0]
+            .notifier_recipients
+            .as_ref()
+            .expect("notifier_recipients present");
+        assert_eq!(r.escalation_after_minutes, Some(240));
+        // Boundary: omitted → None (the no-escalation contract).
+        let y2 =
+            "- id: p\n  vendor: g\n  action: a\n  notifier_recipients:\n    to: ops@acme.com\n";
+        let docs2 = parse_policies(y2).unwrap();
+        let r2 = docs2[0].notifier_recipients.as_ref().unwrap();
+        assert_eq!(r2.escalation_after_minutes, None);
+        // Boundary: zero is an explicit-zero choice, NOT coerced to None
+        // (operator-driven "fire immediately" sentinel).
+        let y3 = "- id: p\n  vendor: g\n  action: a\n  notifier_recipients:\n    to: ops@acme.com\n    escalation_after_minutes: 0\n";
+        let docs3 = parse_policies(y3).unwrap();
+        assert_eq!(
+            docs3[0]
+                .notifier_recipients
+                .as_ref()
+                .unwrap()
+                .escalation_after_minutes,
+            Some(0),
+        );
+    }
+
+    #[test]
+    fn burst_cfg_empty_object_deserializes_with_both_fields_none() {
+        // `notifier_burst: {}` is a valid hand-written shape — the operator
+        // declares the intent to burst-suppress without overriding either
+        // dial yet, planning to fill them in later. Pin that both fields
+        // collapse to None (not to a default integer) — a regression that
+        // added `#[serde(default = "...")]` to either field would silently
+        // pre-fill the operator's still-undecided dial and start
+        // suppressing on next reload.
+        let y = "- id: p\n  vendor: g\n  action: a\n  notifier_burst: {}\n";
+        let docs = parse_policies(y).unwrap();
+        let b = docs[0].notifier_burst.expect("notifier_burst present");
+        assert!(b.threshold.is_none(), "threshold defaults to None");
+        assert!(
+            b.window_seconds.is_none(),
+            "window_seconds defaults to None"
+        );
+    }
+
+    #[test]
+    fn default_quarantine_action_helper_returns_replace_with_marker() {
+        // The `default_quarantine_action` fn drives ReadFilterCfg's
+        // `#[serde(default = "...")]` for the `quarantine_action` field.
+        // The existing `defaults_match_safe_production_posture` test pins
+        // this via a parsed YAML round-trip, but the helper itself was
+        // never invoked directly — a refactor that changed the helper but
+        // forgot to update the call site's path would slip past. Pin the
+        // function-pointer return value directly so a one-character typo
+        // (e.g. `StripSilently`) surfaces here as the canonical posture
+        // failing rather than at the first operator's policy reload.
+        assert!(matches!(
+            default_quarantine_action(),
+            QuarantineActionCfg::ReplaceWithMarker
+        ));
+    }
 }

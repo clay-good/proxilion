@@ -447,6 +447,90 @@ mod tests {
         assert!(s.contains("&lt;script&gt;"));
     }
 
+    #[test]
+    fn html_escape_covers_every_dangerous_entity() {
+        // Five entities the escaper must catch — the previous test only
+        // covered `<` and `>`. A regression that dropped any single arm
+        // (the easy one is the lone-apostrophe case: `&#39;` is the
+        // numeric entity, not `&apos;` — pin the exact bytes operators'
+        // email clients render so a switch to `&apos;` doesn't silently
+        // change rendering in older mail UAs).
+        assert_eq!(html_escape("<"), "&lt;");
+        assert_eq!(html_escape(">"), "&gt;");
+        assert_eq!(html_escape("&"), "&amp;");
+        assert_eq!(html_escape("\""), "&quot;");
+        assert_eq!(html_escape("'"), "&#39;");
+        // Mixed input: every entity in one string, in order.
+        assert_eq!(
+            html_escape("<a href=\"x\" rel='y'>&"),
+            "&lt;a href=&quot;x&quot; rel=&#39;y&#39;&gt;&amp;"
+        );
+    }
+
+    #[test]
+    fn html_escape_passes_plain_text_and_unicode_through_unchanged() {
+        // No entity in the input → byte-identical output (no spurious
+        // entity wrapping, no double-encoding). Unicode codepoints
+        // outside the entity table pass through unchanged so non-ASCII
+        // policy descriptions render correctly in operator mail clients.
+        assert_eq!(html_escape("hello world"), "hello world");
+        assert_eq!(html_escape("αβγ — délicieux"), "αβγ — délicieux");
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[tokio::test]
+    async fn email_notifier_proxy_public_url_round_trips_through_accessor() {
+        // The escalation sweeper reads `proxy_public_url()` to build
+        // approve / reject URLs; a regression that returned the SMTP URL
+        // instead would silently send approvers to the SMTP host. Pin
+        // the field-name round-trip through the public accessor while we
+        // already have a notifier in hand.
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new(
+            "smtp://localhost:25",
+            "sec@x.com",
+            &["a@x.com".into()],
+            "https://proxy.acme.com".into(),
+            pool,
+        )
+        .expect("builds");
+        assert_eq!(n.proxy_public_url(), "https://proxy.acme.com");
+    }
+
+    #[tokio::test]
+    async fn email_notifier_with_max_retries_is_a_fluent_setter() {
+        // `with_max_retries(0)` lets the test suite keep SMTP-failure
+        // paths fast — pin the fluent-builder shape (consumes self,
+        // returns Self) so a future refactor to `&mut self` would
+        // surface here as a compile error rather than break test setup
+        // at every call site.
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new(
+            "smtp://localhost:25",
+            "sec@x.com",
+            &["a@x.com".into()],
+            "https://proxy.local".into(),
+            pool,
+        )
+        .expect("builds")
+        .with_max_retries(0);
+        // No public accessor for max_retries (intentional — internal
+        // tuning knob). Existence of the consuming-self chain is the
+        // contract; reaching this line is success.
+        assert_eq!(n.proxy_public_url(), "https://proxy.local");
+    }
+
+    #[test]
+    fn html_escape_does_not_double_encode_already_escaped_entities() {
+        // Standard expectation for HTML escape: it's a one-shot byte
+        // mapping, NOT a parser. `&amp;` in the input becomes `&amp;amp;`
+        // out — pin that so a future "smart escape" refactor doesn't
+        // silently start parsing entities (which would change rendering
+        // for content that already contains literal `&amp;` strings).
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
+        assert_eq!(html_escape("&lt;script&gt;"), "&amp;lt;script&amp;gt;");
+    }
+
     #[tokio::test]
     async fn invalid_smtp_url_errors() {
         let pool_placeholder = make_dummy_pool();

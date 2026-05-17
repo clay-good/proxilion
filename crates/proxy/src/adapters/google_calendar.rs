@@ -1005,6 +1005,72 @@ mod tests {
         assert!(!ctx.contains_key("visibility"));
     }
 
+    fn outcome_with(policy_id: Option<&str>) -> Outcome {
+        use policy_engine::{OpsExpression, PicMode};
+        Outcome {
+            matched_policy_id: policy_id.map(String::from),
+            decision: Decision::Allow,
+            required_ops: OpsExpression::default(),
+            read_filter: None,
+            pic_mode: PicMode::Audit,
+            mode: policy_engine::Mode::Enforce,
+            observe_would_have: None,
+            audit_body: None,
+        }
+    }
+
+    #[test]
+    fn insert_proxy_headers_round_trip_carries_request_pca_and_policy() {
+        // First positive test for calendar's helper (gmail + drive had
+        // their own; calendar was the gap). Pin the three-header round
+        // trip the dashboard's "calendar request inspector" panel reads.
+        let mut h = HeaderMap::new();
+        let req = Uuid::new_v4();
+        let pca = Uuid::new_v4();
+        insert_proxy_headers(&mut h, req, &outcome_with(Some("cal-policy")), pca);
+        assert_eq!(
+            h.get("x-proxilion-request-id").unwrap().to_str().unwrap(),
+            req.to_string()
+        );
+        assert_eq!(
+            h.get("x-proxilion-pca-id").unwrap().to_str().unwrap(),
+            pca.to_string()
+        );
+        assert_eq!(
+            h.get("x-proxilion-policy").unwrap().to_str().unwrap(),
+            "cal-policy"
+        );
+    }
+
+    #[test]
+    fn insert_proxy_headers_omits_policy_header_when_no_match() {
+        // Calendar paths can also surface `matched_policy_id: None` (e.g.
+        // a default-allow read with no matching policy); the helper must
+        // skip the policy header rather than emit an empty value.
+        let mut h = HeaderMap::new();
+        insert_proxy_headers(&mut h, Uuid::nil(), &outcome_with(None), Uuid::nil());
+        assert!(h.contains_key("x-proxilion-request-id"));
+        assert!(h.contains_key("x-proxilion-pca-id"));
+        assert!(!h.contains_key("x-proxilion-policy"));
+    }
+
+    #[test]
+    fn insert_proxy_headers_skips_invalid_header_value_silently() {
+        // Defense against a policy id with non-visible-ASCII bytes — must
+        // drop the header gracefully via `if let Ok(v)` rather than
+        // panicking the response path. Mirrors the same defense in drive
+        // + gmail — three identical helpers that must drift together.
+        let mut h = HeaderMap::new();
+        insert_proxy_headers(
+            &mut h,
+            Uuid::nil(),
+            &outcome_with(Some("bad\nid")),
+            Uuid::nil(),
+        );
+        assert!(h.contains_key("x-proxilion-request-id"));
+        assert!(!h.contains_key("x-proxilion-policy"));
+    }
+
     #[test]
     fn body_ctx_missing_email_skipped() {
         let ev = json!({

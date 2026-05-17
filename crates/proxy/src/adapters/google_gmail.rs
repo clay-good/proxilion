@@ -1028,4 +1028,36 @@ mod tests {
         .unwrap_err();
         assert!(matches!(e, AppError::RequireConfirmation(_)));
     }
+
+    #[test]
+    fn insert_proxy_headers_omits_policy_header_when_no_match() {
+        // Outcomes from default-deny or read-filter paths can carry
+        // `matched_policy_id: None` — the helper must skip the policy
+        // header entirely (rather than emit an empty value or `(none)`),
+        // since downstream Grafana panels filter by header presence to
+        // separate "policy fired" from "no policy matched".
+        let mut h = HeaderMap::new();
+        let mut o = outcome(Decision::Allow);
+        o.matched_policy_id = None;
+        insert_proxy_headers(&mut h, Uuid::nil(), &o, Uuid::nil());
+        assert!(h.contains_key("x-proxilion-request-id"));
+        assert!(h.contains_key("x-proxilion-pca-id"));
+        assert!(!h.contains_key("x-proxilion-policy"));
+    }
+
+    #[test]
+    fn insert_proxy_headers_skips_invalid_header_value_silently() {
+        // `HeaderValue::from_str` rejects bytes outside the visible-ASCII
+        // range (e.g. newline, NUL). A policy id that smuggled one in
+        // (extreme edge — operator could in principle name a policy with
+        // an embedded `\n` in YAML) must not panic the response path;
+        // the `if let Ok(v)` arm gracefully drops the header instead.
+        let mut h = HeaderMap::new();
+        let mut o = outcome(Decision::Allow);
+        o.matched_policy_id = Some("bad\nid".into());
+        insert_proxy_headers(&mut h, Uuid::nil(), &o, Uuid::nil());
+        // request_id + pca_id still present; policy header skipped.
+        assert!(h.contains_key("x-proxilion-request-id"));
+        assert!(!h.contains_key("x-proxilion-policy"));
+    }
 }

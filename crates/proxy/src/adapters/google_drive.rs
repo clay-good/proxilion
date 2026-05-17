@@ -788,6 +788,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn insert_proxy_headers_omits_policy_header_when_no_match() {
+        // Default-deny + read-filter paths surface `matched_policy_id: None`;
+        // the helper must skip the policy header rather than emit an empty
+        // value (Grafana panels separate "policy fired" from "no match"
+        // on header presence — emitting an empty string would mis-bucket).
+        let mut h = HeaderMap::new();
+        let mut o = outcome(Decision::Allow);
+        o.matched_policy_id = None;
+        insert_proxy_headers(&mut h, Uuid::nil(), &o, Uuid::nil());
+        assert!(h.contains_key("x-proxilion-request-id"));
+        assert!(h.contains_key("x-proxilion-pca-id"));
+        assert!(!h.contains_key("x-proxilion-policy"));
+    }
+
+    #[test]
+    fn insert_proxy_headers_skips_invalid_header_value_silently() {
+        // A policy id with a byte outside the visible-ASCII range (e.g.
+        // an embedded newline) is dropped via `if let Ok(v)` rather than
+        // panicking the response path. Mirrors the same defense in
+        // calendar + gmail — three identical helpers must drift together.
+        let mut h = HeaderMap::new();
+        let mut o = outcome(Decision::Allow);
+        o.matched_policy_id = Some("bad\nid".into());
+        insert_proxy_headers(&mut h, Uuid::nil(), &o, Uuid::nil());
+        assert!(h.contains_key("x-proxilion-request-id"));
+        assert!(!h.contains_key("x-proxilion-policy"));
+    }
+
     #[tokio::test]
     async fn policy_blocked_serializes_to_structured_403() {
         let err = AppError::PolicyBlocked {

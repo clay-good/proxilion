@@ -238,4 +238,91 @@ mod tests {
         let b: SetModeBody = serde_json::from_str(r#"{"mode":"observe"}"#).unwrap();
         assert_eq!(b.mode, "observe");
     }
+
+    #[test]
+    fn parse_listing_returns_empty_when_yaml_is_single_mapping_not_array() {
+        // The handler's listing path expects a top-level YAML array. A
+        // single-mapping document (`id: foo` not wrapped in `-`) fails the
+        // `Vec<Value>` deserialize, surfaces as `Err`, and is mapped to
+        // `vec![]` — operators get an empty listing rather than a 500.
+        // A refactor that silently tried to treat the single mapping as
+        // a one-element list would surface here.
+        let yaml = "id: not-an-array\nvendor: google\n";
+        assert!(parse_listing(yaml).is_empty());
+    }
+
+    #[test]
+    fn parse_listing_drops_non_mapping_entries_in_array() {
+        // The YAML walker filter_maps on `as_mapping()`. A scalar entry
+        // mixed with a real policy must be dropped silently rather than
+        // erroring the entire listing — defensive against hand-edited
+        // policy files. A refactor that surfaced the error would silently
+        // hide every valid policy on a single bad entry.
+        let yaml = "- just-a-string\n- id: real-one\n  vendor: google\n";
+        let out = parse_listing(yaml);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "real-one");
+    }
+
+    #[test]
+    fn list_response_json_carries_source_policy_count_and_policies_keys() {
+        // The admin UI keys on these three field names. Pin the wire shape
+        // so a future rename (e.g. `source` → `path`) would surface here.
+        let r = ListResponse {
+            source: Some("/etc/proxilion/policies.yaml".into()),
+            policy_count: 2,
+            policies: vec![PolicyView {
+                id: "p1".into(),
+                vendor: "google".into(),
+                action: "drive.files.get".into(),
+                mode: "enforce".into(),
+                pic_mode: "audit".into(),
+            }],
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["source"], "/etc/proxilion/policies.yaml");
+        assert_eq!(v["policy_count"], 2);
+        assert_eq!(v["policies"].as_array().unwrap().len(), 1);
+        assert_eq!(v["policies"][0]["id"], "p1");
+    }
+
+    #[test]
+    fn list_response_json_renders_null_source_when_loader_has_no_path() {
+        // The static / embed-API loaders return None from .source(); the
+        // wire shape must render this as JSON null (not absent) so the
+        // admin UI can distinguish "in-memory policies" from "file path
+        // dropped on a refactor". Stay-on-the-wire test for the option
+        // serializer default.
+        let r = ListResponse {
+            source: None,
+            policy_count: 0,
+            policies: vec![],
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("source").is_some(), "key must be present");
+        assert!(v["source"].is_null());
+        assert_eq!(v["policy_count"], 0);
+        assert!(v["policies"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_mode_body_rejects_missing_mode_field() {
+        // The handler's mode-switch path depends on serde failing fast on
+        // an empty `{}` body — a refactor to `Option<String>` with a
+        // silent fall-through to "enforce" would let an operator's
+        // mistyped curl silently flip a policy back to enforce.
+        let r: Result<SetModeBody, _> = serde_json::from_str("{}");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn set_mode_body_accepts_unknown_extra_fields() {
+        // serde's default is `deny_unknown_fields: false`. Pin the
+        // permissive contract — the CLI may send forward-compat fields
+        // (e.g. `audit_note`) that the proxy hasn't learned yet, and the
+        // mode flip must still apply rather than 400.
+        let b: SetModeBody =
+            serde_json::from_str(r#"{"mode":"disabled","audit_note":"experiment"}"#).unwrap();
+        assert_eq!(b.mode, "disabled");
+    }
 }

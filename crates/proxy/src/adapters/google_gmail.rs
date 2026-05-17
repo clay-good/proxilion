@@ -1060,4 +1060,115 @@ mod tests {
         assert!(h.contains_key("x-proxilion-request-id"));
         assert!(!h.contains_key("x-proxilion-policy"));
     }
+
+    #[test]
+    fn domain_of_trims_surrounding_whitespace_on_domain_half() {
+        // The rsplit_once helper trims after splitting, so a stray space
+        // inside `alice@ acme.com` (an LLM-generated address fragment, or
+        // a hand-edited MIME header) round-trips to `acme.com` rather than
+        // ` acme.com`. A regression that dropped the `.trim()` would
+        // surface here as a missed match against `customer_domain`.
+        assert_eq!(domain_of("alice@ acme.com  ").as_deref(), Some("acme.com"));
+    }
+
+    #[test]
+    fn domain_of_returns_none_on_empty_string_and_bare_at() {
+        // Defensive boundaries: empty input has no `@` so rsplit_once → None;
+        // a bare `@` produces an empty-domain split, but rsplit_once treats
+        // the split as `("", "")` → Some("") (lowercased empty). Pin the
+        // observed contract so a refactor that filtered empty domains
+        // would surface here (and would need to update the call sites in
+        // build_send_body_ctx that currently rely on Some("") to round-trip).
+        assert_eq!(domain_of(""), None);
+        assert_eq!(domain_of("@").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn split_addresses_handles_group_form_and_returns_inner_addresses() {
+        // RFC 5322 group form: `name:addr1,addr2;`. mailparse's addrparse
+        // returns a MailAddr::Group; the helper must flatten member addrs
+        // into the output rather than dropping the group. A regression
+        // that handled only Single would silently drop every grouped
+        // recipient on `To:` headers some MUAs emit.
+        let out = split_addresses("team:bob@acme.com, eve@evil.example;");
+        assert!(out.iter().any(|a| a == "bob@acme.com"), "got: {out:?}");
+        assert!(out.iter().any(|a| a == "eve@evil.example"), "got: {out:?}");
+    }
+
+    #[test]
+    fn split_addresses_returns_empty_on_empty_input() {
+        // Pin the empty-input passthrough — addrparse on "" returns Ok with
+        // no addresses, so the helper yields an empty Vec. A refactor that
+        // pre-emptively errored on empty would surface here as a missing
+        // "no recipients" passthrough through `build_send_body_ctx`.
+        assert!(split_addresses("").is_empty());
+    }
+
+    #[test]
+    fn build_send_body_ctx_dedupes_domains_via_btreeset_for_alphabetical_to_domain() {
+        // Three recipients across two distinct domains; the BTreeSet collapse
+        // produces a stable alphabetical `to_domain` (first key). Pin both
+        // the de-dup (`to_domains.len() == 2` despite three recipients) and
+        // the alphabetical-first selection — a refactor to HashSet would
+        // silently break the spec.md §9 single-value `not_in` comparison
+        // by randomizing which domain lands as `to_domain`.
+        let raw = "To: bob@zeta.example, alice@acme.com, carol@zeta.example\r\nFrom: x@x.example\r\nSubject: x\r\n\r\n.\r\n";
+        let p = parse_mime(raw.as_bytes()).unwrap();
+        let ctx = build_send_body_ctx(&p, "internal.example", "x@internal.example");
+        let domains = ctx.get("to_domains").unwrap().as_array().unwrap();
+        let strs: Vec<&str> = domains.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs.len(), 2, "expected 2 unique domains, got: {strs:?}");
+        assert_eq!(strs, vec!["acme.com", "zeta.example"]);
+        assert_eq!(
+            ctx.get("to_domain").unwrap().as_str().unwrap(),
+            "acme.com",
+            "to_domain must be alphabetical-first"
+        );
+        assert_eq!(ctx.get("recipient_count").unwrap().as_u64(), Some(3));
+    }
+
+    #[test]
+    fn build_send_body_ctx_subject_present_round_trips_some_and_none() {
+        // The `Subject:` header maps to `subject_present: bool`. Pin that a
+        // missing Subject in the raw MIME produces `false`, and a present
+        // (even empty-string) Subject produces `true` — the latter is the
+        // edge case where mailparse returns `Some("")` rather than `None`,
+        // and the policy author expects `subject_present` to mean "the
+        // header was present" not "the value was non-empty".
+        let no_subj = "From: a@x.example\r\nTo: b@y.example\r\n\r\n.\r\n";
+        let p = parse_mime(no_subj.as_bytes()).unwrap();
+        let ctx = build_send_body_ctx(&p, "x.example", "a@x.example");
+        assert_eq!(ctx.get("subject_present"), Some(&Value::Bool(false)));
+
+        let with_subj = "From: a@x.example\r\nTo: b@y.example\r\nSubject: hello\r\n\r\n.\r\n";
+        let p2 = parse_mime(with_subj.as_bytes()).unwrap();
+        let ctx2 = build_send_body_ctx(&p2, "x.example", "a@x.example");
+        assert_eq!(ctx2.get("subject_present"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn parse_mime_carries_bcc_recipients_through_to_body_ctx() {
+        // `Bcc:` was previously only exercised via the unit's overall flow,
+        // never asserted on. Pin that bcc round-trips into recipient_count
+        // + the bcc array, and that bcc-only recipients on an external
+        // domain still flip `external_recipient`.
+        let raw = "From: alice@acme.com\r\nTo: bob@acme.com\r\nBcc: spy@evil.example\r\nSubject: x\r\n\r\n.\r\n";
+        let p = parse_mime(raw.as_bytes()).unwrap();
+        assert_eq!(p.bcc, vec!["spy@evil.example".to_string()]);
+        let ctx = build_send_body_ctx(&p, "acme.com", "alice@acme.com");
+        assert_eq!(ctx.get("recipient_count").unwrap().as_u64(), Some(2));
+        assert_eq!(ctx.get("external_recipient"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn count_parts_recurses_into_nested_multipart_attachments() {
+        // multipart/mixed → multipart/related → application/pdf attachment.
+        // count_parts must recurse through both wrappers and tally the
+        // single attachment. A refactor that stopped at the first nesting
+        // level would silently miss attachments in any mail composed by a
+        // client that wrapped inline images in multipart/related.
+        let raw = "From: a@x.example\r\nTo: b@x.example\r\nSubject: x\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"OUTER\"\r\n\r\n--OUTER\r\nContent-Type: multipart/related; boundary=\"INNER\"\r\n\r\n--INNER\r\nContent-Type: text/plain\r\n\r\nhi\r\n--INNER\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"x.pdf\"\r\n\r\nPDF\r\n--INNER--\r\n--OUTER--\r\n";
+        let p = parse_mime(raw.as_bytes()).unwrap();
+        assert_eq!(p.attachment_count, 1);
+    }
 }

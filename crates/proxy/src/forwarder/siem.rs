@@ -409,6 +409,118 @@ mod tests {
         assert!(SiemHmacKey::from_hex("abc").is_err()); // odd length
     }
 
+    #[test]
+    fn key_error_display_exposes_inner_string_without_prefix() {
+        // KeyError uses `#[error("{0}")]` — the operator sees the raw inner
+        // message verbatim (no "siem key: " prefix), so the per-branch
+        // messages from `from_hex` are what dashboard filters key on.
+        // (Matched on the Result rather than `unwrap_err`-ed because
+        // KeyError intentionally has no Debug-print of the source key.)
+        let err = SiemHmacKey::from_hex("abc")
+            .map(|_| ())
+            .expect_err("odd-length must error");
+        assert_eq!(err.to_string(), "HMAC key hex length must be even");
+    }
+
+    #[test]
+    fn build_error_display_carries_siem_forwarder_build_prefix() {
+        // BuildError adds `siem forwarder build: ` — the setup-status path
+        // renders this verbatim so operators distinguish a key-parse fault
+        // (KeyError) from a reqwest::Client construction fault (BuildError).
+        let e = BuildError("transport init: dns lookup failed".into());
+        assert_eq!(
+            e.to_string(),
+            "siem forwarder build: transport init: dns lookup failed"
+        );
+    }
+
+    #[test]
+    fn from_hex_distinguishes_odd_and_too_short_branches() {
+        // Two distinct length checks fire in order: odd-length first
+        // (catches the lone-nibble case before the >= 32 check would lump
+        // it in with the "too short" branch). A regression that collapsed
+        // both into "invalid length" would lose the actionable hint.
+        let odd = SiemHmacKey::from_hex("abc").map(|_| ()).unwrap_err();
+        assert!(odd.to_string().contains("even"), "odd-len → {odd}");
+        let short = SiemHmacKey::from_hex("dead").map(|_| ()).unwrap_err();
+        assert!(
+            short.to_string().contains("16 bytes"),
+            "too-short → {short}"
+        );
+    }
+
+    #[test]
+    fn from_hex_invalid_hex_char_carries_position_index_in_message() {
+        // Operator triages a typo'd env var by reading the byte offset out
+        // of the message — pin both the `invalid hex at` prefix and the
+        // numeric position so a sloppy refactor that lost the index would
+        // surface here. 'g' is not a hex digit.
+        let mut s = "00".repeat(16);
+        s.replace_range(2..4, "0g");
+        let err = SiemHmacKey::from_hex(&s).map(|_| ()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid hex at"), "{msg}");
+        assert!(msg.contains(" 2"), "expected position offset 2 in: {msg}");
+    }
+
+    #[test]
+    fn from_hex_accepts_32_char_minimum_and_rejects_30_just_below() {
+        // 32 hex chars = 16 bytes = the documented minimum (RFC 2104 §5
+        // recommends ≥L; SHA-256 L=32 bytes is stricter still — but the
+        // implementation gates at 16 for parity with common SIEM webhook
+        // shared-secret advice). Pin both edges: 32 passes, 30 fails.
+        assert!(SiemHmacKey::from_hex(&"a".repeat(32)).is_ok());
+        let err = SiemHmacKey::from_hex(&"a".repeat(30))
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("16 bytes"), "{err}");
+    }
+
+    #[test]
+    fn sign_matches_rfc4231_test_vector_1_for_hmac_sha256() {
+        // RFC 4231 §4.2 Test Case 1: Key = 0x0b × 20, Data = "Hi There",
+        // expected HMAC-SHA256 tag =
+        // b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7.
+        // Pinning this catches any future swap of the HMAC primitive (a
+        // SHA-1 / SHA-384 mis-wire would silently break every existing
+        // SIEM receiver expecting SHA-256).
+        let key = SiemHmacKey::from_hex(&"0b".repeat(20)).unwrap();
+        let sig = key.sign(b"Hi There");
+        assert_eq!(
+            sig,
+            "sha256=b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn sign_diverges_when_key_changes_for_identical_body() {
+        // Existing `hmac_key_round_trip` test pins divergence on body
+        // change but not on key change — a regression that ignored the
+        // key (e.g. a stub that hashed the body alone) would silently
+        // satisfy that test. This pins the key axis.
+        let k1 = SiemHmacKey::from_hex(&"aa".repeat(16)).unwrap();
+        let k2 = SiemHmacKey::from_hex(&"bb".repeat(16)).unwrap();
+        let body = b"identical body";
+        assert_ne!(k1.sign(body), k2.sign(body));
+    }
+
+    #[test]
+    fn sign_is_lowercase_hex_with_fixed_prefix_and_length() {
+        // Receivers strip the `sha256=` prefix and hex-decode the rest, so
+        // an uppercase or wrong-length regression would silently break
+        // signature verification at every existing integration.
+        let key = SiemHmacKey::from_hex(&"00".repeat(16)).unwrap();
+        let sig = key.sign(b"any body");
+        let body = sig
+            .strip_prefix("sha256=")
+            .expect("must carry sha256= prefix");
+        assert_eq!(body.len(), 64, "SHA-256 hex tag is 64 chars: {sig}");
+        assert!(
+            body.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "tag must be lowercase hex: {sig}"
+        );
+    }
+
     #[tokio::test]
     async fn posts_event_with_signature_header() {
         let server = MockServer::start().await;

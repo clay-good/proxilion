@@ -610,6 +610,111 @@ mod tests {
     }
 
     #[test]
+    fn slack_build_error_display_carries_slack_build_prefix() {
+        // Operator-facing error envelope: the prefix lets setup-status
+        // surface this distinctly from a webhook or SIEM build fault.
+        let e = SlackBuildError("reqwest client: dns resolve failed".into());
+        assert_eq!(
+            e.to_string(),
+            "slack build: reqwest client: dns resolve failed"
+        );
+    }
+
+    #[test]
+    fn plural_renders_singular_at_one_and_pluralizes_zero_and_many() {
+        // Slack copy reads "1 block suppressed" vs "0 blocks suppressed" /
+        // "7 blocks suppressed". A regression that treated only `n == 0` as
+        // plural (the natural off-by-one) would surface here as "0 block".
+        assert_eq!(plural(0, "block"), "0 blocks");
+        assert_eq!(plural(1, "block"), "1 block");
+        assert_eq!(plural(2, "block"), "2 blocks");
+        assert_eq!(plural(42, "request"), "42 requests");
+    }
+
+    #[test]
+    fn truncate_passes_short_through_and_ellipsizes_at_overflow() {
+        // No ellipsis when within limit (exact-limit included — `chars().count() > n`
+        // is strict greater-than).
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+        // Overflow adds a single horizontal-ellipsis char (one codepoint,
+        // three bytes — the slack `mrkdwn` element renders it as a single
+        // glyph; a regression that emitted `...` instead would break the
+        // 140-char visual width budget the context block depends on).
+        let out = truncate("hello world", 5);
+        assert_eq!(out, "hello…");
+    }
+
+    #[test]
+    fn truncate_uses_char_count_not_byte_len_for_multibyte_input() {
+        // Each Greek alpha is two bytes; `n=3` must keep three glyphs, not
+        // three bytes (which would split a codepoint and panic the
+        // serializer downstream).
+        assert_eq!(truncate("ααααα", 3), "ααα…");
+        // Symmetric: at exact-limit no ellipsis even when bytes > n.
+        assert_eq!(truncate("ααα", 3), "ααα");
+    }
+
+    #[test]
+    fn parse_button_value_round_trip_reject_action() {
+        // The existing test pinned `approve` and `why`; pin `reject` too —
+        // it's the destructive action and the interaction webhook routes
+        // on the variant identity.
+        let id = Uuid::new_v4();
+        let (a, parsed) = parse_button_value(&format!("reject:{id}")).unwrap();
+        assert_eq!(a, SlackAction::Reject);
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn parse_button_value_rejects_known_action_with_bad_uuid() {
+        // The split + verb-match succeeds but the second half is not a
+        // valid UUID — the function must return None rather than panic
+        // or fall through to a default UUID.
+        assert!(parse_button_value("approve:not-a-uuid").is_none());
+        assert!(parse_button_value("reject:").is_none());
+        // Multiple colons: split_once takes the first, so the verb is
+        // "approve" and the rest "abc:def" — neither a valid UUID nor a
+        // re-split target.
+        assert!(parse_button_value("approve:abc:def").is_none());
+    }
+
+    #[test]
+    fn slack_action_copy_and_eq_traits_work_at_use_sites() {
+        // The interaction webhook routes by matching on the enum variant
+        // after a `Copy`; a regression that dropped `Copy` or `PartialEq`
+        // would surface here as a compile error rather than as a confusing
+        // failure at the routing call site.
+        let a = SlackAction::Approve;
+        let a2 = a; // Copy
+        assert_eq!(a, a2);
+        assert_ne!(SlackAction::Approve, SlackAction::Reject);
+        assert_ne!(SlackAction::Reject, SlackAction::Why);
+    }
+
+    #[test]
+    fn resolve_user_returns_none_when_map_is_empty_or_no_inputs() {
+        // The default `SlackNotifier::new` constructor leaves the user
+        // map empty — every lookup must surface None (caller falls back
+        // to `slack:<username>`). A regression that pre-seeded a default
+        // mapping would attribute overrides to the wrong subject.
+        let n = SlackNotifier::new(
+            "https://hooks.slack.com/services/T/B/X".into(),
+            SlackSigningSecret::new("s"),
+            "https://proxy.local".into(),
+        )
+        .unwrap();
+        assert!(n.resolve_user(Some("U01ABC"), None).is_none());
+        assert!(n.resolve_user(None, Some("alice")).is_none());
+        // Both inputs None — never matches.
+        assert!(n.resolve_user(None, None).is_none());
+        // Public-URL accessor pins the field-name round-trip while we
+        // already hold a notifier (cheap symmetric guard for a getter the
+        // approve/reject URL builders depend on).
+        assert_eq!(n.proxy_public_url(), "https://proxy.local");
+    }
+
+    #[test]
     fn verify_rejects_wrong_prefix() {
         let secret = SlackSigningSecret::new("abc");
         let ts = std::time::SystemTime::now()

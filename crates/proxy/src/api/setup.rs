@@ -404,6 +404,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn check_item_id_field_is_static_str_for_zero_alloc_logging() {
+        // The `id` field is `&'static str` (not `String`) — load-bearing
+        // for the operator-visible Grafana panel key (`item.id == "database"`)
+        // and so log aggregators can intern it without allocation. A
+        // refactor to `String` for "consistency with detail" would
+        // silently double the per-item memory cost and add an allocation
+        // to every /api/v1/setup/status response. Pin via compile-time
+        // shape: assigning a static literal must round-trip exactly,
+        // and the JSON wire shape stays unquoted-quoted-string regardless.
+        let item = CheckItem {
+            id: "database",
+            title: "Postgres reachable",
+            ok: true,
+            detail: "ok".into(),
+            fix: None,
+            docs: "https://docs.example/db",
+        };
+        // The `'static` lifetime constraint is enforced at compile time
+        // by the field type — this pure-helper test pins the wire shape
+        // and that the literal flows through unmodified.
+        assert_eq!(item.id, "database");
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["id"], "database");
+    }
+
     #[tokio::test]
     async fn setup_error_response_body_carries_fix_and_docs_hints() {
         // The 500 envelope must surface the troubleshooting link AND a

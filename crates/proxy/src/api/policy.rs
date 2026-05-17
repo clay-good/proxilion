@@ -325,4 +325,32 @@ mod tests {
             serde_json::from_str(r#"{"mode":"disabled","audit_note":"experiment"}"#).unwrap();
         assert_eq!(b.mode, "disabled");
     }
+
+    #[test]
+    fn parse_listing_preserves_source_order_across_multiple_policies() {
+        // The admin UI's policy table relies on the source YAML's order
+        // being preserved verbatim (operators sort their policies by
+        // intent — most-specific first; alphabetizing them on the wire
+        // would break the mental model). serde_yaml's Vec<Value> parse
+        // preserves order, and parse_listing's filter_map preserves it
+        // too. Pin via three policies authored in deliberately non-
+        // alphabetical order — a refactor that switched to a HashMap or
+        // BTreeMap as intermediate state would silently sort the output.
+        let yaml = "\
+- id: zeta
+  vendor: google
+  action: gmail.messages.send
+- id: alpha
+  vendor: google
+  action: drive.files.get
+- id: mu
+  vendor: google
+  action: calendar.events.list
+";
+        let v = parse_listing(yaml);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].id, "zeta", "source order preserved at index 0");
+        assert_eq!(v[1].id, "alpha", "source order preserved at index 1");
+        assert_eq!(v[2].id, "mu", "source order preserved at index 2");
+    }
 }

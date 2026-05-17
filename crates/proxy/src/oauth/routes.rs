@@ -859,4 +859,108 @@ mod tests {
         );
         assert_ne!(c1, c2);
     }
+
+    #[test]
+    fn intersect_scope_filters_gmail_readonly_when_only_send_ops_present() {
+        // Cross-scope filter pin: the operator-granted scope set
+        // includes both `gmail.readonly` AND `gmail.send` but the PCA-0
+        // op set only carries `gmail:send:...` ops (the agent never
+        // declared intent to read). The intersection must keep
+        // `gmail.send` (matches `gmail:send:` prefix) AND drop
+        // `gmail.readonly` (no op starts with `gmail:read:`) — a
+        // regression that conflated the two `gmail:` prefixes would
+        // silently grant gmail.readonly down to PCA-1 and let a
+        // compromised refresh path read mail the agent never authorized
+        // to touch. Pinned explicitly because the existing
+        // `intersect_scope_keeps_only_scopes_with_matching_ops_prefix`
+        // test only tested drive (a single-prefix vendor), not the
+        // split-prefix gmail case.
+        let scope = "openid email \
+            https://www.googleapis.com/auth/gmail.readonly \
+            https://www.googleapis.com/auth/gmail.send";
+        let ops = vec!["gmail:send:user:to:domain".into()];
+        let kept = intersect_scope_with_ops(scope, &ops);
+        assert!(
+            kept.contains("openid"),
+            "openid always kept regardless of ops: {kept}",
+        );
+        assert!(kept.contains("email"), "email always kept: {kept}");
+        assert!(
+            kept.contains("gmail.send"),
+            "gmail.send kept because gmail:send: op present: {kept}",
+        );
+        assert!(
+            !kept.contains("gmail.readonly"),
+            "gmail.readonly must be filtered when only gmail:send: ops present: {kept}",
+        );
+    }
+
+    #[test]
+    fn narrowed_ops_for_pca1_drive_readonly_keeps_all_drive_prefix_ops() {
+        // Drive has only one prefix in `intersect_scope_with_ops`
+        // (`drive:`), but `narrowed_ops_for_pca1` maps BOTH
+        // `drive.readonly` AND `drive` to the same `drive:` prefix —
+        // unlike calendar which splits readonly vs full. The existing
+        // `narrowed_ops_for_pca1_keeps_only_prefixed_ops` test pins the
+        // bare `drive` scope; the readonly variant was unpinned.
+        // Pinning explicitly: `drive.readonly` granted scope must keep
+        // even `drive:write:...` ops in the PCA-1 narrow (the prefix
+        // match is the gate, not a per-op verb check) — the OAuth scope
+        // layer of restriction is upstream (Google won't issue a write
+        // token under drive.readonly); the narrow layer's job is just
+        // to filter ops that don't share the prefix at all.
+        let pca0_ops = vec![
+            "drive:read:files".into(),
+            "drive:write:files".into(),
+            "gmail:send:user".into(),
+        ];
+        let kept =
+            narrowed_ops_for_pca1(&pca0_ops, "https://www.googleapis.com/auth/drive.readonly");
+        assert_eq!(kept.len(), 2, "drive.readonly maps to bare drive: prefix");
+        assert!(kept.contains(&"drive:read:files".into()));
+        assert!(kept.contains(&"drive:write:files".into()));
+        assert!(
+            !kept.iter().any(|s| s.starts_with("gmail:")),
+            "gmail ops must be filtered: {kept:?}",
+        );
+    }
+
+    #[test]
+    fn narrowed_ops_for_pca1_unknown_scope_in_mix_falls_through_filter() {
+        // A scope string with both known + unknown segments must keep
+        // ops matching the known prefixes and silently drop the unknown
+        // segment without panic — a future Google scope addition lands
+        // here before the proxy's mapping table is updated; ignoring
+        // unknown scopes (rather than erroring) is the intentional
+        // forward-compat shape. Pinned because the existing tests cover
+        // empty-input + single-known-scope but never the mixed
+        // known+unknown shape.
+        let pca0_ops = vec!["drive:read:files".into(), "calendar:read:events".into()];
+        let scope = "https://www.googleapis.com/auth/drive \
+            https://www.googleapis.com/auth/some.future.scope.we.dont.know.yet";
+        let kept = narrowed_ops_for_pca1(&pca0_ops, scope);
+        assert_eq!(kept, vec!["drive:read:files"]);
+    }
+
+    #[test]
+    fn new_auth_code_alphabet_excludes_padding_char_and_digits_0_1_8_9() {
+        // RFC 4648 base32 (no padding) uses `A-Z2-7` exclusively. The
+        // existing test pins the uppercase + 2-7 happy path on one
+        // sample, but never asserts the forbidden chars (`=` padding,
+        // `0`/`1`/`8`/`9` digits) DON'T appear across multiple samples.
+        // Pinning the negative across N=8 samples (256 random bytes
+        // total) catches a refactor that swapped to Crockford's base32
+        // (which uses 0/1/8/9) or to standard padded base32 (`=`-padded).
+        for _ in 0..8 {
+            let c = new_auth_code();
+            assert!(
+                !c.contains('='),
+                "padding char must never appear in no-padding alphabet: {c}",
+            );
+            assert!(
+                !c.chars().any(|ch| matches!(ch, '0' | '1' | '8' | '9')),
+                "RFC 4648 alphabet excludes 0/1/8/9: {c}",
+            );
+        }
+    }
 }

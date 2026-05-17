@@ -62,6 +62,23 @@ mod tests {
     }
 
     #[test]
+    fn google_api_base_fallback_uses_https_scheme_not_http() {
+        // Defense-in-depth on the production-fallback URL: a regression
+        // that dropped the `https://` prefix (or fat-fingered `http://`)
+        // would route adapter calls to plaintext on the production
+        // googleapis hostname — every request would fail TLS but the
+        // failure mode is a 30s connect timeout rather than a clean
+        // error, masking the misconfiguration in alerts. Pin the
+        // scheme prefix explicitly.
+        let s = resolve(None);
+        assert!(s.starts_with("https://"), "expected https scheme: {s}");
+        assert!(
+            !s.starts_with("http://"),
+            "fallback URL must not be plaintext: {s}",
+        );
+    }
+
+    #[test]
     fn google_api_base_respects_override_for_wiremock_tests() {
         // The wiremock integration tests in `crates/proxy/tests/` configure
         // an `AdapterState` with the mock server URL here. Pin the precedence

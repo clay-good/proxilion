@@ -494,6 +494,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slack_err_carries_application_json_content_type_header() {
+        // The error helper is responsible for the response's content-type
+        // header — Slack's client renders the inline-message body iff the
+        // header is `application/json`. A regression that dropped the
+        // header (or emitted `text/plain` from a copy-paste with the
+        // catch-all error handler) would silently turn every operator-
+        // facing button-click error into an unrendered raw-text bubble.
+        let r = slack_err(StatusCode::BAD_REQUEST, "missing payload");
+        let ct = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+    }
+
+    #[tokio::test]
+    async fn slack_ok_message_carries_application_json_content_type_header() {
+        // Symmetric to the err-helper test above — pin that the success
+        // path also serializes with `content-type: application/json`.
+        // The two helpers share the same Slack-rendering contract and
+        // must move in lockstep; a divergence (e.g. err uses
+        // application/json but ok forgets it) would silently break the
+        // happy-path inline-message render.
+        let r = slack_ok_message("Approved.");
+        let ct = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+    }
+
+    #[tokio::test]
     async fn slack_ok_message_carries_empty_text_through_to_wire() {
         // Edge: the synthesized success message can be empty in the
         // future if a feature flag elides per-action text. Pin that

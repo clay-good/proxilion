@@ -135,6 +135,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_repeated_same_hash_remains_killed_no_panic() {
+        // `mark` is `insert` under the hood; moka's `insert` of an existing
+        // key is a no-op replace, not an error. Pin idempotency on the
+        // happy path — the killswitch handler may be called twice for the
+        // same row across a quick retry; the second `mark` must not panic
+        // and the hash must remain killed. A regression to a Vec-backed
+        // duplicate-rejecting impl would surface here.
+        let kc = KillCache::new();
+        let h = [3u8; 32];
+        kc.mark(h).await;
+        kc.mark(h).await;
+        kc.mark(h).await;
+        assert!(kc.is_killed(&h).await);
+    }
+
+    #[tokio::test]
+    async fn neighbor_hash_differing_by_one_byte_is_not_killed() {
+        // Pin byte-for-byte hash equality: marking `[7u8; 32]` must NOT
+        // also kill `[7u8; 32]` with byte 0 flipped to `6`. A regression
+        // that compared hash prefixes (e.g. 16-byte hash truncation for
+        // "faster lookup") would let one revoked bearer also kill a
+        // neighbor that happens to share a prefix.
+        let kc = KillCache::new();
+        let marked = [7u8; 32];
+        let mut neighbor = [7u8; 32];
+        neighbor[0] = 6;
+        kc.mark(marked).await;
+        assert!(kc.is_killed(&marked).await);
+        assert!(!kc.is_killed(&neighbor).await);
+    }
+
+    #[tokio::test]
     async fn mark_many_with_empty_iterator_is_noop() {
         // `mark_many` is called from killswitch handlers in a loop over
         // UPDATE's RETURNING; if the UPDATE matched zero rows the iterator

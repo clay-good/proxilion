@@ -225,6 +225,24 @@ mod tests {
     }
 
     #[test]
+    fn handle_new_with_initial_none_first_current_is_none() {
+        // Symmetric to `handle_new_with_initial_some_carries_through_first_current_call`
+        // — pin that constructing with `None` yields `None` on first read
+        // (not a default-built notifier from a refactor that pre-populated
+        // an empty `Arc<T>` "for ergonomics"). The boot path's "no
+        // notifier configured" branch and the `Notifiers::empty()` shape
+        // both depend on this invariant.
+        let h: NotifierHandle = Handle::new(None);
+        assert!(
+            h.current().is_none(),
+            "initial None must surface on first read"
+        );
+        // Repeat reads of the same None must not flip to Some (defends
+        // against a lazy-init refactor that materializes on first call).
+        assert!(h.current().is_none());
+    }
+
+    #[test]
     fn any_configured_triggers_on_slack_alone() {
         // Symmetric coverage to `bundle_any_configured_when_webhook_set`.
         // The OR-chain is easy to break with a copy-paste typo (`||

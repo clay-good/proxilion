@@ -192,6 +192,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_sinks_publish_skips_join_all_branch_without_panic() {
+        // The `if self.sinks.is_empty() { return; }` early-return is the
+        // hot path for installs that haven't configured a SIEM or NATS
+        // forwarder — pin both that the early-return is taken (no panic
+        // on `Vec::with_capacity(0)`-then-join_all of an empty future
+        // set, which is the natural shape if a refactor dropped the
+        // guard) and that the primary still gets the event.
+        let primary = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary.clone());
+        // Three sequential publishes — exercise the empty-sinks branch
+        // multiple times so a stateful regression (e.g. a once-cell that
+        // sets sinks after first call) would surface.
+        tee.publish(sample()).await;
+        tee.publish(sample()).await;
+        tee.publish(sample()).await;
+        assert_eq!(primary.0.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn each_sink_receives_independent_clone() {
         // The fan-out clones the event per sink — each sink must see every
         // field intact (not a default-filled placeholder from a moved value).

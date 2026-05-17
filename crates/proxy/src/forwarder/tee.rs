@@ -127,6 +127,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fans_out_to_five_sinks_concurrently_without_dropping_any() {
+        // The fan-out uses `join_all` over a Vec built from `&self.sinks`
+        // — every registered sink must receive the event regardless of
+        // how many there are. Pin a width > 3 so a refactor that
+        // accidentally hard-coded a small `tokio::select!` branch or a
+        // 2-tuple fan-out doesn't silently truncate the sink list.
+        let primary = Arc::new(Collector::default());
+        let sinks: Vec<Arc<Collector>> = (0..5).map(|_| Arc::new(Collector::default())).collect();
+        let mut tee = TeeStream::new(primary.clone());
+        for s in &sinks {
+            tee = tee.with_sink(s.clone());
+        }
+        tee.publish(sample()).await;
+        assert_eq!(primary.0.lock().unwrap().len(), 1);
+        for s in &sinks {
+            assert_eq!(s.0.lock().unwrap().len(), 1);
+        }
+        assert_eq!(tee.sink_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn primary_publishes_before_secondary_sinks() {
+        // The doc comment guarantees primary is awaited synchronously
+        // BEFORE the secondary fan-out runs (so the durable
+        // `action_events` row is committed before any best-effort
+        // forwarder sees the event). Pin the ordering with a single
+        // shared Mutex<Vec<&str>> that each collector tags itself
+        // into — primary must always land first. A refactor that
+        // moved `primary.publish(...).await` into the join_all set
+        // would silently break the "durable record exists by the
+        // time a NATS subscriber sees the event" invariant.
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct Tag {
+            label: &'static str,
+            order: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ActionStream for Tag {
+            async fn publish(&self, _e: ActionEvent) {
+                self.order.lock().unwrap().push(self.label);
+            }
+        }
+
+        let primary = Arc::new(Tag {
+            label: "primary",
+            order: order.clone(),
+        });
+        let s1 = Arc::new(Tag {
+            label: "s1",
+            order: order.clone(),
+        });
+        let s2 = Arc::new(Tag {
+            label: "s2",
+            order: order.clone(),
+        });
+        let tee = TeeStream::new(primary).with_sink(s1).with_sink(s2);
+        tee.publish(sample()).await;
+        let v = order.lock().unwrap().clone();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], "primary", "primary must publish first; got {v:?}");
+    }
+
+    #[tokio::test]
     async fn each_sink_receives_independent_clone() {
         // The fan-out clones the event per sink — each sink must see every
         // field intact (not a default-filled placeholder from a moved value).

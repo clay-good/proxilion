@@ -220,4 +220,69 @@ mod tests {
         let s = LoggingStream;
         s.publish(sample()).await;
     }
+
+    #[test]
+    fn leaf_pca_id_round_trips_through_json_when_some() {
+        // `leaf_pca_id: Option<Uuid>` is the foreign key into pca_cache —
+        // serde must preserve a `Some(Uuid)` exactly (string form, no
+        // hyphen drift). A refactor to `#[serde(with = "...")]` on this
+        // field could silently switch to the simple (no-hyphen) form;
+        // pin the hyphenated wire shape since downstream NATS / SIEM
+        // consumers parse it through `Uuid::parse_str` which accepts
+        // both forms but operators grep for the hyphenated one.
+        let mut e = sample();
+        let id = Uuid::new_v4();
+        e.leaf_pca_id = Some(id);
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(&format!("\"leaf_pca_id\":\"{id}\"")), "got: {s}");
+        let back: ActionEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.leaf_pca_id, Some(id));
+    }
+
+    #[test]
+    fn status_u16_round_trips_as_unquoted_integer() {
+        // `status: u16` MUST land in JSON as a bare integer (not a
+        // string). Grafana dashboards alert on `status >= 500` with a
+        // numeric comparison; a refactor that wrapped the field in
+        // `#[serde(with = "string")]` would silently break every
+        // operator alert. Pin the unquoted form on the wire.
+        let mut e = sample();
+        e.status = 503;
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"status\":503"), "got: {s}");
+        // And the boundary u16 max — confirm no clipping or overflow.
+        e.status = u16::MAX;
+        let s = serde_json::to_string(&e).unwrap();
+        let back: ActionEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.status, u16::MAX);
+    }
+
+    #[test]
+    fn quarantined_count_round_trips_as_unsigned_integer() {
+        // `quarantined_count: usize` is the read-filter scan tally.
+        // Pin both the wire form (bare integer, never null/string) and
+        // the round-trip — a refactor that switched to `i64` for SQL
+        // alignment would change the deserialization domain (allowing
+        // negatives), which is exactly the regression this test catches.
+        let mut e = sample();
+        e.quarantined_count = 17;
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"quarantined_count\":17"), "got: {s}");
+        let back: ActionEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.quarantined_count, 17);
+        // Negative-string rejection — the wire form is unsigned.
+        let bad = s.replace("\"quarantined_count\":17", "\"quarantined_count\":-1");
+        assert!(serde_json::from_str::<ActionEvent>(&bad).is_err());
+    }
+
+    #[test]
+    fn logging_stream_default_produces_usable_instance() {
+        // `LoggingStream` derives `Default` — pin the derive so a
+        // refactor that gave it state (e.g. a `target: String`) and
+        // dropped the `Default` derive without a manual impl would
+        // surface at test time rather than at the call site that
+        // builds `LoggingStream::default()` in dev-mode wiring.
+        let _s: LoggingStream = LoggingStream;
+        let _s2: LoggingStream = Default::default();
+    }
 }

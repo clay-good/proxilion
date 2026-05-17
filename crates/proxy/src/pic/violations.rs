@@ -150,4 +150,102 @@ mod tests {
             vec!["a:1".to_string(), "b:2".to_string()],
         );
     }
+
+    #[test]
+    fn parse_atoms_uses_first_bracket_pair_only_ignoring_trailing_brackets() {
+        // The Trust Plane refusal body sometimes embeds a second
+        // bracketed list (e.g. `missing [a, b] (predecessor had [x, y])`).
+        // The parser keys on the FIRST `[` and the first `]` after it,
+        // so only `a, b` is surfaced — the trailing pair is ignored.
+        // Pin this so a future refactor that scans every bracket pair
+        // doesn't silently merge the two lists.
+        assert_eq!(
+            parse_missing_atoms("missing [a:1, b:2] (predecessor had [x:9, y:9])"),
+            vec!["a:1".to_string(), "b:2".to_string()],
+        );
+    }
+
+    #[test]
+    fn parse_atoms_close_before_open_returns_empty_without_panic() {
+        // Malformed body where a stray `]` appears before any `[`. The
+        // parser must not slice with a negative offset (which would
+        // panic on usize) nor mistake the orphan `]` for a list end. We
+        // pin this because `detail.find('[')` then `detail[open+1..]
+        // .find(']')` is the load-bearing two-step — a refactor to
+        // `detail.find(']')` first would flip the contract and could
+        // panic on `]a:1` (open uninitialized) or worse, return atoms
+        // from before the `[`.
+        assert!(parse_missing_atoms("] orphan close before [a:1]").len() == 1);
+        assert!(parse_missing_atoms("] orphan with no open").is_empty());
+    }
+
+    #[test]
+    fn parse_atoms_mixed_single_and_double_quotes_strip_both() {
+        // The Trust Plane has been observed emitting both single-quoted
+        // and double-quoted atoms in the same list (e.g. when one
+        // serializer wraps and another doesn't). Pin that the
+        // `trim_matches` closure strips BOTH quote characters — a
+        // refactor that hardcoded `'"'` only would leak a leading `'`
+        // into the resulting atom string.
+        assert_eq!(
+            parse_missing_atoms(r#"missing ["a:b:c", 'd:e:f', g:h:i]"#),
+            vec![
+                "a:b:c".to_string(),
+                "d:e:f".to_string(),
+                "g:h:i".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_atoms_whitespace_only_segments_are_dropped() {
+        // `"[ , , a:1, ]"` is the degenerate trailing/leading-comma
+        // case the round-7 backfill skipped. After `trim()` the empty
+        // segments become `""` and the `.filter(|s| !s.is_empty())`
+        // step must drop them — pin this so a regression that uses
+        // `.filter(|s| !s.is_empty() || include_empty)` (a feature
+        // flag landing for some debug mode, say) doesn't silently
+        // surface phantom empty atoms to the operator UI.
+        assert_eq!(parse_missing_atoms("[ , , a:1, ]"), vec!["a:1".to_string()],);
+    }
+
+    #[test]
+    fn pic_violation_record_clone_preserves_all_borrowed_slices() {
+        // PicViolationRecord is `Clone` and carries five `&str`/`&[]`
+        // borrows + a `Uuid` + a `&'static str` mode tag. The Clone
+        // derive is load-bearing — `persist()` takes the struct by
+        // value, but several adapter call sites build one Record and
+        // pass it to two sinks (the audit-mode logger + the
+        // pic_violations writer). A refactor that accidentally dropped
+        // the `Clone` derive would force a borrow-checker rewrite and
+        // could change the shape of the call sites. Pin the trait.
+        let req = Uuid::new_v4();
+        let sess = Uuid::new_v4();
+        let pred = Uuid::new_v4();
+        let ops = vec!["a:b:c".to_string()];
+        let atoms = vec!["x:y:z".to_string()];
+        let r = PicViolationRecord {
+            request_id: req,
+            session_id: sess,
+            p_0: Some("alice@demo.local"),
+            vendor: "google",
+            action: "drive.files.get",
+            method: "GET",
+            path: "/drive/v3/files/abc",
+            policy_id: Some("drive-read-gate"),
+            predecessor_pca_id: Some(pred),
+            attempted_ops: &ops,
+            missing_atoms: &atoms,
+            pic_mode: "runtime_gate",
+            detail: Some("missing [x:y:z]"),
+        };
+        let c = r.clone();
+        assert_eq!(c.request_id, req);
+        assert_eq!(c.session_id, sess);
+        assert_eq!(c.predecessor_pca_id, Some(pred));
+        assert_eq!(c.attempted_ops.len(), 1);
+        assert_eq!(c.missing_atoms[0], "x:y:z");
+        assert_eq!(c.pic_mode, "runtime_gate");
+        assert_eq!(c.p_0, Some("alice@demo.local"));
+    }
 }

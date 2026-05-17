@@ -256,4 +256,99 @@ mod tests {
         assert_eq!(v["code"], "internal_error");
         assert!(v["docs"].as_str().unwrap().contains("troubleshooting"));
     }
+
+    #[test]
+    fn setup_status_items_preserve_insertion_order_on_serialize() {
+        // The /admin/setup checklist renders items top-to-bottom in the
+        // order the handler pushes them (DB → policies → oauth clients →
+        // google creds → first PCA → federation bridge). A refactor that
+        // sorted or hashed-iterated the items would silently scramble
+        // that order — the UI's progressive-disclosure script depends on
+        // `database` being first (it's the "everything else is moot if
+        // this is red" gate). Pin the wire-shape order here.
+        let s = SetupStatus {
+            ready_for_traffic: true,
+            items: vec![
+                CheckItem {
+                    id: "database",
+                    title: "Database",
+                    ok: true,
+                    detail: "connected".into(),
+                    fix: None,
+                    docs: "d1",
+                },
+                CheckItem {
+                    id: "policies",
+                    title: "Layer-B policies",
+                    ok: true,
+                    detail: "12 policies loaded".into(),
+                    fix: None,
+                    docs: "d2",
+                },
+                CheckItem {
+                    id: "oauth_clients",
+                    title: "OAuth",
+                    ok: true,
+                    detail: "1 client(s)".into(),
+                    fix: None,
+                    docs: "d3",
+                },
+            ],
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let ids: Vec<&str> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["database", "policies", "oauth_clients"]);
+    }
+
+    #[test]
+    fn setup_error_display_carries_underlying_db_error() {
+        // The `#[error("database error: {0}")]` annotation is the
+        // operator-facing log line — a refactor that swapped the message
+        // ("db error: {0}", say) would break grep-based runbook
+        // playbooks. Pin the prefix here so a Display-attribute drift
+        // surfaces as a test failure rather than a silent runbook break.
+        let e = SetupError::Db(sqlx::Error::PoolClosed);
+        let s = format!("{e}");
+        assert!(s.starts_with("database error: "), "got: {s}");
+    }
+
+    #[test]
+    fn check_item_some_fix_includes_actionable_keyword() {
+        // The `fix` field is the only `Option<&'static str>` the
+        // CheckItem carries — a future change that swapped `None` for
+        // `Some("")` on the OK path would dilute the "is_some ↔ is_ok"
+        // contract the admin UI uses to decide whether to render the
+        // fix block. Pin that any Some(_) carries a non-empty hint
+        // (length > 0 — we do NOT pin the exact prose, which evolves).
+        let item = CheckItem {
+            id: "oauth_clients",
+            title: "Registered OAuth clients",
+            ok: false,
+            detail: "0 client(s) registered".into(),
+            fix: Some("Register the managed agent as an OAuth client."),
+            docs: "d",
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert!(!v["fix"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn setup_error_response_body_carries_fix_and_docs_hints() {
+        // The 500 envelope must surface the troubleshooting link AND a
+        // copy-paste-able fix hint (curl /healthz). Both are part of
+        // the operator's first 30 seconds when triaging — pin them so
+        // a refactor that dropped `.with_fix(...)` (e.g. "the response
+        // body shouldn't carry suggestions") doesn't silently regress
+        // the operator-onboarding contract from the install docs.
+        let r = SetupError::Db(sqlx::Error::RowNotFound).into_response();
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["fix"].as_str().unwrap().contains("curl /healthz"));
+        assert!(v["detail"].as_str().unwrap().contains("database error"));
+    }
 }

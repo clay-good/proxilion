@@ -131,6 +131,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn debug_omits_bearer_hash_and_leaf_pca_cbor_to_avoid_leaking_credential_material() {
+        // bearer_hash is the SHA-256 the killswitch SQL predicate keys on
+        // (knowing it lets an attacker construct a kill-row); leaf_pca_cbor
+        // carries the signed PCA bytes. Both are intentionally absent from
+        // the Debug impl. A future field added without updating Debug would
+        // surface here.
+        let ctx = sample_ctx();
+        let s = format!("{ctx:?}");
+        assert!(
+            !s.contains("bearer_hash"),
+            "bearer_hash leaked in Debug: {s}"
+        );
+        assert!(
+            !s.contains("leaf_pca_cbor"),
+            "leaf_pca_cbor leaked in Debug: {s}"
+        );
+    }
+
+    #[test]
+    fn session_ctx_clone_shares_arc_with_original() {
+        // The #[derive(Clone)] on SessionCtx tuple-clones the inner Arc
+        // rather than deep-copying the context — this is the invariant
+        // every spawned task depends on (cheap clone for fan-out). A
+        // refactor to `pub struct SessionCtx(pub SessionContext)` would
+        // surface here as an Arc::ptr_eq failure rather than as a silent
+        // performance/correctness regression at use sites.
+        let ctx = Arc::new(sample_ctx());
+        let a = SessionCtx(ctx.clone());
+        let b = a.clone();
+        assert!(Arc::ptr_eq(&a.0, &b.0));
+        assert!(Arc::ptr_eq(&a.0, &ctx));
+    }
+
+    #[tokio::test]
+    async fn session_extract_error_body_is_exactly_twelve_bytes() {
+        // Pin the body length so a refactor that appended a CRLF, JSON
+        // wrapper, or HTML envelope would surface here. Operator alerts
+        // key on the 401 rate for this fixed-body path as the "agent
+        // session lost" signal — changing the body shape (even just adding
+        // a trailing newline) would break log-parsing dashboards.
+        let r = SessionExtractError.into_response();
+        let bytes = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(&bytes[..], b"unauthorized");
+    }
+
     #[tokio::test]
     async fn extractor_returns_ok_when_arc_session_context_present() {
         let ctx = Arc::new(sample_ctx());

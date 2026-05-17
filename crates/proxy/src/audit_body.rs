@@ -277,4 +277,113 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
+
+    #[test]
+    fn sha256_hex_empty_input_matches_known_digest_and_is_lowercase_width_64() {
+        // Known SHA-256 of the empty string — absence-of-body still produces
+        // a recorded hash per the docstring ("Zero-length bodies are still
+        // recorded"). A regression that special-cased empty to "" would
+        // surface here.
+        let h = sha256_hex(b"");
+        assert_eq!(
+            h,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(h.len(), 64);
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
+    }
+
+    #[test]
+    fn base64_encode_round_trips_through_decoder() {
+        use base64::Engine as _;
+        for input in [&b""[..], &b"hello"[..], &b"\x00\x01\xfe\xff"[..]] {
+            let s = base64_encode(input);
+            let back = base64::engine::general_purpose::STANDARD
+                .decode(&s)
+                .unwrap();
+            assert_eq!(back, input);
+        }
+    }
+
+    #[test]
+    fn redact_pii_text_preserves_non_pii_surroundings_around_match() {
+        // The replace_all calls must keep the prefix/suffix text intact — a
+        // regression that replaced the whole string would mask data loss in
+        // audit rows that the operator UI would render as just `<REDACTED_*>`.
+        let s = redact_pii_text("hello alice@acme.com world");
+        assert!(s.starts_with("hello "));
+        assert!(s.ends_with(" world"));
+        assert!(s.contains("<REDACTED_EMAIL>"));
+    }
+
+    #[test]
+    fn redact_pii_text_replaces_multiple_pii_kinds_in_one_pass() {
+        // A single body can carry several PII shapes (email reply with phone
+        // sig + SSN paste). Pin that one call handles all three — a refactor
+        // that early-returned after the first match would surface here.
+        let s = redact_pii_text("from alice@acme.com; phone (415) 555-1234; ssn 123-45-6789");
+        assert!(
+            s.contains("<REDACTED_EMAIL>"),
+            "missing email redaction: {s}"
+        );
+        assert!(
+            s.contains("<REDACTED_PHONE>"),
+            "missing phone redaction: {s}"
+        );
+        assert!(s.contains("<REDACTED_SSN>"), "missing ssn redaction: {s}");
+        assert!(!s.contains("alice@acme.com"));
+        assert!(!s.contains("123-45-6789"));
+    }
+
+    #[test]
+    fn redact_pii_text_api_key_runs_before_phone_so_slack_token_is_not_split() {
+        // The Slack token shape begins with a 10-digit workspace id then a
+        // 10-digit channel id — both phone-shaped. Order-of-operations in
+        // `redact_pii_text` deliberately runs api_key first; a refactor that
+        // moved phone earlier would chop the token into multiple
+        // `<REDACTED_PHONE>` fragments and leak the rest. Pin the contract.
+        let xox = concat!("xox", "b-1234567890-abcdefghijklmnop");
+        let s = redact_pii_text(xox);
+        assert!(s.contains("<REDACTED_API_KEY>"), "got: {s}");
+        assert!(!s.contains("<REDACTED_PHONE>"), "phone fired first: {s}");
+    }
+
+    #[test]
+    fn redact_pii_bytes_passes_invalid_utf8_through_unchanged() {
+        // Mid-string invalid UTF-8 (no leading null so binary-detection
+        // doesn't short-circuit) must still bypass redaction — the regex
+        // engine operates on &str. A regression that lossily converted to
+        // UTF-8 would silently mutate the audit body.
+        let input = b"\xff\xfe alice@acme.com \xc3\x28";
+        let out = redact_pii_bytes(input);
+        assert_eq!(out, input.to_vec());
+    }
+
+    #[test]
+    fn redact_pii_bytes_binary_detection_only_scans_first_256_bytes() {
+        // The detector reads `take(256)`. A null byte at offset 256+ should
+        // NOT classify the buffer as binary — pin that boundary so a future
+        // bump to `take(usize::MAX)` (or a drop of the take entirely) would
+        // surface here as a behavior change rather than slip past review.
+        let mut input = vec![b'x'; 256];
+        input.extend_from_slice(b" alice@acme.com");
+        input.push(0); // null byte beyond the 256-byte scan window
+        input.extend_from_slice(b" trailing");
+        let out = redact_pii_bytes(&input);
+        // Not classified as binary → redaction applied. The null byte
+        // round-trips because str::from_utf8 accepts NUL as a valid
+        // codepoint, and the regex engine is byte-position safe.
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("<REDACTED_EMAIL>"), "got: {s}");
+    }
+
+    #[test]
+    fn redact_pii_text_empty_input_yields_empty_output() {
+        // No-pii passthrough at the trivial boundary — a regression that
+        // appended a sentinel ("<EMPTY>") would surface here.
+        assert_eq!(redact_pii_text(""), "");
+    }
 }

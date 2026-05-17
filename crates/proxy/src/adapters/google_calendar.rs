@@ -1082,4 +1082,104 @@ mod tests {
         let ctx = build_event_body_ctx(&ev, "acme.com");
         assert_eq!(ctx.get("attendee_count"), Some(&Value::from(1)));
     }
+
+    #[test]
+    fn domain_of_filters_empty_after_trim_unlike_gmail_variant() {
+        // Calendar's domain_of has an extra `.filter(|s| !s.is_empty())` step
+        // that gmail's omits — the bare `@` case lands as None here. Pin
+        // this divergence so a refactor that "unified" the two helpers
+        // doesn't silently change either contract; calendar's external_
+        // attendee gate depends on `domain_of` returning None (not Some(""))
+        // so the empty-domain attendee never flips `external_attendee`.
+        assert_eq!(domain_of("@"), None);
+        assert_eq!(domain_of(""), None);
+        // Whitespace-only domain half also collapses to None via the filter.
+        assert_eq!(domain_of("alice@   "), None);
+    }
+
+    #[test]
+    fn urlencoding_passes_unreserved_through_and_encodes_path_set_members() {
+        // The PATH set encodes ` ` `/` `?` `#` `&` `%` and CONTROLS. Walk
+        // each reserved byte individually to pin the per-byte mapping —
+        // a refactor that dropped `&` (e.g. a copy-paste from a query-
+        // string encoder) would silently break calendar IDs containing
+        // `&` against Google's path parser.
+        assert_eq!(urlencoding(" "), "%20");
+        assert_eq!(urlencoding("/"), "%2F");
+        assert_eq!(urlencoding("?"), "%3F");
+        assert_eq!(urlencoding("#"), "%23");
+        assert_eq!(urlencoding("&"), "%26");
+        assert_eq!(urlencoding("%"), "%25");
+        // Unreserved per RFC 3986 stays raw; the `@` is intentionally NOT
+        // in the PATH set since calendar IDs are typically email-shaped.
+        assert_eq!(urlencoding("ABCabc0-9._~@:"), "ABCabc0-9._~@:");
+    }
+
+    #[test]
+    fn urlencoding_handles_multibyte_utf8_and_empty_input() {
+        // `utf8_percent_encode` walks UTF-8 byte-by-byte; pin that a
+        // multibyte codepoint gets each of its bytes encoded (the
+        // CONTROLS+PATH set covers the high-bit byte range implicitly via
+        // CONTROLS = ascii 0..=0x1F + 0x7F, but `é` (0xC3 0xA9) bytes are
+        // outside CONTROLS — they stay raw). Pin both: empty in / empty
+        // out, and multibyte passthrough.
+        assert_eq!(urlencoding(""), "");
+        assert_eq!(urlencoding("résumé"), "r%C3%A9sum%C3%A9");
+    }
+
+    #[test]
+    fn body_ctx_visibility_absent_renders_no_visibility_key() {
+        // The `if let Some(v) = event.get("visibility")` branch must NOT
+        // insert `visibility: null` — the policy engine's `body.visibility`
+        // lookup differentiates "key absent" from "key present with null"
+        // and an empty-string fallback would silently match `visibility ==
+        // ""` rules. The no_attendees test asserts this implicitly; this
+        // test isolates the contract directly.
+        let ev = json!({
+            "summary": "hold",
+            "attendees": [{"email": "alice@acme.com"}],
+        });
+        let ctx = build_event_body_ctx(&ev, "acme.com");
+        assert!(
+            !ctx.contains_key("visibility"),
+            "visibility key must be absent when source field is missing"
+        );
+        // summary_present still true since `summary` was provided.
+        assert_eq!(ctx.get("summary_present"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn body_ctx_summary_absent_renders_false_not_missing_key() {
+        // Asymmetric with visibility: `summary_present` is ALWAYS inserted
+        // (the policy engine's external-meeting rule reads this as a hard
+        // boolean), with `false` when the source is missing. A refactor
+        // that "unified" both fields into the visibility-style absent-key
+        // pattern would surface here as a missing key + downstream None
+        // → false coercion, hiding the explicit contract.
+        let ev = json!({
+            "attendees": [{"email": "alice@acme.com"}],
+        });
+        let ctx = build_event_body_ctx(&ev, "acme.com");
+        assert_eq!(ctx.get("summary_present"), Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn body_ctx_external_attendee_case_insensitive_against_customer_domain() {
+        // The external check uses `eq_ignore_ascii_case`; pin that an
+        // attendee at `ALICE@Acme.COM` against `customer_domain: "acme.com"`
+        // does NOT flip external_attendee. The `domain_of` lowercase normalizer
+        // makes this case-insensitive on its own, but the symmetric guard
+        // on `customer_domain` ensures the operator-configured domain can
+        // be mixed-case in the YAML without silently flagging every internal
+        // recipient as external.
+        let ev = json!({
+            "attendees": [{"email": "Alice@Acme.COM"}],
+        });
+        let ctx = build_event_body_ctx(&ev, "ACME.COM");
+        assert_eq!(ctx.get("external_attendee"), Some(&Value::Bool(false)));
+        // attendee_domains is lowercased post-de-dup.
+        let domains = ctx.get("attendee_domains").unwrap().as_array().unwrap();
+        let s: Vec<&str> = domains.iter().filter_map(|d| d.as_str()).collect();
+        assert_eq!(s, vec!["acme.com"]);
+    }
 }

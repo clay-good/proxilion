@@ -497,6 +497,77 @@ mod tests {
     }
 
     #[test]
+    fn html_escape_does_not_double_encode_already_escaped_entities() {
+        // The helper is a single-pass byte-mapping, not a parser. Pin that
+        // `&amp;` becomes `&amp;amp;` rather than being recognized as an
+        // already-escaped entity — a "smart" escape refactor would surface
+        // here as missed double-escaping, which on a re-render via `replace`
+        // would actually under-escape and reintroduce XSS surface.
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
+        assert_eq!(html_escape("&lt;"), "&amp;lt;");
+    }
+
+    #[test]
+    fn html_escape_passes_unicode_and_empty_through_unchanged() {
+        // Non-ascii characters fall into the `_ => out.push(c)` branch and
+        // round-trip byte-identical. A regression that pre-emptively
+        // percent-encoded non-ascii would silently mangle policy
+        // descriptions in non-English deployments. Empty input → empty
+        // output for the zero-allocation boundary.
+        assert_eq!(html_escape(""), "");
+        assert_eq!(html_escape("αβγ — délicieux"), "αβγ — délicieux");
+    }
+
+    #[tokio::test]
+    async fn fill_template_html_escapes_path_and_detail_to_prevent_xss_in_stored_fields() {
+        // `path` and `detail` come from the upstream request and the policy
+        // engine respectively; both can carry user-controlled bytes (e.g.
+        // a Drive file id containing `<script>`). Pin that the template
+        // substitution html-escapes them — a refactor that swapped one
+        // `replace` for a raw insertion would reopen stored-XSS surface
+        // in the approver UI. Render through `render_form` (which calls
+        // `fill_template`) and assert the rendered HTML.
+        let row = sample_row("approve");
+        let blocked = BlockedSummary {
+            p_0: Some("eve<script>@evil.example".into()),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            path: "/drive/v3/files/<img src=x onerror=alert(1)>".into(),
+            policy_id: Some("p1".into()),
+            detail: Some("</textarea><script>steal()</script>".into()),
+            created_at: Utc::now(),
+            requested_ops: vec!["drive:read".into()],
+        };
+        let html = fill_template(&row, Some(&blocked), "<p>x</p>");
+        // Path is escaped.
+        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(!html.contains("<img src=x"));
+        // Detail is escaped (the script tag specifically).
+        assert!(html.contains("&lt;script&gt;steal()&lt;/script&gt;"));
+        assert!(!html.contains("<script>steal()"));
+        // p_0 is escaped.
+        assert!(html.contains("eve&lt;script&gt;@evil.example"));
+    }
+
+    #[tokio::test]
+    async fn render_form_reject_action_targets_approve_endpoint_with_token_id() {
+        // The reject form posts to the SAME `/notifier/approve` endpoint as
+        // the approve form — the handler routes on `action` field from the
+        // TokenRow, not on the form URL. Pin this contract; a refactor that
+        // split the endpoints (e.g. `/notifier/reject`) would silently
+        // break every reject link since the handler routing keys on the
+        // single endpoint. Also pin the hidden token field round-trips
+        // the row's UUID verbatim.
+        let mut row = sample_row("reject");
+        row.token_id = Uuid::new_v4();
+        let r = render_form(&row, &sample_blocked());
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("action=\"/notifier/approve\""));
+        assert!(html.contains(&format!("value=\"{}\"", row.token_id)));
+    }
+
+    #[test]
     fn template_substitutions_fill_all_placeholders() {
         let row = TokenRow {
             token_id: Uuid::new_v4(),

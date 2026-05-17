@@ -1011,6 +1011,39 @@ mod tests {
     }
 
     #[test]
+    fn enforce_allow_returns_ok_for_gmail_adapter() {
+        // The Allow arm of enforce_pre_request_decision had no test on
+        // the gmail adapter (drive has it as `enforce_allow_is_ok` —
+        // this is the parity guard so a refactor that touched the
+        // gmail helper alone can't silently regress the happy path).
+        // A regression that mapped Allow → AppError::Internal (the
+        // natural shape of an incomplete match arm expansion) would
+        // 500 every gmail send.
+        let r = enforce_pre_request_decision(&outcome(Decision::Allow));
+        assert!(r.is_ok(), "Allow must surface Ok, got {r:?}");
+    }
+
+    #[test]
+    fn enforce_rate_limit_returns_app_error_rate_limit_for_gmail() {
+        // The fourth arm — `Decision::RateLimit { .. }` → bare
+        // `AppError::RateLimit` (no inner field, intentional per
+        // spec.md §3.4 to hide current-window counts from abusers).
+        // Drive has `enforce_rate_limit`; this is the gmail parity
+        // guard so a refactor that started passing the rate-limit
+        // reason through to AppError on the gmail arm alone would
+        // surface here.
+        let err = enforce_pre_request_decision(&outcome(Decision::RateLimit {
+            burst: 5,
+            per_seconds: 60,
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::RateLimit),
+            "expected AppError::RateLimit, got {err:?}"
+        );
+    }
+
+    #[test]
     fn enforce_block_returns_policy_blocked() {
         let e = enforce_pre_request_decision(&outcome(Decision::Block {
             reason: "external".into(),

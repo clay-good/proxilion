@@ -1164,6 +1164,89 @@ mod tests {
     }
 
     #[test]
+    fn enforce_pre_request_decision_allow_returns_ok_for_calendar() {
+        // First test on enforce_pre_request_decision in the calendar
+        // adapter — drive + gmail each have their own coverage of this
+        // helper (drive: Allow/Block/RequireConfirmation/RateLimit;
+        // gmail: Block/RequireConfirmation), but calendar's was the
+        // gap. The three helpers are byte-identical match expressions
+        // — without coverage they could drift independently on the
+        // next refactor that touched only one. Pin all four arms here
+        // so calendar's contract moves in lockstep with its siblings.
+        let r = enforce_pre_request_decision(&outcome_with(Some("any")));
+        assert!(r.is_ok(), "Allow must surface Ok, got {r:?}");
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_block_carries_policy_id_reason_and_override_for_calendar() {
+        // Pin all three fields preserved through the `Decision::Block`
+        // → `AppError::PolicyBlocked` translation. A refactor that
+        // dropped any single field on the calendar arm (a copy-paste
+        // bug from drive that forgot to copy `override_allowed`, say)
+        // would silently change the dashboard's "this block is
+        // overridable" indicator on every calendar deny.
+        let mut o = outcome_with(Some("cal-deny"));
+        o.decision = Decision::Block {
+            reason: "external attendee".into(),
+            override_allowed: true,
+        };
+        let err = enforce_pre_request_decision(&o).unwrap_err();
+        match err {
+            AppError::PolicyBlocked {
+                policy_id,
+                reason,
+                override_allowed,
+            } => {
+                assert_eq!(policy_id.as_deref(), Some("cal-deny"));
+                assert_eq!(reason, "external attendee");
+                assert!(override_allowed);
+            }
+            other => panic!("expected PolicyBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_require_confirmation_carries_reason_for_calendar() {
+        // The agent SDK reads the reason string out of the body's
+        // `detail` field to surface a confirmation prompt to the
+        // operator. A regression that swapped the inner String for the
+        // empty string (a "redact for privacy" change) would silently
+        // strip the operator's reason from every calendar confirm
+        // prompt — pin the round-trip directly.
+        let mut o = outcome_with(Some("any"));
+        o.decision = Decision::RequireConfirmation {
+            reason: "review external event invite".into(),
+        };
+        let err = enforce_pre_request_decision(&o).unwrap_err();
+        match err {
+            AppError::RequireConfirmation(r) => {
+                assert_eq!(r, "review external event invite");
+            }
+            other => panic!("expected RequireConfirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_rate_limit_returns_app_error_for_calendar() {
+        // The fourth arm — pin `Decision::RateLimit { .. }` → bare
+        // `AppError::RateLimit` (no inner field, intentional: the
+        // rate-limit body surface deliberately hides current-window
+        // counts from abusers per spec.md §3.4). A refactor that
+        // passed the rate-limit reason through to AppError would
+        // silently start leaking server state into agent error bodies.
+        let mut o = outcome_with(Some("any"));
+        o.decision = Decision::RateLimit {
+            burst: 5,
+            per_seconds: 60,
+        };
+        let err = enforce_pre_request_decision(&o).unwrap_err();
+        assert!(
+            matches!(err, AppError::RateLimit),
+            "expected AppError::RateLimit, got {err:?}"
+        );
+    }
+
+    #[test]
     fn body_ctx_external_attendee_case_insensitive_against_customer_domain() {
         // The external check uses `eq_ignore_ascii_case`; pin that an
         // attendee at `ALICE@Acme.COM` against `customer_domain: "acme.com"`

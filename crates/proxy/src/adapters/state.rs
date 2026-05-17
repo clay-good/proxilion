@@ -79,6 +79,53 @@ mod tests {
     }
 
     #[test]
+    fn google_api_base_override_with_empty_string_returns_empty_not_fallback() {
+        // Boundary: `Option<String>::Some(String::new())` is a
+        // wire-distinct shape from `None`. The current `as_deref()`
+        // returns `Some("")` which DOES NOT trigger `unwrap_or`'s
+        // fallback — the empty string is returned verbatim. Pin
+        // this behavior so a future refactor that switched to
+        // `.filter(|s| !s.is_empty()).unwrap_or(...)` (a tempting
+        // "treat empty-string env var as unset" change) would
+        // surface here as a wire-shape difference. Today's contract:
+        // empty override is the operator's explicit choice, not a
+        // misconfigured `None`; honor it.
+        assert_eq!(resolve(Some(String::new())), "");
+    }
+
+    #[test]
+    fn google_api_base_override_preserves_trailing_slash_unchanged() {
+        // The helper is a pure passthrough — it does NOT trim or
+        // normalize the override. Pin that a trailing `/` survives
+        // (operators sometimes configure the override as a base URL
+        // with or without the slash, and the adapter call sites
+        // currently expect the override to be used verbatim before
+        // they append their own path segments). A regression that
+        // started calling `.trim_end_matches('/')` here would
+        // silently change every adapter request URL by one byte.
+        assert_eq!(
+            resolve(Some("http://wiremock.local:8080/".into())),
+            "http://wiremock.local:8080/",
+        );
+    }
+
+    #[test]
+    fn google_api_base_override_preserves_multi_segment_path_verbatim() {
+        // A wiremock fixture may host the Google mock under a
+        // sub-path (e.g. `/google` to share a server with other
+        // mocked services). Pin that the helper passes the full
+        // override through without stripping path segments — a
+        // regression that started extracting only the host
+        // (`url::Url::host_str` shape) would silently re-route
+        // every adapter call to the wiremock root instead of the
+        // configured sub-path, breaking the test fixture.
+        assert_eq!(
+            resolve(Some("http://127.0.0.1:9000/google/v1".into())),
+            "http://127.0.0.1:9000/google/v1",
+        );
+    }
+
+    #[test]
     fn google_api_base_respects_override_for_wiremock_tests() {
         // The wiremock integration tests in `crates/proxy/tests/` configure
         // an `AdapterState` with the mock server URL here. Pin the precedence

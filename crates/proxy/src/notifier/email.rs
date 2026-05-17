@@ -689,6 +689,82 @@ mod tests {
     }
 
     #[test]
+    fn parse_or_fallback_fail_fast_on_mid_list_malformed_returns_fallback_not_partial() {
+        // The existing "any malformed kicks back to fallback" test
+        // uses a 2-element list (good, bad). Pin the mid-list shape
+        // where the FIRST TWO addresses parse successfully but the
+        // third fails — the helper must STILL return the fallback
+        // (NOT the parsed first-two-plus-fallback hybrid). A
+        // regression that switched from `return fallback.to_vec()`
+        // to `out.extend(fallback.clone())` would silently start
+        // delivering to the first valid addresses PLUS the fallback,
+        // doubling the recipient list on every transient YAML typo
+        // and surfacing here as `out.len() == 3` (2 parsed + 1
+        // fallback) where this test expects 1.
+        let fallback = vec![mbox("fallback@example.com")];
+        let list = vec![
+            "alice@example.com".to_string(),
+            "Bob <bob@example.com>".to_string(),
+            "definitely not an email".to_string(),
+            "carol@example.com".to_string(), // never reached on failure path
+        ];
+        let out = parse_or_fallback(&list, &fallback, "to");
+        assert_eq!(
+            out.len(),
+            1,
+            "expected fallback-only, got {} addresses",
+            out.len()
+        );
+        assert_eq!(out[0].email.to_string(), "fallback@example.com");
+    }
+
+    #[test]
+    fn parse_or_fallback_field_param_does_not_affect_output_only_log_label() {
+        // The `field` parameter (e.g. "to" / "cc" / "bcc") is used
+        // ONLY in the warn! log line — it must not influence which
+        // addresses are returned. Pin via a happy-path call against
+        // distinct field labels: same input + different field →
+        // byte-identical output. A regression that started routing
+        // on `field` (e.g. "bcc → strip display names") would
+        // silently corrupt the per-policy BCC overrides without
+        // surfacing as an obvious test failure.
+        let fallback = vec![mbox("fallback@example.com")];
+        let list = vec!["Bob <bob@example.com>".to_string()];
+        let out_to = parse_or_fallback(&list, &fallback, "to");
+        let out_cc = parse_or_fallback(&list, &fallback, "cc");
+        let out_bcc = parse_or_fallback(&list, &fallback, "bcc");
+        assert_eq!(out_to.len(), 1);
+        assert_eq!(out_to[0].email.to_string(), "bob@example.com");
+        assert_eq!(out_to[0].email.to_string(), out_cc[0].email.to_string());
+        assert_eq!(out_to[0].email.to_string(), out_bcc[0].email.to_string());
+    }
+
+    #[test]
+    fn parse_or_fallback_works_with_empty_fallback_when_input_is_valid() {
+        // Boundary: the global fallback is sometimes empty (an install
+        // that requires per-policy recipients with no proxy-wide
+        // default). When the input parses cleanly, the empty fallback
+        // is never consulted — surface the parsed list as usual. A
+        // regression that pre-checked `fallback.is_empty()` and
+        // bailed early (returning the empty fallback even on
+        // happy-path parses) would silently drop every per-policy
+        // email override and break the §5.7 escalation pipeline.
+        let fallback: Vec<Mailbox> = vec![];
+        let list = vec!["alice@example.com".to_string()];
+        let out = parse_or_fallback(&list, &fallback, "to");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].email.to_string(), "alice@example.com");
+        // Symmetric: empty fallback + malformed input → empty out
+        // (the fallback IS the empty vec — surfaced verbatim).
+        let bad = vec!["not an email".to_string()];
+        let out = parse_or_fallback(&bad, &fallback, "to");
+        assert!(
+            out.is_empty(),
+            "empty fallback must propagate when used: {out:?}"
+        );
+    }
+
+    #[test]
     fn parse_or_fallback_empty_input_returns_empty() {
         let fallback = vec![mbox("fallback@example.com")];
         let out = parse_or_fallback(&[], &fallback, "to");

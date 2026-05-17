@@ -166,6 +166,54 @@ mod tests {
         assert!(!kc.is_killed(&neighbor).await);
     }
 
+    #[test]
+    fn entry_ttl_constant_pinned_at_one_hour_per_spec() {
+        // The 1-hour TTL is documented in spec.md §3.2 — long enough that
+        // revoked bearers don't keep racing the DB even on aggressive
+        // agent retries, short enough that an entry rolls off when its
+        // underlying row has been cleaned up. A regression that
+        // tightened it to 60s would silently triple the DB load under
+        // sustained kill traffic; a regression that loosened it to a
+        // day would leak revoked bearers across cache eviction windows
+        // for too long. Pin the documented value directly.
+        assert_eq!(ENTRY_TTL, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn max_capacity_constant_pinned_at_one_hundred_thousand() {
+        // The 100k entry cap is the operational sizing decision per
+        // the file docs ("100k entries is ~3 MB of overhead at most;
+        // proxy v1 design partner = thousands of bearers, not
+        // millions"). A regression that dropped it to 10k would
+        // silently start evicting hot entries under realistic fleet
+        // scale; a bump to 10M would silently change the memory
+        // budget by ~30x. Pin the documented value.
+        assert_eq!(MAX_CAPACITY, 100_000);
+    }
+
+    #[tokio::test]
+    async fn clone_shares_underlying_moka_cache_marks_visible_across_clones() {
+        // `KillCache` derives `Clone` over the `Cache<...>` field; moka's
+        // `Cache::clone` is an `Arc` share, not a deep copy. Pin the
+        // shared-state semantic: a mark on one clone must be visible
+        // through the other. The kill_cache is handed to AppState, then
+        // cloned into every middleware invocation — a refactor that
+        // deep-copied the cache (e.g. "isolate test fixtures") would
+        // silently make every request see a fresh empty cache, breaking
+        // killswitch enforcement on every replica with > 1 in-flight
+        // request.
+        let a = KillCache::new();
+        let b = a.clone();
+        let h = [42u8; 32];
+        // Mark on `a`, observe via `b`.
+        a.mark(h).await;
+        assert!(b.is_killed(&h).await, "clone must see original's marks");
+        // Symmetric: mark on `b`, observe via `a`.
+        let h2 = [43u8; 32];
+        b.mark(h2).await;
+        assert!(a.is_killed(&h2).await, "original must see clone's marks");
+    }
+
     #[tokio::test]
     async fn mark_many_with_empty_iterator_is_noop() {
         // `mark_many` is called from killswitch handlers in a loop over

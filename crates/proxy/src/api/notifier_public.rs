@@ -567,6 +567,141 @@ mod tests {
         assert!(html.contains(&format!("value=\"{}\"", row.token_id)));
     }
 
+    #[tokio::test]
+    async fn render_result_with_ok_true_uses_banner_ok_css_class() {
+        // The `banner-ok` vs `banner-err` CSS class is the only visible
+        // difference between success and failure renders — the approver
+        // UI styles each with distinct colors (green vs red). The
+        // existing `render_already_used_renders_consumed_message` test
+        // hits `ok=true` via `render_already_used`, but never asserts
+        // the CSS class directly. Pin both the class name and that the
+        // banner block is present. A refactor that "unified" the two
+        // banner classes into a generic `banner` would silently make
+        // every success render look like a failure (or vice-versa).
+        let r = render_result(
+            "All set",
+            &sample_row("approve"),
+            Some(&sample_blocked()),
+            "Action committed.",
+            true,
+        );
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            html.contains(r#"class="banner-ok""#),
+            "missing banner-ok class"
+        );
+        assert!(
+            !html.contains(r#"class="banner-err""#),
+            "leaked banner-err on success path"
+        );
+        assert!(html.contains("All set"));
+        assert!(html.contains("Action committed."));
+    }
+
+    #[tokio::test]
+    async fn render_result_with_ok_false_uses_banner_err_css_class() {
+        // Symmetric to the ok=true test — pin that the failure-render
+        // path uses `banner-err`. The existing `render_form_unknown_action_shows_banner_err`
+        // test asserts the substring `Unknown action` via render_form's
+        // unknown branch, but that path uses an inline banner string,
+        // not the `render_result` helper. Pin render_result(ok=false)
+        // directly so a refactor of that helper alone surfaces here.
+        let r = render_result(
+            "Something went wrong",
+            &sample_row("approve"),
+            Some(&sample_blocked()),
+            "Database unavailable.",
+            false,
+        );
+        let bytes = axum::body::to_bytes(r.into_body(), 64_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            html.contains(r#"class="banner-err""#),
+            "missing banner-err class"
+        );
+        assert!(
+            !html.contains(r#"class="banner-ok""#),
+            "leaked banner-ok on failure path"
+        );
+        assert!(html.contains("Something went wrong"));
+        assert!(html.contains("Database unavailable."));
+    }
+
+    #[test]
+    fn fill_template_action_title_renders_three_distinct_strings_for_approve_reject_unknown() {
+        // The action_title match has three arms (approve / reject /
+        // catch-all). The existing tests pin the rendered placeholders
+        // via approve forms but never directly assert the title strings
+        // — and the catch-all branch isn't exercised by any test that
+        // checks the title. Pin all three so a refactor that collapsed
+        // the catch-all into the reject arm (the natural shape of a
+        // "simplify the match" refactor) would silently change the
+        // operator-facing page title on unknown action values.
+        let blocked = sample_blocked();
+        let mut row = sample_row("approve");
+        let html_approve = fill_template(&row, Some(&blocked), "");
+        assert!(
+            html_approve.contains("Approve blocked action"),
+            "missing approve title: {html_approve}"
+        );
+        row.action = "reject".into();
+        let html_reject = fill_template(&row, Some(&blocked), "");
+        assert!(
+            html_reject.contains("Reject blocked action"),
+            "missing reject title: {html_reject}"
+        );
+        // The fallback arm uses the bare "Blocked action" title (no
+        // verb-specific prefix) — pin it directly.
+        row.action = "comment".into();
+        let html_unknown = fill_template(&row, Some(&blocked), "");
+        assert!(
+            html_unknown.contains("Blocked action"),
+            "missing fallback title: {html_unknown}"
+        );
+        // Negative on the unknown render — it must NOT carry the approve
+        // or reject title (so the three arms are wire-distinct).
+        assert!(
+            !html_unknown.contains("Approve blocked action"),
+            "approve title leaked into unknown: {html_unknown}"
+        );
+        assert!(
+            !html_unknown.contains("Reject blocked action"),
+            "reject title leaked into unknown: {html_unknown}"
+        );
+    }
+
+    #[test]
+    fn fill_template_requested_ops_joins_with_comma_space_separator() {
+        // The `requested_ops.join(", ")` shape lands the list of ops as
+        // a single comma-and-space-separated string in the approver UI's
+        // "Requested ops" row. A refactor to `.join(",")` (no space) or
+        // to a `\n` line-break would silently change the rendered HTML
+        // and break operator visual scanning. Pin the exact separator
+        // via a 3-op list.
+        let row = sample_row("approve");
+        let blocked = BlockedSummary {
+            p_0: Some("alice@acme.com".into()),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            path: "/drive/v3/files/abc".into(),
+            policy_id: Some("p1".into()),
+            detail: Some("ext".into()),
+            created_at: Utc::now(),
+            requested_ops: vec![
+                "drive:read:engineering/*".into(),
+                "drive:read:shared/*".into(),
+                "drive:write:my-drive".into(),
+            ],
+        };
+        let html = fill_template(&row, Some(&blocked), "");
+        // The three ops appear joined by `, ` (comma + single space).
+        assert!(
+            html.contains("drive:read:engineering/*, drive:read:shared/*, drive:write:my-drive"),
+            "ops not joined with `, `: {html}"
+        );
+    }
+
     #[test]
     fn template_substitutions_fill_all_placeholders() {
         let row = TokenRow {

@@ -230,6 +230,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_extract_error_response_content_type_defaults_to_text_plain() {
+        // The fixed-body `"unauthorized"` response is built via the
+        // axum `(StatusCode, &'static str)` tuple shape, which routes
+        // through axum's `&'static str → Response` IntoResponse impl
+        // and lands as `content-type: text/plain; charset=utf-8`. Pin
+        // the wire shape so a refactor that swapped to a Json envelope
+        // (or any other content-type) would surface here — operator
+        // log parsers and Grafana panels split text/plain 401s ("agent
+        // session lost") from application/json 401s ("middleware
+        // rejected bearer with structured body").
+        let r = SessionExtractError.into_response();
+        let ct = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/plain"),
+            "expected text/plain default, got: {ct}"
+        );
+        assert!(ct.contains("utf-8"), "expected charset suffix, got: {ct}");
+    }
+
+    #[tokio::test]
+    async fn extractor_does_not_consume_extension_extractor_safe_for_repeat_calls() {
+        // The extractor calls `parts.extensions.get::<Arc<SessionContext>>().cloned()`
+        // — `cloned()` (not `take()`) leaves the extension in place so
+        // downstream middleware or a second extractor invocation can
+        // still see the Arc. Pin this contract: extracting twice must
+        // both succeed and surface ptr-equal Arcs sharing the same
+        // inner context. A refactor that swapped `cloned()` for
+        // `remove()` (the natural shape of a "move out for efficiency"
+        // change) would silently break any handler chain that runs the
+        // extractor more than once.
+        let ctx = Arc::new(sample_ctx());
+        let req = axum::http::Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, _body) = req.into_parts();
+        parts.extensions.insert(ctx.clone());
+        // First extraction.
+        let first = SessionCtx::from_request_parts(&mut parts, &()).await;
+        let SessionCtx(a) = match first {
+            Ok(v) => v,
+            Err(_) => panic!("first extraction failed"),
+        };
+        // Second extraction against the SAME parts — must still succeed.
+        let second = SessionCtx::from_request_parts(&mut parts, &()).await;
+        let SessionCtx(b) = match second {
+            Ok(v) => v,
+            Err(_) => panic!("second extraction failed — extension was consumed"),
+        };
+        // All three Arcs share the same inner context.
+        assert!(Arc::ptr_eq(&ctx, &a));
+        assert!(Arc::ptr_eq(&ctx, &b));
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn extractor_rejects_when_only_a_different_extension_type_is_present() {
+        // `parts.extensions.get::<Arc<SessionContext>>()` is type-keyed.
+        // If a different extension type was inserted (a real bug shape:
+        // some middleware inserted the bare `SessionContext` instead
+        // of `Arc<SessionContext>`, or an unrelated type entirely),
+        // the typed lookup must return None → SessionExtractError. Pin
+        // this distinction with a different type stuffed into
+        // extensions so a refactor that loosened the lookup (e.g.
+        // accepting either `SessionContext` or `Arc<SessionContext>`)
+        // would surface here as an unexpected Ok.
+        #[derive(Clone)]
+        struct UnrelatedExtension(#[allow(dead_code)] String);
+        let req = axum::http::Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, _body) = req.into_parts();
+        parts.extensions.insert(UnrelatedExtension("noise".into()));
+        let r: Result<SessionCtx, SessionExtractError> =
+            SessionCtx::from_request_parts(&mut parts, &()).await;
+        match r {
+            Err(_) => {}
+            Ok(_) => panic!("extractor must reject when typed lookup misses"),
+        }
+    }
+
+    #[tokio::test]
     async fn extractor_returns_ok_when_arc_session_context_present() {
         let ctx = Arc::new(sample_ctx());
         let req = axum::http::Request::builder().uri("/").body(()).unwrap();

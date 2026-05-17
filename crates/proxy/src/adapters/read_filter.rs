@@ -406,6 +406,51 @@ mod tests {
     }
 
     #[test]
+    fn should_scan_strips_parameters_after_semicolon_before_matching() {
+        // The content-type header carries optional parameters after `;`
+        // (e.g. `application/json; charset=utf-8` — the most common
+        // production shape). The helper splits on `;` and matches only
+        // the base type so the parameter doesn't poison the comparison.
+        // A regression that compared the raw header would silently
+        // SKIP every JSON body with a charset suffix — and that's the
+        // shape Google's APIs return — so read-filter scanning would
+        // effectively no-op in production. Pin all three real shapes.
+        assert!(should_scan(Some("application/json; charset=utf-8")));
+        assert!(should_scan(Some("application/json;charset=utf-8"))); // no space variant
+        assert!(should_scan(Some("text/html; charset=utf-8")));
+    }
+
+    #[test]
+    fn should_scan_with_uppercase_content_type_normalizes_case_before_matching() {
+        // The HTTP spec is case-insensitive on content-type values
+        // (RFC 9110 §8.3.1). The helper lowercases before matching so
+        // `APPLICATION/JSON` (legal but uncommon — some SOAP-era
+        // backends still emit it) doesn't silently bypass scanning.
+        // A regression that dropped the `.to_ascii_lowercase()` would
+        // start letting uppercase-typed payloads slip past the
+        // read-filter. Pin via three variants.
+        assert!(should_scan(Some("APPLICATION/JSON")));
+        assert!(should_scan(Some("Application/Json")));
+        assert!(should_scan(Some("TEXT/HTML")));
+    }
+
+    #[test]
+    fn should_scan_with_empty_content_type_string_does_not_scan() {
+        // Boundary: `Some("")` is wire-distinct from `None`. After
+        // `split(';').next().unwrap_or("").trim().to_ascii_lowercase()`
+        // the empty input lands as `""` which matches none of the
+        // accept-list strings — so the helper returns `false`. Pin the
+        // current behavior so a future refactor that defaulted empty
+        // back to scan (the `None` path) doesn't silently start
+        // scanning every Google response that happens to carry an
+        // empty Content-Type header (no production code path emits
+        // empty today, but pinning the behavior catches drift).
+        assert!(!should_scan(Some("")));
+        // Whitespace-only collapses through trim() to empty.
+        assert!(!should_scan(Some("   ")));
+    }
+
+    #[test]
     fn regexset_short_circuits_clean_bodies() {
         let f = build(
             QuarantineAction::ReplaceWithMarker,

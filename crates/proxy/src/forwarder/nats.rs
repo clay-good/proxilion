@@ -198,6 +198,141 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_token_replaces_ascii_control_chars_with_underscore() {
+        // The classifier accepts `a-zA-Z0-9.-_` and replaces every other
+        // character with `_`. The control-char range (0x00–0x1F) is the
+        // most operationally-load-bearing axis: a raw NUL or VT character
+        // smuggled into a vendor or action label (via a future adapter
+        // that doesn't sanitize its inputs at the policy-engine layer
+        // first) would otherwise land on the NATS wire as a subject
+        // token, and most NATS clients reject the whole publish on a
+        // control char. Pin the entire 0x00..=0x1F range via a sweep —
+        // a refactor that narrowed the closure's reject set to a hand-
+        // rolled `matches!(c, ' ' | '\t' | '\n')` (the round-30 test's
+        // partial whitespace pin) would silently let DEL, VT, FF, etc.
+        // through. The existing whitespace test pins `\t`/`\n`/`\r`/`' '`
+        // by example; this fills in the rest of the range.
+        for code in 0u8..=0x1f {
+            let s = format!("a{}b", code as char);
+            let out = sanitize_token(&s);
+            assert_eq!(
+                out, "a_b",
+                "control char {code:#04x} must sanitize to underscore, got {out:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_token_replaces_punctuation_with_underscore_per_allow_list() {
+        // The allow-list closure is `'a'..='z' | 'A'..='Z' | '0'..='9' |
+        // '.' | '-' | '_'`. Pin the explicit reject path for every
+        // ASCII punctuation char NOT on the list — a refactor that
+        // widened the allow-list to "any printable ASCII" (a tempting
+        // "be lenient on inputs" change) would silently start landing
+        // quote chars, parentheses, and shell metacharacters on the
+        // NATS subject wire. Pin a representative spread.
+        for ch in [
+            '"', '\'', '`', '(', ')', '[', ']', '{', '}', '/', '\\', ';', ':', '<', '>', '?', '@',
+            '#', '$', '%', '^', '&', '!', '|', '~', '=', '+',
+        ] {
+            let s = format!("a{ch}b");
+            let out = sanitize_token(&s);
+            assert_eq!(
+                out, "a_b",
+                "punctuation {ch:?} must sanitize to underscore, got {out:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_token_preserves_all_ten_decimal_digits_independently() {
+        // `'0'..='9'` is on the allow-list — pin EACH digit independently
+        // (not just 0..=9 as a range walk, which would mask a regression
+        // that hand-rolled the range as `'1'..='9'` and dropped zero,
+        // for some "leading-zero-rejection" cleanup). Operators use
+        // versioned vendor names (`drive_v1`, `gmail_v2`); a regression
+        // that dropped any digit would silently corrupt those subjects.
+        for d in '0'..='9' {
+            let s = format!("v{d}x");
+            let out = sanitize_token(&s);
+            assert_eq!(out, format!("v{d}x"), "digit {d} must pass through");
+        }
+    }
+
+    #[test]
+    fn sanitize_token_byte_length_equals_input_for_ascii_only_inputs() {
+        // The sanitizer is a per-`char` map — for any ASCII-only input,
+        // the output byte length must equal the input byte length
+        // exactly (every input char maps to either itself or `_`, both
+        // 1 byte). Pin the invariant on a spread of inputs the adapters
+        // emit (vendor/action labels, kebab forms, dotted hierarchies)
+        // — a refactor that started escaping rejected chars with a
+        // multi-byte sequence (e.g. percent-encoding `%2A` for `*`)
+        // would silently inflate subject lengths and break the
+        // wildcard subscription depth contract.
+        for input in [
+            "google",
+            "drive.files.get",
+            "gmail-beta_v2.0",
+            "*invalid*",
+            "a b c",
+            "punctuation!?@#",
+        ] {
+            let out = sanitize_token(input);
+            assert_eq!(
+                out.len(),
+                input.len(),
+                "ASCII input {input:?} → {out:?}: byte length must be preserved",
+            );
+        }
+    }
+
+    #[test]
+    fn connect_error_implements_std_error_trait_for_anyhow_chain_walking() {
+        // The boot path bubbles `ConnectError` through `anyhow::Error`
+        // chains for structured logging — pin that the `thiserror`
+        // derive lands the `std::error::Error` impl so a refactor
+        // that swapped to a hand-rolled error type (dropping the
+        // derive) would surface here at the trait-object cast rather
+        // than at the call-site type mismatch in `server.rs`. The
+        // leaf-arm `source()` is None since the inner is a bare String,
+        // not a wrapped error — pin that contract too so a future
+        // refactor to `ConnectError(#[source] reqwest::Error)` "for
+        // anyhow-style chain walking" would be a deliberate wire-shape
+        // change.
+        let e = ConnectError("dns failure".into());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(dyn_err.to_string().contains("dns failure"));
+        assert!(
+            std::error::Error::source(dyn_err).is_none(),
+            "leaf-arm ConnectError must not expose a source",
+        );
+    }
+
+    #[test]
+    fn connect_error_inner_field_is_pub_and_round_trips_through_construction() {
+        // `pub struct ConnectError(pub String)` — the tuple field is
+        // `pub` so the boot path can introspect the inner reason
+        // without parsing the Display string (operator setup-status
+        // dashboards split on the inner message to surface a
+        // category-specific hint). Pin both that the field is
+        // accessible AND that construction preserves the value
+        // byte-identically (no normalization snuck into the
+        // constructor). A refactor that made the field private would
+        // surface as a compile error; one that normalized the inner
+        // (e.g. trimmed whitespace "for tidiness") would surface here.
+        let e = ConnectError("  preserved with leading spaces  ".to_string());
+        assert_eq!(e.0, "  preserved with leading spaces  ");
+        // Three distinct messages each round-trip through the public
+        // field accessor — a refactor that started interning or
+        // normalizing would surface across the walk.
+        for msg in ["", "connection refused", "тест unicode"] {
+            let e = ConnectError(msg.into());
+            assert_eq!(e.0, msg);
+        }
+    }
+
+    #[test]
     fn connect_error_debug_includes_struct_name_for_grep() {
         // The `#[derive(Debug)]` on `ConnectError` feeds `?e` in
         // `tracing::warn!(?e, "nats connect failed")` at the boot path

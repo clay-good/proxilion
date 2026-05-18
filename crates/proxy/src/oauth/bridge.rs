@@ -399,6 +399,240 @@ mod tests {
     }
 
     #[test]
+    fn validate_federation_token_with_invalid_uuid_pca_0_id_carries_bad_claims_msg() {
+        // `FederationClaims::pca_0_id` is typed `Uuid` — serde delegates
+        // to `Uuid`'s Deserialize impl which rejects non-UUID strings
+        // (wrong segment count, non-hex chars, missing hyphens). The
+        // existing `validate_federation_token_with_b64_valid_but_json_invalid_carries_bad_claims_msg`
+        // test pins the missing-field path; pin the value-validation
+        // path here as a distinct failure mode so a refactor that
+        // swapped `pca_0_id: Uuid` for `pca_0_id: String` (with a
+        // later runtime parse) would silently start accepting garbage
+        // pca ids through the deserialize gate. The "bad claims"
+        // substring is the operator-facing triage signal — pin it
+        // surfaces here too.
+        let now = chrono::Utc::now().timestamp();
+        let header = B64URL.encode(br#"{"alg":"none"}"#);
+        let payload = B64URL.encode(
+            serde_json::json!({
+                "pca_0_id": "not-a-uuid",
+                "p_0": "user:alice@demo.local",
+                "ops": [],
+                "state": "s",
+                "iat": now,
+                "exp": now + 60,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let jwt = format!("{header}.{payload}.sig");
+        let err = validate_federation_token(&jwt).unwrap_err();
+        match err {
+            OAuthError::BridgeRejected(m) => {
+                assert!(
+                    m.contains("bad claims"),
+                    "missing `bad claims` substring: {m}",
+                );
+            }
+            other => panic!("expected BridgeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_federation_token_ignores_header_content_payload_only_validation() {
+        // The docstring on `validate_federation_token` commits to
+        // "payload-only" validation as the M0/M1 stub contract
+        // (signature check stubbed deliberately so the swap to
+        // JWKS-backed verify is one function). Pin that the HEADER
+        // value is NEVER inspected: an arbitrarily-shaped header
+        // (random bytes, claims-style JSON, even an empty string)
+        // must be accepted as long as the payload + signature
+        // segments are dot-separated. A refactor that started
+        // validating the header (e.g. checking `alg == "none"` or
+        // requiring `typ == "JWT"`) would silently break the stub's
+        // forward-compat contract — every existing test fixture +
+        // production bridge stub would start failing at the same
+        // call site without an obvious reason.
+        let now = chrono::Utc::now().timestamp();
+        let payload = B64URL.encode(
+            serde_json::json!({
+                "pca_0_id": "00000000-0000-0000-0000-000000000001",
+                "p_0": "user:alice@demo.local",
+                "ops": [],
+                "state": "s",
+                "iat": now,
+                "exp": now + 60,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        // Three distinct header shapes — base64 of garbage, an empty
+        // string, and a non-base64 raw token. All MUST accept.
+        for header in [
+            B64URL.encode(b"definitely-not-jwt-header"),
+            String::new(),
+            "raw-non-base64-bytes!@#".into(),
+        ] {
+            let jwt = format!("{header}.{payload}.sig");
+            assert!(
+                validate_federation_token(&jwt).is_ok(),
+                "payload-only validation: header `{header}` must not be inspected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_federation_token_ignores_signature_content_payload_only_validation() {
+        // Symmetric to the header pin above — the SIGNATURE segment
+        // is the third dot-separated part and the function NEVER
+        // inspects it (the `(_h, payload, _s)` destructure binds
+        // signature to `_s` and immediately drops it). Pin that an
+        // empty signature, a base64-shaped fake, and a raw garbage
+        // string all accept. A refactor that started validating the
+        // signature (e.g. requiring non-empty `_s` as a sanity check)
+        // would silently break the empty-signature fixtures the
+        // bridge stub emits during early development.
+        let now = chrono::Utc::now().timestamp();
+        let header = B64URL.encode(br#"{"alg":"none"}"#);
+        let payload = B64URL.encode(
+            serde_json::json!({
+                "pca_0_id": "00000000-0000-0000-0000-000000000001",
+                "p_0": "user:alice@demo.local",
+                "ops": [],
+                "state": "s",
+                "iat": now,
+                "exp": now + 60,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        for sig in ["", "AAECAwQF", "definitely-not-a-valid-signature!@#$%"] {
+            let jwt = format!("{header}.{payload}.{sig}");
+            assert!(
+                validate_federation_token(&jwt).is_ok(),
+                "payload-only validation: signature `{sig}` must not be inspected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_federation_token_accepts_jwt_with_extra_segments_using_first_three() {
+        // The destructure `(parts.next(), parts.next(), parts.next())`
+        // consumes the first three dot-separated segments from
+        // `split('.')` and leaves any additional segments in the
+        // iterator (never inspected). So a 5-part JWT (4 dots)
+        // accepts based on the first 3 segments. This is technically
+        // out-of-spec for RFC 7519 JWTs (which have exactly 3
+        // segments for JWS or 5 for JWE), but the payload-only stub
+        // accepts it because the segment-count check isn't enforced.
+        // Pin this behavior so a future refactor that tightened the
+        // segment-count check (the natural "be strict about JWT
+        // shape" cleanup) would surface here as a deliberate
+        // wire-shape change — and would need coordinated bridge-stub
+        // updates to match. A regression that silently REJECTED such
+        // JWTs would break any bridge stub that accidentally emits
+        // an extra trailing dot.
+        let now = chrono::Utc::now().timestamp();
+        let header = B64URL.encode(br#"{"alg":"none"}"#);
+        let payload = B64URL.encode(
+            serde_json::json!({
+                "pca_0_id": "00000000-0000-0000-0000-000000000001",
+                "p_0": "user:alice@demo.local",
+                "ops": [],
+                "state": "s",
+                "iat": now,
+                "exp": now + 60,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        // Five-part JWT — extra segments after the signature.
+        let jwt = format!("{header}.{payload}.sig.extra1.extra2");
+        assert!(
+            validate_federation_token(&jwt).is_ok(),
+            "extra segments after signature must be silently ignored (first 3 used)",
+        );
+    }
+
+    #[test]
+    fn federation_claims_debug_carries_pca_0_id_and_p_0_for_log_grep() {
+        // `FederationClaims` derives `Debug` — the OAuth callback
+        // handler feeds `?claims` into `tracing::info!` so operators
+        // can grep the request_id + the bridge-decoded principal/
+        // pca_0_id from a single log line. Pin that the Debug
+        // rendering surfaces BOTH the `pca_0_id` (as the canonical
+        // hyphenated-lowercase uuid form via Uuid's Debug, which is
+        // identical to Display in `format!("{:?}", uuid)`) AND the
+        // `p_0` principal string. A manual Debug impl that hid
+        // either field (in the name of "don't log PII") would
+        // silently break operator forensics on the OAuth callback
+        // path. Note: the routes module separately decides what to
+        // actually log; this test pins the trait shape, not the log
+        // policy.
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "12345678-1234-5678-1234-567812345678",
+            "p_0": "user:carol@demo.local",
+            "ops": [],
+            "state": "trace-abc",
+            "iat": now,
+            "exp": now + 60,
+        }));
+        let claims = validate_federation_token(&jwt).unwrap();
+        let s = format!("{claims:?}");
+        assert!(
+            s.contains("12345678-1234-5678-1234-567812345678"),
+            "pca_0_id missing from Debug: {s}",
+        );
+        assert!(
+            s.contains("carol@demo.local"),
+            "p_0 missing from Debug: {s}",
+        );
+        // The struct name itself is part of the Debug derive's output —
+        // operator grep against `?claims` keys on the struct prefix.
+        assert!(
+            s.contains("FederationClaims"),
+            "struct name missing from Debug: {s}",
+        );
+    }
+
+    #[test]
+    fn validate_federation_token_state_field_round_trips_verbatim_through_payload() {
+        // The `state` field is the bridge-assigned correlation id —
+        // the OAuth callback handler reads it and persists alongside
+        // the session row so operator dashboards can join the proxy's
+        // request_id against the bridge's emitted JWT for cross-system
+        // tracing. A refactor that normalized the value (e.g.
+        // lowercased it, trimmed whitespace, URL-decoded it) would
+        // silently break that join across distinct character classes.
+        // Pin three shapes the bridge might emit: a uuid-style string,
+        // a mixed-case opaque token, and a token containing characters
+        // operators sometimes embed in correlation ids (`-_.:`).
+        // The deserialize must pass them through byte-identically.
+        let now = chrono::Utc::now().timestamp();
+        for state_value in [
+            "00112233-4455-6677-8899-aabbccddeeff",
+            "MixedCaseStateTokenABC123",
+            "trace-id:req_42.proxy/v1",
+        ] {
+            let jwt = make_jwt(&serde_json::json!({
+                "pca_0_id": "00000000-0000-0000-0000-000000000001",
+                "p_0": "user:alice@demo.local",
+                "ops": [],
+                "state": state_value,
+                "iat": now,
+                "exp": now + 60,
+            }));
+            let claims = validate_federation_token(&jwt).unwrap();
+            assert_eq!(
+                claims.state, state_value,
+                "state must round-trip byte-identically: input `{state_value}` got `{}`",
+                claims.state,
+            );
+        }
+    }
+
+    #[test]
     fn accepts_fresh_token() {
         let now = chrono::Utc::now().timestamp();
         let jwt = make_jwt(&serde_json::json!({

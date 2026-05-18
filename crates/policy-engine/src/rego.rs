@@ -610,4 +610,151 @@ mod helper_tests {
         let err = compile_read_filter(&cfg).unwrap_err();
         assert!(matches!(err, Error::BadRegex { .. }));
     }
+
+    #[test]
+    fn rego_error_yaml_display_carries_yaml_parse_error_prefix_with_inner_serde_message() {
+        // `#[error("YAML parse error: {0}")]` on `Yaml(#[from] serde_yaml::Error)`
+        // — pin the prefix substring `"YAML parse error: "` (with
+        // the trailing colon+space). Operator authoring tools split
+        // YAML-syntax faults from semantic faults (BadDecision /
+        // BadReadFilter) on this prefix; a refactor to `"yaml: {0}"`
+        // for "consistency with the other prefixes" would silently
+        // collapse the bucket. Pin the inner serde_yaml::Error
+        // Display passthrough so authors see the position info the
+        // serde_yaml crate emits (line + column) verbatim.
+        let parse_err: serde_yaml::Error =
+            serde_yaml::from_str::<Yaml>(":\n bad: : :").unwrap_err();
+        let inner_display = parse_err.to_string();
+        let e: Error = Error::Yaml(parse_err);
+        let s = e.to_string();
+        assert!(s.starts_with("YAML parse error: "), "got: {s}");
+        // Inner serde error message passes through verbatim — the
+        // suffix-after-prefix must equal the inner Display so
+        // operator tools can split on `": "` to recover position info.
+        assert_eq!(&s["YAML parse error: ".len()..], inner_display);
+    }
+
+    #[test]
+    fn rego_error_bad_decision_display_carries_invalid_decision_shape_prefix() {
+        // `#[error("invalid decision shape: {0}")]` — this is the
+        // prefix `AppError::Policy`'s adapter-side `"policy engine: "`
+        // wraps (so an operator sees the composed
+        // `"policy engine: invalid decision shape: <inner>"` in the
+        // adapter-side log). The two prefixes are stacked deliberately
+        // to give a runbook the two-axis split (engine vs decision-
+        // shape); a refactor that softened `"invalid decision shape"`
+        // to a generic `"bad decision"` would silently merge it with
+        // future decision-validation variants. Pin the exact prefix
+        // + inner-string Display via `assert_eq!`.
+        let e = Error::BadDecision("unknown decision `banhammer`".into());
+        assert_eq!(
+            e.to_string(),
+            "invalid decision shape: unknown decision `banhammer`",
+        );
+    }
+
+    #[test]
+    fn rego_error_bad_read_filter_display_carries_invalid_read_filter_prefix() {
+        // `#[error("invalid read_filter: {0}")]` — sibling to
+        // BadDecision but distinct prefix so the dashboard's
+        // "policy authoring errors" panel buckets read_filter
+        // faults (e.g. malformed `quarantine_patterns`) separately
+        // from top-level decision-shape faults. Operator runbooks
+        // key on the `"read_filter"` substring (with underscore,
+        // matching the YAML key) — a refactor to `"read filter"`
+        // (space) "for human-readability" would silently break the
+        // log filter and the cross-reference into the YAML the
+        // operator authored.
+        let e = Error::BadReadFilter("quarantine_patterns must be a sequence".into());
+        assert_eq!(
+            e.to_string(),
+            "invalid read_filter: quarantine_patterns must be a sequence",
+        );
+    }
+
+    #[test]
+    fn rego_error_bad_regex_display_renders_pat_in_backticks_and_full_source_message() {
+        // `#[error("invalid regex `{pat}`: {source}")]` — the
+        // BACKTICKED `{pat}` field is load-bearing: operators paste
+        // the literal pattern from the YAML into a regex tester, and
+        // the backticks delimit the boundary so a pattern containing
+        // a colon (the field separator) doesn't confuse the parser.
+        // The `{source}` substitution is wired by `#[source]` AND
+        // appears in the Display via the bare `{source}` placeholder
+        // — pin both surfaces (Display rendering + the inner
+        // regex::Error message passthrough). A refactor to
+        // `#[error("invalid regex {pat}: {source}")]` (no backticks)
+        // would silently swallow the boundary on patterns containing
+        // colons, and a refactor that elided `{source}` would silently
+        // drop the parser's "unbalanced parenthesis" / "missing
+        // character class" actionable triage.
+        // Build the pattern dynamically so the `clippy::invalid_regex`
+        // lint (which only fires on string literals) doesn't trip on
+        // the intentionally-malformed input.
+        let bad_pat = format!("({}", "unbalanced");
+        let compile_err = regex::Regex::new(&bad_pat).unwrap_err();
+        let inner_display = compile_err.to_string();
+        let e = Error::BadRegex {
+            pat: bad_pat.clone(),
+            source: compile_err,
+        };
+        let s = e.to_string();
+        assert!(s.starts_with("invalid regex `(unbalanced`: "), "got: {s}");
+        // Inner regex::Error message passes through verbatim after the prefix.
+        assert!(s.contains(&inner_display), "missing inner in: {s}");
+    }
+
+    #[test]
+    fn rego_error_match_arm_transparent_display_strips_no_prefix() {
+        // `#[error(transparent)]` on `Match(#[from] match_expr::MatchError)`
+        // — the transparent attribute means the wrapper adds NO
+        // prefix; the Display is byte-identical to the inner
+        // MatchError's Display. This is asymmetric to the other
+        // arms which DO add prefixes (YAML / BadDecision /
+        // BadReadFilter / BadRegex). The asymmetry is intentional:
+        // MatchError already self-identifies via its own `#[error(...)]`
+        // attributes (round 85 pinned the backticked-operator prefix
+        // for UnsupportedOp etc.), so adding a `"match: "` prefix
+        // here would just produce the noisy `"match: unsupported
+        // operator `weird_op`"`. Pin the transparent-passthrough so
+        // a refactor that added a wrapper prefix "for consistency
+        // with the prefixed arms" would surface here and force a
+        // discussion before merging.
+        let inner = match_expr::MatchError::UnsupportedOp("weird_op".into());
+        let inner_display = inner.to_string();
+        let e: Error = Error::Match(inner);
+        assert_eq!(e.to_string(), inner_display);
+        // Symmetric explicit pin to ensure the inner Display is
+        // exactly what round 85 pinned — cross-module drift surfaces.
+        assert_eq!(e.to_string(), "unsupported operator `weird_op`");
+    }
+
+    #[test]
+    fn rego_error_ops_arm_transparent_display_forwards_inner_and_source_chain() {
+        // `#[error(transparent)]` on `Ops(#[from] OpsParseError)` —
+        // symmetric to `Match` above. The OpsParseError already
+        // self-identifies (`"template variable `ctx.missing` not found"`),
+        // and `thiserror`'s `transparent` attribute forwards BOTH
+        // `Display` AND `Error::source()` directly to the inner
+        // error (not wrapping it). Since `OpsParseError::UnknownVar`
+        // is a leaf with no inner source, `Error::Ops(_).source()`
+        // returns None — pin that contract so a refactor that
+        // dropped `transparent` for an explicit prefix wrapper
+        // would silently start exposing the leaf via `source()`
+        // (which would NOT match the anyhow-style walkers in
+        // adapter code that expect a fresh `source()` link only at
+        // the prefixed `Match`/`BadRegex` arms).
+        use std::error::Error as _;
+        let inner = OpsParseError::UnknownVar("ctx.missing".into());
+        let inner_display = inner.to_string();
+        let e: Error = Error::Ops(inner);
+        assert_eq!(e.to_string(), inner_display);
+        // `transparent` forwards `source()` to the inner — and the
+        // inner OpsParseError::UnknownVar variant is a leaf, so the
+        // chain terminates here. Symmetric pin against `Match`.
+        assert!(
+            e.source().is_none(),
+            "transparent forwards to inner leaf — no further source link",
+        );
+    }
 }

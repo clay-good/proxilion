@@ -239,6 +239,121 @@ mod tests {
     }
 
     #[test]
+    fn prefix_constant_is_byte_exact_pxl_underscore_live_underscore() {
+        // PREFIX is the version tag the auth middleware AND the dashboard
+        // UI's "this looks like a live bearer" copy-detector both key on.
+        // A refactor to `pxl-live-` (kebab) or `proxilion_live_` (longer
+        // brand prefix) would silently break every operator's grep + every
+        // existing bearer in the database (the SHA-256 hash includes the
+        // prefix bytes). Pin the byte sequence AND the length explicitly
+        // so a change to either surfaces here AND in the consumer pins.
+        assert_eq!(PREFIX, "pxl_live_");
+        assert_eq!(PREFIX.len(), 9);
+        assert_eq!(PREFIX.as_bytes(), b"pxl_live_");
+    }
+
+    #[test]
+    fn token_len_equals_prefix_plus_fifty_two_base32_chars_per_spec() {
+        // TOKEN_LEN is structurally `PREFIX.len() + 52` — the base32-of-
+        // 32-bytes-unpadded encoding is exactly 52 chars (⌈32·8/5⌉ = 52).
+        // A refactor to padded base32 would push to 56 chars; a swap to
+        // base64-url would push to 43; either would change TOKEN_LEN AND
+        // invalidate every existing stored bearer. Pin all three constants
+        // (RAW_BYTES + PREFIX.len() + TOKEN_LEN) so a refactor of any one
+        // without the others surfaces as a structural mismatch here.
+        assert_eq!(RAW_BYTES, 32);
+        assert_eq!(TOKEN_LEN, 61);
+        assert_eq!(TOKEN_LEN, PREFIX.len() + 52);
+    }
+
+    #[test]
+    fn bearer_hash_method_matches_bearer_hash_of_as_str_for_generated_token() {
+        // `Bearer::hash()` is a convenience wrapper over
+        // `BearerHash::of(self.as_str())`. The middleware path uses both
+        // forms (the auth handler hashes `Bearer::generate().hash()`;
+        // the killswitch handler hashes the bearer string it pulled out
+        // of a SQL row via `BearerHash::of`). A refactor that diverged
+        // them (e.g. `Bearer::hash()` started salting with a per-process
+        // nonce "for cache-key uniqueness") would silently make every
+        // newly issued bearer un-revokable via the killswitch path —
+        // because the bearer middleware's lookup hash wouldn't match
+        // the killswitch handler's. Pin the equivalence directly.
+        let b = Bearer::generate();
+        assert_eq!(b.hash(), BearerHash::of(b.as_str()));
+    }
+
+    #[test]
+    fn parse_rejects_body_with_mixed_uppercase_and_lowercase_chars() {
+        // The alphabet check `b'A'..=b'Z' | b'2'..=b'7'` is uppercase-only.
+        // A body that mixes case (e.g. `AaAa...`) MUST reject — a refactor
+        // that swapped to `.to_ascii_uppercase()` before alphabet check
+        // "for operator-typing tolerance" would silently widen the accept
+        // set and break the SHA-256 hash identity (the auth middleware
+        // hashes the slice byte-for-byte). Pin both a mixed-case shape
+        // AND a single lowercase char in an otherwise valid body.
+        let mixed = format!(
+            "{PREFIX}{}",
+            "AaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa"
+        );
+        assert_eq!(mixed.len(), TOKEN_LEN);
+        assert!(Bearer::parse(&mixed).is_none(), "mixed case must reject");
+        // One lowercase char in an otherwise valid uppercase body.
+        let one_low = format!("{PREFIX}{}{}", "a", "A".repeat(51));
+        assert_eq!(one_low.len(), TOKEN_LEN);
+        assert!(
+            Bearer::parse(&one_low).is_none(),
+            "single lowercase must reject"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_body_with_url_safe_or_padding_chars() {
+        // RFC 4648 base32 (the variant we use) excludes the base32-hex
+        // alphabet's `=` padding char AND the base64-url alphabet's `-`
+        // and `_`. A refactor that swapped to base32hex or base64-url
+        // "for shorter tokens" would still produce valid-length strings
+        // but would silently change the wire shape — break every existing
+        // stored bearer. Pin each excluded char.
+        for bad in ['=', '-', '_', '+', '/'] {
+            let body: String = std::iter::once(bad)
+                .chain(std::iter::repeat_n('A', 51))
+                .collect();
+            let s = format!("{PREFIX}{body}");
+            assert_eq!(s.len(), TOKEN_LEN);
+            assert!(
+                Bearer::parse(&s).is_none(),
+                "char {bad} should not parse but did",
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_hash_of_is_deterministic_across_distinct_input_lengths() {
+        // `BearerHash::of` is `sha256(input.as_bytes())` — pin determinism
+        // across input lengths (empty, single byte, full token, oversized
+        // 1KB). The killswitch handler hashes whatever string it pulled
+        // out of `agent_bearers.bearer`; a refactor that truncated the
+        // input before hashing "for SHA-256 performance" (sha256 is fast
+        // enough at any size) would silently make all-equal-prefix bearers
+        // collide. Pin self-equality across lengths AND distinctness across
+        // distinct inputs at the same length.
+        let empty_a = BearerHash::of("");
+        let empty_b = BearerHash::of("");
+        assert_eq!(empty_a, empty_b);
+        let one_a = BearerHash::of("x");
+        let one_b = BearerHash::of("x");
+        assert_eq!(one_a, one_b);
+        assert_ne!(empty_a, one_a);
+        let long = "A".repeat(1024);
+        let long_a = BearerHash::of(&long);
+        let long_b = BearerHash::of(&long);
+        assert_eq!(long_a, long_b);
+        // Distinctness: 1024 'A's vs 1024 'B's hash differently.
+        let other_long = "B".repeat(1024);
+        assert_ne!(long_a, BearerHash::of(&other_long));
+    }
+
+    #[test]
     fn bearer_hash_partial_eq_distinguishes_different_inputs() {
         // BearerHash derives PartialEq+Eq; pin both axes — equal inputs hash
         // equal, distinct inputs hash distinct. The middleware uses Eq to

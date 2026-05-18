@@ -214,6 +214,129 @@ mod tests {
         assert!(a.is_killed(&h2).await, "original must see clone's marks");
     }
 
+    #[test]
+    fn kill_cache_is_send_sync_static_for_app_state_arc_path() {
+        // `KillCache` is held in `AppState` which is cloned into every
+        // tower layer / middleware extractor — the `Send + Sync + 'static`
+        // combo is the AppState-bound contract. A refactor that gave
+        // `KillCache` a `Cell<u64>` field "for in-process hit counters"
+        // would break Sync without surfacing at this file; the breakage
+        // would appear at AppState assembly with an unrelated trait-bound
+        // error. Pin the three-trait combo here so the type boundary
+        // fails fast at the right call site.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<KillCache>();
+    }
+
+    #[tokio::test]
+    async fn mark_many_with_one_hundred_distinct_hashes_all_observable() {
+        // The killswitch handlers fire `mark_many` on the full set of
+        // sha256 values returned from a single UPDATE — for `/killswitch/all`
+        // that can be the entire active-bearer table. Pin bulk correctness:
+        // 100 distinct hashes all observable individually after one
+        // `mark_many` call, with no boundary entries lost (first / middle /
+        // last). A regression that capped the loop at N entries or hashed
+        // the iterator position into the key would surface as missing kills
+        // at the boundaries.
+        let kc = KillCache::new();
+        let hashes: Vec<[u8; 32]> = (0..100u8).map(|i| [i; 32]).collect();
+        kc.mark_many(hashes.clone()).await;
+        assert!(kc.is_killed(&hashes[0]).await);
+        assert!(kc.is_killed(&hashes[50]).await);
+        assert!(kc.is_killed(&hashes[99]).await);
+        for h in &hashes {
+            assert!(kc.is_killed(h).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_many_with_duplicate_hashes_in_iterator_is_idempotent() {
+        // The killswitch handler is the only `mark_many` caller; today's
+        // implementation iterates the UPDATE's RETURNING which produces
+        // distinct rows. But a future caller (multi-killswitch fan-in,
+        // say) could legitimately produce a deduplicated set. Pin that
+        // duplicate hashes in the same `mark_many` call do not panic and
+        // leave the cache in the same observable state as a single mark
+        // — moka `insert` of an existing key is a no-op replace, but a
+        // refactor to a count-tracking variant ("dedupe stats for ops")
+        // could trip on the duplicate. Symmetric to the existing single-
+        // mark idempotency pin but on the bulk path.
+        let kc = KillCache::new();
+        let h = [11u8; 32];
+        kc.mark_many(vec![h, h, h, h, h]).await;
+        assert!(kc.is_killed(&h).await);
+    }
+
+    #[tokio::test]
+    async fn mark_and_mark_many_single_element_produce_equivalent_state() {
+        // `mark(h)` and `mark_many([h])` are the two write paths into the
+        // cache — they MUST produce equivalent observable state. A
+        // refactor that gave `mark_many` a different code path (a bulk
+        // batch op, say) and accidentally tagged its entries with a
+        // distinguishing TTL or flag would silently make killswitch/user
+        // (mark_many) behave differently from killswitch/single (mark).
+        // Pin equivalence by symmetric setup: same hash via each path,
+        // both yield is_killed == true; the cross-path mark is also a
+        // no-op (the entry is already there).
+        let a = KillCache::new();
+        let b = KillCache::new();
+        let h = [21u8; 32];
+        a.mark(h).await;
+        b.mark_many(std::iter::once(h)).await;
+        assert!(a.is_killed(&h).await);
+        assert!(b.is_killed(&h).await);
+        // Cross-path: marking the same hash via the other path is a no-op.
+        a.mark_many(std::iter::once(h)).await;
+        b.mark(h).await;
+        assert!(a.is_killed(&h).await);
+        assert!(b.is_killed(&h).await);
+    }
+
+    #[tokio::test]
+    async fn boundary_hash_values_all_zero_and_all_ones_killed_independently() {
+        // The 32-byte hash space's two extreme corners — `[0u8; 32]` and
+        // `[0xffu8; 32]` — are valid sha256 outputs in principle (probability
+        // is negligible but the type accepts them). Pin both: each can be
+        // marked, each is killed, and marking one does NOT kill the other
+        // (no "treat all-zero as sentinel meaning unset" regression). A
+        // refactor to a sparse-bitset backend that branched on the all-zero
+        // key as a placeholder would surface here as a false-negative on
+        // the all-zero arm.
+        let kc = KillCache::new();
+        let zeros = [0u8; 32];
+        let ones = [0xffu8; 32];
+        kc.mark(zeros).await;
+        assert!(kc.is_killed(&zeros).await);
+        assert!(!kc.is_killed(&ones).await);
+        kc.mark(ones).await;
+        assert!(kc.is_killed(&zeros).await);
+        assert!(kc.is_killed(&ones).await);
+    }
+
+    #[tokio::test]
+    async fn is_killed_takes_reference_and_does_not_consume_or_mutate_hash() {
+        // `is_killed` signature is `&self, hash: &[u8; 32]) -> bool` —
+        // it takes a borrow, NOT an owned array. Pin that the hash
+        // value the caller holds is unchanged after the call AND that
+        // repeated calls with the same `&` reference return the same
+        // result without side-effects. The middleware path is
+        // ```ignore
+        // let hash = h.as_bytes(); if kill_cache.is_killed(&hash).await ...
+        // ```
+        // — a refactor that took the hash by value would force the
+        // call site to clone for downstream use; pin the borrow
+        // signature so any such refactor surfaces here.
+        let kc = KillCache::new();
+        let h = [55u8; 32];
+        kc.mark(h).await;
+        let observed_1 = kc.is_killed(&h).await;
+        let observed_2 = kc.is_killed(&h).await;
+        let observed_3 = kc.is_killed(&h).await;
+        assert!(observed_1 && observed_2 && observed_3);
+        // The original hash array is byte-unchanged after the calls.
+        assert_eq!(h, [55u8; 32]);
+    }
+
     #[tokio::test]
     async fn mark_many_with_empty_iterator_is_noop() {
         // `mark_many` is called from killswitch handlers in a loop over

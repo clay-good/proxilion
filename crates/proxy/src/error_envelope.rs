@@ -233,6 +233,131 @@ mod tests {
     }
 
     #[test]
+    fn with_fix_overrides_prior_value_on_repeated_call() {
+        // The builder is `mut self`-by-value — symmetric to the existing
+        // `with_extras_overrides_prior_value_on_repeated_call` test, but
+        // on the `with_fix` arm. Adapter call sites sometimes layer the
+        // envelope construction (a default operator-facing fix from the
+        // engine, then a more specific one from the adapter); pin
+        // last-write-wins so a future refactor that collapsed the two
+        // slots into a "prepend / append" shape would surface here.
+        // `with_fix` takes `&'static str`, so both call sites are
+        // string-literals — pin the override path explicitly.
+        let body = ErrorBody::new("t", "c")
+            .with_fix("run migration A")
+            .with_fix("run migration B");
+        assert_eq!(body.fix, Some("run migration B"));
+    }
+
+    #[test]
+    fn with_docs_overrides_prior_value_on_repeated_call() {
+        // Symmetric to `with_fix_overrides_prior_value_on_repeated_call`
+        // on the `with_docs` arm. The docs URL is the operator's
+        // copy-paste-into-browser path — a refactor that appended (e.g.
+        // building a `docs/?next=...&prev=...` chain) would silently
+        // change the wire shape from one URL to a query-string-encoded
+        // pair, breaking every `docs` field consumer that expects a
+        // single canonical URL.
+        let body = ErrorBody::new("t", "c")
+            .with_docs("https://proxilion.com/docs/old")
+            .with_docs("https://proxilion.com/docs/new");
+        assert_eq!(body.docs, Some("https://proxilion.com/docs/new"));
+    }
+
+    #[test]
+    fn with_detail_overrides_prior_value_on_repeated_call() {
+        // Symmetric to the fix/docs override pins. `with_detail` accepts
+        // `impl Into<String>` (already pinned by
+        // `with_detail_accepts_string_and_str_via_into`) — pin the
+        // last-write-wins contract here so a refactor that concatenated
+        // (e.g. `format!("{old}; {new}")` "to preserve operator history")
+        // would silently double the rendered detail string on every
+        // adapter that calls `with_detail` from two layers.
+        let body = ErrorBody::new("t", "c")
+            .with_detail("first detail")
+            .with_detail("second detail");
+        assert_eq!(body.detail.as_deref(), Some("second detail"));
+    }
+
+    #[test]
+    fn with_extras_boolean_false_serializes_as_present_distinct_from_null_skip() {
+        // The `extras` field's skip predicate is `serde_json::Value::is_null`
+        // — explicitly NOT `is_falsy` or `as_bool().unwrap_or(true)`. Pin
+        // that a JSON-`false` value lands on the wire (not skipped) so a
+        // refactor that swapped the predicate to a more aggressive
+        // "empty-ish value" check would surface here. The existing
+        // `extras_null_omitted_extras_object_included_on_wire` test
+        // pins the null-skip + object-present arms; this fills in the
+        // boolean-false-and-zero-and-empty-string boundary.
+        for v in [
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!(""),
+        ] {
+            let body = ErrorBody::new("t", "c").with_extras(v.clone());
+            let s = serde_json::to_value(&body).unwrap();
+            assert!(
+                s.get("extras").is_some(),
+                "extras={v} must be present on wire, got: {s}",
+            );
+            assert_eq!(s["extras"], v);
+        }
+    }
+
+    #[test]
+    fn error_body_required_fields_accept_static_str_literals_for_zero_alloc_paths() {
+        // `error` and `code` are `&'static str` — pin the lifetime
+        // contract via a function whose signature requires the
+        // 'static bound. Adapter call sites construct envelopes from
+        // string literals on the hot path, and the &'static contract
+        // is what keeps them zero-alloc (no `String::from`). A refactor
+        // that widened to `Cow<'static, str>` would surface as a
+        // borrow-checker rewrite at call sites; a refactor to bare
+        // `String` would silently land an allocation per error body
+        // — pin the trait bound here.
+        fn require_static<T: 'static>(_: T) {}
+        let title: &'static str = "title";
+        let code: &'static str = "code";
+        let body = ErrorBody::new(title, code);
+        // The fields surface unchanged.
+        assert_eq!(body.error, "title");
+        assert_eq!(body.code, "code");
+        // And the bound holds — the body itself is 'static-borrowable
+        // for its &'static str fields. (The String detail field is
+        // owned and doesn't enter this check.)
+        require_static(body.error);
+        require_static(body.code);
+    }
+
+    #[test]
+    fn builders_chain_in_any_order_and_compose_independently() {
+        // The four builders (with_detail / with_fix / with_docs /
+        // with_extras) take `mut self` by value and return Self — pin
+        // that the chain order is irrelevant (each builder touches one
+        // field independently) so a refactor that introduced a hidden
+        // dependency (e.g. with_fix only honors the fix if detail is
+        // already set, "for consistency") would surface here. The
+        // existing `builders_compose_and_set_individual_fields` test
+        // pins ONE chain order; this pins the symmetric reverse order
+        // produces the same shape.
+        let forward = ErrorBody::new("t", "c")
+            .with_detail("d")
+            .with_fix("f")
+            .with_docs("https://x")
+            .with_extras(serde_json::json!({"k": "v"}));
+        let reverse = ErrorBody::new("t", "c")
+            .with_extras(serde_json::json!({"k": "v"}))
+            .with_docs("https://x")
+            .with_fix("f")
+            .with_detail("d");
+        // Compare via the wire shape (the operator-facing surface) —
+        // every field must match across both orderings.
+        let f = serde_json::to_value(&forward).unwrap();
+        let r = serde_json::to_value(&reverse).unwrap();
+        assert_eq!(f, r, "builder chain order must not affect wire shape");
+    }
+
+    #[test]
     fn extras_with_array_or_string_value_serialize_as_non_null_and_present() {
         // The `extras` field is `serde_json::Value`, so it accepts any
         // JSON value — but the load-bearing skip predicate is

@@ -478,4 +478,142 @@ mod tests {
         assert_eq!(err.missing.len(), 1);
         assert_eq!(err.missing[0].object, "file/xyz");
     }
+
+    #[test]
+    fn is_satisfied_by_preserves_required_order_in_missing_list() {
+        // The `missing` Vec is consumed by the operator-facing log
+        // line + the PIC-violations table — the order must match the
+        // order in `required` so an operator reading the policy YAML
+        // top-to-bottom can correlate which template fired which
+        // missing atom. Existing `missing_ops_lists_atoms` walks a
+        // single-missing shape; pin the multi-missing ordered shape
+        // so a refactor that swapped to `HashSet`-based diffing (for
+        // dedup "consistency") would silently scramble the order
+        // and break the operator triage path. Walk three required
+        // ops where the middle one is present in leaf so the
+        // missing list is the first + third in that exact order.
+        let exp = OpsExpression {
+            required: vec![
+                OpsAtom::parse("drive:read:file/a").unwrap(),
+                OpsAtom::parse("drive:read:file/b").unwrap(),
+                OpsAtom::parse("drive:read:file/c").unwrap(),
+            ],
+        };
+        let leaf = vec![OpsAtom::parse("drive:read:file/b").unwrap()];
+        let err = exp.is_satisfied_by(&leaf).unwrap_err();
+        assert_eq!(err.missing.len(), 2);
+        assert_eq!(err.missing[0].object, "file/a");
+        assert_eq!(err.missing[1].object, "file/c");
+    }
+
+    #[test]
+    fn ops_expression_resolve_propagates_unknown_var_from_inner_template() {
+        // `OpsExpression::resolve` walks a list of templates and short-
+        // circuits on the first error. Existing `unknown_var_errors`
+        // walks a single template; pin that a multi-template list
+        // surfaces the OpsParseError::UnknownVar from the FIRST failing
+        // template (not the last, not an aggregated error). A refactor
+        // that switched to `flat_map` + a join of all errors would
+        // silently change the error surface from "Err(first)" to
+        // "Err(all)" and break the operator-facing single-error log
+        // contract.
+        let c = ctx();
+        let templates = vec![
+            "drive:read:file/${path.id}".to_string(),
+            "drive:read:dir/${path.missing}".to_string(),
+        ];
+        let err = OpsExpression::resolve(&templates, &c).unwrap_err();
+        match err {
+            OpsParseError::UnknownVar(name) => {
+                assert_eq!(name, "path.missing", "expected the failing var name")
+            }
+            other => panic!("expected UnknownVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ops_atom_parse_rejects_empty_middle_action_field() {
+        // The format is `scheme:action:object` — the existing
+        // `ops_atom_parse_rejects_each_malformed_shape` covers fully
+        // empty inputs, no-colon, single-colon, and trailing-colon
+        // shapes, but the explicit empty-middle-field shape (`a::b`)
+        // was unpinned. Pin so a refactor that switched to
+        // `splitn(3, ':')` without explicit emptiness checks (since
+        // `splitn` happily produces an empty middle segment from `a::b`)
+        // would silently land an `OpsAtom { scheme: "a", action: "",
+        // object: "b" }` on the wire and produce an unmatchable atom
+        // in the PIC violation log.
+        let err = OpsAtom::parse("drive::file/x").unwrap_err();
+        assert!(matches!(err, OpsParseError::Malformed));
+        // Symmetric: empty SCHEME (leading colon).
+        let err2 = OpsAtom::parse(":read:file/x").unwrap_err();
+        assert!(matches!(err2, OpsParseError::Malformed));
+    }
+
+    #[test]
+    fn ops_atom_clone_yields_independent_owned_strings() {
+        // `OpsExpression::resolve` clones atoms into the required Vec;
+        // the adapter then clones the OpsExpression for the policy
+        // trace AND the Trust-Plane request builder. Pin that Clone
+        // yields independent owned Strings (not aliased via Cow or
+        // Arc<str>) so a future refactor toward `Arc<str>` "for
+        // cheaper clone" would surface here as a borrow-checker
+        // rewrite at the trace's mutation-aliasing back to the
+        // original. Mutate the clone's fields and assert the
+        // original is untouched.
+        let a = OpsAtom::parse("drive:read:file/abc").unwrap();
+        let mut b = a.clone();
+        b.scheme = "modified".into();
+        b.action = "modified".into();
+        b.object = "modified".into();
+        assert_eq!(a.scheme, "drive");
+        assert_eq!(a.action, "read");
+        assert_eq!(a.object, "file/abc");
+        assert_eq!(b.scheme, "modified");
+    }
+
+    #[test]
+    fn ops_expression_clone_yields_independent_required_vec() {
+        // Symmetric to the OpsAtom Clone pin — `OpsExpression` is
+        // Clone, and the adapter clones the expression once per
+        // request to feed both the policy trace and the Trust-Plane
+        // request builder. Pin that Clone yields an independent
+        // `required` Vec so a refactor to `Arc<Vec<OpsAtom>>` would
+        // surface here at the mutation aliasing. Mutate the clone's
+        // Vec and assert the original Vec is untouched.
+        let original = OpsExpression {
+            required: vec![
+                OpsAtom::parse("drive:read:file/a").unwrap(),
+                OpsAtom::parse("drive:read:file/b").unwrap(),
+            ],
+        };
+        let mut c = original.clone();
+        c.required
+            .push(OpsAtom::parse("drive:write:file/c").unwrap());
+        assert_eq!(original.required.len(), 2);
+        assert_eq!(c.required.len(), 3);
+    }
+
+    #[test]
+    fn ops_parse_error_implements_std_error_trait_for_anyhow_chains() {
+        // Adapter call sites bubble OpsParseError through
+        // `anyhow::Error` chains for structured logging — pin that
+        // the `thiserror` derive lands the `std::error::Error` impl
+        // for BOTH variants (`Malformed` is a leaf with no inner;
+        // `UnknownVar(String)` carries a String name but no inner
+        // error). The trait-object cast surfaces a missing impl at
+        // this file rather than at the far-away `?` call site. Both
+        // variants must be leaf-arms (source() returns None) since
+        // neither wraps another error.
+        let m: OpsParseError = OpsParseError::Malformed;
+        let u: OpsParseError = OpsParseError::UnknownVar("path.id".into());
+        let dyn_m: &dyn std::error::Error = &m;
+        let dyn_u: &dyn std::error::Error = &u;
+        assert!(std::error::Error::source(dyn_m).is_none());
+        assert!(std::error::Error::source(dyn_u).is_none());
+        // And the dyn-Display rendering must carry an operator-grep
+        // substring for each variant.
+        assert!(dyn_m.to_string().contains("malformed"));
+        assert!(dyn_u.to_string().contains("path.id"));
+    }
 }

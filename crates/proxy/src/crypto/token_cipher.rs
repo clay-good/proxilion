@@ -216,6 +216,125 @@ mod tests {
     }
 
     #[test]
+    fn from_bytes_boundary_31_and_33_bytes_rejected_with_actual_length() {
+        // The 32-byte requirement is the boundary; existing pins walk
+        // 0 / 16 / empty but not the just-off-by-one shapes. Operators
+        // who pasted a 64-char hex string have sometimes hex-decoded it
+        // wrong and landed on 31 (a leading zero stripped) or 33 (an
+        // extra nybble). Pin both boundaries so the error carries the
+        // actual length — a refactor that pre-padded to 32 ("for
+        // robustness") would silently accept a truncated key and the
+        // produced ciphertext would later decrypt against the wrong
+        // bytes.
+        match TokenCipher::from_bytes(&[0u8; 31]) {
+            Err(CipherError::BadKeyLen(31)) => {}
+            Err(e) => panic!("expected BadKeyLen(31), got {e:?}"),
+            Ok(_) => panic!("expected error for 31-byte key"),
+        }
+        match TokenCipher::from_bytes(&[0u8; 33]) {
+            Err(CipherError::BadKeyLen(33)) => {}
+            Err(e) => panic!("expected BadKeyLen(33), got {e:?}"),
+            Ok(_) => panic!("expected error for 33-byte key"),
+        }
+    }
+
+    #[test]
+    fn decrypt_with_zero_length_nonce_rejected_without_panic() {
+        // Boundary: the existing `wrong_nonce_length_rejected_without_aead_call`
+        // pin walks 11 / 13 but not the explicit zero-byte nonce shape
+        // (a corrupt-row scenario where the persisted `nonce` column
+        // got NULL-treated-as-empty by a deserializer). The current
+        // `ct.nonce.len() != 12` guard handles this — pin the no-panic
+        // contract directly so a refactor that switched to
+        // `Nonce::from_slice(&ct.nonce)` first (without the length
+        // pre-check) would panic on the zero-length slice. The
+        // `nonce.len() != 12` guard MUST come before any nonce slicing.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let pt = c.encrypt(b"hi").unwrap();
+        let zero = Ciphertext {
+            nonce: Vec::new(),
+            bytes: pt.bytes,
+        };
+        assert!(matches!(c.decrypt(&zero), Err(CipherError::Aead)));
+    }
+
+    #[test]
+    fn cipher_error_implements_std_error_trait_for_anyhow_chain_walking() {
+        // Adapter call sites bubble CipherError through `anyhow::Error`
+        // chains for structured logging at the OAuth-token-persist
+        // path — pin that the `thiserror` derive lands the
+        // `std::error::Error` impl for both variants. Both arms are
+        // leaves (no inner error), so `source()` must return None.
+        // A refactor that swapped to a hand-rolled error type and
+        // forgot the trait would surface here at the dyn-cast rather
+        // than only at the far `?` call site.
+        let len: CipherError = CipherError::BadKeyLen(17);
+        let aead: CipherError = CipherError::Aead;
+        let dyn_len: &dyn std::error::Error = &len;
+        let dyn_aead: &dyn std::error::Error = &aead;
+        assert!(std::error::Error::source(dyn_len).is_none());
+        assert!(std::error::Error::source(dyn_aead).is_none());
+    }
+
+    #[test]
+    fn encrypt_empty_plaintext_still_yields_distinct_nonces_across_calls() {
+        // The existing `distinct_nonces` pin walks `b"hi"`; pin the
+        // empty-plaintext shape symmetrically. The Google OAuth
+        // refresh-token field can be omitted (encrypted as empty),
+        // and two consecutive empty encryptions must still produce
+        // distinct nonces — a refactor that special-cased empty
+        // plaintexts to a fixed nonce "for speed" would silently
+        // collapse every empty-token row's IV onto a constant and
+        // break the IV-uniqueness guarantee AES-GCM relies on.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let a = c.encrypt(b"").unwrap();
+        let b = c.encrypt(b"").unwrap();
+        assert_ne!(a.nonce, b.nonce, "nonce must be random per encryption");
+        // The 16-byte auth tag will be deterministic for a constant
+        // (empty) plaintext under the same key + nonce — but since
+        // the nonces differ, the tag bytes must also differ.
+        assert_ne!(a.bytes, b.bytes);
+    }
+
+    #[test]
+    fn ciphertext_debug_renders_field_names_for_operator_grep() {
+        // `Ciphertext` derives Debug — the OAuth persistence path
+        // sometimes traces a redacted ciphertext shape via
+        // `tracing::debug!(?ct, ..)` during failure triage. Pin that
+        // the rendered Debug includes the `nonce` and `bytes` field
+        // names so an operator filter keyed on those substrings
+        // works. A manual Debug that rendered the bytes inline
+        // (e.g. as hex without the field names) would silently
+        // strip the operator's grep handle. Note: this test does
+        // NOT pin that the bytes are redacted — that's a separate
+        // operator concern; the current derive renders them
+        // verbatim.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let ct = c.encrypt(b"x").unwrap();
+        let s = format!("{ct:?}");
+        assert!(s.contains("nonce"), "got: {s}");
+        assert!(s.contains("bytes"), "got: {s}");
+        assert!(s.contains("Ciphertext"), "got: {s}");
+    }
+
+    #[test]
+    fn nonce_is_exactly_12_bytes_per_aes_gcm_spec() {
+        // AES-GCM's nonce MUST be exactly 12 bytes (96 bits) per
+        // NIST SP 800-38D — the `Aes256Gcm::generate_nonce` helper
+        // produces this length, and the `decrypt` path rejects
+        // anything else. Pin the length on the encrypt side directly
+        // (existing tests pin the decrypt-rejection side for !=12).
+        // A refactor that swapped to a larger nonce "for safety
+        // margin" would silently break wire compat with any
+        // already-persisted Ciphertext row.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        for _ in 0..3 {
+            let ct = c.encrypt(b"sample").unwrap();
+            assert_eq!(ct.nonce.len(), 12, "nonce MUST be 96 bits");
+        }
+    }
+
+    #[test]
     fn empty_key_rejected_with_zero_length() {
         // Boundary: a missing env var sometimes shows up as an empty byte
         // slice. The variant must carry `0`, not panic on the indexing path.

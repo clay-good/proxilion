@@ -308,4 +308,190 @@ mod tests {
         assert!(s.contains("layer_b=ok"));
         assert!(s.contains("read_filter=read_filter_blocked"));
     }
+
+    #[test]
+    fn summary_renders_unknown_for_failed_layer_with_no_error_code() {
+        // `summary()` falls back to `"unknown"` when a failed layer
+        // carries `error_code: None`. The fallback is the `unwrap_or`
+        // arm on the rendered code substring and is what surfaces in
+        // the comma-joined summary when a hand-constructed
+        // `LayerOutcome` lands in the trace without going through
+        // `LayerOutcome::failed()` (which always sets a code).
+        // Operator dashboards split on `=unknown` as the "trace was
+        // mutated by hand without a code" tripwire — a refactor that
+        // collapsed the fallback to `""` (empty) would silently
+        // produce `layer_b=` and break log-derived metrics keyed on
+        // the `=<word>` pattern.
+        let t = PolicyTrace::new(
+            vec![LayerOutcome {
+                layer: PolicyLayer::LayerB,
+                passed: false,
+                matched_rule_id: None,
+                error_code: None,
+                detail: None,
+            }],
+            Decision::Allow,
+            vec![],
+        );
+        assert_eq!(summary(&t), "layer_b=unknown");
+    }
+
+    #[test]
+    fn mark_layer_a_failed_always_sets_matched_rule_id_to_none() {
+        // `mark_layer_a_failed` hardcodes `None` for the
+        // `matched_rule_id` field — Layer A faults are PIC
+        // monotonicity failures, NOT policy-rule matches, so the
+        // helper never carries a policy_id. Pin this contract so a
+        // refactor that "for consistency with mark_read_filter"
+        // added a `matched_policy_id` parameter would surface here.
+        // The dashboard's "PCA refused" alert keys on `layer_a` rows
+        // with `matched_rule_id: null` as the discriminant against
+        // any future Layer A variant that DOES carry a policy id.
+        let mut t = fresh_trace();
+        mark_layer_a_failed(&mut t, "missing drive:write:bob/*".into());
+        let la = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .unwrap();
+        assert!(
+            la.matched_rule_id.is_none(),
+            "got: {:?}",
+            la.matched_rule_id
+        );
+        assert_eq!(la.error_code, Some(ErrorCode::PicInvariantViolation));
+    }
+
+    #[test]
+    fn mark_read_filter_passed_arm_carries_none_error_code_with_detail_present() {
+        // The `blocked=false` arm of `mark_read_filter` constructs
+        // a `LayerOutcome` directly (not via `LayerOutcome::passed()`
+        // or `LayerOutcome::failed()`) so it can carry BOTH
+        // `passed: true` AND a `detail: Some(_)` describing the
+        // quarantine action that ran. This is the only place in the
+        // adapter where a passed layer surfaces a `detail` — pin
+        // the four-axis shape (passed=true, error_code=None,
+        // matched_rule_id=Some, detail=Some) so a refactor that
+        // routed through `LayerOutcome::passed()` (which drops
+        // `detail`) would silently strip the per-event quarantine
+        // count from the structured log.
+        let mut t = fresh_trace();
+        mark_read_filter(
+            &mut t,
+            false,
+            Some("drive-secret-scanner".into()),
+            "quarantined 3 of 12 chunks".into(),
+        );
+        let rf = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::ReadFilter)
+            .unwrap();
+        assert!(rf.passed);
+        assert!(
+            rf.error_code.is_none(),
+            "passed arm must NOT set an error_code"
+        );
+        assert_eq!(rf.matched_rule_id.as_deref(), Some("drive-secret-scanner"));
+        assert_eq!(rf.detail.as_deref(), Some("quarantined 3 of 12 chunks"));
+    }
+
+    #[test]
+    fn set_layer_replaces_only_first_matching_entry_when_duplicates_exist() {
+        // `set_layer` uses `iter_mut().find(|l| l.layer == layer)` —
+        // a linear scan that returns the FIRST matching slot. If a
+        // caller (today: only the engine's initial construction +
+        // `mark_*` helpers) accidentally produced a trace with two
+        // entries for the same layer, only the first one would be
+        // replaced. Pin this contract: the helper is single-replace,
+        // not replace-all. A refactor to `iter_mut().filter(...).for_each(|s| *s = ...)`
+        // (replace-all) would silently double-mutate a malformed
+        // trace and mask the duplicate; the current single-replace
+        // semantic preserves the duplicate as a visible bug for
+        // operator triage.
+        let mut t = PolicyTrace::new(
+            vec![
+                LayerOutcome::passed(PolicyLayer::LayerB),
+                LayerOutcome::passed(PolicyLayer::LayerA),
+                LayerOutcome::passed(PolicyLayer::LayerB),
+            ],
+            Decision::Allow,
+            vec![],
+        );
+        set_layer(
+            &mut t,
+            PolicyLayer::LayerB,
+            LayerOutcome::failed(
+                PolicyLayer::LayerB,
+                ErrorCode::PolicyBlocked,
+                Some("p1".into()),
+                Some("first".into()),
+            ),
+        );
+        // Length unchanged — single-replace, no append.
+        assert_eq!(t.layers.len(), 3);
+        // First LayerB entry (index 0) was replaced.
+        assert!(!t.layers[0].passed);
+        assert_eq!(t.layers[0].error_code, Some(ErrorCode::PolicyBlocked));
+        // LayerA in the middle untouched.
+        assert!(t.layers[1].passed);
+        assert_eq!(t.layers[1].layer, PolicyLayer::LayerA);
+        // Second LayerB entry (index 2) preserved unchanged — single-replace.
+        assert!(t.layers[2].passed);
+        assert_eq!(t.layers[2].layer, PolicyLayer::LayerB);
+    }
+
+    #[test]
+    fn summary_single_failed_layer_renders_without_trailing_separator() {
+        // `summary()` joins the per-layer renderings with `","` via
+        // `Vec::join`. On a single-element Vec the join produces NO
+        // separator — pin that contract so a refactor that swapped
+        // to a manual `for { push(','); push(layer) }` loop (which
+        // would emit a trailing comma) would silently break operator
+        // log filters keyed on the exact `"layer_a=pic_invariant_violation"`
+        // shape with no trailing punctuation. The empty-Vec case is
+        // already pinned by `summary_renders_read_filter_label_and_empty_layers`;
+        // this fills in the single-element boundary.
+        let t = PolicyTrace::new(
+            vec![LayerOutcome::failed(
+                PolicyLayer::LayerA,
+                ErrorCode::PicInvariantViolation,
+                None,
+                Some("missing".into()),
+            )],
+            Decision::Allow,
+            vec![],
+        );
+        let s = summary(&t);
+        assert_eq!(s, "layer_a=pic_invariant_violation");
+        assert!(!s.ends_with(','), "no trailing separator allowed: {s:?}");
+    }
+
+    #[test]
+    fn mark_read_filter_blocked_with_none_policy_id_omits_matched_rule_id() {
+        // Symmetric to round-2's existing `mark_read_filter_blocked_sets_failed_with_code`
+        // which only pinned the `Some(_)` arm. The `None` arm fires
+        // when an ad-hoc / default-deny scan triggers without a
+        // matched policy (e.g. a global scanner that runs on every
+        // response). The dashboard's "scan triggered" panel
+        // distinguishes per-policy hits from global-scanner hits on
+        // the presence of `matched_rule_id` — a refactor that
+        // unwrap_or-defaulted the field to `"unknown"` to "always
+        // surface something" would silently merge the two buckets.
+        let mut t = fresh_trace();
+        mark_read_filter(&mut t, true, None, "secret detected".into());
+        let rf = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::ReadFilter)
+            .unwrap();
+        assert!(!rf.passed);
+        assert_eq!(rf.error_code, Some(ErrorCode::ReadFilterBlocked));
+        assert!(
+            rf.matched_rule_id.is_none(),
+            "None-policy-id arm must NOT synthesize a rule id; got: {:?}",
+            rf.matched_rule_id,
+        );
+        assert_eq!(rf.detail.as_deref(), Some("secret detected"));
+    }
 }

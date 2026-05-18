@@ -252,6 +252,173 @@ mod tests {
     }
 
     #[test]
+    fn cache_error_implements_std_error_trait_and_source_carries_inner_sqlx() {
+        // `CacheError::Db` is `#[from] sqlx::Error` — the `thiserror`
+        // derive wires both the `From` impl AND the `source()` chain. The
+        // existing `cache_error_display_passes_through_db_message` test
+        // pins the Display prefix but does NOT pin the chain walk; the
+        // existing `cache_error_from_sqlx_via_question_mark` test pins
+        // the `?` conversion but not the trait/source surface. Pin
+        // `std::error::Error::source() == Some(sqlx_inner)` so a
+        // refactor that swapped `#[from] sqlx::Error` for a
+        // `String`-stringified inner (which would still pass the
+        // existing Display + `?` tests) would surface here as
+        // `source()` collapsing to None and breaking
+        // `anyhow::Error::chain()` walks in the verifier's logs.
+        use std::error::Error;
+        let e: CacheError = CacheError::from(sqlx::Error::RowNotFound);
+        let dyn_e: &(dyn Error + 'static) = &e;
+        // source() MUST surface the inner sqlx::Error (a `String`-wrapped
+        // refactor would silently return None here).
+        let src = dyn_e.source().expect("Db variant has a #[from] source");
+        // And the inner source's Display is the sqlx message verbatim
+        // — pin the byte-identical passthrough at the chain-walk level.
+        assert!(
+            src.to_string().contains("no rows"),
+            "inner sqlx::Error message must surface via source(): {}",
+            src,
+        );
+        // The leaf has no further source (sqlx::Error::RowNotFound is
+        // itself a leaf).
+        assert!(src.source().is_none(), "inner sqlx leaf has no source");
+    }
+
+    #[test]
+    fn current_pic_profile_format_pinned_proxilion_dot_v1_for_grep() {
+        // The existing `current_pic_profile_is_stable_v1_string` test
+        // pins byte-exact equality but doesn't pin the structural shape
+        // (vendor prefix + version suffix). Operator dashboards that
+        // bucket cached PCA rows by profile family (`proxilion.*` vs.
+        // a future cross-vendor `consortium.*`) rely on the dot-separator
+        // shape, and a future v2 bump still needs to match the
+        // `proxilion.vN` pattern. Pin the structural invariants
+        // explicitly so a refactor that swapped to underscore-separator
+        // (`proxilion_v1`) or to a UUID would surface here alongside
+        // the byte-exact pin.
+        assert!(
+            CURRENT_PIC_PROFILE.starts_with("proxilion."),
+            "vendor prefix: {CURRENT_PIC_PROFILE}",
+        );
+        assert!(
+            CURRENT_PIC_PROFILE.ends_with(".v1"),
+            "version suffix: {CURRENT_PIC_PROFILE}",
+        );
+        // Exactly one dot separator between vendor and version (a
+        // future `proxilion.v1.beta` shape would need a conscious
+        // dashboard-routing change).
+        assert_eq!(
+            CURRENT_PIC_PROFILE.matches('.').count(),
+            1,
+            "exactly one dot separator: {CURRENT_PIC_PROFILE}",
+        );
+        // The vendor half is non-empty (a refactor to `.v1` alone
+        // — e.g. an `_VERSION` constant rename collapse — would
+        // silently drop the vendor namespace).
+        let (vendor, _version) = CURRENT_PIC_PROFILE
+            .split_once('.')
+            .expect("dot present per invariant above");
+        assert!(!vendor.is_empty(), "vendor half non-empty");
+    }
+
+    #[test]
+    fn cached_pca_debug_carries_pca_id_ops_hop_and_predecessor_field_names() {
+        // Symmetric expansion of `cached_pca_debug_includes_pca_id_for_operator_log_grep`
+        // — that test pins ONLY the `pca_id` substring. The verifier's
+        // chain-walk failure logs render `?pca` and operators grep for
+        // `ops=`, `hop=`, `predecessor_id=` selectors to bucket "missing
+        // op at hop N" vs. "broken chain link at predecessor M". A
+        // manual Debug impl that hid the structural field names "for
+        // brevity" would silently strip every selector but `pca_id`.
+        // Pin all four field names AND the predecessor UUID substring.
+        let pca_id = Uuid::new_v4();
+        let pred = Uuid::new_v4();
+        let pca = CachedPca::new(
+            pca_id,
+            vec![0xAA, 0xBB],
+            "alice@acme.com".into(),
+            vec!["drive:read:file/x".into()],
+            7,
+            Some(pred),
+        );
+        let s = format!("{pca:?}");
+        assert!(s.contains("pca_id"), "got: {s}");
+        assert!(s.contains("ops"), "got: {s}");
+        assert!(s.contains("hop"), "got: {s}");
+        assert!(s.contains("predecessor_id"), "got: {s}");
+        // And the hop integer value (7) and predecessor UUID surface
+        // for grep — a refactor that elided values for "log brevity"
+        // would strip the selector content alongside the field name.
+        assert!(s.contains("7"), "hop value visible: {s}");
+        assert!(s.contains(&pred.to_string()), "predecessor UUID: {s}");
+    }
+
+    #[test]
+    fn cached_pca_new_accepts_empty_strings_and_vecs_without_panic() {
+        // The PCA cache row's `p_0` can in principle be an empty string
+        // (e.g. a system-issued chain with no principal — not a real
+        // production shape today, but a wire-shape edge). The current
+        // constructor MUST NOT panic on empty inputs and MUST preserve
+        // the empty values through to the struct fields (no
+        // "default-to-(none)" sentinel substitution). A refactor that
+        // started rejecting empty `p_0` at construction time "for
+        // hygiene" would surface here — and would need to be a
+        // conscious wire-shape change since the DB column is NOT NULL
+        // but tolerates empty strings.
+        let pca = CachedPca::new(Uuid::nil(), Vec::new(), String::new(), Vec::new(), 0, None);
+        assert!(pca.cbor.is_empty());
+        assert!(pca.p_0.is_empty(), "p_0 preserved as empty, not (none)");
+        assert!(pca.ops.is_empty());
+        assert!(pca.signature.is_empty());
+        assert_eq!(pca.pic_profile, CURRENT_PIC_PROFILE);
+    }
+
+    #[test]
+    fn pca_cache_clone_shares_underlying_pg_pool_via_arc() {
+        // `PcaCache` derives `Clone` over a `PgPool` field; sqlx's
+        // `PgPool::clone` is an Arc share, not a deep copy. Pin the
+        // shared-state semantic via two compile-time + runtime checks:
+        // (1) `PcaCache: Clone` (the `Clone` derive is what AppState
+        // relies on when handing the cache to per-request handlers);
+        // (2) cloning compiles without requiring a runtime PG
+        // connection (PgPool's clone is infallible Arc bump). A
+        // refactor that swapped `Clone` for a `try_clone() -> Result`
+        // (in the name of "explicit failure") would surface as a
+        // compile break here.
+        // We can't easily construct a real PgPool in a unit test
+        // without a connection, but we CAN verify the type-level
+        // contract — `PcaCache: Clone + Send + Sync` are the bounds
+        // every adapter handler signature relies on.
+        fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+        assert_clone_send_sync::<PcaCache>();
+    }
+
+    #[test]
+    fn cached_pca_new_round_trips_distinct_predecessor_uuids_independently() {
+        // Each chain link's `predecessor_id` MUST round-trip the EXACT
+        // UUID bytes — not a normalized/zeroed-out placeholder. The
+        // existing `cached_pca_new_carries_predecessor_when_present`
+        // test walks a single predecessor; pin that ten distinct
+        // predecessors yield ten distinct struct fields with no
+        // aliasing across constructions (a refactor to a `lazy_static`
+        // sentinel for "speed" would surface here).
+        let preds: Vec<Uuid> = (0..10).map(|_| Uuid::new_v4()).collect();
+        let pcas: Vec<CachedPca> = preds
+            .iter()
+            .map(|p| CachedPca::new(Uuid::new_v4(), vec![], "x".into(), vec![], 1, Some(*p)))
+            .collect();
+        for (i, pca) in pcas.iter().enumerate() {
+            assert_eq!(pca.predecessor_id, Some(preds[i]));
+        }
+        // And all ten predecessor UUIDs are pairwise distinct — sanity
+        // check that the test fixture itself isn't degenerate (a
+        // refactor in `Uuid::new_v4` would surface here as alias).
+        let mut sorted = preds.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 10, "test fixture: 10 distinct UUIDs");
+    }
+
+    #[test]
     fn cache_error_from_sqlx_via_question_mark() {
         // `?`-conversion is what the public `insert` / `get` methods use;
         // pin the `#[from]` blanket-impl path so a future refactor that

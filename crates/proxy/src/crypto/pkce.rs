@@ -142,6 +142,152 @@ mod tests {
     }
 
     #[test]
+    fn pkce_error_source_is_none_for_both_variants_leaf_contract() {
+        // The existing `pkce_error_implements_std_error_trait_for_anyhow_chains`
+        // test pins the `std::error::Error` trait via dyn-cast on the
+        // Mismatch variant only and asserts only the `to_string()`
+        // substring — it does NOT walk `source()`. Both variants are
+        // leaf errors (no `#[source]` / `#[from]` inner), so
+        // `source()` MUST return None for both. A refactor that
+        // chained an inner cause (e.g. `Mismatch { inner: sqlx::Error }`
+        // for "richer triage") would silently change the anyhow chain
+        // walk shape, making the OAuth callback log render two
+        // entries instead of one for a PKCE failure — pin the leaf
+        // contract explicitly across both variants.
+        use std::error::Error;
+        let m: PkceError = PkceError::Mismatch;
+        let l: PkceError = PkceError::VerifierLength;
+        let dyn_m: &(dyn Error + 'static) = &m;
+        let dyn_l: &(dyn Error + 'static) = &l;
+        assert!(dyn_m.source().is_none(), "Mismatch is a leaf");
+        assert!(dyn_l.source().is_none(), "VerifierLength is a leaf");
+    }
+
+    #[test]
+    fn pkce_error_debug_carries_variant_name_for_operator_grep() {
+        // The OAuth callback's failure-triage path traces
+        // `tracing::warn!(?err, ..)` — operators grep for the variant
+        // name to bucket "verifier mismatch (likely a tampered code_verifier)"
+        // vs. "verifier malformed (length out of range)". A manual
+        // Debug impl that hid the variant name (e.g. rendered as
+        // `PkceError(1)` after a refactor to a numeric error code)
+        // would silently collapse the two failure modes onto an opaque
+        // integer in every operator log line. Pin both variant names
+        // in the Debug render.
+        let s = format!("{:?}", PkceError::Mismatch);
+        assert!(s.contains("Mismatch"), "got: {s}");
+        let s = format!("{:?}", PkceError::VerifierLength);
+        assert!(s.contains("VerifierLength"), "got: {s}");
+    }
+
+    #[test]
+    fn verifier_length_check_counts_bytes_not_unicode_codepoints() {
+        // RFC 7636 §4.1 specifies the verifier as ASCII characters from
+        // the [A-Z][a-z][0-9]-._~ unreserved set — the 43..=128 bound is
+        // a byte count. Rust's `str::len()` returns BYTES, which matches
+        // the RFC. Pin the byte-semantic via a multi-byte UTF-8 string:
+        // 43 × `é` (2 bytes each = 86 bytes) MUST pass the length check
+        // (since 86 is in 43..=128) and proceed to the Mismatch path
+        // — not surface a "43 codepoints" interpretation that would
+        // reject it as too short. Symmetric: 11 × `é` (22 bytes, below
+        // 43) MUST be rejected as VerifierLength. A refactor to
+        // `verifier.chars().count()` would surface here as flipping the
+        // two errors. This isn't a "valid PKCE inbound" — actual PKCE
+        // verifiers are ASCII — but the BYTE-vs-CHAR distinction is the
+        // load-bearing invariant against `chars().count()` refactors.
+        let v_86_bytes = "é".repeat(43);
+        assert_eq!(v_86_bytes.len(), 86);
+        assert!(
+            matches!(
+                verify_pkce_s256(&v_86_bytes, "bogus").unwrap_err(),
+                PkceError::Mismatch,
+            ),
+            "86-byte verifier must pass length, fall to Mismatch",
+        );
+        let v_22_bytes = "é".repeat(11);
+        assert_eq!(v_22_bytes.len(), 22);
+        assert!(
+            matches!(
+                verify_pkce_s256(&v_22_bytes, "bogus").unwrap_err(),
+                PkceError::VerifierLength,
+            ),
+            "22-byte verifier must trip VerifierLength",
+        );
+    }
+
+    #[test]
+    fn empty_challenge_with_valid_length_verifier_yields_mismatch_not_panic() {
+        // The challenge side is fed directly into a constant-time byte
+        // comparison; a wire-shape edge is an empty challenge string
+        // (length 0) against a valid-length verifier. The current
+        // implementation MUST yield Mismatch (the computed b64url
+        // challenge for any 43-byte verifier is 43 bytes long, so an
+        // empty challenge never equals it) and MUST NOT panic in the
+        // `ct_eq` path (subtle's ct_eq returns Choice(0) for
+        // length-mismatched slices, not a panic — a refactor that
+        // pre-checked `assert_eq!(a.len(), b.len())` for "tidiness"
+        // would surface here as a panic on the empty-challenge edge).
+        let verifier = "a".repeat(43);
+        let err = verify_pkce_s256(&verifier, "").unwrap_err();
+        assert!(matches!(err, PkceError::Mismatch), "got {err:?}");
+    }
+
+    #[test]
+    fn computed_challenge_is_exactly_43_bytes_for_any_input_length() {
+        // The base64url-no-pad encoding of a SHA-256 digest is always
+        // 43 bytes (32 bytes input → ceil(32*8/6) = 43 chars, no
+        // padding). The PKCE wire shape on the callback storage side
+        // depends on this — the `code_challenge` column is sized to
+        // 43 chars in the OAuth state table, and a refactor that
+        // swapped to standard base64 (WITH padding, 44 chars) or to
+        // hex (64 chars) would silently overflow the column on the
+        // first PKCE flow after deploy. Pin the 43-byte invariant
+        // across three verifier lengths so a per-length silent
+        // truncation surfaces here too.
+        for verifier_str in ["a".repeat(43), "b".repeat(64), "c".repeat(128)] {
+            let digest = Sha256::digest(verifier_str.as_bytes());
+            let encoded = URL_SAFE_NO_PAD.encode(digest);
+            assert_eq!(
+                encoded.len(),
+                43,
+                "b64url-no-pad of SHA-256 must be 43 chars (input len {})",
+                verifier_str.len(),
+            );
+            // And `verify_pkce_s256` with the byte-identical computed
+            // challenge MUST return Ok — round-trip pin.
+            assert!(verify_pkce_s256(&verifier_str, &encoded).is_ok());
+        }
+    }
+
+    #[test]
+    fn mismatch_returned_when_challenge_differs_by_one_trailing_byte() {
+        // Boundary on the constant-time compare: flip a single trailing
+        // byte of the real challenge and pin that the verifier fails
+        // closed. Without this pin, a refactor to a length-only check
+        // (e.g. `if computed.len() == challenge.len() { Ok(()) }`) would
+        // silently pass — the existing `mismatch_rejected` test walks a
+        // wholly bogus challenge that also fails a length check, so it
+        // doesn't isolate the byte-comparison path. Pin a 43-byte
+        // bogus challenge that has the SAME LENGTH as the real one but
+        // differs in one byte at the tail.
+        let verifier = "a".repeat(43);
+        let digest = Sha256::digest(verifier.as_bytes());
+        let real = URL_SAFE_NO_PAD.encode(digest);
+        assert_eq!(real.len(), 43);
+        // Flip the last byte to a different valid b64url char.
+        let mut tampered = real.clone();
+        let last = tampered.pop().unwrap();
+        let flipped = if last == 'A' { 'B' } else { 'A' };
+        tampered.push(flipped);
+        assert_eq!(tampered.len(), 43);
+        assert_ne!(tampered, real);
+        assert!(matches!(
+            verify_pkce_s256(&verifier, &tampered).unwrap_err(),
+            PkceError::Mismatch,
+        ));
+    }
+
+    #[test]
     fn error_display_strings_are_stable_for_log_filters() {
         // Operator log filters key on the substring "PKCE check" /
         // "length must be 43..=128". A future variant rename or message

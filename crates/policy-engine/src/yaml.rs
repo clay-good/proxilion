@@ -501,6 +501,218 @@ mod tests {
     }
 
     #[test]
+    fn policy_doc_clone_preserves_all_optional_fields_independently() {
+        // `PolicyDoc` derives `Clone` — adapter call sites snapshot
+        // the engine's parsed policies into per-request handler
+        // state (the hot path uses `Engine::evaluate` which borrows,
+        // but the dashboard's policy-list endpoint clones for the
+        // wire-serialize). Pin that the Clone derive covers every
+        // optional field (read_filter / notifier_burst /
+        // notifier_recipients / audit_body / override_) and that
+        // the inner `serde_yaml::Value` slots for `match_` and
+        // `decision` round-trip without aliasing the source. A
+        // refactor that switched any field to `Cow<...>` or
+        // dropped the derive would surface here.
+        let yaml = "\
+- id: p1
+  vendor: google
+  action: drive.files.get
+  mode: observe
+  pic_mode: runtime-gate
+  override: requires_justification
+  audit_body: hash
+  notifier_burst:
+    threshold: 5
+  notifier_recipients:
+    to: ops@acme.com
+    escalation_after_minutes: 30
+  read_filter:
+    quarantine_action: strip_silently
+  required_ops:
+    - drive:read:file/${path.id}
+  match:
+    user.email:
+      not_in: [bot@acme.com]
+  decision: allow
+";
+        let docs = parse_policies(yaml).unwrap();
+        let original = &docs[0];
+        let c = original.clone();
+        assert_eq!(c.id, "p1");
+        assert_eq!(c.vendor, "google");
+        assert_eq!(c.action, "drive.files.get");
+        assert_eq!(c.mode, Mode::Observe);
+        assert_eq!(c.pic_mode, PicMode::RuntimeGate);
+        assert_eq!(c.override_.as_deref(), Some("requires_justification"));
+        assert_eq!(c.audit_body, Some(AuditBodyMode::Hash));
+        assert!(c.notifier_burst.is_some());
+        assert_eq!(c.notifier_burst.unwrap().threshold, Some(5));
+        let r = c.notifier_recipients.as_ref().unwrap();
+        assert_eq!(r.to.as_deref(), Some(&["ops@acme.com".to_string()][..]));
+        assert_eq!(r.escalation_after_minutes, Some(30));
+        assert!(c.read_filter.is_some());
+        assert_eq!(c.required_ops.len(), 1);
+        assert_eq!(c.required_ops[0], "drive:read:file/${path.id}");
+        // The serde_yaml::Value fields survive the Clone (no aliasing).
+        assert!(c.match_.is_mapping(), "match_ value lost: {:?}", c.match_);
+        assert!(
+            c.decision.as_str() == Some("allow"),
+            "decision value lost: {:?}",
+            c.decision,
+        );
+    }
+
+    #[test]
+    fn policy_doc_override_field_renamed_from_override_serde_attr_round_trip() {
+        // `pub override_: Option<String>` is annotated
+        // `#[serde(default, rename = "override")]` — the `override_`
+        // trailing underscore is Rust's reserved-keyword escape
+        // (`override` is a reserved identifier). The wire key MUST
+        // be the bare `override`, NOT `override_`. spec.md §9
+        // example policies key on the bare wire form, and the
+        // dashboard's policy-author renders it back to the operator
+        // verbatim. A refactor that dropped the `#[serde(rename)]`
+        // attribute would silently start emitting `override_` on
+        // serialize and rejecting `override` on deserialize — every
+        // existing operator-authored policy would fail-parse on
+        // reload. Pin BOTH directions.
+        let yaml = "\
+- id: p1
+  vendor: g
+  action: a
+  override: requires_justification
+";
+        let d = &parse_policies(yaml).unwrap()[0];
+        assert_eq!(d.override_.as_deref(), Some("requires_justification"));
+        // Symmetric serialize via serde_json (yaml round-trip would
+        // re-quote and reformat — the rename attribute fires for
+        // every Serializer, so json is a cleaner pin).
+        let v = serde_json::to_value(d).unwrap();
+        assert!(
+            v.get("override").is_some(),
+            "serialize must emit `override`, got keys: {:?}",
+            v.as_object().unwrap().keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            v.get("override_").is_none(),
+            "serialize must NOT emit `override_` (Rust escape form): {v}",
+        );
+        assert_eq!(v["override"], "requires_justification");
+    }
+
+    #[test]
+    fn parse_policies_empty_yaml_array_returns_zero_policies_without_error() {
+        // The top-level YAML is a sequence — pin that the empty
+        // sequence `[]` is a VALID input that returns an empty
+        // Vec, not a deserialize error. The empty-engine boot path
+        // (`Engine::new("[]")`) depends on this for the no-policy
+        // default the integration tests use. A refactor that
+        // required at least one policy (a tightening for
+        // "operator-friendly" validation) would silently break
+        // every test fixture and the dev-default engine.
+        let docs = parse_policies("[]").unwrap();
+        assert!(docs.is_empty());
+        // The block-style empty sequence is the same shape via a
+        // different YAML rendering — also accepted.
+        let docs = parse_policies("--- []\n").unwrap();
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn default_pic_mode_helper_returns_audit_directly() {
+        // The `default_pic_mode` fn drives `PolicyDoc`'s
+        // `#[serde(default = "default_pic_mode")]` for the
+        // `pic_mode` field. The existing
+        // `defaults_match_safe_production_posture` test pins this
+        // via `assert_eq!(default_pic_mode(), PicMode::Audit)`,
+        // but the SYMMETRIC `default_mode` and
+        // `default_quarantine_action` helpers each have a separate
+        // dedicated test (`default_quarantine_action_helper_returns_replace_with_marker`)
+        // that pins the function-pointer return value in isolation
+        // — pin `default_pic_mode` here for consistency. The
+        // contract: `Audit` is the safe-posture default (PIC
+        // monotonicity faults are recorded but the request still
+        // proceeds against the predecessor PCA — runtime_gate is
+        // the opt-in tightening). A refactor that flipped the
+        // default to `RuntimeGate` would silently start blocking
+        // every customer who hadn't explicitly opted in.
+        assert_eq!(default_pic_mode(), PicMode::Audit);
+    }
+
+    #[test]
+    fn recipients_cfg_empty_to_list_round_trips_as_some_empty_vec_distinct_from_none() {
+        // `deserialize_string_or_vec_opt` walks `Option<One>` where
+        // `One` is the untagged String/Vec<String> union. When the
+        // YAML carries an explicit empty list (`to: []`), the
+        // helper must produce `Some(vec![])` — DISTINCT from the
+        // absent-field shape which produces `None`. The notifier
+        // logic distinguishes "operator explicitly set empty"
+        // (`Some(vec![])` — suppress all email to this list) from
+        // "inherit from global" (`None`); a refactor that collapsed
+        // the empty list to `None` (the natural "treat empty as
+        // unset" simplification) would silently start
+        // email-blasting an operator who deliberately blanked a list.
+        let y = "\
+- id: p
+  vendor: g
+  action: a
+  notifier_recipients:
+    to: []
+    cc: alice@x.com
+";
+        let d = &parse_policies(y).unwrap()[0];
+        let r = d.notifier_recipients.as_ref().unwrap();
+        // `to: []` → Some(empty vec), NOT None.
+        assert_eq!(r.to.as_deref(), Some(&[][..]));
+        assert!(
+            r.to.is_some(),
+            "to: [] must remain Some(_), not collapse to None"
+        );
+        // `cc` exercises the single-string path side-by-side.
+        assert_eq!(r.cc.as_deref(), Some(&["alice@x.com".to_string()][..]));
+        // `bcc` was absent → None.
+        assert!(r.bcc.is_none());
+    }
+
+    #[test]
+    fn audit_body_unknown_variant_value_is_rejected_by_closed_enum() {
+        // `AuditBodyMode` is a closed enum (no `#[serde(other)]`
+        // catch-all), so an operator typo like `audit_body: hashing`
+        // (extra `ing`) or a future-spec variant the proxy doesn't
+        // know yet MUST fail-parse rather than silently
+        // forward-compat into `Hash`. Symmetric to
+        // `parse_policies_rejects_unknown_mode_value` which pins
+        // the same contract on `Mode`. The fail-loud contract is
+        // load-bearing: a silent forward-compat would mean an
+        // operator pinning `audit_body: hashing` thinking it
+        // enabled SHA-256 minimization would actually NOT enable
+        // it AND not see any error, leaving the privacy default
+        // (no body persistence) in force without their knowledge.
+        let yaml = "\
+- id: p
+  vendor: g
+  action: a
+  audit_body: hashing
+";
+        assert!(
+            parse_policies(yaml).is_err(),
+            "closed enum must reject unknown variant",
+        );
+        // Symmetric: a kebab-case variant that doesn't exist in
+        // the snake_case attribute should also fail.
+        let yaml = "\
+- id: p
+  vendor: g
+  action: a
+  audit_body: redact-pii
+";
+        assert!(
+            parse_policies(yaml).is_err(),
+            "kebab-case variant of snake-case enum must reject",
+        );
+    }
+
+    #[test]
     fn default_quarantine_action_helper_returns_replace_with_marker() {
         // The `default_quarantine_action` fn drives ReadFilterCfg's
         // `#[serde(default = "...")]` for the `quarantine_action` field.

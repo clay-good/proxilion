@@ -271,4 +271,115 @@ mod tests {
             assert_eq!(hex_encode(&buf).len(), n * 2);
         }
     }
+
+    #[test]
+    fn api_error_verifier_arm_maps_to_500_with_verifier_error_code() {
+        // Symmetric pin to `api_error_db_maps_to_500_with_internal_error_code`:
+        // the Verifier arm was the only one of the three ApiError variants
+        // never directly exercised — the operator dashboard splits chain-
+        // walker faults from generic DB faults on the `code` axis, and a
+        // refactor that collapsed `verifier_error` into `internal_error`
+        // "for consistency" would silently merge the two buckets in
+        // Grafana panels keyed on `code="verifier_error"`.
+        let e = ApiError::Verifier(crate::pic::VerifierError::Missing(Uuid::nil()));
+        let r = e.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_error_verifier_body_carries_fix_and_pic_verify_docs_link() {
+        // The Verifier 500 envelope's operator-actionable shape — the
+        // `fix` must mention `broken_at` (the field on `VerificationResult`
+        // the operator walks to) and the docs link must point at the
+        // `/pic/verify` page. A refactor that dropped either `.with_fix`
+        // or `.with_docs` would silently degrade the operator's first
+        // 30 seconds during a chain-walk fault.
+        let e = ApiError::Verifier(crate::pic::VerifierError::Missing(Uuid::nil()));
+        let r = e.into_response();
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], "verifier_error");
+        assert!(v["fix"].as_str().unwrap().contains("broken_at"));
+        assert!(v["docs"].as_str().unwrap().contains("pic/verify"));
+    }
+
+    #[tokio::test]
+    async fn api_error_verifier_body_carries_detail_from_inner_error() {
+        // The `.with_detail(e.to_string())` is the only surface that
+        // carries the inner `VerifierError` message to the operator —
+        // a refactor that dropped the detail "to avoid leaking internals"
+        // would strip the actionable triage half (which pca id failed,
+        // why). Pin both that `detail` is present AND that it carries
+        // the inner error's `Display` substring ("not found in cache"
+        // for the Missing variant).
+        let e = ApiError::Verifier(crate::pic::VerifierError::Missing(Uuid::nil()));
+        let r = e.into_response();
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let detail = v["detail"].as_str().expect("detail field present");
+        assert!(
+            detail.contains("not found in cache"),
+            "expected inner VerifierError Display in detail, got: {detail}",
+        );
+    }
+
+    #[test]
+    fn api_error_display_renders_not_found_string_for_grep() {
+        // `thiserror` derives Display from the `#[error("not found")]`
+        // attribute — operator log filters and the `tracing::error!(error = %e, ...)`
+        // shape both surface this string. A refactor that prefixed the
+        // variant name (e.g. "not_found: not found") would silently break
+        // any operator log filter keyed on the exact substring `"not found"`
+        // as a standalone token.
+        let s = format!("{}", ApiError::NotFound);
+        assert_eq!(s, "not found");
+    }
+
+    #[test]
+    fn api_error_display_renders_verifier_prefix_with_inner_message() {
+        // The Verifier arm's `#[error("verifier: {0}")]` template is the
+        // single-line shape that lands in `tracing::error!(error = %e, ...)`
+        // when the chain-walker faults. Pin both halves: the literal
+        // `"verifier: "` prefix (operator log aggregators split chain-
+        // walker faults from generic DB faults on this prefix) AND the
+        // inner VerifierError's Display substring after the colon. A
+        // refactor to `#[error("chain: {0}")]` "for clarity" would
+        // silently break every log filter keyed on `"verifier:"`.
+        let e = ApiError::Verifier(crate::pic::VerifierError::Missing(Uuid::nil()));
+        let s = format!("{e}");
+        assert!(s.starts_with("verifier: "), "got: {s}");
+        assert!(s.contains("not found in cache"), "got: {s}");
+    }
+
+    #[test]
+    fn pca_view_predecessor_id_serializes_null_when_none_for_root_hop() {
+        // A chain-root PCA has `predecessor_id = None` (hop 0). The
+        // dashboard's chain-walker keys on `predecessor_id === null`
+        // (key-presence with null value, NOT key-absence) to decide
+        // whether to render the "← prev" link. Pin that the wire shape
+        // is `null` (the default serde behavior for `Option<Uuid>`
+        // without `skip_serializing_if`) — a refactor that added
+        // `#[serde(skip_serializing_if = "Option::is_none")]` would
+        // silently break the dashboard's root-hop detection. Symmetric
+        // to the `Some` case pinned in `pca_view_serializes_with_stable_field_names`.
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: "alice@demo.local".into(),
+            ops: vec![],
+            hop: 0,
+            predecessor_id: None,
+            pic_profile: "proxilion.v1".into(),
+            cbor_hex: String::new(),
+        };
+        let s = serde_json::to_value(&v).unwrap();
+        assert!(
+            s.get("predecessor_id").is_some(),
+            "predecessor_id key must be present even when None"
+        );
+        assert!(
+            s["predecessor_id"].is_null(),
+            "expected null, got: {}",
+            s["predecessor_id"],
+        );
+    }
 }

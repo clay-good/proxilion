@@ -598,6 +598,55 @@ mod tests {
         require_clone::<AuthState>();
     }
 
+    #[test]
+    fn auth_fail_refresh_display_carries_google_token_refresh_failed_prefix() {
+        // `#[error("google token refresh failed: {0}")]` — the existing
+        // tests pin only the inner-string passthrough (`"network timeout"`).
+        // Pin the full Display shape (prefix + colon + space + inner)
+        // because operator log filters split bearer-refresh failures
+        // ("google token refresh failed:" substring) from other refresh-
+        // class errors (e.g. upstream PCA fetch). A refactor that
+        // softened the prefix to "refresh: {0}" (the natural "tidy up
+        // error messages" mistake) would silently break every Grafana
+        // panel keyed on the `google token` qualifier.
+        let s = AuthFail::Refresh("network timeout".into()).to_string();
+        assert_eq!(s, "google token refresh failed: network timeout");
+    }
+
+    #[test]
+    fn auth_fail_cat_key_display_carries_cat_key_fetch_failed_prefix() {
+        // Symmetric to the Refresh variant — the CatKey arm carries
+        // its operator-facing prefix (`"CAT key fetch failed: "`) which
+        // dashboards split from generic upstream errors on. Pin the
+        // full Display shape against three distinct inner messages so
+        // a refactor that hardcoded the prefix into a smaller string
+        // (e.g. for a uniform "trust plane error: {0}" wrapper) would
+        // surface here on at least one of the three inputs.
+        for inner in [
+            "trust plane 503",
+            "expected 32 bytes",
+            "transport: connection refused",
+        ] {
+            let s = AuthFail::CatKey(inner.into()).to_string();
+            assert_eq!(s, format!("CAT key fetch failed: {inner}"));
+        }
+    }
+
+    #[test]
+    fn auth_fail_other_display_carries_internal_prefix_with_inner_message() {
+        // The `Other(String)` variant is the catch-all for unanticipated
+        // internal errors; its `#[error("internal: {0}")]` prefix is
+        // what distinguishes "we hit a code path with no specific
+        // variant" from the more-specific upstream / cat_key / refresh
+        // variants. Operators reading the proxy logs look for the
+        // `"internal:"` substring to triage to "this is a proxy bug,
+        // file an issue" vs the other variants which all point at
+        // external systems. Pin the full shape so a refactor that
+        // dropped the prefix would silently merge buckets.
+        let s = AuthFail::Other("unexpected state at session-handoff".into()).to_string();
+        assert_eq!(s, "internal: unexpected state at session-handoff");
+    }
+
     #[tokio::test]
     async fn refresh_coordinator_default_starts_empty_then_populates() {
         // `Default` builds an empty moka cache; the first `lock_for` is

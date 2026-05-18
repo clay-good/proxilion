@@ -880,6 +880,63 @@ mod tests {
     }
 
     #[test]
+    fn api_error_not_found_display_is_exact_not_found_string() {
+        // `#[error("not found")]` — pin the exact byte sequence (no
+        // variant-name prefix, no trailing punctuation). Operator log
+        // filters across the proxy and the operator-cli's blocked-list
+        // renderer key on the exact `"not found"` substring as the
+        // "row already resolved or expired" signal. A refactor to
+        // `#[error("blocked action not found")]` (the natural "be more
+        // descriptive in error messages" change) would silently merge
+        // this 404 surface with the wire-shape `error` field (which IS
+        // `"blocked action not found"`) — the wire field is the
+        // operator-UI title, the Display is the log substring; they
+        // are intentionally distinct.
+        assert_eq!(ApiError::NotFound.to_string(), "not found");
+    }
+
+    #[test]
+    fn api_error_pic_refused_display_carries_pic_invariant_refused_prefix() {
+        // `#[error("PIC invariant refused: {0}")]` — pin the full
+        // Display shape (prefix + colon + space + inner string). The
+        // PicRefused variant is the operator-actionable boundary
+        // (spec.md §6.6 escape hatch) and its prefix is the substring
+        // log aggregators key on to bucket "operator override attempt
+        // refused by Trust Plane" separately from policy decisions
+        // (which never use the "invariant" qualifier). A refactor that
+        // softened the prefix to "pic refused" or merged it with the
+        // generic `Internal(_)` "internal: {0}" shape would silently
+        // collapse the two operator dashboards. Pin against an inner
+        // string carrying the canonical missing-ops syntax that the
+        // upstream Trust Plane emits.
+        let s = ApiError::PicRefused(
+            "ops not subset of predecessor: missing [drive:write:bob/*]".into(),
+        )
+        .to_string();
+        assert_eq!(
+            s,
+            "PIC invariant refused: ops not subset of predecessor: missing [drive:write:bob/*]",
+        );
+    }
+
+    #[test]
+    fn api_error_internal_display_carries_internal_prefix_with_inner_string() {
+        // `#[error("internal: {0}")]` — pin the prefix-and-inner
+        // shape. The Internal variant is the catch-all for "this
+        // shouldn't happen" code paths (panicked task surfaced as a
+        // string, a malformed CBOR slice from the cache, etc); the
+        // `"internal:"` prefix is what distinguishes it from `Db` (which
+        // surfaces sqlx::Error transparently — NO prefix). A refactor
+        // that aligned Internal to `Db`'s transparent shape (or that
+        // merged the two variants into one `Generic(String)` shape)
+        // would silently flatten the operator-triage signal that lets
+        // Grafana distinguish "proxy bug" (Internal) from "postgres
+        // health issue" (Db).
+        let s = ApiError::Internal("unexpected None on session lookup".into()).to_string();
+        assert_eq!(s, "internal: unexpected None on session lookup");
+    }
+
+    #[test]
     fn blocked_row_includes_request_canonical_json_when_set() {
         let mut row = BlockedRow {
             id: Uuid::nil(),

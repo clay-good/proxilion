@@ -353,6 +353,67 @@ mod tests {
     }
 
     #[test]
+    fn policy_eval_mode_comprehensive_variant_compares_distinct_from_fail_fast() {
+        // The existing `policy_eval_mode_default_is_fail_fast` test pins
+        // the Default value only — but the `Comprehensive` variant
+        // (used by the dashboard's "explain this denial" replay per
+        // qiuth-patterns.md §3.3) was never directly compared against
+        // its sibling. A regression that collapsed the two variants
+        // into one (in the name of "Comprehensive is the only path that
+        // ever runs in tests anyway") would silently break the
+        // FailFast-vs-Comprehensive predicate every engine call site
+        // depends on for early-return decisions. Pin distinct-equality
+        // on both axes.
+        assert_ne!(PolicyEvalMode::FailFast, PolicyEvalMode::Comprehensive);
+        assert_eq!(PolicyEvalMode::Comprehensive, PolicyEvalMode::Comprehensive);
+        assert_eq!(PolicyEvalMode::FailFast, PolicyEvalMode::FailFast);
+    }
+
+    #[test]
+    fn policy_eval_mode_is_copy_at_use_sites() {
+        // `PolicyEvalMode` derives `Copy` — pinned at compile time by
+        // the engine call sites that pass it by value through nested
+        // closures without cloning. A refactor that dropped `Copy` (for
+        // a hypothetical "stop allowing accidental duplicates" cleanup)
+        // would surface here as a use-after-move borrow-check error
+        // rather than at hundreds of engine call sites. The trait-bound
+        // check `fn require_copy<T: Copy>()` is the canonical zero-cost
+        // pin (no instantiation, but the bound is enforced).
+        fn require_copy<T: Copy>() {}
+        require_copy::<PolicyEvalMode>();
+        // And surface via use-by-value: assign then read.
+        let a = PolicyEvalMode::FailFast;
+        let b = a; // Copy, not move
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn policy_layer_is_copy_at_use_sites_and_distinct_across_three_variants() {
+        // `PolicyLayer` derives `Copy + Eq` — both are load-bearing for
+        // the `set_layer` helper in `adapters/policy_trace.rs` which
+        // iterates `trace.layers.iter_mut().find(|l| l.layer == layer)`.
+        // A refactor that dropped `Copy` (the same "clean up implicit
+        // duplicates" mistake as the PolicyEvalMode test above) would
+        // force the find closure to deref, surface as a borrow-check
+        // error at the call site, and the engine would no longer
+        // compile. Pin `Copy` via the same trait-bound check + a
+        // distinct-equality walk over all three variants so a refactor
+        // that aliased LayerA/LayerB (e.g. for a "Layer" merge) would
+        // surface here.
+        fn require_copy<T: Copy>() {}
+        require_copy::<PolicyLayer>();
+        let a = PolicyLayer::LayerA;
+        let _b = a; // Copy
+        assert_ne!(PolicyLayer::LayerA, PolicyLayer::LayerB);
+        assert_ne!(PolicyLayer::LayerB, PolicyLayer::ReadFilter);
+        assert_ne!(PolicyLayer::LayerA, PolicyLayer::ReadFilter);
+        // Reflexive equality for each variant.
+        assert_eq!(PolicyLayer::LayerA, PolicyLayer::LayerA);
+        assert_eq!(PolicyLayer::LayerB, PolicyLayer::LayerB);
+        assert_eq!(PolicyLayer::ReadFilter, PolicyLayer::ReadFilter);
+    }
+
+    #[test]
     fn policy_trace_json_carries_trace_id_and_layers() {
         let t = PolicyTrace::new(
             vec![LayerOutcome::passed(PolicyLayer::LayerA)],

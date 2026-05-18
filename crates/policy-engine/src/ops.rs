@@ -391,6 +391,81 @@ mod tests {
     }
 
     #[test]
+    fn ops_atom_serde_json_round_trip_carries_three_named_fields_no_extras() {
+        // `OpsAtom` derives Serialize + Deserialize — pin the wire shape
+        // directly. The trace's `OpsAtomView` (in `trace.rs`) is the
+        // exported wire shape, but `OpsAtom` is also serde-round-tripped
+        // through CBOR for the signed-PCA payload (the `ops` field on
+        // every cache row is the canonical-form string list, but the
+        // intermediate `OpsAtom` value is serialized in tests + future
+        // SCIM sync paths). Pin three field names (`scheme`, `action`,
+        // `object`) AND that no extra fields snuck in via a derive on
+        // a new field. A refactor that camelCased the field names (the
+        // common "tidy up the wire shape" mistake) would surface here.
+        let a = OpsAtom {
+            scheme: "drive".into(),
+            action: "read".into(),
+            object: "file/x".into(),
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["scheme"], "drive");
+        assert_eq!(v["action"], "read");
+        assert_eq!(v["object"], "file/x");
+        assert_eq!(v.as_object().unwrap().len(), 3, "no extra fields");
+        // Round-trip back equals the original.
+        let back: OpsAtom = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn ops_expression_default_is_empty_required_vec_trivially_satisfied() {
+        // `OpsExpression` derives Default — pin both halves of the
+        // contract: the Default value has an empty `required` Vec AND
+        // is_satisfied_by treats it as a no-op pass against ANY leaf
+        // ops set (including empty). A regression that dropped the
+        // Default derive (or wired it to produce a sentinel "deny all"
+        // atom — the "fail-closed" mistake on a no-policy-matched
+        // path) would silently mass-deny every action whose policy
+        // matched with no required_ops declared.
+        let exp: OpsExpression = OpsExpression::default();
+        assert!(exp.required.is_empty(), "Default must yield empty Vec");
+        // Trivially satisfied by ANY leaf set: empty + non-empty leaves
+        // both pass.
+        assert!(exp.is_satisfied_by(&[]).is_ok());
+        assert!(
+            exp.is_satisfied_by(&[
+                OpsAtom::parse("drive:read:file/x").unwrap(),
+                OpsAtom::parse("gmail:send:alice@acme.com").unwrap(),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn ops_expression_resolve_with_empty_templates_list_returns_empty_required() {
+        // The empty-templates input is the operationally common shape
+        // for policies that match on Layer-B content rules but declare
+        // zero required_ops (the policy doesn't care about chain ops —
+        // common for `block` decisions that fire regardless of
+        // authority). Pin that the `for t in templates` loop produces
+        // an empty Vec without erroring — a regression that added a
+        // "must have at least one required op" guard would silently
+        // reject every block-only policy at the next reload. Also pin
+        // it's `is_satisfied_by` Ok against empty + non-empty leaf
+        // sets (composes with the `default` test above to cover both
+        // construction paths).
+        let ctx = ctx();
+        let exp = OpsExpression::resolve(&[], &ctx).expect("empty templates is not an error");
+        assert!(exp.required.is_empty());
+        assert!(exp.is_satisfied_by(&[]).is_ok());
+        assert!(
+            exp.is_satisfied_by(&[OpsAtom::parse("drive:read:file/x").unwrap()])
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn missing_ops_lists_atoms() {
         let exp = OpsExpression {
             required: vec![

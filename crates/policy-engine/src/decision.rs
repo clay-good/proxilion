@@ -263,6 +263,116 @@ mod tests {
     }
 
     #[test]
+    fn pattern_regex_debug_includes_regex_source_for_operator_grep() {
+        // `Pattern` derives `Debug`; the `Regex(regex::Regex)` arm's
+        // `regex::Regex` Debug impl renders the source pattern. The
+        // read-filter logger feeds `?pattern` into `tracing::warn!` on
+        // every match — operators grep the log lines for the literal
+        // pattern source to triage false positives. A manual Debug
+        // impl that elided the source (in the name of "redact possibly-
+        // sensitive policy text") would silently break that workflow.
+        // Pin both arms' Debug shapes: Literal carries the needle string,
+        // Regex carries the pattern source.
+        let lit = Pattern::Literal("ignore previous instructions".into());
+        let s = format!("{lit:?}");
+        assert!(
+            s.contains("ignore previous instructions"),
+            "Literal Debug must surface needle: {s}"
+        );
+        assert!(s.contains("Literal"), "Literal variant tag missing: {s}");
+
+        let rx = Pattern::Regex(regex::Regex::new(r"(?i)system\s+prompt").unwrap());
+        let s = format!("{rx:?}");
+        assert!(s.contains("Regex"), "Regex variant tag missing: {s}");
+        assert!(
+            s.contains("system") && s.contains("prompt"),
+            "Regex source must be visible: {s}"
+        );
+    }
+
+    #[test]
+    fn decision_block_requires_explicit_override_allowed_field_on_deserialize() {
+        // The `override_allowed: bool` field on `Decision::Block` has NO
+        // `#[serde(default)]` — every operator authoring a block in YAML
+        // must commit explicitly to whether a human override applies.
+        // The current behavior surfaces a deserialize error when the
+        // field is missing; a regression that added `#[serde(default)]`
+        // would silently make every legacy `block:` without override
+        // language fall through to `override_allowed: false`, which
+        // would orphan the approver UI for that policy. Pin both
+        // halves: explicit true/false round-trips AND missing-field
+        // rejection.
+        let with_true = r#"{"kind":"block","reason":"x","override_allowed":true}"#;
+        let with_false = r#"{"kind":"block","reason":"x","override_allowed":false}"#;
+        let missing = r#"{"kind":"block","reason":"x"}"#;
+        let d: Decision = serde_json::from_str(with_true).unwrap();
+        assert_eq!(
+            d,
+            Decision::Block {
+                reason: "x".into(),
+                override_allowed: true
+            }
+        );
+        let d: Decision = serde_json::from_str(with_false).unwrap();
+        assert_eq!(
+            d,
+            Decision::Block {
+                reason: "x".into(),
+                override_allowed: false
+            }
+        );
+        let err = serde_json::from_str::<Decision>(missing).unwrap_err();
+        assert!(
+            err.to_string().contains("override_allowed"),
+            "expected missing-field error: {err}"
+        );
+    }
+
+    #[test]
+    fn decision_rate_limit_rejects_negative_or_overflow_values_on_deserialize() {
+        // `burst: u32` and `per_seconds: u32` are unsigned by deliberate
+        // choice — rate-limit semantics have no meaning at negative
+        // values, and an operator who typed `-1` into their policy YAML
+        // should see a parse failure (caught at policy-reload time)
+        // rather than the silent two's-complement wrap a `i32→u32`
+        // collapse would produce on a refactor. Pin both halves:
+        // negative numbers reject AND values above u32::MAX reject.
+        let neg = r#"{"kind":"rate_limit","burst":-1,"per_seconds":60}"#;
+        assert!(
+            serde_json::from_str::<Decision>(neg).is_err(),
+            "negative burst must reject"
+        );
+        let neg = r#"{"kind":"rate_limit","burst":5,"per_seconds":-60}"#;
+        assert!(
+            serde_json::from_str::<Decision>(neg).is_err(),
+            "negative per_seconds must reject"
+        );
+        // u32::MAX itself round-trips fine (the boundary).
+        let max = format!(
+            r#"{{"kind":"rate_limit","burst":{},"per_seconds":{}}}"#,
+            u32::MAX,
+            u32::MAX
+        );
+        let d: Decision = serde_json::from_str(&max).unwrap();
+        assert_eq!(
+            d,
+            Decision::RateLimit {
+                burst: u32::MAX,
+                per_seconds: u32::MAX
+            }
+        );
+        // u32::MAX + 1 (overflow) must reject.
+        let over = format!(
+            r#"{{"kind":"rate_limit","burst":{},"per_seconds":60}}"#,
+            (u32::MAX as u64) + 1
+        );
+        assert!(
+            serde_json::from_str::<Decision>(&over).is_err(),
+            "u32 overflow must reject"
+        );
+    }
+
+    #[test]
     fn decision_kind_wire_strings_are_stable() {
         let cases: &[(Decision, &str)] = &[
             (Decision::Allow, "allow"),

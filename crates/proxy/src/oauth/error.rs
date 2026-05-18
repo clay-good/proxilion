@@ -314,6 +314,84 @@ mod tests {
     }
 
     #[test]
+    fn internal_variant_display_does_not_carry_inner_string() {
+        // `#[error("internal error")]` on `Internal(String)` deliberately
+        // masks the inner String — the Display contract is the
+        // operator-facing log substring `"internal error"` (Grafana / Loki
+        // alerts key on it), and the inner detail is intended for the
+        // structured `tracing::error!(?self, ...)` path only. A refactor
+        // to `#[error("internal error: {0}")]` would silently leak the
+        // raw inner String (which adapter call sites build via `format!`
+        // — e.g. `Internal(format!("token={token}"))`) into log
+        // aggregators that summarize the textual Display, not the
+        // structured fields.
+        let e = OAuthError::Internal("integer overflow at line 42".into());
+        let s = e.to_string();
+        assert_eq!(s, "internal error", "got: {s}");
+        assert!(!s.contains("integer overflow"), "inner String leaked: {s}");
+        assert!(!s.contains("42"), "inner String leaked: {s}");
+    }
+
+    #[tokio::test]
+    async fn upstream_body_omits_detail_to_avoid_leaking_reqwest_error_url() {
+        // `OAuthError::Upstream(reqwest::Error)` is the ONLY variant
+        // whose inner error type carries the upstream URL (and any
+        // embedded credentials in path/query). The `body()` match arm
+        // for Upstream deliberately does NOT call `.with_detail(...)` —
+        // a refactor that "for consistency" passed `e.to_string()`
+        // through would surface that URL to the agent-facing response.
+        // The existing `upstream_body_carries_upstream_unavailable_code_and_no_detail`
+        // test exercises the Internal arm (which shares an arm pattern)
+        // — pin the Upstream arm directly here against a real
+        // reqwest::Error so a future arm-split refactor doesn't slip the
+        // Upstream half through.
+        let bad = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap()
+            // RFC 5737 documentation prefix — routable nowhere.
+            .get("http://192.0.2.1:1/secret-path?token=hunter2")
+            .send()
+            .await
+            .unwrap_err();
+        let e: OAuthError = OAuthError::from(bad);
+        let body = e.body();
+        assert_eq!(body.code, "upstream_unavailable");
+        assert!(
+            body.detail.is_none(),
+            "Upstream body must not carry detail (would leak upstream URL): {:?}",
+            body.detail
+        );
+        // The fix + docs survive — these are operator-actionable and
+        // contain no caller-supplied bytes.
+        assert!(body.fix.is_some());
+        assert!(body.docs.unwrap().contains("troubleshooting"));
+    }
+
+    #[test]
+    fn bad_request_body_fix_mentions_required_oauth_parameters() {
+        // `BadRequest` is the operator-actionable variant — its fix
+        // string commits to naming the four required OAuth parameter
+        // shapes (`response_type=code`, `S256` PKCE, `scope`, and
+        // `redirect_uri`) verbatim so the troubleshooting docs page can
+        // anchor on those exact substrings. A refactor that softened
+        // the message (e.g. "check OAuth parameters") would orphan
+        // every docs cross-reference and force agents to debug by
+        // grep across the proxy source.
+        let body = OAuthError::BadRequest("scope is required".into()).body();
+        assert_eq!(body.code, "bad_request");
+        let fix = body.fix.expect("fix present");
+        assert!(fix.contains("response_type=code"), "got: {fix}");
+        assert!(fix.contains("S256"), "got: {fix}");
+        assert!(fix.contains("scope"), "got: {fix}");
+        assert!(fix.contains("redirect_uri"), "got: {fix}");
+        // And the docs link points at the OAuth intercept page (not the
+        // generic troubleshooting page — BadRequest is a misconfigured
+        // agent, not a proxy bug).
+        assert!(body.docs.unwrap().contains("oauth/intercept"));
+    }
+
+    #[test]
     fn body_fix_strings_are_actionable_for_unique_variants() {
         // Pin the fix text for the four variants whose fix strings are
         // their stable contract with the operator-docs page (the docs page

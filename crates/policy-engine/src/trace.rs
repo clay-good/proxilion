@@ -414,6 +414,170 @@ mod tests {
     }
 
     #[test]
+    fn layer_outcome_passed_constructor_emits_each_of_three_layer_variants_with_identical_zero_fields()
+     {
+        // The existing `passed_outcome_has_no_error` test pins ONE arm
+        // (LayerB) through the `passed()` constructor. The constructor
+        // is the canonical entry point for the engine's stub-Layer-A
+        // emit AND the read-filter pass arm AND the engine's Layer-B
+        // happy path — pin all three layers route through `passed()`
+        // with byte-identical empty `matched_rule_id`/`error_code`/`detail`
+        // fields (a refactor that switched one arm to a layer-specific
+        // default — e.g. `Some("read_filter".into())` for the read-filter
+        // matched_rule_id "for consistency" — would silently start
+        // emitting a non-empty field on the wire for that arm only).
+        for layer in [
+            PolicyLayer::LayerA,
+            PolicyLayer::LayerB,
+            PolicyLayer::ReadFilter,
+        ] {
+            let o = LayerOutcome::passed(layer);
+            assert_eq!(o.layer, layer);
+            assert!(o.passed);
+            assert!(
+                o.matched_rule_id.is_none(),
+                "passed({layer:?}) must have None matched_rule_id"
+            );
+            assert!(
+                o.error_code.is_none(),
+                "passed({layer:?}) must have None error_code"
+            );
+            assert!(
+                o.detail.is_none(),
+                "passed({layer:?}) must have None detail"
+            );
+        }
+    }
+
+    #[test]
+    fn layer_outcome_failed_with_none_matched_rule_id_and_none_detail_carries_error_code_only() {
+        // The existing `failed_outcome_carries_code` test pins the
+        // FULL-info shape (Some matched_rule_id + Some detail). The
+        // adapter's read-filter dispatcher constructs `failed()` with
+        // BOTH optional args as None when the filter scanner reports a
+        // policy-engine internal fault that isn't attributable to a
+        // specific pattern — pin that shape so a future signature
+        // refactor that promoted matched_rule_id to non-Option
+        // (defaulting to an empty string for "consistency") would
+        // surface here. The error_code MUST still be Some — `failed()`
+        // is the only path that surfaces an ErrorCode on the wire.
+        let o = LayerOutcome::failed(
+            PolicyLayer::ReadFilter,
+            ErrorCode::PolicyEngineError,
+            None,
+            None,
+        );
+        assert!(!o.passed);
+        assert_eq!(o.layer, PolicyLayer::ReadFilter);
+        assert_eq!(o.error_code, Some(ErrorCode::PolicyEngineError));
+        assert!(o.matched_rule_id.is_none());
+        assert!(o.detail.is_none());
+    }
+
+    #[test]
+    fn policy_trace_new_assigns_fresh_unique_trace_id_per_call() {
+        // `PolicyTrace::new` stamps `trace_id: Uuid::new_v4()` per call
+        // — the dashboard's per-request panel and the
+        // `X-Proxilion-Trace-Id` response header BOTH depend on every
+        // engine eval producing a distinct id (operators paste the id
+        // into the dashboard's lookup endpoint to recover the trace).
+        // A refactor that swapped `Uuid::new_v4()` for a once-cell
+        // static (or for a hash of the layers — both are plausible
+        // "deterministic id" cleanups) would silently start collapsing
+        // every eval onto the same id and break per-request lookup
+        // entirely. Pin distinctness across five back-to-back calls.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let t = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+            assert!(
+                seen.insert(t.trace_id),
+                "duplicate trace_id {} surfaced — Uuid::new_v4 contract broken",
+                t.trace_id,
+            );
+        }
+        assert_eq!(seen.len(), 5);
+    }
+
+    #[test]
+    fn ops_atom_view_clone_independence_after_field_mutation() {
+        // `OpsAtomView` derives `Clone` — the trace's `required_ops` Vec
+        // is cloned by both the dashboard's wire-serialize path and the
+        // adapter's Trust-Plane request builder. Pin that the clone is
+        // a deep copy across all three String fields (a refactor that
+        // switched to `Cow<'static, str>` or `Arc<str>` for "cheaper
+        // clone" would surface here as the mutation visibly aliasing
+        // back to the original). The existing
+        // `ops_atom_view_round_trips_fields` pins the `From<&OpsAtom>`
+        // path, not the Clone trait.
+        let mut a = OpsAtomView {
+            scheme: "drive".into(),
+            action: "read".into(),
+            object: "file/abc".into(),
+        };
+        let b = a.clone();
+        a.scheme = "gmail".into();
+        a.action = "send".into();
+        a.object = "messages/xyz".into();
+        // Mutated original.
+        assert_eq!(a.scheme, "gmail");
+        // Clone untouched — deep copy semantic.
+        assert_eq!(b.scheme, "drive");
+        assert_eq!(b.action, "read");
+        assert_eq!(b.object, "file/abc");
+    }
+
+    #[test]
+    fn policy_layer_deserialize_rejects_unknown_variant_strings_for_closed_enum_contract() {
+        // The `#[serde(rename_all = "snake_case")]` plus the enum's lack
+        // of a `#[non_exhaustive]` attribute makes the wire enum closed
+        // at deserialize time. Pin that three plausibly-wrong inputs
+        // ("layer_c" / "layer-a" hyphen-form / "LayerA" PascalCase) all
+        // fail-parse, NOT silently forward-compat into a new variant or
+        // (worse) deserialize into LayerA as a default. A future
+        // refactor that added `#[serde(other)]` to provide forward-compat
+        // would silently bucket operator typos into one arm — surface
+        // any such drift here.
+        for bogus in ["\"layer_c\"", "\"layer-a\"", "\"LayerA\"", "\"\""] {
+            let r: Result<PolicyLayer, _> = serde_json::from_str(bogus);
+            assert!(
+                r.is_err(),
+                "unknown PolicyLayer wire string {bogus} must reject, got: {r:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn layer_outcome_serde_round_trip_with_failed_shape_preserves_all_named_fields() {
+        // The wire shape of `LayerOutcome` is consumed verbatim by the
+        // dashboard's per-request panel — pin a full-info `failed()`
+        // round-trip through `serde_json::Value` so any field rename
+        // (matched_rule_id → matched_id, detail → message — both
+        // tempting "tidy up" refactors) surfaces on both directions.
+        // The existing `layer_outcome_json_omits_none_fields_via_explicit_serialize`
+        // pins the passed-shape null fields; this pins the failed-shape
+        // full-value shape symmetrically.
+        let o = LayerOutcome::failed(
+            PolicyLayer::LayerB,
+            ErrorCode::PolicyBlocked,
+            Some("p-external-share".into()),
+            Some("external recipient detected".into()),
+        );
+        let v = serde_json::to_value(&o).unwrap();
+        assert_eq!(v["layer"], "layer_b");
+        assert_eq!(v["passed"], false);
+        assert_eq!(v["matched_rule_id"], "p-external-share");
+        assert_eq!(v["error_code"], "policy_blocked");
+        assert_eq!(v["detail"], "external recipient detected");
+        // Round-trip back — every named field must survive.
+        let back: LayerOutcome = serde_json::from_value(v).unwrap();
+        assert_eq!(back.layer, PolicyLayer::LayerB);
+        assert!(!back.passed);
+        assert_eq!(back.matched_rule_id.as_deref(), Some("p-external-share"));
+        assert_eq!(back.error_code, Some(ErrorCode::PolicyBlocked));
+        assert_eq!(back.detail.as_deref(), Some("external recipient detected"));
+    }
+
+    #[test]
     fn policy_trace_json_carries_trace_id_and_layers() {
         let t = PolicyTrace::new(
             vec![LayerOutcome::passed(PolicyLayer::LayerA)],

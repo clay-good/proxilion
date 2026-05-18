@@ -279,6 +279,170 @@ mod tests {
     }
 
     #[test]
+    fn debug_renders_struct_name_and_key_field_names_for_operator_grep() {
+        // `BlockedNotification` flows through `tracing::warn!(?n, ...)` on
+        // the notifier dispatch path when a fan-out hop fails — operators
+        // grep the resulting log line by struct name AND by the
+        // `blocked_id` / `request_id` / `schema` field names to bucket
+        // which blocked row tripped which sink. A manual Debug that
+        // dropped the struct-name prefix "for brevity" would silently
+        // collapse all notifier-failure log lines onto each other; a
+        // manual Debug that hid field names "to compact" the output
+        // would strip every selector but the value. Pin the four-way
+        // shape (struct name + three load-bearing field names) so a
+        // refactor lands as a test failure rather than as a quiet
+        // observability degradation.
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        let s = format!("{n:?}");
+        assert!(s.contains("BlockedNotification"), "got: {s}");
+        assert!(s.contains("blocked_id"), "got: {s}");
+        assert!(s.contains("request_id"), "got: {s}");
+        assert!(s.contains("schema"), "got: {s}");
+    }
+
+    #[test]
+    fn approve_and_reject_urls_share_prefix_and_differ_only_by_verb_segment() {
+        // The two URLs are constructed symmetrically — same scheme +
+        // host + `/api/v1/blocked/{id}/` prefix, differing only by the
+        // final `approve` vs `reject` segment. Pin this so a refactor
+        // that introduced separate URL templates (e.g. one routes to
+        // `/api/v1/blocked/{id}/approve` and the other to a different
+        // endpoint family like `/approver/{id}/reject` for vendor
+        // routing) would surface here as a structural divergence. The
+        // Slack template + email template both build button URLs from
+        // these two fields and rely on the prefix being identical.
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let n = BlockedNotification::from_record(id, &r, "https://proxy.example");
+        let prefix = "https://proxy.example/api/v1/blocked/01234567-89ab-cdef-0123-456789abcdef/";
+        assert!(n.approve_url.starts_with(prefix), "got: {}", n.approve_url);
+        assert!(n.reject_url.starts_with(prefix), "got: {}", n.reject_url);
+        assert_eq!(&n.approve_url[prefix.len()..], "approve");
+        assert_eq!(&n.reject_url[prefix.len()..], "reject");
+    }
+
+    #[test]
+    fn approve_and_reject_urls_each_contain_blocked_id_exactly_once() {
+        // The blocked_id must appear ONCE in each URL — the path
+        // template is `/api/v1/blocked/{id}/{verb}` and the verb segment
+        // is a fixed literal. A refactor that accidentally interpolated
+        // the id twice (e.g. `/blocked/{id}/{id}/approve` via a copy-paste
+        // typo) would still pass a `.contains(id)` check but would route
+        // operators to a 404. Pin the count.
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let n = BlockedNotification::from_record(id, &r, "https://proxy.example");
+        let id_str = id.to_string();
+        assert_eq!(
+            n.approve_url.matches(&id_str).count(),
+            1,
+            "got: {}",
+            n.approve_url
+        );
+        assert_eq!(
+            n.reject_url.matches(&id_str).count(),
+            1,
+            "got: {}",
+            n.reject_url
+        );
+    }
+
+    #[test]
+    fn from_record_with_empty_proxy_public_url_still_yields_well_formed_path() {
+        // Operator boot-up edge case: `proxy_public_url` is sourced from
+        // `PROXILION_PUBLIC_URL` env which an operator may leave empty
+        // during initial install. The current implementation does NOT
+        // validate the input — an empty base produces a path-only URL
+        // starting with `/api/v1/blocked/{id}/approve`. Pin this so a
+        // future hardening that started rejecting empty bases at
+        // `from_record` time would surface here as a wire-shape change
+        // rather than at a downstream HTTP send site. Today's contract
+        // is "the operator gets the URL they configured, even if it's
+        // empty"; the notifier doesn't second-guess.
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let id = Uuid::nil();
+        let n = BlockedNotification::from_record(id, &r, "");
+        assert!(
+            n.approve_url.starts_with("/api/v1/blocked/"),
+            "got: {}",
+            n.approve_url
+        );
+        assert!(
+            n.approve_url.ends_with("/approve"),
+            "got: {}",
+            n.approve_url
+        );
+        assert!(
+            n.reject_url.starts_with("/api/v1/blocked/"),
+            "got: {}",
+            n.reject_url
+        );
+        assert!(n.reject_url.ends_with("/reject"), "got: {}", n.reject_url);
+    }
+
+    #[test]
+    fn schema_constant_is_static_str_with_exactly_three_dot_separated_segments() {
+        // `SCHEMA: &'static str` is the version tag webhook receivers
+        // route on. The dotted shape `proxilion.blocked_action.v1` has
+        // exactly three segments (`vendor.family.version`) — a refactor
+        // that flattened to `proxilion_blocked_action_v1` (underscore
+        // form) would still pass the `.starts_with("proxilion.")` /
+        // `.ends_with(".v1")` checks if `proxilion.` were re-prefixed
+        // by accident, but cross-vendor schema registries bucket on
+        // segment count. Pin both the count and the type-level static
+        // bound (a refactor to `&str` with a runtime lifetime would
+        // surface here as a compile break, not at the receiver).
+        let _: &'static str = BlockedNotification::SCHEMA;
+        let segments: Vec<&str> = BlockedNotification::SCHEMA.split('.').collect();
+        assert_eq!(segments.len(), 3, "got: {segments:?}");
+        assert_eq!(segments[0], "proxilion");
+        assert_eq!(segments[1], "blocked_action");
+        assert_eq!(segments[2], "v1");
+    }
+
+    #[test]
+    fn from_record_passes_non_ascii_p_0_principal_through_verbatim() {
+        // The `p_0` principal is end-user-supplied via the IdP claim
+        // and can be a non-ASCII identifier (operators in jurisdictions
+        // with localized email systems or non-Latin display names see
+        // this routinely). The wire path must preserve the UTF-8 bytes
+        // exactly — a refactor that introduced `.to_ascii_lowercase()`
+        // or any normalization "for grep-friendliness" would silently
+        // alter the principal that the human approver sees in the
+        // Slack card / email body vs. the principal recorded in
+        // `blocked_actions`, breaking forensic correlation. Pin a
+        // mixed Cyrillic + email-local-part form end-to-end through
+        // both the struct field and the JSON wire.
+        let ops: Vec<String> = vec![];
+        let p_0 = "алиса@демо.рф";
+        let r = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: Some(p_0),
+            vendor: "google",
+            action: "drive.files.get",
+            method: "GET",
+            path: "/drive/v3/files/x",
+            layer: "policy",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        assert_eq!(n.p_0, Some(p_0));
+        let j = serde_json::to_value(&n).unwrap();
+        assert_eq!(j["p_0"], p_0);
+    }
+
+    #[test]
     fn from_record_carries_empty_requested_ops_slice() {
         // The PIC layer sometimes blocks without a discrete ops list
         // (e.g. a monotonicity refusal where the upstream body didn't

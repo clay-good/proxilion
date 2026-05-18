@@ -276,6 +276,154 @@ mod tests {
     }
 
     #[test]
+    fn action_event_debug_carries_struct_name_and_key_field_names_for_grep() {
+        // ActionEvent flows through `info!(target: "proxilion.action_stream",
+        // event = ?event, "action")` on every adapter call. Operators
+        // grep the resulting log line by struct name + by the
+        // `request_id` / `vendor` / `action` / `decision` selectors
+        // to bucket "which request did what" across the full action
+        // log. A manual Debug that hid the struct name or any of
+        // these four selectors "to compact" the log line would break
+        // every operator bucket. Pin all five surfaces.
+        let s = format!("{:?}", sample());
+        assert!(s.contains("ActionEvent"), "got: {s}");
+        assert!(s.contains("request_id"), "got: {s}");
+        assert!(s.contains("vendor"), "got: {s}");
+        assert!(s.contains("action"), "got: {s}");
+        assert!(s.contains("decision"), "got: {s}");
+    }
+
+    #[test]
+    fn action_event_clone_produces_independent_value_for_each_sink() {
+        // `TeeStream::publish` clones the event once per sink (primary
+        // + every secondary). The clone MUST be independent — mutating
+        // a clone's owned fields (`decision`, `block_reason`, `vendor`)
+        // must NOT touch the original. A refactor that snuck in an
+        // `Arc<String>` "for memory savings" would silently share state
+        // across sinks; if one sink decorator (a redactor, say) mutated
+        // the inner string via `Arc::make_mut`, every other sink would
+        // observe the mutation. Pin field-level independence on three
+        // owned-String fields and the bool flag.
+        let original = sample();
+        let mut clone = original.clone();
+        clone.decision = "allow".to_string();
+        clone.block_reason = Some("mutated".to_string());
+        clone.vendor = "other".to_string();
+        clone.read_filter_triggered = !original.read_filter_triggered;
+        assert_eq!(original.decision, "block");
+        assert_eq!(original.block_reason.as_deref(), Some("policy"));
+        assert_eq!(original.vendor, "google");
+        assert!(!original.read_filter_triggered);
+    }
+
+    #[test]
+    fn at_datetime_serializes_as_rfc3339_with_z_suffix_not_offset_form() {
+        // `at: DateTime<Utc>` serializes through chrono's serde impl
+        // as an RFC3339 string ending in `Z`. Grafana / Datadog
+        // ingestors parse this byte-for-byte; a refactor that swapped
+        // to the `+00:00` offset form (also RFC3339-valid) would
+        // change the wire shape and break dashboards that compute
+        // bucket alignment off the trailing character. Pin the `Z`
+        // suffix AND the absence of the offset form.
+        let s = serde_json::to_string(&sample()).unwrap();
+        assert!(s.contains("\"at\":\"2026-05-16T12:00:00Z\""), "got: {s}");
+        assert!(!s.contains("+00:00"), "got: {s}");
+    }
+
+    #[test]
+    fn read_filter_triggered_serializes_as_bare_json_boolean_not_string() {
+        // `read_filter_triggered: bool` MUST land on the wire as
+        // `true` / `false`, not `"true"` / `"false"`. The Slack
+        // notifier template + the SIEM forwarder both branch on the
+        // JSON type (`is_boolean()`) — a refactor that wrapped the
+        // field in `#[serde(with = "string")]` would silently flip
+        // every branch to the false path. Pin both polarities.
+        let mut e = sample();
+        e.read_filter_triggered = false;
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"read_filter_triggered\":false"), "got: {s}");
+        assert!(
+            !s.contains("\"read_filter_triggered\":\"false\""),
+            "got: {s}"
+        );
+        e.read_filter_triggered = true;
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"read_filter_triggered\":true"), "got: {s}");
+        assert!(
+            !s.contains("\"read_filter_triggered\":\"true\""),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn logging_stream_is_send_sync_static_for_app_state_arc_dyn_path() {
+        // `LoggingStream` is wired into AppState as an
+        // `Arc<dyn ActionStream>` in dev / test configurations. The
+        // `ActionStream` trait declares `Send + Sync + 'static`
+        // bounds — a refactor that gave `LoggingStream` an interior
+        // `RefCell` field "for instance-local config" would break
+        // Sync without surfacing at this file (the breakage would
+        // appear at AppState assembly with an unrelated trait-bound
+        // error). Pin the three-trait combo here so the type
+        // boundary fails fast at the right call site.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<LoggingStream>();
+    }
+
+    #[test]
+    fn full_round_trip_preserves_all_sixteen_fields_when_extra_is_non_null() {
+        // The existing `full_round_trip_preserves_all_fields` test
+        // only spot-checks 9 of 16 fields and uses `Value::Null` for
+        // `extra` (which is skipped on serialize). The wire contract
+        // covers all 16 — every Option round-trips through Some, the
+        // serde_json::Value round-trips through a structured shape,
+        // and the two usize / u16 numeric fields round-trip without
+        // signedness drift. Pin every field so a refactor that added
+        // a 17th field without `#[serde(default)]` would surface as
+        // a deserialize failure here.
+        let request_id = Uuid::new_v4();
+        let agent_session_id = Uuid::new_v4();
+        let leaf_pca_id = Uuid::new_v4();
+        let original = ActionEvent {
+            request_id,
+            agent_session_id,
+            p_0: "alice@example.com".into(),
+            leaf_pca_id: Some(leaf_pca_id),
+            vendor: "google".into(),
+            action: "drive.files.list".into(),
+            method: "GET".into(),
+            path: "/drive/v3/files".into(),
+            status: 200,
+            decision: "allow".into(),
+            block_reason: Some("none".into()),
+            read_filter_triggered: true,
+            quarantined_count: 5,
+            at: chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            policy_id: Some("drive-read-gate".into()),
+            extra: serde_json::json!({"to_domain": "external.com", "n": 42}),
+        };
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let back: ActionEvent = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.request_id, request_id);
+        assert_eq!(back.agent_session_id, agent_session_id);
+        assert_eq!(back.p_0, "alice@example.com");
+        assert_eq!(back.leaf_pca_id, Some(leaf_pca_id));
+        assert_eq!(back.vendor, "google");
+        assert_eq!(back.action, "drive.files.list");
+        assert_eq!(back.method, "GET");
+        assert_eq!(back.path, "/drive/v3/files");
+        assert_eq!(back.status, 200);
+        assert_eq!(back.decision, "allow");
+        assert_eq!(back.block_reason.as_deref(), Some("none"));
+        assert!(back.read_filter_triggered);
+        assert_eq!(back.quarantined_count, 5);
+        assert_eq!(back.at, original.at);
+        assert_eq!(back.policy_id.as_deref(), Some("drive-read-gate"));
+        assert_eq!(back.extra["to_domain"], "external.com");
+        assert_eq!(back.extra["n"], 42);
+    }
+
+    #[test]
     fn logging_stream_default_produces_usable_instance() {
         // `LoggingStream` derives `Default` — pin the derive so a
         // refactor that gave it state (e.g. a `target: String`) and

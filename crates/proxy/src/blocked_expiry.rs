@@ -268,4 +268,52 @@ mod tests {
         let c = r.clone();
         assert_eq!(c.escalated_rows, 0);
     }
+
+    #[test]
+    fn expiry_sweep_report_clone_at_nonzero_value_yields_independent_copy() {
+        // The round-31 test pinned Clone-independence at zero; pin the
+        // symmetric non-zero case so a refactor that turned the inner
+        // u64 into a shared `Arc<AtomicU64>` for "concurrent updates
+        // from multiple sweeps" would surface here as the clone seeing
+        // a later mutation on the original. The sweep loop relies on
+        // the report being a snapshot of THIS tick's flip count, not
+        // a live counter that future ticks can roll into.
+        let r = ExpirySweepReport { expired_rows: 17 };
+        let mut c = r.clone();
+        assert_eq!(c.expired_rows, 17);
+        c.expired_rows = 99;
+        // Original snapshot unchanged after clone mutation.
+        assert_eq!(r.expired_rows, 17);
+        assert_eq!(c.expired_rows, 99);
+    }
+
+    #[test]
+    fn escalation_sweep_report_debug_renders_struct_name_for_grep() {
+        // Operator log aggregators key on the rendered Debug shape
+        // (`tracing::debug!(?r, ...)` in the spawn loop's match arm).
+        // A manual Debug impl that hid the type name (e.g. rendered
+        // just the field value as "17") would silently collapse the
+        // expiry sweep's log lines onto the escalation sweep's, since
+        // both reports carry one u64 field. Pin that the rendered
+        // string carries the struct name so the two sweeps stay
+        // grep-distinguishable.
+        let r = EscalationSweepReport { escalated_rows: 5 };
+        let s = format!("{r:?}");
+        assert!(s.contains("EscalationSweepReport"), "got: {s}");
+        assert!(s.contains("5"));
+    }
+
+    #[test]
+    fn default_tick_interval_carries_no_subsecond_component() {
+        // The `Duration::from_secs(60)` constructor pins zero subsecond
+        // nanos. A regression that swapped to `Duration::from_millis(60_000)`
+        // would still equal `from_secs(60)` (covered by the round-31
+        // test), but a refactor that pinned to `from_secs_f64(60.5)`
+        // (perhaps from a config-driven default that defaulted to 60.5
+        // for some operator-overridable shape) would silently widen the
+        // sweep window by half a second per tick — over a 24h run that
+        // is 720 fewer ticks. Pin subsec_nanos == 0 directly.
+        assert_eq!(DEFAULT_TICK_INTERVAL.subsec_nanos(), 0);
+        assert_eq!(DEFAULT_TICK_INTERVAL.as_secs(), 60);
+    }
 }

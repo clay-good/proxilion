@@ -551,4 +551,102 @@ mod tests {
         let r = require_scope(&req, "policy:read").expect_err("no principal");
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[test]
+    fn token_layout_constants_pinned_per_module_docstring() {
+        // The module docstring commits to `pxl_operator_<52 base32 chars>`
+        // as the operator-token shape, and the proxy CLI's `tokens issue`
+        // command renders that exact format to the operator on screen.
+        // PREFIX, BODY_LEN, and TOKEN_LEN are all `const` (no public
+        // accessor), so a tightening / loosening regression on any of
+        // the three would silently produce tokens that the CLI's own
+        // round-trip (issue → SHA-256 hash → DB lookup) accepts but
+        // that no operator-facing documentation describes. Pin all three.
+        assert_eq!(PREFIX, "pxl_operator_");
+        assert_eq!(BODY_LEN, 52);
+        assert_eq!(TOKEN_LEN, PREFIX.len() + BODY_LEN);
+        assert_eq!(TOKEN_LEN, 65);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_content_type_is_text_plain() {
+        // Operator log parsers split "operator auth lost" 401s from the
+        // structured-401s that handlers emit on the `application/json`
+        // content type. The bearer middleware uses the same shape per
+        // the docstring's "fixed body — same posture as the bearer
+        // middleware" — a refactor that swapped to a JSON envelope
+        // "for consistency with handler 401s" would silently merge the
+        // two buckets on every operator dashboard.
+        let r = unauthorized("malformed");
+        let ct = r
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("content-type set")
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/plain");
+    }
+
+    #[tokio::test]
+    async fn require_scope_helper_403_response_is_application_json() {
+        // Symmetric to the unauthorized() text/plain pin above — the
+        // 403 path serializes the structured `{code, required, have}`
+        // envelope and MUST carry `application/json`. The CLI's renderer
+        // parses the body and fails loudly on a content-type mismatch
+        // (better to surface a confusing message than to silently render
+        // raw bytes), so a regression here would break operator
+        // dashboards on every scope-denied request.
+        let p = OperatorPrincipal {
+            token_id: Uuid::new_v4(),
+            name: "ci-bot".into(),
+            scopes: Arc::new(vec!["actions:read".into()]),
+            last_used_at: None,
+        };
+        let mut req = Request::new(Body::empty());
+        req.extensions_mut().insert(p);
+        let r = require_scope(&req, "policy:write").expect_err("must deny");
+        let ct = r
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("content-type set")
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn operator_principal_scopes_cloned_through_arc_share() {
+        // `scopes: Arc<Vec<String>>` is intentional — every successful
+        // auth clones the principal into request extensions, and on a
+        // hot route the per-handler `principal.clone()` would otherwise
+        // allocate one Vec<String> per scope every request. Pin via
+        // `Arc::ptr_eq` that the cloned principal shares the SAME
+        // backing Vec — a refactor to `scopes: Vec<String>` "for
+        // simplicity" would silently regress every request's allocation
+        // count without surfacing as a wire-shape change.
+        let p = OperatorPrincipal {
+            token_id: Uuid::new_v4(),
+            name: "ci-bot".into(),
+            scopes: Arc::new(vec!["policy:read".into(), "actions:read".into()]),
+            last_used_at: None,
+        };
+        let c = p.clone();
+        assert!(Arc::ptr_eq(&p.scopes, &c.scopes));
+        // Sanity: both views see the same contents.
+        assert_eq!(c.scopes.len(), 2);
+        assert_eq!(c.scopes[0], "policy:read");
+    }
+
+    #[test]
+    fn operator_auth_state_is_clone_for_axum_state_propagation() {
+        // axum's `State<OperatorAuthState>` extractor requires Clone on
+        // every middleware invocation — a `!Clone` field landing on the
+        // state struct (e.g. a `tokio::sync::Mutex` for some new
+        // per-state counter) would surface here as a compile error
+        // rather than at the hundreds of router-build sites in
+        // `server.rs`. Compile-time trait bound; no instantiation
+        // required.
+        fn require_clone<T: Clone>() {}
+        require_clone::<OperatorAuthState>();
+    }
 }

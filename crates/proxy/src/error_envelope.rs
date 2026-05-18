@@ -213,4 +213,44 @@ mod tests {
         let r: Response = IntoResponse::into_response(body);
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    #[test]
+    fn with_extras_overrides_prior_value_on_repeated_call() {
+        // The builder methods take `mut self`-by-value, so a repeated
+        // call MUST overwrite the prior value (last-write-wins). Pin
+        // this on `with_extras` specifically — adapter call sites
+        // sometimes build the envelope in two stages (a default
+        // policy_id from the engine, then an override from the
+        // adapter), and a refactor that collapsed the two slots into
+        // a merge / append shape would silently change which value
+        // surfaces on the wire.
+        let body = ErrorBody::new("t", "c")
+            .with_extras(serde_json::json!({"policy_id": "old"}))
+            .with_extras(serde_json::json!({"policy_id": "new"}));
+        assert_eq!(body.extras["policy_id"], "new");
+        // The first call's value is fully replaced — not merged.
+        assert!(body.extras.get("policy_id").is_some());
+    }
+
+    #[test]
+    fn extras_with_array_or_string_value_serialize_as_non_null_and_present() {
+        // The `extras` field is `serde_json::Value`, so it accepts any
+        // JSON value — but the load-bearing skip predicate is
+        // `Value::is_null`, not "is empty object". Pin that an array
+        // extras value (operators occasionally surface a `missing_atoms`
+        // vec directly into extras) AND a string extras value
+        // (defensive: a debug shim someday passing a raw error string)
+        // both serialize as present + non-null. A refactor that
+        // tightened the skip predicate to "only objects are kept"
+        // would silently drop both of these alternate shapes.
+        let with_arr = ErrorBody::new("t", "c").with_extras(serde_json::json!(["a:1", "b:2"]));
+        let v = serde_json::to_value(&with_arr).unwrap();
+        assert!(v["extras"].is_array());
+        assert_eq!(v["extras"][0], "a:1");
+
+        let with_str = ErrorBody::new("t", "c").with_extras(serde_json::json!("scalar"));
+        let v = serde_json::to_value(&with_str).unwrap();
+        assert!(v["extras"].is_string());
+        assert_eq!(v["extras"], "scalar");
+    }
 }

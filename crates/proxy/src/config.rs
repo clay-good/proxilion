@@ -791,6 +791,155 @@ operator_auth_enforced = false
     }
 
     #[test]
+    fn config_error_bind_addr_display_carries_raw_input_and_parse_message() {
+        // The BindAddr variant carries both the raw operator input (so
+        // they can spot the typo without scrolling back through env) and
+        // the underlying parse error (so they know whether the port is
+        // out of range vs. the host is malformed). Pin both substrings —
+        // a future Display refactor that hid either field would silently
+        // strip operator-actionable triage info from the bootstrap log.
+        let raw = "not-an-addr:99999".to_string();
+        let parse_err: std::net::AddrParseError =
+            "not-an-addr:99999".parse::<SocketAddr>().unwrap_err();
+        let e = ConfigError::BindAddr(raw.clone(), parse_err);
+        let s = e.to_string();
+        assert!(s.contains("not-an-addr:99999"), "display: {s}");
+        // The thiserror template is `invalid bind addr {0:?}: {1}` — the
+        // raw input is debug-formatted (quoted) so the substring above
+        // still matches. The trailing `{1}` is the AddrParseError's
+        // Display, which always carries the word "invalid" — pin that
+        // the parse-error half is rendered (not dropped to `_`).
+        assert!(s.contains("invalid"), "display: {s}");
+    }
+
+    #[test]
+    fn from_file_invalid_bind_addr_surfaces_bind_addr_error_variant() {
+        // The from_file path runs the same `.parse::<SocketAddr>()` as
+        // the env-layer path. The existing `from_file_overrides_defaults`
+        // test covers the happy path; this test pins the negative — a
+        // malformed bind_addr line in the TOML must surface
+        // `ConfigError::BindAddr` (not collapse to `FileLoad` or
+        // `InvalidValue`). A regression that wrapped the parse error in
+        // `FileLoad` for "consistency" would silently change which
+        // variant operator dashboards key on.
+        let dir =
+            std::env::temp_dir().join(format!("proxilion-cfg-bad-addr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        std::fs::write(&path, "bind_addr = \"definitely-not-an-addr\"\n").unwrap();
+        let err = ConfigBuilder::defaults().from_file(&path).unwrap_err();
+        match err {
+            ConfigError::BindAddr(raw, _) => {
+                assert_eq!(raw, "definitely-not-an-addr");
+            }
+            other => panic!("expected BindAddr variant, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn from_file_log_format_pretty_value_selects_pretty_variant() {
+        // The `eq_ignore_ascii_case("pretty")` branch is operator-facing
+        // — `pretty` is what local-dev TOML files set so log lines are
+        // human-readable. Pin the Pretty variant on both `"pretty"`
+        // (lowercase) and `"Pretty"` (mixed-case) inputs since the
+        // comparison is case-insensitive — a refactor that tightened to
+        // case-sensitive would silently break every existing operator's
+        // capitalized config without surfacing a parse error.
+        for raw in &["pretty", "Pretty", "PRETTY"] {
+            let dir =
+                std::env::temp_dir().join(format!("proxilion-cfg-pretty-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("c.toml");
+            std::fs::write(&path, format!("log_format = {raw:?}\n")).unwrap();
+            let c = ConfigBuilder::defaults()
+                .from_file(&path)
+                .unwrap()
+                .with_dev_mode(true)
+                .build()
+                .unwrap();
+            assert!(matches!(c.log_format, LogFormat::Pretty), "input: {raw}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn from_file_log_format_unknown_value_falls_back_to_json_no_error() {
+        // The else-branch on `log_format` collapses every non-"pretty"
+        // value (including garbage) to JSON rather than surfacing an
+        // error. Pin both halves of the contract: the build succeeds
+        // (no parse error from a typo) and the variant is JSON. A
+        // refactor that tightened this into a closed enum would silently
+        // start rejecting deployments that carry a typo'd log_format
+        // line — a hard cutover that the docs page hasn't warned about.
+        let dir =
+            std::env::temp_dir().join(format!("proxilion-cfg-bad-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        std::fs::write(&path, "log_format = \"compact-but-unknown\"\n").unwrap();
+        let c = ConfigBuilder::defaults()
+            .from_file(&path)
+            .unwrap()
+            .with_dev_mode(true)
+            .build()
+            .unwrap();
+        assert!(matches!(c.log_format, LogFormat::Json));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn from_file_siem_batch_size_one_collapses_to_none_via_gt_one_filter() {
+        // The `.filter(|n| *n > 1)` predicate intentionally collapses
+        // `siem_batch_size = 1` to None — a 1-event batch is identical
+        // to the unbatched path and the spawn of the flush loop is
+        // wasted work. Pin both branches: 1 → None (collapsed), 5 →
+        // Some(5) (kept). A regression to `>= 1` would silently spawn
+        // the flush loop on every install with the documented
+        // "disable batching" sentinel, while `> 5` would break the
+        // common low-volume tuning at 2 or 3.
+        for (n, want) in &[(1_usize, None), (5, Some(5))] {
+            let dir = std::env::temp_dir()
+                .join(format!("proxilion-cfg-siem-{n}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("c.toml");
+            std::fs::write(&path, format!("siem_batch_size = {n}\n")).unwrap();
+            let c = ConfigBuilder::defaults()
+                .from_file(&path)
+                .unwrap()
+                .with_dev_mode(true)
+                .build()
+                .unwrap();
+            assert_eq!(c.siem_batch_size, *want, "input: {n}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn from_file_siem_batch_max_age_secs_zero_clamps_to_one() {
+        // The `.max(1)` clamp on `siem_batch_max_age_secs` prevents a
+        // 0-second flush interval from busy-looping the forwarder. Pin
+        // both the clamp (0 → 1) and the passthrough (30 → 30) so a
+        // refactor that dropped the clamp would surface here as a
+        // 0-second value rather than as production CPU pegged at
+        // 100% on the first low-flag operator misconfiguration.
+        for (raw, want) in &[(0_u64, 1_u64), (30, 30), (1, 1)] {
+            let dir = std::env::temp_dir()
+                .join(format!("proxilion-cfg-age-{raw}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("c.toml");
+            std::fs::write(&path, format!("siem_batch_max_age_secs = {raw}\n")).unwrap();
+            let c = ConfigBuilder::defaults()
+                .from_file(&path)
+                .unwrap()
+                .with_dev_mode(true)
+                .build()
+                .unwrap();
+            assert_eq!(c.siem_batch_max_age_secs, *want, "input: {raw}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
     fn config_error_display_strings_include_field_or_path_context() {
         // Operator-facing error messages — the setup-status path renders
         // these verbatim. Pin the substrings the docs page keys on.

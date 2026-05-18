@@ -301,6 +301,165 @@ mod tests {
     }
 
     #[test]
+    fn handle_is_send_sync_static_for_each_concrete_notifier_type() {
+        // `NotifierHandle` / `SlackHandle` / `EmailHandle` all live in
+        // AppState which is cloned into every tower layer + handler
+        // extractor; the `Send + Sync + 'static` combo is the AppState-
+        // bound contract. A refactor that gave `Handle<T>` a `Cell<...>`
+        // field "for in-process state tracking" would break Sync without
+        // surfacing at this file; the breakage would appear at AppState
+        // assembly with an unrelated trait-bound error. Pin the three-
+        // trait combo for all three concrete aliases here so the type
+        // boundary fails fast at the right call site.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<NotifierHandle>();
+        require_send_sync_static::<SlackHandle>();
+        require_send_sync_static::<EmailHandle>();
+        require_send_sync_static::<Notifiers>();
+    }
+
+    #[test]
+    fn handle_supports_non_clone_inner_type_via_arc_indirection() {
+        // The file docstring commits to "the bound doesn't require
+        // T: Clone (the inner is Arc<T>, which is always cloneable)".
+        // Pin this contract with a deliberately non-Clone type wrapped
+        // in Arc — Handle<NonClone> must construct, swap, and clone
+        // without requiring a Clone bound on the inner. A refactor that
+        // added `T: Clone` to Handle's impl block (e.g. via a derive
+        // that pulls it implicitly through serde or another trait)
+        // would surface here as a compile failure at this test site
+        // rather than silently constraining every future driver type.
+        struct NonClone(#[allow(dead_code)] String);
+        let a = Arc::new(NonClone("payload".into()));
+        let h: Handle<NonClone> = Handle::new(Some(a.clone()));
+        let got = h.current().expect("initial Some must surface");
+        assert!(Arc::ptr_eq(&a, &got));
+        let h2 = h.clone();
+        h.replace(None);
+        assert!(h2.current().is_none());
+        h2.replace(Some(Arc::new(NonClone("replaced".into()))));
+        assert!(h.current().is_some());
+    }
+
+    #[test]
+    fn handle_current_returns_same_arc_across_repeated_reads_without_swap() {
+        // The hot-path call site is `let n = handle.current(); if let
+        // Some(notifier) = n { notifier.fire(...).await; }` — repeated
+        // `current()` calls without an intervening `replace` MUST
+        // return Arcs pointing to the SAME underlying T. A refactor
+        // that started materializing a fresh Arc on each load (e.g.
+        // `Arc::new((**self.inner.load()).clone())` "for snapshot
+        // isolation") would silently double the Arc clone cost per
+        // request and break any caller that relied on `Arc::ptr_eq`
+        // for cache keys. Pin pointer-stability across three reads.
+        let w = mk_webhook("https://stable.example");
+        let h: NotifierHandle = Handle::new(Some(w.clone()));
+        let r1 = h.current().expect("first read Some");
+        let r2 = h.current().expect("second read Some");
+        let r3 = h.current().expect("third read Some");
+        assert!(Arc::ptr_eq(&r1, &r2));
+        assert!(Arc::ptr_eq(&r2, &r3));
+        assert!(Arc::ptr_eq(&w, &r1));
+    }
+
+    #[test]
+    fn handle_replace_with_same_arc_value_keeps_current_observable_as_some() {
+        // The `/api/v1/notifier/config` endpoint may be invoked twice
+        // with byte-identical config (operator click-storm, or a CI
+        // sync that re-applies the same TOML); each call constructs a
+        // fresh `Arc<WebhookNotifier>` (different Arc pointer) carrying
+        // the same logical config. Pin that the post-replace
+        // `current()` is `Some` and points to the NEW Arc, not the old
+        // one (the swap actually happened — ArcSwap doesn't dedupe on
+        // value equality). A refactor that added a value-equality
+        // short-circuit "to avoid spurious swaps" would silently drop
+        // the second replace's burst-suppressor re-attachment, breaking
+        // the §10.3 hot-swap suppressor-survival contract.
+        let h: NotifierHandle = Handle::new(None);
+        let w1 = mk_webhook("https://example.com/config");
+        h.replace(Some(w1.clone()));
+        let got1 = h.current().expect("first replace Some");
+        assert!(Arc::ptr_eq(&w1, &got1));
+        let w2 = mk_webhook("https://example.com/config");
+        h.replace(Some(w2.clone()));
+        let got2 = h.current().expect("second replace Some");
+        assert!(Arc::ptr_eq(&w2, &got2));
+        // The two webhook Arcs are distinct pointers (mk_webhook
+        // builds a fresh Arc each call) — confirming the second
+        // replace actually advanced state.
+        assert!(!Arc::ptr_eq(&w1, &w2));
+    }
+
+    #[test]
+    fn two_independent_empty_bundles_have_independent_handle_state() {
+        // `Notifiers::empty()` constructs three fresh `Handle::new(None)`
+        // values per call — each call MUST produce independent state.
+        // Pin that swapping a webhook into bundle A does NOT surface
+        // through bundle B. A refactor that introduced a process-wide
+        // singleton ArcSwap "for memory savings" (the kind of change
+        // that looks safe under static analysis since every read goes
+        // through `Arc<ArcSwap>`) would silently make every
+        // `Notifiers::empty()` test fixture share state with the
+        // production bundle, cross-contaminating notifier dispatch.
+        let a = Notifiers::empty();
+        let b = Notifiers::empty();
+        a.webhook.replace(Some(mk_webhook("https://a.example")));
+        assert!(a.any_configured());
+        assert!(
+            !b.any_configured(),
+            "second empty bundle must not share state"
+        );
+        // Symmetric: configure B's slack — A's any_configured must NOT
+        // flip on the slack arm.
+        use crate::notifier::{SlackNotifier, SlackSigningSecret};
+        let slack = Arc::new(
+            SlackNotifier::new(
+                "https://hooks.slack.com/services/T/B/C".into(),
+                SlackSigningSecret::new("00112233445566778899aabbccddeeff"),
+                "https://proxy.local".into(),
+            )
+            .unwrap(),
+        );
+        b.slack.replace(Some(slack));
+        // A's slack still unconfigured.
+        assert!(a.slack.current().is_none());
+        // B's webhook still unconfigured.
+        assert!(b.webhook.current().is_none());
+    }
+
+    #[test]
+    fn handle_clone_chain_three_deep_propagates_swap_to_all_clones() {
+        // The hot-swap contract scales: the `/api/v1/notifier/config`
+        // endpoint holds one clone, the bundle inside AppState holds
+        // another, the per-request handler-derived state holds a third.
+        // A swap through ANY of the three MUST surface through all
+        // three. Existing tests pin the two-clone case; pin the three-
+        // deep chain to defend against a refactor that introduced a
+        // copy-on-write semantic (CoW would surface here as the third
+        // clone observing the pre-replace state while the first two
+        // observed the post-replace state).
+        let a: NotifierHandle = Handle::new(None);
+        let b = a.clone();
+        let c = b.clone(); // clone the clone
+        // All three start None.
+        assert!(a.current().is_none());
+        assert!(b.current().is_none());
+        assert!(c.current().is_none());
+        // Replace through the deepest clone — both ancestors must see it.
+        c.replace(Some(mk_webhook("https://deep.example")));
+        assert!(a.current().is_some(), "root must see grandchild's replace");
+        assert!(
+            b.current().is_some(),
+            "middle must see grandchild's replace"
+        );
+        assert!(c.current().is_some());
+        // Clear through the root — both descendants must see it.
+        a.replace(None);
+        assert!(b.current().is_none());
+        assert!(c.current().is_none());
+    }
+
+    #[test]
     fn empty_bundle_starts_with_none_for_email_handle_too() {
         // The `webhook_burst` and `slack_burst` Option<BurstSuppressor>
         // fields had their default-None pin (`empty_bundle_has_none_for_burst_suppressors`),

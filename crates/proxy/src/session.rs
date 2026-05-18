@@ -310,6 +310,163 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_context_debug_carries_struct_name_and_four_critical_field_names() {
+        // SessionContext flows through `tracing::error!(?session, ...)` on
+        // adapter-call failures — operators grep the resulting log line by
+        // struct name + by the four load-bearing field selectors
+        // (`agent_session_id` / `p_0` / `leaf_pca_id` / `granted_ops`) to
+        // bucket "which session, which principal, which PCA, which ops"
+        // when triaging. A manual Debug that hid any of them "to compact"
+        // would break every operator bucket. The existing
+        // `debug_omits_bearer_hash_and_leaf_pca_cbor_to_avoid_leaking_credential_material`
+        // test pins the redacted-side; pin the positive-side here so a
+        // refactor that flipped the include/exclude lists would surface
+        // on BOTH tests rather than just the redaction half.
+        let ctx = sample_ctx();
+        let s = format!("{ctx:?}");
+        assert!(s.contains("SessionContext"), "got: {s}");
+        assert!(s.contains("agent_session_id"), "got: {s}");
+        assert!(s.contains("p_0"), "got: {s}");
+        assert!(s.contains("leaf_pca_id"), "got: {s}");
+        assert!(s.contains("granted_ops"), "got: {s}");
+        assert!(s.contains("google_token_scope"), "got: {s}");
+    }
+
+    #[test]
+    fn session_ctx_and_session_extract_error_are_send_sync_static_for_axum_bounds() {
+        // `SessionCtx` is held in axum's per-request typed extractor map
+        // and cloned across spawned tasks; `SessionExtractError` is the
+        // `FromRequestParts::Rejection` associated type axum requires to
+        // be `IntoResponse + 'static`. Both flow through the Router's
+        // Send+Sync+'static bag at compile time — a refactor that gave
+        // either a non-Send field (e.g. `Rc<...>` "for single-thread test
+        // ergonomics") would break axum at the route mount site with an
+        // unrelated trait-bound error. Pin the three-trait combo here so
+        // the type boundary fails fast at the right call site.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<SessionCtx>();
+        require_send_sync_static::<SessionExtractError>();
+    }
+
+    #[tokio::test]
+    async fn session_extract_error_into_response_is_byte_equal_across_independent_calls() {
+        // `SessionExtractError` is a unit struct — constructing two
+        // separate instances and calling `into_response` on each must
+        // produce byte-equal bodies AND identical status codes AND
+        // identical content-type headers. The downstream operator log
+        // parser keys on a stable 12-byte body shape ("agent session
+        // lost" signal); a refactor that introduced per-call state
+        // (e.g. a request-id stamp "for correlation") would silently
+        // make the bodies diverge across calls and break log dedup.
+        // Pin idempotency end-to-end across two independent error
+        // values.
+        let r1 = SessionExtractError.into_response();
+        let r2 = SessionExtractError.into_response();
+        assert_eq!(r1.status(), r2.status());
+        let ct1 = r1
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let ct2 = r2
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(ct1, ct2);
+        let b1 = axum::body::to_bytes(r1.into_body(), 1024).await.unwrap();
+        let b2 = axum::body::to_bytes(r2.into_body(), 1024).await.unwrap();
+        assert_eq!(&b1[..], &b2[..]);
+        assert_eq!(&b1[..], b"unauthorized");
+    }
+
+    #[tokio::test]
+    async fn successful_extraction_preserves_all_session_context_field_values_byte_equal() {
+        // The existing `extractor_returns_ok_when_arc_session_context_present`
+        // pins Arc::ptr_eq; pin the field-level byte-equal contract
+        // independently — every SessionContext field the extractor
+        // surfaces MUST match the inserted one (string fields via byte
+        // comparison, Uuid via equality, Vec<String> via element-wise
+        // equality, bearer_hash byte-array via equality). A refactor
+        // that copied the SessionContext into a new Arc with a partial
+        // field subset "for memory pressure" would still preserve
+        // Arc::ptr_eq if it cached the new Arc, but would silently
+        // drop the unmentioned fields.
+        let ctx = sample_ctx();
+        let expected_session = ctx.agent_session_id;
+        let expected_p_0 = ctx.p_0.clone();
+        let expected_leaf = ctx.leaf_pca_id;
+        let expected_ops = ctx.granted_ops.clone();
+        let expected_scope = ctx.google_token_scope.clone();
+        let expected_cbor = ctx.leaf_pca_cbor.clone();
+        let expected_hash = ctx.bearer_hash;
+        let arc = Arc::new(ctx);
+        let req = axum::http::Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, _body) = req.into_parts();
+        parts.extensions.insert(arc.clone());
+        let extracted = SessionCtx::from_request_parts(&mut parts, &()).await;
+        let SessionCtx(out) = match extracted {
+            Ok(v) => v,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(out.agent_session_id, expected_session);
+        assert_eq!(out.p_0, expected_p_0);
+        assert_eq!(out.leaf_pca_id, expected_leaf);
+        assert_eq!(out.granted_ops, expected_ops);
+        assert_eq!(out.google_token_scope, expected_scope);
+        assert_eq!(out.leaf_pca_cbor, expected_cbor);
+        assert_eq!(out.bearer_hash, expected_hash);
+    }
+
+    #[test]
+    fn session_context_debug_renders_full_granted_ops_vec_without_truncation_at_twenty_elements() {
+        // Operators triaging "wrong ops" use the Debug-rendered
+        // granted_ops set as the ground truth of "what the bearer was
+        // actually authorized for" — a refactor that capped the
+        // rendered Vec at N elements "for log line length" would
+        // silently truncate the observability of a wide grant. Pin
+        // that all 20 elements of a 20-element vec render verbatim in
+        // the Debug output, including the boundary elements (first +
+        // tenth + twentieth). Twenty is enough to surface a `.take(N)`
+        // truncation at any reasonable N (most tracing crates default
+        // to 32 or higher; common operator-targeted caps are 5/10/16).
+        let mut ctx = sample_ctx();
+        ctx.granted_ops = (0..20)
+            .map(|i| format!("op:tier{i}:resource/path/{i}"))
+            .collect();
+        let s = format!("{ctx:?}");
+        for i in [0, 10, 19] {
+            let needle = format!("op:tier{i}:resource/path/{i}");
+            assert!(s.contains(&needle), "missing {needle} in: {s}");
+        }
+    }
+
+    #[test]
+    fn debug_is_pure_and_produces_identical_output_across_independent_calls() {
+        // `Debug` is exercised by `tracing::error!(?session, ...)` —
+        // the trait impl MUST be a pure function of the struct state
+        // (no per-call counters, no clock-stamped fields, no hidden
+        // side effects on the SessionContext). Pin purity by formatting
+        // the SAME SessionContext twice and comparing the byte output;
+        // a refactor that snuck in a per-format counter "for log
+        // correlation" or an interior-mutable cache "for memoization"
+        // would silently make the two formattings diverge AND break
+        // log dedup pipelines that hash on the rendered line.
+        let ctx = sample_ctx();
+        let a = format!("{ctx:?}");
+        let b = format!("{ctx:?}");
+        assert_eq!(a, b);
+        // And across two DIFFERENT SessionContext values built from the
+        // same fixture seed — the byte output is byte-equal too (no
+        // per-instance address-derived field rendering).
+        let ctx2 = sample_ctx();
+        let c = format!("{ctx2:?}");
+        assert_eq!(a, c);
+    }
+
     #[tokio::test]
     async fn extractor_returns_ok_when_arc_session_context_present() {
         let ctx = Arc::new(sample_ctx());

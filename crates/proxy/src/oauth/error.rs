@@ -392,6 +392,152 @@ mod tests {
     }
 
     #[test]
+    fn oauth_error_bad_request_display_carries_invalid_request_prefix_with_inner_string() {
+        // `#[error("invalid request: {0}")]` — the existing
+        // `oauth_error_display_strings_pinned_for_log_filters` test
+        // pins substrings via `.contains(...)` for five other
+        // variants but NEVER pinned `BadRequest`'s Display at all,
+        // and no test pinned the exact prefix-plus-inner shape via
+        // `assert_eq!`. Operator log filters key on the literal
+        // `"invalid request: "` prefix (matching the `body()`
+        // arm's `error: "invalid request"` title) — a refactor
+        // that softened to `"bad request: "` (matching the wire
+        // `code: "bad_request"`) would silently break Loki filters
+        // that historically grep the Display string. Pin the full
+        // shape against a known inner message.
+        let e = OAuthError::BadRequest("scope is required".into());
+        assert_eq!(e.to_string(), "invalid request: scope is required");
+    }
+
+    #[test]
+    fn oauth_error_bridge_rejected_display_carries_federation_token_rejected_prefix() {
+        // `#[error("federation token rejected: {0}")]` — the
+        // `BridgeRejected` variant was completely absent from any
+        // Display assertion (the existing filter-substring test
+        // covers PkceFail / SessionGone / UnknownClient /
+        // PicInvariant / BadAuthCode, plus round 79's exact-shape
+        // pins for Internal/Upstream/BadRequest body boundaries —
+        // BridgeRejected has neither). Operator dashboards bucket
+        // federation-bridge JWT validation failures on this prefix
+        // separately from upstream-call failures (`upstream call
+        // failed` — pinned in the sibling test) and from PIC
+        // monotonicity refusals (`Trust Plane refused PCA:` —
+        // already substring-pinned). A refactor that softened to
+        // `"bridge rejected: {0}"` for symmetry with the body code
+        // `"bridge_rejected"` would silently break log filters
+        // keyed on the `"federation token"` qualifier.
+        let e = OAuthError::BridgeRejected("token expired".into());
+        assert_eq!(e.to_string(), "federation token rejected: token expired");
+    }
+
+    #[test]
+    fn oauth_error_db_display_does_not_carry_inner_sqlx_string() {
+        // `#[error("database error")]` on `Db(#[from] sqlx::Error)`
+        // — symmetric to round-79's `Internal` mask: the inner
+        // sqlx::Error Display carries schema column names, query
+        // fragments, and constraint identifiers (operator-internal
+        // surface) that must NOT bleed through into log
+        // aggregators that summarize the textual Display rather
+        // than the structured `?self` field. Pin the no-leak
+        // contract via `assert_eq!` against the bare string and
+        // confirm the inner Display ISN'T present even when sqlx
+        // would carry distinctive substrings.
+        let e = OAuthError::Db(sqlx::Error::RowNotFound);
+        let s = e.to_string();
+        assert_eq!(s, "database error");
+        // The inner sqlx::Error Display contains "no rows" — pin
+        // explicitly that it does NOT leak through to the wrapper.
+        assert!(
+            !s.to_lowercase().contains("no rows"),
+            "inner sqlx Display leaked: {s}",
+        );
+    }
+
+    #[test]
+    fn oauth_error_crypto_display_is_fixed_no_detail_form() {
+        // `#[error("crypto failure")]` on `Crypto` (unit variant —
+        // no inner) — the Display is a fixed two-word string with
+        // no field substitution. Operator log filters key on the
+        // exact substring `"crypto failure"` to bucket AES-GCM /
+        // token-cipher faults separately from `"database error"`
+        // (Db) and `"internal error"` (Internal). A refactor that
+        // promoted `Crypto` to `Crypto(String)` for "consistency
+        // with the other detail-carrying arms" would force the
+        // `#[error]` attribute to change to `"crypto failure: {0}"`
+        // and silently start surfacing the cipher-internal string
+        // — a regression catchable here.
+        let e = OAuthError::Crypto;
+        assert_eq!(e.to_string(), "crypto failure");
+    }
+
+    #[tokio::test]
+    async fn oauth_error_upstream_display_masks_inner_reqwest_url_for_no_secret_leak() {
+        // `#[error("upstream call failed")]` on
+        // `Upstream(#[from] reqwest::Error)` — the inner reqwest
+        // error carries the full URL (including any path/query
+        // credentials in the upstream call), and round-79's
+        // sibling `upstream_body_omits_detail_to_avoid_leaking_reqwest_error_url`
+        // pins the BODY no-leak contract. This is the symmetric
+        // pin for the DISPLAY string: the Display contract is the
+        // fixed `"upstream call failed"` substring that operator
+        // log filters bucket on, with NO inner URL leaking through.
+        // A refactor to `"upstream call failed: {0}"` would
+        // surface the URL (and any embedded creds) into log
+        // aggregators that summarize the textual Display rather
+        // than the structured field. Construct a real reqwest::Error
+        // against a black-hole URL containing a sentinel `secret-path`
+        // substring so we can assert its absence in the wrapper Display.
+        let reqwest_err = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap()
+            .get("http://192.0.2.1:1/secret-path?token=hunter2")
+            .send()
+            .await
+            .unwrap_err();
+        let e: OAuthError = OAuthError::from(reqwest_err);
+        let s = e.to_string();
+        assert_eq!(s, "upstream call failed");
+        assert!(!s.contains("secret-path"), "URL path leaked: {s}");
+        assert!(!s.contains("hunter2"), "query credential leaked: {s}");
+        assert!(!s.contains("192.0.2.1"), "host leaked: {s}");
+    }
+
+    #[test]
+    fn oauth_error_display_tightened_for_five_substring_pinned_variants() {
+        // The existing `oauth_error_display_strings_pinned_for_log_filters`
+        // test pins five variants via `.contains(...)` substring
+        // checks. Tighten each to the full `assert_eq!` shape so a
+        // refactor that prepended a variant prefix (`"oauth: "`)
+        // or trailing punctuation (`"."`) would silently slip past
+        // a `.contains()` check but surface here. The five
+        // variants are unit-shaped (no field substitution) so the
+        // Display strings are byte-stable constants.
+        assert_eq!(OAuthError::PkceFail.to_string(), "PKCE verification failed");
+        assert_eq!(
+            OAuthError::SessionGone.to_string(),
+            "session expired or unknown",
+        );
+        assert_eq!(
+            OAuthError::UnknownClient.to_string(),
+            "unknown OAuth client"
+        );
+        assert_eq!(
+            OAuthError::BadAuthCode.to_string(),
+            "authorization code invalid or already used",
+        );
+        // PicInvariant carries an inner String — pin the full
+        // prefix-plus-inner shape (distinct from `AppError::PicInvariantViolation`'s
+        // `"Trust Plane refused PCA: "` prefix which uses the
+        // "Violation" word; this OAuth-side variant uses the
+        // bare "Invariant" form).
+        assert_eq!(
+            OAuthError::PicInvariant("missing drive:write:bob/*".into()).to_string(),
+            "Trust Plane refused PCA: missing drive:write:bob/*",
+        );
+    }
+
+    #[test]
     fn body_fix_strings_are_actionable_for_unique_variants() {
         // Pin the fix text for the four variants whose fix strings are
         // their stable contract with the operator-docs page (the docs page

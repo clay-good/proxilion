@@ -304,6 +304,130 @@ mod tests {
     }
 
     #[test]
+    fn expiry_sweep_report_debug_renders_struct_name_for_grep() {
+        // Symmetric to the existing
+        // `escalation_sweep_report_debug_renders_struct_name_for_grep`
+        // pin on the EscalationSweepReport arm — operator log
+        // aggregators key on the rendered Debug shape from the spawn
+        // loop's `tracing::debug!(?r, ...)` match arm. Both report
+        // types carry one u64 field; a manual Debug impl that hid the
+        // type name (rendering just the field value) would silently
+        // collapse the expiry sweep's log lines onto the escalation
+        // sweep's. Pin that the rendered string carries the
+        // `ExpirySweepReport` struct name so the two stay
+        // grep-distinguishable. (The sibling test on
+        // EscalationSweepReport was added previously; this fills the
+        // symmetric gap on the expiry arm.)
+        let r = ExpirySweepReport { expired_rows: 23 };
+        let s = format!("{r:?}");
+        assert!(s.contains("ExpirySweepReport"), "got: {s}");
+        assert!(s.contains("23"));
+    }
+
+    #[test]
+    fn escalation_sweep_report_clone_at_nonzero_value_yields_independent_copy() {
+        // Symmetric to the existing
+        // `expiry_sweep_report_clone_at_nonzero_value_yields_independent_copy`
+        // pin on the ExpirySweepReport arm. The escalation sweep loop
+        // also relies on the report being a snapshot of THIS tick's
+        // escalation count, not a live counter that future ticks can
+        // roll into. Pin that a `Clone` of a non-zero report yields an
+        // independent value (a future refactor to `Arc<AtomicU64>` for
+        // "concurrent updates across multiple sweep workers" would
+        // surface here as the clone seeing a later mutation on the
+        // original — silently breaking the per-tick snapshot
+        // invariant).
+        let r = EscalationSweepReport { escalated_rows: 11 };
+        let mut c = r.clone();
+        assert_eq!(c.escalated_rows, 11);
+        c.escalated_rows = 77;
+        assert_eq!(r.escalated_rows, 11);
+        assert_eq!(c.escalated_rows, 77);
+    }
+
+    #[test]
+    fn sweep_reports_are_send_sync_static_for_tokio_task_boundary() {
+        // Both report types flow through the `spawn` task loop's
+        // `match sweep_once(&db).await` and `match sweep_escalations(...)`
+        // arms — those `match` scopes hold the report value across
+        // an await point inside a `tokio::spawn`-ed future, so the
+        // type bound the spawn site requires is `Send + 'static`.
+        // (`Sync` is not strictly required by `tokio::spawn` but is
+        // structurally upheld by both — a refactor that introduced
+        // a `!Sync` field like `Cell<u64>` "for interior mutability"
+        // would still pass the spawn bound but surface a future
+        // `Arc<Report>` sharing path here.) Pin the three-trait combo
+        // at the type level so a refactor surfaces in this file
+        // rather than at some unrelated AppState assembly site.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ExpirySweepReport>();
+        require_send_sync_static::<EscalationSweepReport>();
+    }
+
+    #[test]
+    fn default_tick_interval_equals_sixty_via_multiple_duration_constructors() {
+        // `Duration::from_secs(60)` is the canonical form, but Rust's
+        // Duration treats `from_millis(60_000)` / `from_micros(60_000_000)`
+        // / `from_nanos(60_000_000_000)` as byte-identical values via
+        // its `PartialEq` impl. The existing
+        // `default_tick_interval_pinned_at_60_seconds` test pins ONE
+        // constructor; pin equality across ALL the natural
+        // alternatives so a refactor that swapped to a different
+        // constructor (e.g. `Duration::from_millis(60_000)` for some
+        // config-loader compat reason) doesn't silently widen any
+        // future comparison against the canonical form. Symmetric pin
+        // to round-31's subsec_nanos check, but on the equality side.
+        assert_eq!(DEFAULT_TICK_INTERVAL, Duration::from_millis(60_000));
+        assert_eq!(DEFAULT_TICK_INTERVAL, Duration::from_micros(60_000_000));
+        assert_eq!(DEFAULT_TICK_INTERVAL, Duration::from_nanos(60_000_000_000));
+    }
+
+    #[test]
+    fn default_tick_interval_is_strictly_positive_and_bounded_for_loop_safety() {
+        // The sweeper loop's `tokio::time::sleep(tick_interval).await`
+        // does NOT defend against a zero-duration default — a
+        // `from_secs(0)` would tight-loop the sweeper and burn one
+        // CPU core hammering the DB with no backoff. Symmetric upper
+        // bound: a refactor that loosened the default to `from_secs(3600)`
+        // would silently leave overdue blocked rows lingering in
+        // `status='pending'` for up to an hour, well past the
+        // 60–120s operator-alert window pinned by
+        // `default_tick_interval_pinned_at_60_seconds`. Pin both
+        // bounds so a future refactor surfaces here rather than as a
+        // production runtime regression.
+        assert!(
+            DEFAULT_TICK_INTERVAL > Duration::ZERO,
+            "default tick interval must be > 0 to avoid tight-looping the sweeper",
+        );
+        assert!(
+            DEFAULT_TICK_INTERVAL <= Duration::from_secs(300),
+            "default tick interval must be <= 5min to keep the expiry-alert window meaningful",
+        );
+    }
+
+    #[test]
+    fn sweep_report_clone_at_u64_max_preserves_value_without_overflow() {
+        // The `expired_rows` / `escalated_rows` fields are `u64` —
+        // the sweep `RETURNING id, ...` query returns rows whose
+        // count is bounded by the table size (tens of thousands at
+        // most), but a refactor that switched the field to a smaller
+        // numeric type (e.g. `u32` "since we never see > 4B rows in
+        // a sweep") would silently introduce a truncation hazard at
+        // the cast site `let n = rows.len() as u64;`. Pin that u64::MAX
+        // round-trips through Clone unchanged on both report types
+        // — a regression to u32 would surface here as a value-domain
+        // failure rather than at the cast site in `sweep_once`.
+        let e = ExpirySweepReport {
+            expired_rows: u64::MAX,
+        };
+        let s = EscalationSweepReport {
+            escalated_rows: u64::MAX,
+        };
+        assert_eq!(e.clone().expired_rows, u64::MAX);
+        assert_eq!(s.clone().escalated_rows, u64::MAX);
+    }
+
+    #[test]
     fn default_tick_interval_carries_no_subsecond_component() {
         // The `Duration::from_secs(60)` constructor pins zero subsecond
         // nanos. A regression that swapped to `Duration::from_millis(60_000)`

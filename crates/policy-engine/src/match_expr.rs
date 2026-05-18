@@ -645,4 +645,141 @@ body.external_recipient: { equals: false }
         let err = as_str_seq(&s, "not_in", &ctx()).unwrap_err();
         assert!(matches!(err, MatchError::BadShape { ref op, .. } if op == "not_in"));
     }
+
+    #[test]
+    fn match_error_unsupported_op_display_carries_backticked_operator() {
+        // `#[error("unsupported operator `{0}`")]` — the backticks
+        // around `{0}` are load-bearing: operator-facing log filters
+        // and runbook examples key on the exact substring
+        // ``unsupported operator `foo` `` to bucket "operator typo"
+        // (e.g. `equls` instead of `equals`) separately from
+        // `BadShape` faults (which use the prefix `"operator `..`
+        // expects ..."`). A refactor that dropped the backticks for
+        // "consistency with the other variants" would silently merge
+        // the buckets — both would then start with `"operator "` and
+        // a Loki filter on `operator \``…`\`` would lose precision.
+        let e = MatchError::UnsupportedOp("weird_op".into());
+        assert_eq!(e.to_string(), "unsupported operator `weird_op`");
+    }
+
+    #[test]
+    fn match_error_bad_shape_display_renders_all_three_named_fields_in_order() {
+        // `#[error("operator `{op}` expects {expected}, got {got}")]`
+        // — the three named-field substitutions are emitted in the
+        // operator/expected/got order matching the struct's field
+        // declaration order. The dashboard's "policy authoring
+        // errors" panel renders the Display verbatim; a refactor
+        // that flipped to `expected/got/op` ordering "for grammar"
+        // would silently break operator scripts that grep the suffix
+        // for the actual-vs-expected type pair. Pin the full shape
+        // with three distinct values so any ordering swap fails loud.
+        let e = MatchError::BadShape {
+            op: "in".into(),
+            expected: "sequence",
+            got: "number".into(),
+        };
+        assert_eq!(e.to_string(), "operator `in` expects sequence, got number");
+    }
+
+    #[test]
+    fn match_error_bad_shape_display_static_str_expected_field_supports_typical_descriptors() {
+        // The `expected` field is typed `&'static str` — pin the
+        // shape across a small range of descriptors actually used
+        // by the call sites (`"sequence"`, `"string"`, `"mapping"`)
+        // so a refactor to `String` (the natural "consistency with
+        // op and got" mistake) would surface as a compile error at
+        // every construction site rather than as a silent allocation
+        // per error. The `&'static str` type is also load-bearing
+        // for the BadShape variant being cheap-clone for retry-tracing.
+        for expected in ["sequence", "string", "mapping", "scalar"] {
+            let e = MatchError::BadShape {
+                op: "matches".into(),
+                expected,
+                got: "null".into(),
+            };
+            let s = e.to_string();
+            assert!(s.contains(expected), "expected `{expected}` in: {s}");
+            assert!(s.starts_with("operator `matches` expects "), "got: {s}");
+            assert!(s.ends_with(", got null"), "got: {s}");
+        }
+    }
+
+    #[test]
+    fn match_error_template_display_carries_template_error_prefix_with_inner_passthrough() {
+        // `#[error("template error: {0}")]` on `Template(#[from] OpsParseError)`
+        // — distinct from the `"policy ops template: "` prefix that
+        // `proxy::adapters::error::AppError::OpsTemplate` uses, even
+        // though both wrap the SAME `OpsParseError` type. The two
+        // prefixes are intentionally different layers (engine-side
+        // vs adapter-side) so an operator runbook can grep
+        // `"template error:"` for inline match-expr template faults
+        // separately from `"policy ops template:"` for required_ops
+        // template faults. A "harmonize the prefix across layers"
+        // refactor would silently merge the two and force the
+        // operator to re-walk the structured trace. Pin the prefix
+        // AND the inner OpsParseError Display passthrough so
+        // cross-module drift surfaces.
+        let inner = crate::ops::OpsParseError::UnknownVar("ctx.missing".into());
+        let e: MatchError = MatchError::from(inner);
+        let s = e.to_string();
+        assert!(s.starts_with("template error: "), "got: {s}");
+        assert!(s.contains("ctx.missing"), "got: {s}");
+    }
+
+    #[test]
+    fn match_error_bad_shape_display_op_field_supports_dotted_field_paths() {
+        // The `op` field is typed `String` so it accepts both bare
+        // operator names (`"in"`, `"matches"`) and dotted field
+        // paths (`"user.email"`, `"resource.attributes.size"`) when
+        // a top-level field-key surfaces in the BadShape. The
+        // existing tests pin the bare-operator shape via `"in"` /
+        // `"not_in"`; pin the dotted path so a refactor that
+        // canonicalized `op` to the last segment (the natural
+        // "strip the prefix for display brevity" mistake) would
+        // silently drop the path context operators rely on to
+        // locate the offending policy clause.
+        let e = MatchError::BadShape {
+            op: "user.contact.email".into(),
+            expected: "mapping",
+            got: "string".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "operator `user.contact.email` expects mapping, got string",
+        );
+    }
+
+    #[test]
+    fn match_error_implements_std_error_trait_for_source_chain_walking() {
+        // `Template(#[from] OpsParseError)` — `thiserror`'s `#[from]`
+        // wires both the `From` conversion AND the `std::error::Error::source()`
+        // chain so anyhow-style walkers can recover the inner
+        // `OpsParseError` without parsing the Display string. Pin
+        // that `source()` surfaces a non-None for the `Template` arm
+        // and None for the other two arms (UnsupportedOp / BadShape
+        // are leaf errors with no inner source). A refactor to a
+        // hand-rolled `From` impl that didn't wire `source()` would
+        // surface here — the chain-walker behavior is what makes the
+        // adapter-side error chain in `AppError::OpsTemplate` work.
+        use std::error::Error as _;
+        let leaf_unsupported = MatchError::UnsupportedOp("x".into());
+        assert!(
+            leaf_unsupported.source().is_none(),
+            "UnsupportedOp is a leaf — no inner source",
+        );
+        let leaf_bad_shape = MatchError::BadShape {
+            op: "in".into(),
+            expected: "sequence",
+            got: "number".into(),
+        };
+        assert!(
+            leaf_bad_shape.source().is_none(),
+            "BadShape is a leaf — no inner source",
+        );
+        let chained: MatchError = crate::ops::OpsParseError::UnknownVar("ctx.x".into()).into();
+        let src = chained.source().expect("Template wraps an inner source");
+        // The inner source is the OpsParseError — its Display must
+        // pass through the same substring as the wrapper's Display.
+        assert!(src.to_string().contains("ctx.x"), "got: {}", src);
+    }
 }

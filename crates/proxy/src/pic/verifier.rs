@@ -762,4 +762,124 @@ mod tests {
         assert!(s.contains("3"));
         assert!(s.contains("1"));
     }
+
+    #[test]
+    fn verifier_error_missing_display_carries_pca_not_found_prefix_and_uuid() {
+        // `#[error("pca {0} not found in cache")]` — the operator-facing
+        // log substring the chain-walker dashboard keys on. The Uuid
+        // renders via its Display (lowercase-hyphenated, NOT the
+        // braced Debug form `Uuid("...")`); a refactor to
+        // `#[error("pca {0:?} not found ...")]` (the natural
+        // "consistent debug formatting" mistake) would silently swap
+        // the wire shape and break log filters keyed on the raw uuid
+        // substring. Pin both the literal prefix + suffix and the
+        // exact uuid Display rendering.
+        let id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let e = VerifierError::Missing(id);
+        assert_eq!(
+            e.to_string(),
+            "pca 00112233-4455-6677-8899-aabbccddeeff not found in cache",
+        );
+    }
+
+    #[test]
+    fn verifier_error_bad_cat_signature_display_carries_pca_uuid_and_signature_prefix() {
+        // `#[error("CAT signature failed to verify on pca {0}")]` —
+        // operators bucket "key rotation drift" (a CAT signature
+        // failure on a specific pca) separately from
+        // `BadCatSignature`-adjacent variants like `Missing` (which
+        // also carries a uuid but indicates the pca itself never
+        // arrived in cache). The prefix substring `"CAT signature
+        // failed"` is the dashboard key — a "tighten the message"
+        // refactor to `"CAT sig failed"` would silently merge the
+        // bucket with any future shorter-prefixed CAT-key variant.
+        // Pin the full Display shape with a known uuid.
+        let id = Uuid::parse_str("deadbeef-0000-0000-0000-000000000001").unwrap();
+        let e = VerifierError::BadCatSignature(id);
+        assert_eq!(
+            e.to_string(),
+            "CAT signature failed to verify on pca deadbeef-0000-0000-0000-000000000001",
+        );
+    }
+
+    #[test]
+    fn verifier_error_continuity_broken_display_renders_both_named_uuids_and_full_suffix() {
+        // `#[error("continuity broken between pca {child} and predecessor {parent}: provenance.cat_sig mismatch")]`
+        // — the only multi-line `thiserror` attribute in the enum
+        // (formatted across two source lines). The Display output must
+        // be a SINGLE line with both uuids substituted via `{child}` /
+        // `{parent}` named-field syntax AND the trailing
+        // `": provenance.cat_sig mismatch"` literal preserved (the
+        // dashboard keys on the `"provenance.cat_sig"` substring to
+        // distinguish a continuity break from a `BadCatSignature`
+        // which is also a signature fault but on a different field).
+        // A refactor that collapsed the suffix to a generic ": mismatch"
+        // would silently merge the two on the wire.
+        let child = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let parent = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let e = VerifierError::ContinuityBroken { child, parent };
+        assert_eq!(
+            e.to_string(),
+            "continuity broken between pca 00000000-0000-0000-0000-000000000001 and predecessor 00000000-0000-0000-0000-000000000002: provenance.cat_sig mismatch",
+        );
+    }
+
+    #[test]
+    fn verifier_error_p0_mismatch_display_carries_full_shape_with_both_principals() {
+        // `#[error("p_0 changed across hop ({child_p0} != {parent_p0})")]`
+        // — pin the parenthesized inequality shape that the
+        // dashboard's chain-walker renders verbatim into the
+        // "principal mismatch" alert. The asymmetric ordering
+        // (child first, parent second) matches the
+        // `HopOrder` variant's parameter order so operators can
+        // build muscle memory across the two structured variants;
+        // a refactor that flipped the ordering "for alphabetical
+        // consistency with `child_p0` < `parent_p0`" would silently
+        // invert the rendered direction and confuse triage.
+        let e = VerifierError::P0Mismatch {
+            child_p0: "oidc:alice@example.com".into(),
+            parent_p0: "oidc:bob@example.com".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "p_0 changed across hop (oidc:alice@example.com != oidc:bob@example.com)",
+        );
+    }
+
+    #[test]
+    fn verifier_error_decode_display_carries_decoding_signed_pca_prefix_with_inner_string() {
+        // `#[error("decoding signed PCA bytes: {0}")]` — the inner
+        // String is built by `SignedPca::from_bytes` and carries the
+        // CBOR-decoder's actionable triage message (e.g. "trailing
+        // bytes after PCA", "unexpected map key"). The prefix
+        // `"decoding signed PCA bytes: "` is what Grafana splits the
+        // chain-walker "malformed bytes" bucket on; a refactor to
+        // `"decode error: {0}"` would silently merge this with any
+        // adjacent decode-style variants. Pin the full prefix-plus-
+        // inner-string shape.
+        let e = VerifierError::Decode("trailing bytes after PCA terminator".into());
+        assert_eq!(
+            e.to_string(),
+            "decoding signed PCA bytes: trailing bytes after PCA terminator",
+        );
+    }
+
+    #[test]
+    fn verifier_error_cat_key_display_carries_cat_key_fetch_prefix_with_inner_string() {
+        // `#[error("CAT key fetch: {0}")]` — the variant the
+        // chain-walker emits when the Trust Plane info endpoint or
+        // the local CatKeyRegistry lookup fails for a specific kid.
+        // Distinct from `BadCatSignature` (which means we HAVE the
+        // key but it didn't verify) — the dashboard splits these
+        // two on the `"CAT key fetch:"` vs `"CAT signature failed"`
+        // substrings, and a refactor that softened either prefix
+        // would silently merge "key unavailable" with "key
+        // disagreed" on the operator's alert pipeline. Pin the
+        // full shape with a known inner message.
+        let e = VerifierError::CatKey("kid `cat-2026-Q2` not present in registry".into());
+        assert_eq!(
+            e.to_string(),
+            "CAT key fetch: kid `cat-2026-Q2` not present in registry",
+        );
+    }
 }

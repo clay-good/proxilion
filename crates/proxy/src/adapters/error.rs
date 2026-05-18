@@ -365,6 +365,142 @@ mod tests {
     }
 
     #[test]
+    fn app_error_policy_blocked_display_carries_policy_id_debug_form_and_reason() {
+        // `#[error("policy {policy_id:?} blocked request: {reason}")]`
+        // — the `{policy_id:?}` Debug form is load-bearing: `Some("p1")`
+        // renders as `Some("p1")` (with the quotes) and `None` renders
+        // as `None`, both distinguishable in log aggregators. Operators
+        // grep `policy Some("p1") blocked` to bucket per-policy block
+        // rates separately from the catch-all default-deny path which
+        // shows as `policy None blocked`. A refactor to `{policy_id}`
+        // (without `:?`) would either panic (Option doesn't impl
+        // Display) or require unwrap_or("(none)") and silently merge
+        // the two buckets.
+        let e = AppError::PolicyBlocked {
+            policy_id: Some("gmail-external-send-gate".into()),
+            reason: "external recipient".into(),
+            override_allowed: true,
+        };
+        assert_eq!(
+            e.to_string(),
+            r#"policy Some("gmail-external-send-gate") blocked request: external recipient"#,
+        );
+        // Symmetric None case — pin the bare `None` rendering so a
+        // refactor that injected a placeholder wouldn't slip past.
+        let e = AppError::PolicyBlocked {
+            policy_id: None,
+            reason: "default-deny".into(),
+            override_allowed: false,
+        };
+        assert_eq!(e.to_string(), "policy None blocked request: default-deny",);
+    }
+
+    #[test]
+    fn app_error_require_confirmation_display_carries_prefix_with_inner_reason() {
+        // `#[error("requires user confirmation: {0}")]` — pin the full
+        // shape so a refactor that softened the prefix to "needs
+        // confirmation: {0}" (a natural "tighten the message" change)
+        // would surface here. The 428 docs page anchors on the literal
+        // "requires user confirmation" substring as the operator-facing
+        // log signal that distinguishes a `RequireConfirmation` 428
+        // from a `RateLimit` 429 (both block the agent retry loop).
+        let e = AppError::RequireConfirmation("external attendee on calendar invite".into());
+        assert_eq!(
+            e.to_string(),
+            "requires user confirmation: external attendee on calendar invite",
+        );
+    }
+
+    #[test]
+    fn app_error_pic_invariant_violation_display_carries_trust_plane_prefix() {
+        // `#[error("Trust Plane refused PCA: {0}")]` — the prefix
+        // distinguishes this Layer-A error from `OAuthError::PicInvariant`
+        // (which also surfaces a Trust Plane refusal but on the OAuth
+        // flow side, not the adapter call side). Operator dashboards
+        // bucket the two on the prefix presence — a "tidy up" refactor
+        // that aligned both to the same prefix would silently flatten
+        // adapter-side monotonicity faults onto OAuth-side ones,
+        // making operators chase the wrong root cause. Pin the full
+        // shape against an inner string carrying the canonical
+        // missing-atoms syntax.
+        let e = AppError::PicInvariantViolation(
+            "ops not subset of predecessor: missing [drive:write:file/secret]".into(),
+        );
+        assert_eq!(
+            e.to_string(),
+            "Trust Plane refused PCA: ops not subset of predecessor: missing [drive:write:file/secret]",
+        );
+    }
+
+    #[test]
+    fn app_error_policy_display_carries_policy_engine_prefix_with_inner_error_message() {
+        // `#[error("policy engine: {0}")]` on `Policy(#[from] rego::Error)`
+        // — the prefix distinguishes engine-evaluation errors (a
+        // malformed YAML decision shape, a regex compile fault) from
+        // adapter-side errors (`OpsTemplate`, `Upstream`). Build a
+        // concrete `rego::Error::BadDecision` and pin both halves of
+        // the Display: the `"policy engine: "` prefix AND the inner
+        // `rego::Error` Display passthrough (which itself starts with
+        // `"invalid decision shape: "` — pinned in policy-engine's own
+        // tests, included here defensively so a regression in either
+        // module surfaces alongside the symmetric test).
+        let inner = policy_engine::rego::Error::BadDecision("missing reason field".into());
+        let e: AppError = AppError::Policy(inner);
+        let s = e.to_string();
+        assert!(s.starts_with("policy engine: "), "got: {s}");
+        assert!(s.contains("invalid decision shape"), "got: {s}");
+        assert!(s.contains("missing reason field"), "got: {s}");
+    }
+
+    #[test]
+    fn app_error_ops_template_display_carries_policy_ops_template_prefix() {
+        // `#[error("policy ops template: {0}")]` on
+        // `OpsTemplate(#[from] OpsParseError)` — symmetric to the
+        // `Policy(_)` arm above but distinct in prefix. The two
+        // variants share a 500 ErrorCode::PolicyEngineError on the
+        // wire (operators see the same `code`) but the log Display
+        // string distinguishes them so a triage runbook can tell
+        // "operator authored a bad template" (OpsTemplate) from "the
+        // engine itself rejected the YAML structure" (Policy) without
+        // walking back to the structured-trace. A refactor that
+        // collapsed the two prefixes to a uniform "policy: {0}" would
+        // silently merge the buckets.
+        let inner = policy_engine::ops::OpsParseError::UnknownVar("path.missing".into());
+        let e: AppError = AppError::OpsTemplate(inner);
+        let s = e.to_string();
+        assert!(s.starts_with("policy ops template: "), "got: {s}");
+        // The inner OpsParseError Display surfaces — pinned in
+        // policy-engine's own tests; included here so cross-module
+        // drift surfaces.
+        assert!(s.contains("template variable"), "got: {s}");
+        assert!(s.contains("path.missing"), "got: {s}");
+    }
+
+    #[test]
+    fn app_error_internal_display_carries_internal_error_prefix_with_inner_string() {
+        // `#[error("internal error: {0}")]` — unlike `OAuthError::Internal`
+        // (which is `#[error("internal error")]` and deliberately
+        // masks the inner String to prevent leaking adapter-built
+        // `format!("token=...")` payloads through the OAuth response
+        // path), `AppError::Internal` DOES include the inner String
+        // because adapter call sites surface it only into operator-
+        // facing logs (the agent-facing 500 body collapses to the
+        // shared "internal error" title with no detail — pinned by
+        // `app_error_body_db_and_internal_collapse_to_internal_error_envelope`).
+        // The asymmetry is intentional: OAuth-side errors face the
+        // public OAuth flow, adapter-side errors face the agent which
+        // is already authenticated. Pin the full prefix-and-inner
+        // shape so a refactor that "harmonized" the two (the natural
+        // "treat both Internal variants the same" mistake) would
+        // surface here.
+        let e = AppError::Internal("integer overflow at quarantine_count".into());
+        assert_eq!(
+            e.to_string(),
+            "internal error: integer overflow at quarantine_count",
+        );
+    }
+
+    #[test]
     fn app_error_body_read_filter_blocked_has_no_detail_but_dashboard_hint() {
         // ReadFilterBlocked is intentionally generic to the agent — the
         // matched pattern lives in `/admin/` (Live feed → row). Pin

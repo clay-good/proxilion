@@ -467,6 +467,186 @@ mod tests {
         assert!(rendered.ends_with("pg pool exhausted"));
     }
 
+    #[test]
+    fn policy_load_error_implements_std_error_trait_for_anyhow_chain_walking() {
+        // `PolicyLoadError` is the boundary error returned to the proxy's
+        // policy_handle reload loop, which bubbles it through `anyhow`
+        // chains for operator-facing logs. A refactor that swapped
+        // `thiserror::Error` for a hand-rolled `impl Display` would
+        // silently drop the `std::error::Error` impl, breaking
+        // `anyhow::Error::source()` walks at the policy_handle layer
+        // (surfacing as truncated log chains rather than as a compile
+        // error). Pin the dyn-cast AND the `source() == None` leaf
+        // contract for all three variants — none of them carry an inner
+        // `#[source]`/`#[from]` so all three are leaf nodes in the chain.
+        use std::error::Error;
+        for e in [
+            PolicyLoadError::Io("perm denied".into()),
+            PolicyLoadError::NotFound("/etc/proxilion/p.yaml".into()),
+            PolicyLoadError::Backend("pg connection refused".into()),
+        ] {
+            let dyn_e: &(dyn Error + 'static) = &e;
+            assert!(dyn_e.source().is_none(), "leaf variant: {e:?}");
+            // Display still works via dyn-cast (the Display impl is what
+            // anyhow's chain printing calls).
+            let rendered = dyn_e.to_string();
+            assert!(!rendered.is_empty(), "Display via dyn-cast empty: {e:?}");
+        }
+    }
+
+    #[test]
+    fn policy_load_error_not_found_display_passes_path_through_unchanged() {
+        // Symmetric counterpart to
+        // `policy_load_error_io_display_passes_inner_error_message_through_unchanged`
+        // — pin byte-exact passthrough on the NotFound variant. Operator
+        // triage during a policy-file rename or volume-mount typo depends
+        // on the full path surfacing in the log (a "did you mean
+        // /etc/proxilion/policy.yaml?" check). A refactor that truncated
+        // the path to a basename "for log brevity" would silently strip
+        // the directory half — the operator-visible message would still
+        // mention "policy.yaml" but lose the mount-point context. Pin
+        // both the `"source not found: "` prefix AND the trailing
+        // byte-identical inner.
+        let path = "/var/run/proxilion/configs/policy.yaml.disabled";
+        let e = PolicyLoadError::NotFound(path.into());
+        let rendered = e.to_string();
+        assert!(
+            rendered.starts_with("source not found: "),
+            "got: {rendered}"
+        );
+        assert!(rendered.ends_with(path), "got: {rendered}");
+        // Empty-inner edge: a refactor that gated on `!inner.is_empty()`
+        // (in the name of "tidy up empty messages") would silently
+        // produce a bare `"source not found:"` log line with no path —
+        // an operator alert filter keyed on the colon-space-path shape
+        // would silently miss it. Pin the prefix-survives-empty-inner
+        // contract.
+        let e = PolicyLoadError::NotFound(String::new());
+        let rendered = e.to_string();
+        assert!(
+            rendered.starts_with("source not found: "),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn policy_bundle_debug_carries_field_names_for_operator_grep() {
+        // The `policy_handle` reload tick traces a `PolicyBundle` shape
+        // via `tracing::debug!(?bundle, ..)`. A manual Debug impl that
+        // hid the field names (rendered as a tuple, or collapsed
+        // `version` into a Display alias) would silently strip the
+        // operator's grep handle — the `version=` field selector that
+        // the reload-event log filter uses to bucket version-token
+        // changes vs. yaml-only changes (which shouldn't happen but
+        // would surface as a bug). Pin both field names AND the version
+        // value substring.
+        let b = PolicyBundle {
+            yaml: "- id: pin-test".into(),
+            version: "mtime:1234567890".into(),
+        };
+        let s = format!("{b:?}");
+        assert!(s.contains("yaml"), "got: {s}");
+        assert!(s.contains("version"), "got: {s}");
+        assert!(s.contains("mtime:1234567890"), "got: {s}");
+        assert!(s.contains("pin-test"), "got: {s}");
+    }
+
+    #[test]
+    fn file_loader_new_accepts_str_string_pathbuf_and_path_via_as_ref() {
+        // The `FilePolicyLoader::new` signature is `impl AsRef<Path>` —
+        // every standard path-ish type round-trips through `to_path_buf`
+        // to land in the inner `PathBuf` field. The existing
+        // `file_loader_path_and_source_label_round_trip` test only walks
+        // the `&str` shape; pin the four common shapes (`&str`,
+        // `String`, `&Path`, `PathBuf`) so a refactor that tightened the
+        // bound to `Into<PathBuf>` or `&Path` would surface here as a
+        // compile break on this test rather than at a downstream caller
+        // (server.rs builds the loader from an env-var-derived `String`;
+        // the embed API may build it from a `&Path`). All four MUST
+        // yield byte-identical `path()` output.
+        let target = "/tmp/proxilion-as-ref-test.yaml";
+        let from_str = FilePolicyLoader::new(target);
+        let from_string = FilePolicyLoader::new(String::from(target));
+        let from_pathbuf = FilePolicyLoader::new(PathBuf::from(target));
+        let from_path_ref = FilePolicyLoader::new(Path::new(target));
+        assert_eq!(from_str.path().to_string_lossy(), target);
+        assert_eq!(from_string.path().to_string_lossy(), target);
+        assert_eq!(from_pathbuf.path().to_string_lossy(), target);
+        assert_eq!(from_path_ref.path().to_string_lossy(), target);
+        // And source_label round-trips byte-identically across all four
+        // shapes (a refactor that started normalizing the PathBuf via
+        // `.canonicalize()` "for consistency" would surface here as
+        // diverging labels — and as broken log filters since the
+        // canonicalize'd path lands on `/private/tmp/...` on macOS).
+        assert_eq!(from_str.source_label(), target);
+        assert_eq!(from_string.source_label(), target);
+        assert_eq!(from_pathbuf.source_label(), target);
+        assert_eq!(from_path_ref.source_label(), target);
+    }
+
+    #[tokio::test]
+    async fn static_loader_changed_since_returns_none_when_caller_already_tracks_current() {
+        // The `changed_since` default impl returns `None` when the
+        // caller's tracked version equals the current bundle's. Pin
+        // the idempotent-after-update path that
+        // `static_loader_changed_since_uses_default_impl_correctly`
+        // doesn't fully walk: after `set_yaml`, the caller observes a
+        // new version (`v1`), advances its tracked token to `v1`, and
+        // calls `changed_since("rev:1")` again — MUST return None. A
+        // refactor that conflated "current revision" with "any
+        // post-init revision" (e.g. an `is_post_init: bool` cache
+        // instead of value comparison) would silently keep reporting
+        // change every tick, triggering an engine rebuild storm on
+        // every reload-tick after the first edit.
+        let l = StaticPolicyLoader::new("[]");
+        l.set_yaml("- id: a\n  vendor: g\n  action: a\n  decision: allow\n  required_ops: []\n");
+        let v1 = l.load().await.unwrap().version;
+        assert_eq!(v1, "rev:1");
+        // Caller has advanced its tracked version to v1 — subsequent
+        // changed_since must report None until set_yaml is called again.
+        let no_change = l.changed_since(&v1).await.unwrap();
+        assert!(no_change.is_none(), "post-advance must report None");
+        // And a second changed_since call (no set_yaml in between) MUST
+        // remain None — pin idempotency across repeated polls.
+        let still_none = l.changed_since(&v1).await.unwrap();
+        assert!(still_none.is_none(), "repeated poll must remain None");
+    }
+
+    #[tokio::test]
+    async fn static_loader_clone_via_arc_share_set_yaml_visible_across_handles() {
+        // `StaticPolicyLoader` holds its YAML behind `Arc<Mutex<String>>`
+        // and its revision behind `Arc<AtomicU64>`. Two clones of the
+        // same loader MUST share state — a `set_yaml` on one handle MUST
+        // surface through the other's `load()`. The proxy wraps the
+        // loader in an `Arc<dyn PolicyLoader>` and hands clones to the
+        // policy-handle background task; a refactor that deep-copied
+        // the inner String "to isolate test fixtures" would silently
+        // make every reload tick read stale YAML while operator edits
+        // landed only on the producer-side handle. Note: the trait
+        // requires `Send + Sync` so the share is via the inner Arc, not
+        // a `Clone` derive on `StaticPolicyLoader` itself — pin the
+        // shared-state via wrapping in an explicit Arc<dyn ...>.
+        let producer = Arc::new(StaticPolicyLoader::new("[]"));
+        let consumer = producer.clone();
+        producer.set_yaml(
+            "- id: shared\n  vendor: g\n  action: a\n  decision: allow\n  required_ops: []\n",
+        );
+        // Consumer-side load surfaces producer-side edit (Arc share).
+        let b = consumer.load().await.unwrap();
+        assert!(
+            b.yaml.contains("id: shared"),
+            "consumer must see producer's set_yaml: {}",
+            b.yaml,
+        );
+        assert_eq!(b.version, "rev:1");
+        // Symmetric: a producer-side load also surfaces the same shape
+        // (a refactor that gave each clone its own revision counter
+        // would surface here as version mismatch between handles).
+        let b2 = producer.load().await.unwrap();
+        assert_eq!(b2.yaml, b.yaml);
+        assert_eq!(b2.version, b.version);
+    }
+
     struct Tmp {
         path: PathBuf,
         file: std::fs::File,

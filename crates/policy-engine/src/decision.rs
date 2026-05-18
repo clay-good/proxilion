@@ -373,6 +373,134 @@ mod tests {
     }
 
     #[test]
+    fn decision_partial_eq_distinguishes_require_confirmation_variants_by_reason() {
+        // Existing `decision_partial_eq_distinguishes_block_variants_by_reason_and_override`
+        // pins the Block-variant equality axis (reason + override_allowed);
+        // pin the symmetric axis for RequireConfirmation. The runtime
+        // dedup path in the adapter compares two consecutive Decisions
+        // via `==` to short-circuit duplicate notifier fan-outs — a
+        // refactor that derived `PartialEq` ignoring `reason` (perhaps
+        // "the user-facing string drifts across evaluations, so don't
+        // gate on it") would silently start collapsing two distinct
+        // confirmation prompts (e.g. "share external" vs "share to
+        // anyone") onto one prompt for the operator.
+        let a = Decision::RequireConfirmation {
+            reason: "share to external domain".into(),
+        };
+        let b = Decision::RequireConfirmation {
+            reason: "share to external domain".into(),
+        };
+        let c = Decision::RequireConfirmation {
+            reason: "share to anyone".into(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn decision_partial_eq_distinguishes_rate_limit_variants_by_burst_and_per_seconds() {
+        // Symmetric to the RequireConfirmation pin above. The RateLimit
+        // variant has two numeric fields; PartialEq must distinguish on
+        // BOTH. Pin via the four-corner shape so a refactor that hashed
+        // only `burst` (perhaps "per_seconds is always 60 in practice")
+        // would silently collapse two distinct burst-rate budgets onto
+        // the same wire identity, breaking the adapter's idempotent-
+        // rate-limit response cache.
+        let baseline = Decision::RateLimit {
+            burst: 10,
+            per_seconds: 60,
+        };
+        let same = Decision::RateLimit {
+            burst: 10,
+            per_seconds: 60,
+        };
+        let diff_burst = Decision::RateLimit {
+            burst: 20,
+            per_seconds: 60,
+        };
+        let diff_per = Decision::RateLimit {
+            burst: 10,
+            per_seconds: 30,
+        };
+        assert_eq!(baseline, same);
+        assert_ne!(baseline, diff_burst);
+        assert_ne!(baseline, diff_per);
+        assert_ne!(diff_burst, diff_per);
+    }
+
+    #[test]
+    fn decision_deserialize_rejects_unknown_kind_value() {
+        // The `#[serde(tag = "kind", rename_all = "snake_case")]` attribute
+        // produces a CLOSED enum — an unknown `kind` value must fail
+        // deserialization rather than silently bucketing into a default
+        // arm (no `#[serde(other)]` is present). Pin via two distinct
+        // mis-spellings + a wholly unknown variant. A future refactor
+        // that added `#[serde(other)]` (perhaps "for forward-compat
+        // with v2 decision types") would silently collapse operator
+        // typos in the embed-API test panel into a fallback that
+        // doesn't match their intent.
+        let cases = [
+            r#"{"kind":"allows"}"#,
+            r#"{"kind":"ALLOW"}"#,
+            r#"{"kind":"warn","reason":"x"}"#,
+        ];
+        for raw in cases {
+            let r: Result<Decision, _> = serde_json::from_str(raw);
+            assert!(r.is_err(), "expected reject for: {raw}");
+        }
+    }
+
+    #[test]
+    fn quarantine_action_debug_carries_variant_name_for_log_grep() {
+        // The `tracing::info!` calls in the adapter pipeline render
+        // QuarantineAction via the `?` (Debug) operator — operator
+        // log filters key on the variant name substring (e.g.
+        // `quarantine_action=ReplaceWithMarker`). A manual Debug
+        // impl that rendered just `(0)` for tidiness would silently
+        // collapse the three variants onto an opaque integer in every
+        // log line. Pin all three variant-name substrings.
+        assert!(format!("{:?}", QuarantineAction::ReplaceWithMarker).contains("ReplaceWithMarker"));
+        assert!(format!("{:?}", QuarantineAction::StripSilently).contains("StripSilently"));
+        assert!(format!("{:?}", QuarantineAction::BlockRequest).contains("BlockRequest"));
+    }
+
+    #[test]
+    fn pattern_literal_debug_carries_needle_for_operator_grep() {
+        // Symmetric to `pattern_regex_debug_includes_regex_source_for_operator_grep`
+        // — pin the Literal arm's Debug surfaces the inner needle string.
+        // The adapter logs the matched pattern via `?` on a violation
+        // event; without the needle the operator can't tell WHICH
+        // literal pattern fired. A manual Debug that hid the inner
+        // value (in the name of "may contain user PII") would silently
+        // strip the operator's only triage handle on literal patterns.
+        let p = Pattern::Literal("ignore previous instructions".into());
+        let s = format!("{p:?}");
+        assert!(s.contains("Literal"), "got: {s}");
+        assert!(s.contains("ignore previous instructions"), "got: {s}");
+    }
+
+    #[test]
+    fn read_filter_debug_surfaces_both_patterns_slot_and_quarantine_action() {
+        // The boot-time policy-load log line uses `tracing::debug!(?cfg, ..)`
+        // — pin that the rendered Debug includes both the patterns slot
+        // (so an operator can see WHICH patterns were compiled) AND the
+        // quarantine_action variant name (so they can verify the field
+        // wasn't elided by a refactor). A custom Debug that surfaced
+        // only `quarantine_patterns.len()` as a count "for brevity"
+        // would silently hide the compiled-regex source from the
+        // operator-facing log line.
+        let rf = ReadFilter {
+            quarantine_patterns: vec![Pattern::Literal("secret".into())],
+            quarantine_action: QuarantineAction::ReplaceWithMarker,
+        };
+        let s = format!("{rf:?}");
+        assert!(s.contains("quarantine_patterns"), "got: {s}");
+        assert!(s.contains("quarantine_action"), "got: {s}");
+        assert!(s.contains("ReplaceWithMarker"), "got: {s}");
+        assert!(s.contains("secret"), "got: {s}");
+    }
+
+    #[test]
     fn decision_kind_wire_strings_are_stable() {
         let cases: &[(Decision, &str)] = &[
             (Decision::Allow, "allow"),

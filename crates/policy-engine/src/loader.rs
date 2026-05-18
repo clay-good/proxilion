@@ -365,6 +365,108 @@ mod tests {
         assert_eq!(l.source_label(), "inline-test");
     }
 
+    #[tokio::test]
+    async fn static_loader_load_returns_new_yaml_bytes_after_set_yaml() {
+        // The existing `static_loader_bumps_revision_on_set_yaml` and
+        // `static_loader_set_yaml_bumps_revision_monotonically` tests
+        // pin the version-token bump, but NEITHER directly asserts the
+        // `yaml` field of the post-`set_yaml` PolicyBundle matches the
+        // new content. A regression that swapped `Mutex<String>` for an
+        // `OnceCell<String>` (in the name of "we only set once at
+        // bootstrap") would freeze the YAML at the initial value while
+        // still bumping the AtomicU64 revision — every reload tick
+        // would short-circuit on "version changed" but compile the
+        // SAME engine bytes, silently masking every operator policy
+        // edit. Pin the bytes-on-the-wire round-trip across three
+        // distinct YAML payloads.
+        let l = StaticPolicyLoader::new(
+            "- id: a\n  vendor: g\n  action: a\n  decision: allow\n  required_ops: []\n",
+        );
+        let b0 = l.load().await.unwrap();
+        assert!(b0.yaml.contains("id: a"));
+        l.set_yaml(
+            "- id: b\n  vendor: google\n  action: drive.files.get\n  decision: block\n  required_ops: []\n",
+        );
+        let b1 = l.load().await.unwrap();
+        assert!(
+            b1.yaml.contains("id: b") && b1.yaml.contains("drive.files.get"),
+            "post-set_yaml load did not surface new content: {}",
+            b1.yaml,
+        );
+        // Symmetric: a third edit must again surface the new content
+        // (a refactor that cached the first set_yaml's output behind a
+        // OnceCell-after-init would surface here).
+        l.set_yaml("- id: c\n  vendor: g\n  action: a\n  decision: allow\n  required_ops: []\n");
+        let b2 = l.load().await.unwrap();
+        assert!(b2.yaml.contains("id: c"));
+        // And the post-edit YAML must NOT carry the prior content
+        // (no append-only buffer regression).
+        assert!(!b2.yaml.contains("id: a"));
+        assert!(!b2.yaml.contains("id: b"));
+    }
+
+    #[tokio::test]
+    async fn file_loader_mtime_token_format_is_mtime_colon_nanos_for_grep() {
+        // The mtime token format is `mtime:<unsigned-nanos-since-epoch>`
+        // — operator log filters key on the `mtime:` prefix to bucket
+        // reload events, and dashboards rendering the version token
+        // alongside the policy listing rely on the nanos suffix being
+        // a bare integer (no separators, no leading zero pad). The
+        // existing `file_loader_round_trips_yaml_and_version` test
+        // pins only the `starts_with("mtime:")` prefix — pin the full
+        // shape (prefix + non-empty all-digit suffix) here so a
+        // refactor that swapped to RFC 3339 timestamps or to a hex
+        // hash would surface the format break before any operator
+        // log filter silently misses every entry.
+        let tmp = tempfile_for_test();
+        std::fs::write(&tmp.path, "[]\n").unwrap();
+        let l = FilePolicyLoader::new(&tmp.path);
+        let token = l.load().await.unwrap().version;
+        let suffix = token
+            .strip_prefix("mtime:")
+            .expect("mtime: prefix required");
+        assert!(!suffix.is_empty(), "nanos suffix must be present");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_digit()),
+            "nanos suffix must be all digits, got: {suffix}",
+        );
+        // And the sync version-token computation produces the
+        // byte-identical token (already covered, but pin again here so
+        // a format-only refactor that touched one branch but not the
+        // other surfaces in this same module).
+        let sync = l.version_token_sync().unwrap();
+        assert_eq!(sync, token);
+    }
+
+    #[test]
+    fn policy_load_error_io_display_passes_inner_error_message_through_unchanged() {
+        // The existing `policy_load_error_display_renders_each_variant`
+        // test pins the prefix-and-message Display shape via a fixed
+        // operator-style string. Pin the byte-identical pass-through
+        // contract on the Io variant specifically against a real
+        // `std::io::Error::to_string()` shape — the `from_file` /
+        // `load` paths surface IO errors verbatim through this Display
+        // (the operator's first 30 seconds during a permission denial
+        // depend on the inner OS message reaching the log). A refactor
+        // that truncated or normalized the inner string (e.g. for
+        // "consistency across platforms") would silently strip the
+        // actionable triage half. Note: we don't depend on the OS-
+        // specific text — only that whatever message we feed in
+        // surfaces verbatim after the `"io error: "` prefix.
+        let msg = "permission denied (os error 13)";
+        let e = PolicyLoadError::Io(msg.into());
+        let rendered = e.to_string();
+        assert!(rendered.starts_with("io error: "), "got: {rendered}");
+        assert!(rendered.ends_with(msg), "got: {rendered}");
+        // And the Backend variant follows the symmetric shape —
+        // pin it in the same test so a "tidy up the prefixes"
+        // refactor must update both arms in lockstep.
+        let e = PolicyLoadError::Backend("pg pool exhausted".into());
+        let rendered = e.to_string();
+        assert!(rendered.starts_with("backend error: "));
+        assert!(rendered.ends_with("pg pool exhausted"));
+    }
+
     struct Tmp {
         path: PathBuf,
         file: std::fs::File,

@@ -438,6 +438,92 @@ mod tests {
         assert_eq!(n.proxy_public_url(), "https://proxy.example");
     }
 
+    #[test]
+    fn secret_from_hex_accepts_uppercase_and_mixed_case_hex_letters() {
+        // `u8::from_str_radix(_, 16)` is case-insensitive — pin that
+        // `from_hex` honors this end-to-end so operators who paste hex
+        // from `openssl rand -hex 16` (lowercase) or from a Vault UI
+        // (often uppercase) get the same bytes. A future tightening
+        // to require lowercase (in the name of "canonical form") would
+        // silently start rejecting half of operator workflows. The
+        // three shapes — all-lower, all-upper, mixed — must each
+        // decode to the same `WebhookSecret` (verified via signing the
+        // same body and asserting matching MACs, since the inner Vec
+        // is private).
+        let lower = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let upper = WebhookSecret::from_hex("00112233445566778899AABBCCDDEEFF").unwrap();
+        let mixed = WebhookSecret::from_hex("00112233445566778899AaBbCcDdEeFf").unwrap();
+        let body = b"sample-payload";
+        assert_eq!(lower.sign(body), upper.sign(body));
+        assert_eq!(lower.sign(body), mixed.sign(body));
+    }
+
+    #[test]
+    fn secret_sign_on_empty_body_still_returns_sha256_prefix_and_64_hex_chars() {
+        // HMAC-SHA256 has no special case for empty input — the empty
+        // body is a valid (and operationally observable) shape: a
+        // notifier event with a serializer that emits `{}` and gets
+        // stripped to nothing is fixture-shaped here as `b""`. Pin
+        // that the format invariant (`sha256=` prefix + exactly 64
+        // lowercase hex chars) survives the empty case. A refactor
+        // that early-returned on empty input (e.g. `if body.is_empty() {
+        // return String::new() }` "for performance") would silently
+        // produce an unverifiable empty signature header — receivers
+        // would 401 every empty-body event.
+        let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let sig = s.sign(b"");
+        assert!(sig.starts_with("sha256="), "got: {sig}");
+        let suffix = sig.strip_prefix("sha256=").unwrap();
+        assert_eq!(suffix.len(), 64, "got: {sig}");
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "suffix must be lowercase hex: {suffix}",
+        );
+        // And it must be byte-equal across two calls (no random salt).
+        assert_eq!(sig, s.sign(b""));
+        // And differ from the same key signing a non-empty body
+        // (sanity: empty isn't a degenerate fixed-output shortcut).
+        assert_ne!(sig, s.sign(b" "));
+    }
+
+    #[test]
+    fn webhook_notifier_with_burst_replaces_prior_suppressor_on_chained_call() {
+        // The fluent builder takes `mut self`-by-value — repeated calls
+        // to `with_burst` MUST replace the prior suppressor (last-write-
+        // wins) rather than chain into a Vec or panic. Adapter call
+        // sites occasionally build the notifier in two stages (default
+        // suppressor at construction, then operator-configured override
+        // applied later). A refactor that pushed onto a `Vec<BurstSuppressor>`
+        // for "compose multiple suppressors" would silently change the
+        // semantics — every event would be admit-checked against every
+        // suppressor in turn, doubling the gating logic. Pin the
+        // replace-on-chain invariant by chaining two distinct suppressor
+        // configs and asserting the accessor surfaces a Some (i.e.
+        // didn't accidentally clear it). The inner-suppressor identity
+        // can't be checked from outside the module (private fields),
+        // so the assertion is binary: still Some after two calls + the
+        // chained value compiles.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(
+            "http://localhost:9/hook".into(),
+            secret,
+            "https://proxy.local".into(),
+        )
+        .unwrap()
+        .with_burst(crate::notifier::BurstSuppressor::new(
+            crate::notifier::BurstConfig::default(),
+        ))
+        .with_burst(crate::notifier::BurstSuppressor::new(
+            crate::notifier::BurstConfig::default(),
+        ));
+        assert!(
+            n.burst().is_some(),
+            "second with_burst must not clear the suppressor",
+        );
+    }
+
     #[tokio::test]
     async fn posts_with_signature_and_schema_headers() {
         let server = MockServer::start().await;

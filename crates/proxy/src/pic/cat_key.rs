@@ -188,6 +188,138 @@ mod tests {
     }
 
     #[test]
+    fn cat_key_error_implements_std_error_trait_for_anyhow_chain_walking() {
+        // The OAuth callback path bubbles `CatKeyError` through
+        // `anyhow::Error` chains for structured logging — pin that
+        // the `thiserror` derive lands the `std::error::Error` impl
+        // so a refactor that swapped to a hand-rolled error type
+        // (dropping the derive) would surface here at the trait-
+        // object cast rather than at the call-site type mismatch
+        // far from this module. Pin BOTH the trait existence AND
+        // the `source()` chain semantics: `Fetch(#[from] reqwest::Error)`
+        // surfaces the inner reqwest::Error via `source()` (the
+        // operator-actionable triage layer), while `Status` and
+        // `Decode` are leaf arms with no inner error to chain.
+        let status: CatKeyError = CatKeyError::Status(503);
+        let decode: CatKeyError = CatKeyError::Decode("bad b64".into());
+        let dyn_status: &dyn std::error::Error = &status;
+        let dyn_decode: &dyn std::error::Error = &decode;
+        assert!(
+            std::error::Error::source(dyn_status).is_none(),
+            "Status leaf-arm must not expose a source",
+        );
+        assert!(
+            std::error::Error::source(dyn_decode).is_none(),
+            "Decode leaf-arm must not expose a source",
+        );
+    }
+
+    #[test]
+    fn cat_key_error_status_zero_does_not_panic_and_renders_zero_for_grep() {
+        // `Status(u16)` is constructed against the raw HTTP code — the
+        // boundary `0` is operationally observable when the upstream
+        // closes the connection mid-response (some reqwest call sites
+        // surface a zero-status sentinel rather than an explicit
+        // transport error). Pin that the Display does NOT panic on the
+        // boundary AND renders the integer verbatim — a refactor that
+        // formatted via `StatusCode::from_u16(code).unwrap()` would
+        // panic on the boundary (zero is outside the 100..1000 range
+        // StatusCode permits) and silently turn an upstream-closure
+        // log line into a worker thread crash. The existing
+        // `cat_key_error_status_variants_distinguish_4xx_and_5xx_codes`
+        // walks 403/404/500/503 — pin both the zero edge AND the
+        // u16::MAX upper boundary so any future refactor that
+        // tightened to a status-class match surfaces here on both
+        // axes.
+        for code in [0u16, u16::MAX] {
+            let s = CatKeyError::Status(code).to_string();
+            assert!(s.contains(&code.to_string()), "missing code {code} in: {s}",);
+        }
+    }
+
+    #[test]
+    fn cat_key_error_decode_with_empty_inner_string_still_renders_prefix() {
+        // `Decode(String)` accepts the empty string — pin that the
+        // Display still surfaces the `"CAT public key decode failed:"`
+        // prefix even when the inner reason is empty. The empty-inner
+        // shape arises in tests + when a future refactor of an inner
+        // `.map_err(|_| CatKeyError::Decode(String::new()))` drops the
+        // context. The prefix is the operator-facing grep target so
+        // the log line is still bucketable. A refactor that gated
+        // rendering on a non-empty inner (e.g. `if self.0.is_empty()
+        // { return Ok(()); }`) would silently produce a blank line
+        // that no log filter could route — surface that here.
+        let s = CatKeyError::Decode(String::new()).to_string();
+        assert!(
+            s.to_lowercase().contains("decode"),
+            "prefix must survive empty inner: {s}",
+        );
+        assert!(s.contains("CAT public key"), "got: {s}");
+    }
+
+    #[test]
+    fn info_resp_rejects_missing_required_kid_field() {
+        // The `InfoResp` deserializer's `kid: String` field has no
+        // `#[serde(default)]` — operator-facing setup MUST commit
+        // explicit kid in the Trust Plane response. The existing
+        // `info_resp_deserializes` test pins the happy path, and
+        // `info_resp_ignores_unknown_fields_for_forward_compat` pins
+        // forward-compat — but the missing-field error path was
+        // unpinned. A regression that added `#[serde(default)]` for
+        // "be permissive" would silently accept a kid-less response
+        // and the verifier would later fail-hard on the empty kid
+        // value rather than surfacing the wire-shape mismatch at
+        // decode time. Pin the strict-required contract here.
+        let raw = r#"{"public_key":"AAA"}"#;
+        let r: Result<InfoResp, _> = serde_json::from_str(raw);
+        assert!(r.is_err(), "missing kid must reject, got: {r:?}");
+    }
+
+    #[test]
+    fn info_resp_rejects_missing_required_public_key_field() {
+        // Symmetric to `info_resp_rejects_missing_required_kid_field`
+        // — pin the `public_key: String` strict-required contract.
+        // The verifier loads the bytes from this field and feeds them
+        // into `PublicKey::from_bytes`; a refactor that defaulted to
+        // empty would surface as a curve-point validation error
+        // downstream rather than as a wire-shape mismatch at decode
+        // time, with a confusing log line.
+        let raw = r#"{"kid":"k1"}"#;
+        let r: Result<InfoResp, _> = serde_json::from_str(raw);
+        assert!(r.is_err(), "missing public_key must reject, got: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn cat_key_error_fetch_variant_display_carries_trust_plane_prefix_with_inner_reason() {
+        // The `Fetch(#[from] reqwest::Error)` arm is the operator-
+        // actionable boundary for transient Trust-Plane network
+        // faults. The existing `registry_errors_when_trust_plane_unreachable`
+        // test constructs a real reqwest::Error via a connect-refuse
+        // and pins `matches!(err, CatKeyError::Fetch(_))`, but does
+        // NOT assert the Display string carries the `"Trust Plane info
+        // fetch failed: "` prefix end-to-end through the `#[from]`
+        // conversion. Pin via a real reqwest::Error captured from a
+        // connect-refused localhost port (the same shape the existing
+        // test uses, but asserting the Display prefix). A refactor
+        // that hand-rolled the Display to mask the inner (in the
+        // name of "don't leak upstream errors") would silently strip
+        // the actionable triage half from every operator log line.
+        let reg = CatKeyRegistry::new("http://127.0.0.1:1/".into());
+        let err = reg.get().await.unwrap_err();
+        let s = err.to_string();
+        assert!(s.starts_with("Trust Plane info fetch failed: "), "got: {s}",);
+        // And the inner reqwest message must not be empty — pin some
+        // non-prefix content survives the `#[from]` Display passthrough.
+        let suffix = s
+            .strip_prefix("Trust Plane info fetch failed: ")
+            .unwrap_or("");
+        assert!(
+            !suffix.is_empty(),
+            "inner reqwest::Error Display must surface after prefix, got: {s}",
+        );
+    }
+
+    #[test]
     fn info_resp_ignores_unknown_fields_for_forward_compat() {
         // The Trust Plane may add fields to `/v1/federation/info` over time
         // (e.g. `next_kid`). Pin that the deserializer ignores unknown

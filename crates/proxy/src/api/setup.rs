@@ -430,6 +430,141 @@ mod tests {
         assert_eq!(v["id"], "database");
     }
 
+    #[test]
+    fn setup_api_state_and_setup_error_are_send_sync_static_for_axum_boundary() {
+        // `SetupApiState` is passed via `with_state(...)` into the axum
+        // Router; axum requires `Send + Sync + 'static`. `SetupError`
+        // flows through `IntoResponse` from handler futures crossing
+        // tokio task boundaries and also requires the same bounds. A
+        // refactor that gave `SetupApiState` an `Rc<String>` field "for
+        // cheap clone of `federation_bridge_url`" would break Sync at
+        // the router site with a far-removed trait-bound error. Pin the
+        // three-trait combo on both types here — symmetric to the
+        // `api_error_and_killswitch_state_are_send_sync_static_for_axum_state_boundary`
+        // pin on [crates/proxy/src/api/killswitch.rs].
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<SetupApiState>();
+        require_send_sync_static::<SetupError>();
+    }
+
+    #[test]
+    fn setup_error_db_arm_chains_source_to_inner_sqlx_error_via_from_derive() {
+        // `Db(#[from] sqlx::Error)` with the explicit
+        // `#[error("database error: {0}")]` shape (NOT `#[error(transparent)]`)
+        // — the `std::error::Error::source()` walk MUST return the inner
+        // `sqlx::Error` so anyhow chain-walking surfaces it for operator
+        // triage. The killswitch sibling uses `#[error(transparent)]`
+        // (which DELEGATES source() to the inner's source(), skipping a
+        // level); this module's explicit-format derive instead returns
+        // the inner directly. Pin source() == Some here so a refactor
+        // that dropped `#[from]` "for explicit map_err" would surface
+        // here as a chain-walk break.
+        let e = SetupError::Db(sqlx::Error::RowNotFound);
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(
+            std::error::Error::source(dyn_err).is_some(),
+            "Db arm with explicit #[error] format must chain source to inner",
+        );
+    }
+
+    #[test]
+    fn setup_error_debug_carries_variant_name_for_grep_bucketing() {
+        // The `#[derive(Debug)]` on `SetupError` feeds `?e` in
+        // `tracing::warn!(?err, ...)` call sites and the 500-branch
+        // logs. Operators grep the log line by variant name to bucket
+        // "Postgres outage" rows. A hand-rolled `impl Debug` that hid
+        // the variant name "to compact" the line would break the bucket.
+        // Pin "Db" variant name — symmetric to the ApiError variant-
+        // name pins on api/killswitch.rs.
+        let s = format!("{:?}", SetupError::Db(sqlx::Error::RowNotFound));
+        assert!(s.contains("Db"), "got: {s}");
+    }
+
+    #[test]
+    fn setup_error_display_carries_byte_exact_database_error_prefix_with_inner() {
+        // `#[error("database error: {0}")]` — pin the byte-exact
+        // prefix-plus-inner Display shape via `assert_eq!`. The existing
+        // `setup_error_display_carries_underlying_db_error` test uses
+        // `starts_with("database error: ")` which would pass even if a
+        // refactor dropped the inner (or duplicated the prefix). Pin
+        // the full wrapper shape here against the inner's known Display
+        // so a refactor that softened to `"db error: {0}"` or dropped
+        // the colon would surface here. Operator log filters historically
+        // grep `"database error:"` to bucket setup-probe failures.
+        let inner = sqlx::Error::PoolClosed;
+        let expected = format!("database error: {inner}");
+        let e = SetupError::Db(sqlx::Error::PoolClosed);
+        assert_eq!(e.to_string(), expected);
+    }
+
+    #[test]
+    fn setup_status_ready_for_traffic_serializes_as_json_boolean_not_numeric() {
+        // `ready_for_traffic: bool` lands on the wire as a JSON
+        // boolean. Pin the type tag explicitly — a refactor that
+        // promoted it to a `RedinessClass` enum with
+        // `#[serde(into = "u8")]` "for finer-grained signal" (e.g.
+        // 0=red, 1=yellow, 2=green) would silently break every
+        // dashboard filter keyed on `ready_for_traffic === true` /
+        // `=== false`. The existing
+        // `setup_status_envelope_contains_items_and_readiness` pin
+        // covers the field NAME + value-equality on a single false
+        // case, but does NOT pin the type tag. Pin both polarities
+        // as JSON booleans here.
+        let red = SetupStatus {
+            ready_for_traffic: false,
+            items: vec![],
+        };
+        let v = serde_json::to_value(&red).unwrap();
+        assert!(v["ready_for_traffic"].is_boolean(), "got: {v}");
+        assert_eq!(v["ready_for_traffic"], false);
+        let green = SetupStatus {
+            ready_for_traffic: true,
+            items: vec![],
+        };
+        let v = serde_json::to_value(&green).unwrap();
+        assert!(v["ready_for_traffic"].is_boolean(), "got: {v}");
+        assert_eq!(v["ready_for_traffic"], true);
+    }
+
+    #[test]
+    fn check_item_ok_serializes_as_json_boolean_and_detail_as_string_regardless_of_content() {
+        // `ok: bool` MUST land on the wire as a JSON boolean (not
+        // a 0/1 integer or a "true"/"false" string — both would break
+        // the admin UI's `if (item.ok)` rendering branch which strictly
+        // dispatches on JSON's `true`/`false` literal). `detail: String`
+        // MUST land as a JSON string regardless of content shape (even
+        // an all-numeric detail like "0 client(s) registered" must NOT
+        // serialize as a number). Pin both type tags on both polarities
+        // of ok and across two distinct detail shapes (text + numeric).
+        let item = CheckItem {
+            id: "x",
+            title: "T",
+            ok: true,
+            detail: "12 policies loaded".into(),
+            fix: None,
+            docs: "d",
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert!(v["ok"].is_boolean(), "ok must be JSON bool: {v}");
+        assert!(v["detail"].is_string(), "detail must be JSON string: {v}");
+        // All-numeric detail still surfaces as string (not coerced).
+        let numeric_detail = CheckItem {
+            id: "x",
+            title: "T",
+            ok: false,
+            detail: "0".into(),
+            fix: None,
+            docs: "d",
+        };
+        let v = serde_json::to_value(&numeric_detail).unwrap();
+        assert!(
+            v["detail"].is_string(),
+            "numeric-content detail must remain string: {v}"
+        );
+        assert_eq!(v["detail"], "0");
+        assert!(v["ok"].is_boolean(), "ok=false must be JSON bool: {v}");
+    }
+
     #[tokio::test]
     async fn setup_error_response_body_carries_fix_and_docs_hints() {
         // The 500 envelope must surface the troubleshooting link AND a

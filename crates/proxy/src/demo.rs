@@ -407,6 +407,154 @@ mod tests {
     }
 
     #[test]
+    fn scenarios_constant_has_exactly_four_entries_for_demo_dashboard_variety() {
+        // SCENARIOS length is the canonical demo-event variety pin.
+        // The admin dashboard's "live demo" walkthrough commits to
+        // showing four distinct decision/action shapes (drive.get
+        // allow + drive.list allow + gmail.send block + drive.get
+        // require_confirmation) — a refactor that consolidated to
+        // three "to reduce noise" would silently break the
+        // walkthrough script's "this is what a require_confirmation
+        // looks like" beat. Pin the exact length here so any change
+        // is a conscious choice.
+        assert_eq!(SCENARIOS.len(), 4);
+    }
+
+    #[test]
+    fn scenarios_all_use_google_vendor_for_current_adapter_coverage() {
+        // The proxy ships with adapters for `google` only (Drive +
+        // Gmail + Calendar). Every demo scenario currently emits
+        // `vendor = "google"` so the synthetic timeline reflects the
+        // installed adapter set. A refactor that added a scenario
+        // for a not-yet-shipped vendor (e.g. "slack") would silently
+        // surface a vendor on the demo dashboard that operators can't
+        // actually exercise against, breaking the install-time
+        // promise. Pin the contract across every entry.
+        for s in SCENARIOS {
+            assert_eq!(
+                s.vendor, "google",
+                "non-google vendor in SCENARIOS: {}/{}",
+                s.vendor, s.action,
+            );
+        }
+    }
+
+    #[test]
+    fn synth_event_quarantined_count_and_method_and_read_filter_round_trip_from_scenario() {
+        // The existing `synth_event_passthrough_scenario_fields` test
+        // pins vendor / action / method / status / decision /
+        // policy_id / block_reason / at / extra — but does NOT pin
+        // `quarantined_count` or `read_filter_triggered`. Both are
+        // operator-visible columns on the demo timeline ("quarantined
+        // attachments shown in red" UI rule keys on `quarantined_count
+        // > 0`; "read-filter triggered" is the columnar marker for
+        // the prompt-injection-defense demo panel). A refactor that
+        // defaulted either field to a constant (e.g. always 0 / always
+        // false "for tidy demo rows") would silently break both demo
+        // panels. Pin round-trip on a drive_scenario which carries
+        // both fields non-zero / true.
+        let s = drive_scenario(); // read_filter_triggered=true, quarantined_count=1
+        let ev = synth_event(&s, Utc::now());
+        assert_eq!(ev.quarantined_count, 1);
+        assert!(ev.read_filter_triggered);
+        assert_eq!(ev.method, "GET");
+        // And the symmetric polarity: a block scenario carries
+        // read_filter_triggered=false + quarantined_count=0.
+        let b = block_scenario();
+        let ev = synth_event(&b, Utc::now());
+        assert_eq!(ev.quarantined_count, 0);
+        assert!(!ev.read_filter_triggered);
+        assert_eq!(ev.method, "POST");
+    }
+
+    #[test]
+    fn synth_event_produces_fresh_uuids_per_call_for_each_uuid_field() {
+        // `Uuid::new_v4()` is the constructor for `request_id`,
+        // `agent_session_id`, and `leaf_pca_id`. Two consecutive
+        // synth_event calls with the same scenario MUST yield
+        // distinct UUIDs on all three fields — a refactor that
+        // hoisted any UUID constructor to a `static` or `OnceCell`
+        // "for cheaper demo seeding" would silently collapse every
+        // demo row onto the same request_id and break the chain-
+        // walker panel's "each row is independent" pre-condition.
+        // Pin distinctness across all three UUID fields between two
+        // back-to-back calls.
+        let s = drive_scenario();
+        let a = synth_event(&s, Utc::now());
+        let b = synth_event(&s, Utc::now());
+        assert_ne!(a.request_id, b.request_id);
+        assert_ne!(a.agent_session_id, b.agent_session_id);
+        let (Some(la), Some(lb)) = (a.leaf_pca_id, b.leaf_pca_id) else {
+            panic!("leaf_pca_id must be Some on demo scenarios");
+        };
+        assert_ne!(la, lb);
+    }
+
+    #[test]
+    fn synth_event_suffix_alphabet_is_lowercase_alphanumeric_only() {
+        // The 6-char path suffix is generated via a custom char-table
+        // selection (`0..36`: 0-9 mapped to `0`..=`9`, 10-35 mapped to
+        // `a`..=`z`). Pin the alphabet contract — no uppercase, no
+        // symbols. A refactor that swapped to a generic `rand::distr::Alphanumeric`
+        // (which includes BOTH `A-Z` and `a-z` plus digits, totalling 62
+        // chars) would silently change the suffix shape. The existing
+        // `synth_event_path_template_not_ending_in_s_or_slash_gets_6_char_suffix`
+        // test pins length + ASCII-alphanumeric only — pin the
+        // narrower lowercase + digits contract here. Verify across 20
+        // independent suffixes (probabilistic coverage of the alphabet
+        // — at suffix-len 6 and per-call random selection, 20 calls
+        // sample 120 chars, enough to surface a uppercase regression).
+        let s = drive_scenario(); // `/drive/v3/files/demo-file-`
+        for _ in 0..20 {
+            let ev = synth_event(&s, Utc::now());
+            let suffix = &ev.path["/drive/v3/files/demo-file-".len()..];
+            assert_eq!(suffix.len(), 6, "suffix wrong length: {suffix}");
+            for c in suffix.chars() {
+                assert!(
+                    c.is_ascii_lowercase() || c.is_ascii_digit(),
+                    "suffix char outside lowercase+digit alphabet: {c:?} in {suffix}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scenario_type_clone_and_copy_preserves_every_field_byte_equal() {
+        // The manual `impl Copy for Scenario` + `impl Clone` (delegating
+        // to `*self`) are load-bearing for `SCENARIOS.choose(&mut rng)`
+        // which calls `.copied()` to escape the slice's borrow. A
+        // refactor that added a non-Copy field (e.g. swapping
+        // `&'static str` for `String`) would surface here at compile
+        // time. Pin the Copy semantics behaviorally: a copy MUST
+        // preserve every field byte-equal to the source so the chosen
+        // scenario in `ticker(...)` is interchangeable with the
+        // referenced original. Walks all eight fields explicitly.
+        let original = block_scenario();
+        let copy: Scenario = original; // requires Copy
+        assert_eq!(copy.vendor, original.vendor);
+        assert_eq!(copy.action, original.action);
+        assert_eq!(copy.method, original.method);
+        assert_eq!(copy.path_template, original.path_template);
+        assert_eq!(copy.decision, original.decision);
+        assert_eq!(copy.status, original.status);
+        assert_eq!(copy.policy, original.policy);
+        assert_eq!(copy.read_filter_triggered, original.read_filter_triggered);
+        assert_eq!(copy.quarantined_count, original.quarantined_count);
+        assert_eq!(copy.block_reason, original.block_reason);
+        // Explicit Clone path also preserves — symmetric to the Copy
+        // assignment above, but exercises the manual `clone()` impl
+        // through a generic helper (a direct `.clone()` call would
+        // trip `clippy::clone_on_copy` because Copy is in scope).
+        fn via_clone<T: Clone>(v: &T) -> T {
+            v.clone()
+        }
+        let cloned = via_clone(&original);
+        assert_eq!(cloned.vendor, original.vendor);
+        assert_eq!(cloned.status, original.status);
+        assert_eq!(cloned.block_reason, original.block_reason);
+    }
+
+    #[test]
     fn scenario_set_includes_block_allow_and_require_confirmation_decisions() {
         // SCENARIOS is the canonical demo set. Pin the decision variety so a
         // refactor that drops an interesting class is caught.

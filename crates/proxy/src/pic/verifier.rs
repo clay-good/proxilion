@@ -882,4 +882,238 @@ mod tests {
             "CAT key fetch: kid `cat-2026-Q2` not present in registry",
         );
     }
+
+    #[test]
+    fn verifier_error_and_verification_result_and_pic_verifier_send_sync_static() {
+        // `VerifierError` flows through `?` chains across `.await`
+        // points in the chain-walker; `VerificationResult` is held in
+        // `Arc<...>` and cached in moka (Send+Sync bound on the cache
+        // value type); `PicVerifier` is held in `AppState` and cloned
+        // into every request scope. All three must be Send+Sync+'static
+        // — a refactor adding an `Rc<...>` field on any one would
+        // break Sync at the AppState wire site rather than as a
+        // far-removed trait-bound error. Pin all three at compile time.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<VerifierError>();
+        require_send_sync_static::<VerificationResult>();
+        require_send_sync_static::<PicVerifier>();
+    }
+
+    #[test]
+    fn verifier_error_debug_carries_variant_names_for_grep_bucketing() {
+        // `#[derive(Debug)]` on VerifierError feeds `?err` /
+        // `error = %self` in the chain-walker's structured-trace path.
+        // Operators grep tracing log lines by VerifierError variant
+        // name to bucket Missing (cache miss — likely a sync gap with
+        // Trust Plane) vs BadCatSignature (tampering) vs Monotonicity
+        // (ops broadened across a hop) vs ContinuityBroken
+        // (cryptographic link broken) vs HopOrder (hop counter
+        // mismatch). A hand-rolled `impl Debug` that hid variant names
+        // "to compact" the line would break every operator bucket.
+        // Symmetric to the AppError + OAuthError + ApiError variant-
+        // name Debug pins.
+        let nil = Uuid::nil();
+        for (variant, name) in [
+            (VerifierError::Missing(nil), "Missing"),
+            (VerifierError::BadCatSignature(nil), "BadCatSignature"),
+            (
+                VerifierError::ContinuityBroken {
+                    child: nil,
+                    parent: nil,
+                },
+                "ContinuityBroken",
+            ),
+            (
+                VerifierError::Monotonicity {
+                    missing: "drive:write:secret".into(),
+                },
+                "Monotonicity",
+            ),
+            (
+                VerifierError::P0Mismatch {
+                    child_p0: "a".into(),
+                    parent_p0: "b".into(),
+                },
+                "P0Mismatch",
+            ),
+            (
+                VerifierError::HopOrder {
+                    child: 2,
+                    parent: 0,
+                },
+                "HopOrder",
+            ),
+            (VerifierError::Decode("trailing".into()), "Decode"),
+            (VerifierError::CatKey("kid missing".into()), "CatKey"),
+        ] {
+            let s = format!("{:?}", variant);
+            assert!(s.contains(name), "expected `{name}` in Debug, got: {s}");
+        }
+    }
+
+    #[test]
+    fn verifier_error_implements_std_error_trait_via_dyn_cast() {
+        // `VerifierError` is thiserror-derived. Pin the `std::error::Error`
+        // trait impl via `dyn Error` cast — required by anyhow chains
+        // higher up the stack (the chain walker's caller propagates
+        // VerifierError through `anyhow::Error` for the structured-
+        // trace audit row). A refactor that swapped to a hand-rolled
+        // enum without the trait impl would silently break the
+        // anyhow::Error::from path. The leaf variants (Missing,
+        // BadCatSignature, etc.) have no inner error, so source()
+        // should return None.
+        let e = VerifierError::Missing(Uuid::nil());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(
+            std::error::Error::source(dyn_err).is_none(),
+            "Missing variant must be leaf arm with no source",
+        );
+        // Symmetric on Decode + CatKey leaf arms.
+        let e = VerifierError::Decode("x".into());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(std::error::Error::source(dyn_err).is_none());
+        let e = VerifierError::CatKey("x".into());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(std::error::Error::source(dyn_err).is_none());
+    }
+
+    #[test]
+    fn verification_result_serializes_with_exactly_seven_known_keys() {
+        // The struct has 7 fields (intact, links_verified, p_0,
+        // broken_at, reason, pic_profile, pic_profile_mismatch_at).
+        // None field has `skip_serializing_if`, so the serialized JSON
+        // MUST carry EXACTLY 7 keys regardless of which Option fields
+        // are None. The dashboard's chain-verification panel keys on
+        // ALL 7 fields by name — a refactor that elided one (e.g.
+        // adding `skip_serializing_if = "Option::is_none"` to
+        // `pic_profile_mismatch_at` "for cleaner wire on intact
+        // chains") would silently break the panel's "click to drill
+        // in on profile mismatch" link. Pin both the count AND each
+        // name across BOTH the intact-all-None-fields shape AND a
+        // shape with every Option set.
+        let intact = VerificationResult {
+            intact: true,
+            links_verified: 3,
+            p_0: None,
+            broken_at: None,
+            reason: None,
+            pic_profile: None,
+            pic_profile_mismatch_at: None,
+        };
+        let v = serde_json::to_value(&intact).unwrap();
+        let obj = v.as_object().expect("must serialize to JSON object");
+        assert_eq!(obj.len(), 7, "field count drift on intact: {obj:?}");
+        for k in [
+            "intact",
+            "links_verified",
+            "p_0",
+            "broken_at",
+            "reason",
+            "pic_profile",
+            "pic_profile_mismatch_at",
+        ] {
+            assert!(obj.contains_key(k), "missing key {k}: {obj:?}");
+        }
+        // Symmetric: with every Option set the count stays 7.
+        let broken = VerificationResult {
+            intact: false,
+            links_verified: 1,
+            p_0: Some("alice".into()),
+            broken_at: Some(Uuid::nil()),
+            reason: Some("cat sig".into()),
+            pic_profile: Some("p".into()),
+            pic_profile_mismatch_at: Some(Uuid::nil()),
+        };
+        let v2 = serde_json::to_value(&broken).unwrap();
+        assert_eq!(v2.as_object().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn verification_result_intact_field_is_bool_not_option_or_result() {
+        // The `intact: bool` field is the load-bearing top-level
+        // boolean every dashboard panel keys on (a refactor to
+        // `Option<bool>` "for the unsentenced-yet-not-yet-checked
+        // case" would silently change the wire shape from `true` /
+        // `false` to `null` for some path — every dashboard's chain-
+        // health donut chart would split or break). Pin the field
+        // type via a fn that takes `bool` only. The
+        // `verification_result_serializes_with_exactly_seven_known_keys`
+        // pin walks both polarities; pin the TYPE bound here so the
+        // wire-shape pins above can't silently degrade if the
+        // underlying type drifts.
+        fn require_bool(_: bool) {}
+        let r = VerificationResult {
+            intact: true,
+            links_verified: 0,
+            p_0: None,
+            broken_at: None,
+            reason: None,
+            pic_profile: None,
+            pic_profile_mismatch_at: None,
+        };
+        require_bool(r.intact);
+        // And `links_verified` is `usize` not signed — operators key
+        // on the "0 links" sentinel as "chain not even loaded";
+        // negative values would either signal an off-by-one in the
+        // walker's counter OR a refactor to a signed type. Pin the
+        // unsigned bound.
+        fn require_usize(_: usize) {}
+        require_usize(r.links_verified);
+    }
+
+    #[test]
+    fn verifier_error_display_prefix_sweep_distinguishes_all_eight_variants() {
+        // Each VerifierError variant has a distinct `#[error("...")]`
+        // attribute — the prefix is what the chain-walker's tracing
+        // log filter buckets violations on. Pin that every variant's
+        // Display string starts with a distinct, recognizable
+        // substring AND that no two prefixes collide. The existing
+        // tests pin individual variants' full Display shapes (Decode,
+        // CatKey) — this pin walks ALL EIGHT for completeness,
+        // confirming the prefix-distinct contract holds across the
+        // whole enum. A refactor that "harmonized" any two variants
+        // to a shared prefix "for shorter messages" would silently
+        // merge operator buckets.
+        let nil = Uuid::nil();
+        let displays: Vec<String> = vec![
+            VerifierError::Missing(nil).to_string(),
+            VerifierError::BadCatSignature(nil).to_string(),
+            VerifierError::ContinuityBroken {
+                child: nil,
+                parent: nil,
+            }
+            .to_string(),
+            VerifierError::Monotonicity {
+                missing: "x".into(),
+            }
+            .to_string(),
+            VerifierError::P0Mismatch {
+                child_p0: "a".into(),
+                parent_p0: "b".into(),
+            }
+            .to_string(),
+            VerifierError::HopOrder {
+                child: 2,
+                parent: 0,
+            }
+            .to_string(),
+            VerifierError::Decode("x".into()).to_string(),
+            VerifierError::CatKey("x".into()).to_string(),
+        ];
+        // No two Display strings begin with the same first 5 bytes —
+        // sufficient to distinguish all eight in operator log filters.
+        for (i, a) in displays.iter().enumerate() {
+            for (j, b) in displays.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let prefix_a: String = a.chars().take(5).collect();
+                let prefix_b: String = b.chars().take(5).collect();
+                assert_ne!(
+                    prefix_a, prefix_b,
+                    "variants {i} and {j} share prefix `{prefix_a}` — operator log filter collision",
+                );
+            }
+        }
+    }
 }

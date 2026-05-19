@@ -802,6 +802,180 @@ mod tests {
         );
     }
 
+    #[test]
+    fn burst_suppressor_and_summary_and_event_and_config_all_send_sync_static() {
+        // The four public types in this module flow across boundaries:
+        // `BurstSuppressor` is held in AppState and cloned into the
+        // flush-loop tokio::spawn; `BurstSummary` and `SuppressedEvent`
+        // are passed across .await points in the send_one fan-out path;
+        // `BurstConfig` is constructed at boot and held by value in the
+        // suppressor. All four MUST be Send+Sync+'static — a refactor
+        // adding an `Rc<...>` field "for cheap clone" on any one would
+        // break Send at the AppState wire site rather than at this file
+        // with an opaque tower::Service trait-bound. Pin all four at
+        // compile time.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<BurstSuppressor>();
+        require_send_sync_static::<BurstSummary>();
+        require_send_sync_static::<SuppressedEvent>();
+        require_send_sync_static::<BurstConfig>();
+    }
+
+    #[test]
+    fn burst_summary_schema_field_is_static_str_lifetime_via_require_static_str() {
+        // `schema: &'static str` lives in the read-only binary segment;
+        // the existing `burst_summary_schema_is_versioned_string_consumers_key_on`
+        // pin checks the literal byte sequence but NOT the lifetime
+        // bound. A refactor to `schema: String` "for ergonomic
+        // version-from-env runtime selection" would silently
+        // heap-allocate on every burst summary emit AND break the
+        // free-clone the FnMut send_one path depends on. Pin the
+        // `&'static str` lifetime contract via a fn helper that takes
+        // `&'static str` only — type coercion alone catches the drift.
+        fn require_static_str(_: &'static str) {}
+        require_static_str(BurstSummary::SCHEMA);
+        // And the constructed-summary field surfaces the same static
+        // pointer (not a heap-allocated copy via `into()`).
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 0,
+            window_seconds: 0,
+            exemplar: None,
+            details_url: String::new(),
+        };
+        require_static_str(s.schema);
+    }
+
+    #[test]
+    fn burst_summary_serialized_json_object_carries_six_keys_when_details_url_empty_seven_when_set()
+    {
+        // The struct has 7 fields total (`schema`, `policy_id`, `p_0`,
+        // `suppressed_count`, `window_seconds`, `exemplar`, `details_url`)
+        // but `details_url` carries `skip_serializing_if = "String::is_empty"`.
+        // Pin BOTH the elided-key count AND the all-set count so a
+        // refactor that flipped the skip predicate to
+        // `Option::is_none` "for consistency" (or wrapped the field in
+        // `Option<String>` to match) would silently change the wire
+        // shape between empty and absent. The existing
+        // `burst_summary_json_skips_empty_details_url_via_serde_attr`
+        // pin checks key-presence only; widen to exact count.
+        let empty = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 0,
+            window_seconds: 0,
+            exemplar: None,
+            details_url: String::new(),
+        };
+        let v = serde_json::to_value(&empty).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 6, "details_url empty must elide: {obj:?}");
+        for k in [
+            "schema",
+            "policy_id",
+            "p_0",
+            "suppressed_count",
+            "window_seconds",
+            "exemplar",
+        ] {
+            assert!(obj.contains_key(k), "missing key {k}");
+        }
+        // Symmetric: with details_url set, the count becomes 7.
+        let with_url = BurstSummary {
+            details_url: "https://x/y".into(),
+            ..empty
+        };
+        let v2 = serde_json::to_value(&with_url).unwrap();
+        let obj2 = v2.as_object().unwrap();
+        assert_eq!(obj2.len(), 7, "details_url set must surface: {obj2:?}");
+        assert!(obj2.contains_key("details_url"));
+    }
+
+    #[test]
+    fn suppressed_event_serialized_json_object_carries_exactly_five_keys_no_skip_predicates() {
+        // The struct has 5 fields (policy_id, p_0, vendor, action,
+        // layer) and NO skip-serializing attrs — every field surfaces
+        // verbatim. Symmetric to the BurstSummary count pin: a refactor
+        // that swapped `policy_id: String` for `Option<String>` "for
+        // future read-filter compatibility" plus a skip-if-none attr
+        // would silently change the wire object's key count and break
+        // Slack-template renderers that iterate the 5 fields by name.
+        // Pin EXACTLY 5 keys with no skip-elision across both Some and
+        // None for the only Option field (`p_0`).
+        for p_0 in [Some("alice@acme.com".to_string()), None] {
+            let ev = SuppressedEvent {
+                policy_id: "p".into(),
+                p_0,
+                vendor: "google".into(),
+                action: "drive.files.get".into(),
+                layer: "policy".into(),
+            };
+            let v = serde_json::to_value(&ev).unwrap();
+            let obj = v
+                .as_object()
+                .expect("SuppressedEvent must be a JSON object");
+            assert_eq!(obj.len(), 5, "field count drift: {obj:?}");
+            for k in ["policy_id", "p_0", "vendor", "action", "layer"] {
+                assert!(obj.contains_key(k), "missing key {k}: {obj:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn burst_config_clone_yields_byte_equal_independent_value() {
+        // `#[derive(Clone, Debug)]` on BurstConfig — clone must yield a
+        // logically-equivalent value with all three fields byte-equal,
+        // AND mutating one clone MUST NOT affect the other (the three
+        // fields are owned primitives, so this is trivially true today
+        // — but pin both axes so a refactor to `Arc<...>`-shared
+        // fields "for cheap clone in a hot loop" would surface as a
+        // mutation-leak between clones).
+        let a = BurstConfig {
+            threshold: 25,
+            window: Duration::from_secs(45),
+            flush_interval: Duration::from_secs(15),
+        };
+        let mut b = a.clone();
+        assert_eq!(a.threshold, b.threshold);
+        assert_eq!(a.window, b.window);
+        assert_eq!(a.flush_interval, b.flush_interval);
+        // Mutate b — a must be unaffected.
+        b.threshold = 999;
+        b.window = Duration::from_secs(1);
+        b.flush_interval = Duration::from_secs(1);
+        assert_eq!(a.threshold, 25);
+        assert_eq!(a.window, Duration::from_secs(45));
+        assert_eq!(a.flush_interval, Duration::from_secs(15));
+        // Sanity that the mutation landed on b (also satisfies the
+        // unused-assignments lint — without reading the post-mutation
+        // values, clippy flags the assigns as dead stores).
+        assert_eq!(b.threshold, 999);
+        assert_eq!(b.window, Duration::from_secs(1));
+        assert_eq!(b.flush_interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn urlencoding_encode_empty_string_returns_empty_string_boundary() {
+        // The helper feeds `with_details_url`'s query-value escaping;
+        // a boundary input of `""` must return `""` (NOT a sentinel
+        // like `%00` and NOT panic). The existing pins exercise
+        // non-empty strings only — pin the empty boundary so a
+        // refactor that pre-encoded a leading nul-byte "for path
+        // safety" would surface here. Also pin a single-space string
+        // (a frequent operator-typo input from CLI pastes) encodes to
+        // `%20` (the canonical query-space encoding under
+        // NON_ALPHANUMERIC).
+        assert_eq!(urlencoding_encode(""), "");
+        assert_eq!(urlencoding_encode(" "), "%20");
+        // Tab and newline also encode (control chars in
+        // NON_ALPHANUMERIC).
+        assert_eq!(urlencoding_encode("\t"), "%09");
+        assert_eq!(urlencoding_encode("\n"), "%0A");
+    }
+
     #[tokio::test]
     async fn summary_carries_exemplar() {
         let s = BurstSuppressor::new(BurstConfig {

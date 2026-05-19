@@ -354,6 +354,96 @@ mod tests {
     }
 
     #[test]
+    fn bearer_and_bearer_hash_are_send_sync_static_for_axum_extractor_boundary() {
+        // The auth middleware extractor holds `Bearer` across `.await`
+        // points in the request handler, and the killswitch+kill_cache
+        // paths hold `BearerHash` across async boundaries on the
+        // tokio runtime. An `Rc<String>` field on `Bearer` "for cheap
+        // clone of the inner string" or a `Cell<[u8; 32]>` on
+        // `BearerHash` "for interior-mutable rehashing on demand" would
+        // break `Send` and surface at the AppState/handler assembly
+        // site with an opaque tower::Service trait-bound rather than at
+        // this file. Pin all three bounds (`Send + Sync + 'static`) on
+        // BOTH types so a refactor of either lands clean diagnostics.
+        fn require_send_sync_static<T: Send + Sync + 'static>(_: &T) {}
+        let b = Bearer::generate();
+        let h = b.hash();
+        require_send_sync_static(&b);
+        require_send_sync_static(&h);
+    }
+
+    #[test]
+    fn bearer_hash_of_byte_exact_for_well_known_sha256_vector_abc() {
+        // SHA-256 of "abc" is one of the most widely cross-published
+        // test vectors (FIPS 180-4 §B.1 + RFC 6234 §A.5):
+        // ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        // `BearerHash::of` is `sha256(input.as_bytes())`. Pin the
+        // byte-exact 32-byte output for this vector so a refactor that
+        // swapped the hash function (e.g. to BLAKE3 "for speed") OR
+        // that prepended a per-process salt "for cache-key uniqueness"
+        // would surface here against the canonical FIPS vector — not as
+        // a flaky downstream production incident months later when an
+        // old bearer's stored hash mysteriously stopped matching.
+        let h = BearerHash::of("abc");
+        let expected: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(h.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn bearer_generate_emits_prefix_exactly_once_at_offset_zero() {
+        // The generator concats PREFIX + 52-char base32 body — the prefix
+        // appears exactly once, at byte offset 0, with no internal
+        // duplication. A refactor that, e.g., changed `format!("{PREFIX}
+        // {enc}")` to `format!("{PREFIX}{PREFIX}{enc}")` (an easy
+        // mistake when wrapping for env-tag like `pxl_test_pxl_live_…`)
+        // would surface here. Pin BOTH that the prefix occurs exactly
+        // once AND that it occupies bytes [0..9), not somewhere later
+        // (e.g. a refactor that produced `<base32>pxl_live_<base32>`).
+        let b = Bearer::generate();
+        let s = b.as_str();
+        let count = s.matches(PREFIX).count();
+        assert_eq!(count, 1, "PREFIX should appear exactly once, got {count}");
+        assert_eq!(&s[..PREFIX.len()], PREFIX, "PREFIX must be at offset 0");
+    }
+
+    #[test]
+    fn bearer_hash_of_is_referentially_transparent_across_fifty_repeated_calls() {
+        // Hashing is pure; pin determinism explicitly across 50 sequential
+        // calls on the same input. A refactor that introduced any form of
+        // hidden state (a per-process counter, a static OnceCell salt, a
+        // PRNG-seeded XOR layer "to defeat rainbow tables" — already
+        // pointless for 256-bit bearers) would surface here on the first
+        // diverging call. The existing `hash_is_stable` pin only checks
+        // two calls; widen to 50 so an N-th-call special case surfaces.
+        let base = BearerHash::of("pxl_live_repeat_test");
+        for i in 0..50 {
+            let again = BearerHash::of("pxl_live_repeat_test");
+            assert_eq!(again, base, "hash drifted on iteration {i}");
+        }
+    }
+
+    #[test]
+    fn bearer_as_str_returns_slice_covering_full_token_length() {
+        // `as_str` returns a view over the inner `String` — pin that
+        // the slice spans the FULL TOKEN_LEN bytes, not a truncated
+        // head or a redaction shape. The auth middleware feeds this
+        // slice directly into `BearerHash::of`, so any accessor-level
+        // mangling would silently break the SHA-256 identity that the
+        // killswitch path's lookup keys on. A refactor that returned
+        // `&self.0[..PREFIX.len()]` "for safe logging" would surface
+        // here. Pin both the length AND that the slice begins with
+        // PREFIX (i.e. the accessor returned the head, not the tail).
+        let b = Bearer::generate();
+        let s = b.as_str();
+        assert_eq!(s.len(), TOKEN_LEN);
+        assert!(s.starts_with(PREFIX));
+    }
+
+    #[test]
     fn bearer_hash_partial_eq_distinguishes_different_inputs() {
         // BearerHash derives PartialEq+Eq; pin both axes — equal inputs hash
         // equal, distinct inputs hash distinct. The middleware uses Eq to
@@ -364,5 +454,26 @@ mod tests {
         let c = BearerHash::of("pxl_live_BBBB");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn one_thousand_generated_bearers_yield_one_thousand_distinct_hashes() {
+        // 256-bit entropy per token means birthday collisions are
+        // negligible at scale 1000 (~5e-71 expected). Pin distinctness
+        // across 1000 generations so a refactor that, e.g., re-seeded
+        // the RNG once per process from a static value "for replayable
+        // tests" or that hard-coded a sample body in a debug build
+        // would surface immediately — the HashSet would shrink below
+        // 1000 and the assertion would carry the exact diff in the
+        // failure message. The existing `two_generated_bearers_are_distinct`
+        // pin only checks N=2; widen to N=1000 so an N-th-call special
+        // case (e.g. a free-list-style counter that wrapped) surfaces.
+        use std::collections::HashSet;
+        let mut seen: HashSet<[u8; 32]> = HashSet::with_capacity(1000);
+        for _ in 0..1000 {
+            let b = Bearer::generate();
+            seen.insert(b.hash().0);
+        }
+        assert_eq!(seen.len(), 1000, "bearer collision in 1000 generations");
     }
 }

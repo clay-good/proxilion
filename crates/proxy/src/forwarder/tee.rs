@@ -572,4 +572,137 @@ mod tests {
         assert_eq!(primary.0.lock().unwrap().len(), 1);
         assert_eq!(*s2_ref.0.lock().unwrap(), 1);
     }
+
+    #[tokio::test]
+    async fn tee_stream_publish_with_only_primary_skips_join_all_branch_under_burst() {
+        // The `if self.sinks.is_empty() { return; }` early-return is a
+        // hot path — pin it under a tight burst (50 sequential publishes)
+        // so that any refactor introducing per-call allocation in the
+        // empty-sinks branch (e.g. `Vec::with_capacity(0)` plus a
+        // `join_all` of an empty future-set "for code-path uniformity")
+        // would still see the same observable shape: primary saw N
+        // events, no panics, no hangs. The existing
+        // `no_sinks_publish_skips_join_all_branch_without_panic` pin
+        // walks 3 publishes; widen to 50 so a stateful regression
+        // (e.g. a once-cell that flips to non-empty after some
+        // threshold) surfaces clearly.
+        let primary = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary.clone());
+        for _ in 0..50 {
+            tee.publish(sample()).await;
+        }
+        assert_eq!(primary.0.lock().unwrap().len(), 50);
+        assert_eq!(tee.sink_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn tee_of_tee_composes_recursively_through_arc_dyn_action_stream() {
+        // `TeeStream::new` takes `Arc<dyn ActionStream>` — that bound
+        // lets a `TeeStream` itself be a primary (or a sink) of another
+        // `TeeStream`. Production hasn't wired this today, but pin
+        // recursive composition so a refactor that narrowed the
+        // `primary` field type to a concrete sink struct "for
+        // monomorphization" would surface here, AND so a future
+        // operator wanting "publish to SIEM-A AND (SIEM-B fan-out across
+        // 3 regions)" has the composition shape validated. A 3-level
+        // nested tee with two sinks at each level must deliver to all
+        // leaf collectors.
+        let leaf_a = Arc::new(Collector::default());
+        let leaf_b = Arc::new(Collector::default());
+        let leaf_c = Arc::new(Collector::default());
+        let inner: Arc<dyn ActionStream> = Arc::new(
+            TeeStream::new(leaf_a.clone() as Arc<dyn ActionStream>).with_sink(leaf_b.clone()),
+        );
+        let outer = TeeStream::new(inner).with_sink(leaf_c.clone());
+        outer.publish(sample()).await;
+        assert_eq!(leaf_a.0.lock().unwrap().len(), 1);
+        assert_eq!(leaf_b.0.lock().unwrap().len(), 1);
+        assert_eq!(leaf_c.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tee_stream_propagates_event_with_all_optional_fields_none_intact() {
+        // The `ActionEvent` has three `Option<_>` fields (`leaf_pca_id`,
+        // `block_reason`, `policy_id`) that the demo-mode + the
+        // not-yet-bound-to-a-PCA paths both leave as None. The existing
+        // `every_field_of_event_round_trips_through_each_sink_byte_equal`
+        // pin sets all three to Some; pin the symmetric NONE shape so a
+        // refactor that, e.g., backfilled `block_reason` with `Some(...)
+        // .or(Some("unknown".into()))` "for dashboard hygiene" would
+        // surface here as a None → Some flip on every audit-mode event.
+        let primary = Arc::new(Collector::default());
+        let sink = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary.clone()).with_sink(sink.clone());
+        let ev = sample();
+        assert!(ev.leaf_pca_id.is_none() && ev.block_reason.is_none() && ev.policy_id.is_none());
+        tee.publish(ev).await;
+        for c in [&primary, &sink] {
+            let v = c.0.lock().unwrap();
+            assert_eq!(v.len(), 1);
+            assert!(v[0].leaf_pca_id.is_none(), "leaf_pca_id became Some");
+            assert!(v[0].block_reason.is_none(), "block_reason became Some");
+            assert!(v[0].policy_id.is_none(), "policy_id became Some");
+        }
+    }
+
+    #[test]
+    fn tee_stream_sink_count_return_type_is_usize_not_signed() {
+        // `sink_count` returns `usize` — pin the return type so a
+        // refactor that flipped to `i32` "to allow -1 as a sentinel
+        // for not-yet-finalized" or to `u32` "to save 4 bytes on
+        // 64-bit targets" would surface here at the type bound rather
+        // than at downstream comparisons (which would auto-coerce
+        // numeric literals and hide the drift). The helper takes
+        // `usize` only; passing the result implicitly type-checks.
+        fn require_usize(_: usize) {}
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary);
+        require_usize(tee.sink_count());
+    }
+
+    #[tokio::test]
+    async fn tee_stream_publish_visits_every_sink_at_least_once_under_eight_registrations() {
+        // The fan-out uses `Vec::with_capacity(self.sinks.len())` and a
+        // simple for-loop over `&self.sinks` — pin that EVERY one of 8
+        // registered sinks is visited at least once on a single publish.
+        // The existing `fans_out_to_five_sinks_concurrently_without_dropping_any`
+        // pin checks width 5; widen to 8 so any off-by-one cap (a refactor
+        // hard-coding `if sinks.len() < 6 { ... }` for some micro-opt)
+        // surfaces. Use distinct collectors so an "all events landed on
+        // sink 0" regression would be visible in the per-sink counts.
+        let primary = Arc::new(Collector::default());
+        let sinks: Vec<Arc<Collector>> = (0..8).map(|_| Arc::new(Collector::default())).collect();
+        let mut tee = TeeStream::new(primary.clone());
+        for s in &sinks {
+            tee = tee.with_sink(s.clone());
+        }
+        tee.publish(sample()).await;
+        assert_eq!(primary.0.lock().unwrap().len(), 1);
+        for (i, s) in sinks.iter().enumerate() {
+            assert_eq!(
+                s.0.lock().unwrap().len(),
+                1,
+                "sink {i} did not receive the event"
+            );
+        }
+        assert_eq!(tee.sink_count(), 8);
+    }
+
+    #[tokio::test]
+    async fn tee_stream_publish_returns_unit_not_result_for_infallible_fan_out_contract() {
+        // The doc comment promises secondary-sink failures are
+        // "logged and metric'd but never propagated" — therefore
+        // `publish` returns `()`, not `Result<_, _>`. Pin the unit
+        // return shape via a helper that takes `()`. A refactor that
+        // surfaced sink errors back up the call chain "for finer-grained
+        // operator telemetry" would surface here — and would also break
+        // the request-handler flow that today calls `publish(...).await`
+        // without a `?` AND that today does not check the return.
+        fn require_unit(_: ()) {}
+        let primary = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary.clone());
+        let out: () = tee.publish(sample()).await;
+        require_unit(out);
+        assert_eq!(primary.0.lock().unwrap().len(), 1);
+    }
 }

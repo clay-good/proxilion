@@ -468,6 +468,171 @@ mod tests {
     }
 
     #[test]
+    fn summary_return_type_is_owned_string_not_borrowed_str_for_log_field_ownership() {
+        // `summary()` returns `String` because the `tracing::info!`/
+        // `warn!` call sites in `emit()` capture it with `%summary`
+        // and stream the value across thread boundaries via the
+        // tracing subscriber's structured-field bag (which requires
+        // owned data). A refactor to `&'a str` "for zero-alloc" would
+        // surface here at the type-coercion boundary AND break the
+        // emit path with a borrow-checker error (the borrowed slice
+        // would outlive its trace owner once handed to the tracing
+        // event). Pin the owned String shape via a helper that
+        // accepts String only.
+        fn require_string(_: String) {}
+        let t = fresh_trace();
+        let s = summary(&t);
+        require_string(s);
+    }
+
+    #[test]
+    fn mark_layer_a_failed_flips_passed_to_false_polarity_pin() {
+        // The mark_layer_a_failed helper is the Trust-Plane-refusal
+        // path — the dashboard's "PCA invariant break" panel counts
+        // `passed == false` rows on the LayerA bucket. The existing
+        // `mark_layer_a_failed_replaces_passed_entry` test pins the
+        // error_code + detail; pin the BOOLEAN passed polarity
+        // explicitly here so a refactor that constructed the
+        // replacement via `LayerOutcome::passed()` (which would land
+        // `passed: true`) "to surface the detail even on the success
+        // path" would silently break the count metric. The boolean
+        // false is the load-bearing tripwire — pin it.
+        let mut t = fresh_trace();
+        // Pre-check: the LayerA slot starts as passed == true.
+        let pre = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .unwrap();
+        assert!(pre.passed, "pre-condition: LayerA must start passed");
+        mark_layer_a_failed(&mut t, "ops not subset".into());
+        let post = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .unwrap();
+        assert!(!post.passed, "mark_layer_a_failed must flip passed→false");
+    }
+
+    #[test]
+    fn summary_renders_multiple_failed_layers_with_distinct_error_codes_comma_joined() {
+        // The existing `summary_renders_codes` pin walks ONE failed
+        // layer; widen to TWO failed layers (LayerA via
+        // PicInvariantViolation + LayerB via PolicyBlocked) so a
+        // refactor that emitted only the FIRST failure "for log
+        // brevity" or that collapsed multi-failed traces to a single
+        // `denied` token "for consistency with Decision::Block" would
+        // surface here. The dashboard's "multi-layer fault" alert
+        // keys on the comma-joined two-code shape as the
+        // discriminant between cascading vs single-point faults.
+        let mut t = fresh_trace();
+        mark_layer_a_failed(&mut t, "pic break".into());
+        // Replace LayerB with a failed PolicyBlocked outcome.
+        set_layer(
+            &mut t,
+            PolicyLayer::LayerB,
+            LayerOutcome::failed(
+                PolicyLayer::LayerB,
+                ErrorCode::PolicyBlocked,
+                Some("gmail-external".into()),
+                Some("external recipient".into()),
+            ),
+        );
+        let s = summary(&t);
+        assert!(
+            s.contains("layer_a=pic_invariant_violation"),
+            "missing LayerA code: {s}",
+        );
+        assert!(
+            s.contains("layer_b=policy_blocked"),
+            "missing LayerB code: {s}",
+        );
+        // Both codes joined with `,` (per the helper's contract).
+        assert!(s.contains(','), "missing comma separator: {s}");
+    }
+
+    #[test]
+    fn emit_takes_trace_by_reference_not_consuming_value() {
+        // `emit(trace, ...)` takes `&PolicyTrace` (NOT `PolicyTrace`).
+        // The adapter path calls emit AFTER the policy decision has
+        // already been recorded into the audit-event row — the trace
+        // must remain available for downstream consumers (the
+        // `tracing::info!` field bag captures by value via `%trace`,
+        // but the caller still owns the trace for its own audit
+        // serialization). A refactor that consumed the trace "for
+        // a zero-copy serialize" would surface here as a borrow-
+        // checker error at the call site after emit; pin the
+        // `&PolicyTrace` signature by calling emit and then
+        // continuing to use the original via summary().
+        let t = fresh_trace();
+        emit(&t, uuid::Uuid::new_v4(), "google", "drive.files.get");
+        // The trace is still usable after emit — pin via a sync
+        // operation on the original reference.
+        let s = summary(&t);
+        assert_eq!(s, "layer_a=ok,layer_b=ok");
+    }
+
+    #[test]
+    fn set_layer_mutation_observable_via_subsequent_read_through_same_reference() {
+        // `set_layer(&mut trace, ...)` mutates in place. Pin the
+        // mutation is observable through a subsequent read on the
+        // SAME `&trace` reference — proves the helper actually writes
+        // through the borrow, NOT just operates on a local copy. A
+        // refactor to `fn set_layer(trace: PolicyTrace, ...) -> PolicyTrace`
+        // (functional / by-value) would silently start dropping the
+        // mutation at every call site that doesn't reassign the
+        // return value. Pin the in-place contract.
+        let mut t = fresh_trace();
+        let initial_layer_a_passed = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .map(|l| l.passed);
+        assert_eq!(initial_layer_a_passed, Some(true));
+        set_layer(
+            &mut t,
+            PolicyLayer::LayerA,
+            LayerOutcome::failed(
+                PolicyLayer::LayerA,
+                ErrorCode::PicInvariantViolation,
+                None,
+                Some("after mutation".into()),
+            ),
+        );
+        // Read through the same reference — mutation visible.
+        let after = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .map(|l| (l.passed, l.detail.clone()));
+        assert_eq!(after, Some((false, Some("after mutation".to_string()))));
+    }
+
+    #[test]
+    fn summary_helper_is_pure_returning_byte_equal_output_across_independent_calls() {
+        // `summary()` is a pure function of the trace state — calling
+        // it twice on the SAME trace MUST return byte-equal output.
+        // A refactor that introduced internal state (a per-call
+        // counter, an Instant-stamped suffix "for log correlation",
+        // a memoization cache that subtly drifted) would silently
+        // make two calls diverge AND break log-dedup pipelines that
+        // hash on the summary string. Pin purity on a trace with
+        // multiple layers across two calls — symmetric to the Debug
+        // purity pin on session.rs.
+        let mut t = fresh_trace();
+        mark_read_filter(&mut t, true, Some("p1".into()), "hit".into());
+        let a = summary(&t);
+        let b = summary(&t);
+        assert_eq!(a, b, "summary must be pure: {a:?} vs {b:?}");
+        // Symmetric on a denied trace.
+        let mut denied = fresh_trace();
+        mark_layer_a_failed(&mut denied, "missing drive:write:bob/*".into());
+        let c = summary(&denied);
+        let d = summary(&denied);
+        assert_eq!(c, d);
+    }
+
+    #[test]
     fn mark_read_filter_blocked_with_none_policy_id_omits_matched_rule_id() {
         // Symmetric to round-2's existing `mark_read_filter_blocked_sets_failed_with_code`
         // which only pinned the `Some(_)` arm. The `None` arm fires

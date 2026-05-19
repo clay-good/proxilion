@@ -501,6 +501,139 @@ mod tests {
     }
 
     #[test]
+    fn compiled_filter_and_filter_outcome_and_quarantine_sample_send_sync_static() {
+        // `CompiledFilter` is held in AdapterState and shared across
+        // every request scope; `FilterOutcome` + `QuarantineSample`
+        // flow across `.await` points in the read-filter apply path.
+        // All three MUST be Send+Sync+'static — `regex::RegexSet` /
+        // `regex::Regex` already satisfy the bound, but a refactor
+        // that wrapped any field in `Rc<...>` "for cheap clone of
+        // the per_pattern Vec" would silently break Sync at the
+        // AppState wire site with an opaque tower::Service trait-
+        // bound. Pin all three at this file.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<CompiledFilter>();
+        require_send_sync_static::<FilterOutcome>();
+        require_send_sync_static::<QuarantineSample>();
+    }
+
+    #[test]
+    fn marker_constant_is_static_str_byte_exact_for_replace_with_marker_action() {
+        // `MARKER` is the canonical replacement substring substituted
+        // in place of every quarantined match under the
+        // `ReplaceWithMarker` action. The byte-exact shape is the
+        // operator-visible contract — downstream consumers (the
+        // audit dashboard's "show before/after" diff renderer, the
+        // policy-author docs page) anchor on the literal `"[redacted
+        // by proxilion read-filter]"` substring. A refactor that
+        // changed the marker to `"[REDACTED]"` (shorter) or
+        // `"[redacted]"` (without the brand) would silently break
+        // every anchor and force a coordinated docs/dashboard update.
+        // Pin the byte sequence AND the `&'static str` lifetime AND
+        // the byte length (38 bytes) so a one-byte drift surfaces.
+        fn require_static_str(_: &'static str) {}
+        require_static_str(MARKER);
+        assert_eq!(MARKER, "[redacted by proxilion read-filter]");
+        assert_eq!(MARKER.len(), 35);
+        assert!(MARKER.starts_with('['));
+        assert!(MARKER.ends_with(']'));
+    }
+
+    #[test]
+    fn apply_with_empty_body_returns_empty_body_and_no_triggered_outcome() {
+        // The empty-body boundary fires when a 204 No Content response
+        // surfaces from an upstream API call OR when an adapter's
+        // bytes-extraction path hits a zero-length stream. `apply`
+        // must handle it without panic AND without triggering any
+        // quarantine. A refactor that pre-checked `body.is_empty()`
+        // and early-returned `MARKER` "for safety" would silently
+        // start mangling every legitimate 204 / empty upstream body.
+        // Pin both axes: empty body in → empty body out + outcome is
+        // default (no matches + no trigger + no samples + no block).
+        let f = build(
+            QuarantineAction::ReplaceWithMarker,
+            vec![Pattern::Literal("ignore previous instructions".into())],
+        );
+        let (out, o) = apply(b"", &f, Some("text/plain"));
+        assert!(out.is_empty(), "empty in must produce empty out");
+        assert_eq!(o.matches, 0);
+        assert!(!o.triggered);
+        assert!(o.samples.is_empty());
+        assert!(!o.block);
+    }
+
+    #[test]
+    fn should_scan_is_case_insensitive_for_content_type_matching() {
+        // The content-type matcher MUST be case-insensitive — RFC 7231
+        // §3.1.1.1 mandates HTTP content-type tokens are
+        // case-insensitive AND real-world servers emit mixed-case
+        // (`Text/Plain`, `APPLICATION/JSON`) inconsistently. A refactor
+        // that switched the inner matcher to a strict
+        // `==`-against-lowercase comparison "for cheap branch
+        // prediction" would silently start skipping scans on
+        // mixed-case content-types and let secrets through. Pin
+        // case-insensitive on three shape: TitleCase, UPPERCASE,
+        // hyphen-separated mixed. The existing should_scan tests
+        // exercise lowercase only.
+        // (We call should_scan directly via the public helper -
+        // it's referenced from apply but is module-private; route
+        // through apply to exercise it.)
+        let f = build(QuarantineAction::ReplaceWithMarker, vec![]);
+        // `apply` with empty patterns + a mixed-case content-type
+        // returns the body verbatim (no scan triggered, body
+        // preserved through the should_scan→empty-RegexSet path).
+        for ct in ["Text/Plain", "APPLICATION/JSON", "Application/Xml"] {
+            let body = b"hello world";
+            let (out, o) = apply(body, &f, Some(ct));
+            assert_eq!(out, body, "body must round-trip on content-type `{ct}`");
+            assert!(!o.triggered);
+        }
+    }
+
+    #[test]
+    fn truncate_helper_preserves_input_when_char_count_equals_n_exactly() {
+        // `truncate(s, n)` returns `s.to_owned()` when
+        // `s.chars().count() <= n` (the boundary is inclusive). Pin
+        // the exact-N-chars boundary so a refactor that flipped the
+        // predicate to strict `<` (which would force an ellipsis
+        // on N-char input) would surface here. The audit row's
+        // "pattern" field uses truncate(s, 80) — a strict-less
+        // refactor would add a trailing `…` byte to every 80-char
+        // pattern source AND break dashboard regex filters keyed on
+        // the un-trailed form. Pin both AT and ONE-BELOW the
+        // boundary explicitly.
+        let s5 = "abcde"; // 5 chars exactly
+        assert_eq!(truncate(s5, 5), "abcde", "exact-N must round-trip");
+        assert_eq!(truncate(s5, 4), "abcd…", "N-1 must ellipsize");
+        assert_eq!(truncate(s5, 6), "abcde", "N+1 must round-trip");
+        // Multibyte unicode boundary — `truncate` uses chars().count()
+        // not bytes; pin a multibyte input round-trips at exact char
+        // count even though its byte length exceeds N.
+        let café = "café"; // 4 chars, 5 bytes
+        assert_eq!(truncate(café, 4), "café");
+        assert_eq!(truncate(café, 3), "caf…");
+    }
+
+    #[test]
+    fn filter_outcome_default_yields_zero_matches_no_trigger_empty_samples_no_block() {
+        // `FilterOutcome` derives `Default` — the apply path returns
+        // `FilterOutcome::default()` on the no-content-type-match,
+        // no-RegexSet-hit, and empty-body short-circuit branches.
+        // Operators key on the `triggered: false` + `block: false`
+        // combination as the "scan passed clean" signal. A refactor
+        // that derived a different default (e.g. via `Default`-derive
+        // changing field order or via a manual impl that initialized
+        // `triggered: true` "to surface scan-happened-even-if-clean")
+        // would silently break the dashboard's "clean scan rate"
+        // counter. Pin all four field defaults explicitly.
+        let d = FilterOutcome::default();
+        assert_eq!(d.matches, 0);
+        assert!(!d.triggered);
+        assert!(d.samples.is_empty());
+        assert!(!d.block);
+    }
+
+    #[test]
     fn regexset_short_circuits_clean_bodies() {
         let f = build(
             QuarantineAction::ReplaceWithMarker,

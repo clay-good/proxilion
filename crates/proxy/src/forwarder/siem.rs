@@ -679,6 +679,126 @@ mod tests {
         );
     }
 
+    #[test]
+    fn siem_forwarder_and_key_types_are_send_sync_static_for_app_state_arc_path() {
+        // `SiemForwarder` is wired into AppState as
+        // `Arc<dyn ActionStream>`; its `publish` is `.await`-ed from
+        // inside tokio-spawned tasks (TeeStream fan-out). `SiemHmacKey`
+        // is held by `SiemForwarder`. `KeyError` and `BuildError` flow
+        // through `anyhow::Error` chains at boot. Pin the three-trait
+        // combo on all four so a refactor that introduced a `Cell<...>`
+        // field on the forwarder, an `Rc<[u8]>` on the key buffer, or
+        // a non-Send inner on either error type would break the
+        // AppState assembly at the right call site rather than as a
+        // far-removed trait-bound error.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<SiemForwarder>();
+        require_send_sync_static::<SiemHmacKey>();
+        require_send_sync_static::<KeyError>();
+        require_send_sync_static::<BuildError>();
+    }
+
+    #[test]
+    fn key_error_and_build_error_implement_std_error_trait_with_no_source() {
+        // Both error types are `thiserror::Error` derives with
+        // `#[error("{0}")]` shapes. Pin the `std::error::Error` impl
+        // via dyn-cast AND confirm both are leaf arms with `source()
+        // == None`. A refactor that swapped to a hand-rolled
+        // `impl Display` and forgot to re-impl Error would surface
+        // here at the trait cast rather than as a silently-truncated
+        // anyhow chain in production logs. A refactor that added an
+        // inner-error field with `#[from]` would surface the symmetric
+        // direction (source becomes Some).
+        let k = KeyError("kx".into());
+        let b = BuildError("bx".into());
+        let dk: &dyn std::error::Error = &k;
+        let db: &dyn std::error::Error = &b;
+        assert!(
+            std::error::Error::source(dk).is_none(),
+            "KeyError must be leaf",
+        );
+        assert!(
+            std::error::Error::source(db).is_none(),
+            "BuildError must be leaf",
+        );
+    }
+
+    #[test]
+    fn key_error_and_build_error_debug_carries_struct_name_for_grep() {
+        // Both error types feed `?e` in `tracing::warn!` call sites at
+        // boot and at SIEM publish-failure paths. Operators grep the
+        // resulting log line by struct name to bucket "key parse fault"
+        // vs "transport build fault". A hand-rolled Debug that hid the
+        // struct name "to compact" the line would break every operator
+        // bucket. Pin the struct-name shape on both — symmetric to the
+        // `connect_error_debug_includes_struct_name_for_grep` pin on
+        // [crates/proxy/src/forwarder/nats.rs] for ConnectError.
+        let k = format!("{:?}", KeyError("inner".into()));
+        assert!(k.contains("KeyError"), "got: {k}");
+        let b = format!("{:?}", BuildError("inner".into()));
+        assert!(b.contains("BuildError"), "got: {b}");
+    }
+
+    #[test]
+    fn siem_hmac_key_from_hex_accepts_uppercase_and_mixed_case_hex_chars() {
+        // `u8::from_str_radix(..., 16)` accepts both `a-f` and `A-F`.
+        // The existing `hmac_key_round_trip` test only exercises
+        // lowercase hex; pin the uppercase + mixed-case acceptance
+        // contract here. Operators paste hex strings from various
+        // tools (`openssl rand -hex` is lowercase, but some KMS
+        // dumps and Slack-shared secrets are uppercase). A refactor
+        // that swapped to a hand-rolled nibble parser gated on
+        // `'0'..='9' | 'a'..='f'` only would silently reject every
+        // uppercase paste and break setup with a confusing "invalid
+        // hex at N" rather than working transparently. Cross-pin
+        // that all three case-shapes produce byte-equal HMAC
+        // signatures on the same body.
+        let lower = SiemHmacKey::from_hex(&"ab".repeat(16)).unwrap();
+        let upper = SiemHmacKey::from_hex(&"AB".repeat(16)).unwrap();
+        let mixed = SiemHmacKey::from_hex(&"aB".repeat(16)).unwrap();
+        let body = b"identical body across case variants";
+        assert_eq!(lower.sign(body), upper.sign(body));
+        assert_eq!(lower.sign(body), mixed.sign(body));
+    }
+
+    #[test]
+    fn siem_hmac_key_clone_preserves_bytes_via_sign_equality() {
+        // `SiemHmacKey` derives `Clone` over `Vec<u8>` — the clone
+        // holds an independent buffer with byte-equal contents. Pin
+        // that the clone signs identically (proxy of "bytes preserved")
+        // so a refactor that swapped the inner to `Arc<[u8]>` would
+        // still pass (good — that's the same observable), but one
+        // that accidentally zeroized the source buffer on clone
+        // (e.g. `mem::take`-then-restore that panicked mid-way) would
+        // surface here as a divergent signature.
+        let k = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let c = k.clone();
+        let body = b"some payload here";
+        assert_eq!(k.sign(body), c.sign(body));
+        // Cross-check the clone is independent — dropping the source
+        // does not invalidate the clone's signing capability.
+        drop(k);
+        let again = c.sign(body);
+        assert!(again.starts_with("sha256="));
+        assert_eq!(again.len(), "sha256=".len() + 64);
+    }
+
+    #[test]
+    fn siem_hmac_key_from_hex_rejects_empty_string_via_too_short_branch() {
+        // The empty string has even length (0) AND is below the
+        // 32-char minimum. The odd-length check fires first; for an
+        // empty string (even length), the `< 32` branch is what
+        // catches it. Pin that the resulting error carries the
+        // "16 bytes" hint — operators with an unset env var land
+        // here, and the "16 bytes" message is what tells them the
+        // key was missing entirely vs malformed. A refactor that
+        // re-ordered the branches (length-min first, then even) or
+        // collapsed both into a generic "invalid length" would
+        // silently lose the actionable hint.
+        let err = SiemHmacKey::from_hex("").map(|_| ()).unwrap_err();
+        assert!(err.to_string().contains("16 bytes"), "got: {err}");
+    }
+
     #[tokio::test]
     async fn flush_batch_is_noop_when_buffer_empty() {
         let server = MockServer::start().await;

@@ -333,6 +333,159 @@ mod tests {
     }
 
     #[test]
+    fn nats_bridge_and_connect_error_are_send_sync_static_for_spawn_boundary() {
+        // `NatsBridge` is wired into AppState as an
+        // `Arc<dyn ActionStream>` and its `publish` method is `.await`-ed
+        // from inside tokio task boundaries (the TeeStream fan-out runs
+        // each secondary sink on a spawned task). `ConnectError` flows
+        // through `anyhow::Error` chains at the boot path which also
+        // require `Send + Sync + 'static`. A refactor that gave
+        // `NatsBridge` a `Cell<...>` field "for in-process retry tracking"
+        // would break Sync at the AppState site with an unrelated
+        // trait-bound error; a refactor that swapped `ConnectError(pub
+        // String)` for `ConnectError(Rc<String>)` "for cheap clone"
+        // would break Send. Pin the three-trait combo for both types
+        // here so the type boundary fails fast at the right call site.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<NatsBridge>();
+        require_send_sync_static::<ConnectError>();
+    }
+
+    #[test]
+    fn sanitize_token_shrinks_byte_length_when_multibyte_utf8_chars_are_replaced() {
+        // The sanitizer is a per-`char` map: each `char` becomes either
+        // itself (single-byte ASCII or multibyte UTF-8) OR a single-byte
+        // `_`. Multibyte chars (Latin-1 like `é` = 2 bytes, BMP like `→`
+        // = 3 bytes, supplementary like `🔥` = 4 bytes) on the reject path
+        // collapse to a 1-byte underscore, so the output is BYTE-shorter
+        // than the input. The previous round's
+        // `sanitize_token_byte_length_equals_input_for_ascii_only_inputs`
+        // pin documented the ASCII-only invariant; pin the symmetric
+        // multibyte case here so a refactor that escaped multibyte chars
+        // as multi-byte placeholders (e.g. `%XX%XX`) would break the
+        // length-shrink invariant — operators monitoring subject byte
+        // length budget would see the contract change. Three-tier
+        // multibyte coverage: 2-byte (`é`), 3-byte (`→`), 4-byte (`🔥`).
+        // Each one in / out of `caXb` produces 4-byte `ca_b` regardless.
+        for (input_byte_len, mb) in [(5usize, "é"), (6, "→"), (7, "🔥")] {
+            let input = format!("ca{mb}b");
+            assert_eq!(
+                input.len(),
+                input_byte_len,
+                "fixture char_byte sanity: {mb}",
+            );
+            let out = sanitize_token(&input);
+            assert_eq!(out, "ca_b", "got: {out:?} for input {input:?}");
+            assert!(
+                out.len() < input.len(),
+                "multibyte replacement must shrink length: {input:?} ({}) → {out:?} ({})",
+                input.len(),
+                out.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_token_replaces_del_and_high_bit_ascii_codepoints_with_underscore() {
+        // The 0x00..=0x1F control-char range is already pinned via the
+        // round-N control-chars test. The remaining ASCII space — DEL
+        // (0x7F) AND any char with the high bit set (Latin-1 supplement
+        // range when interpreted as bytes) — is also on the reject
+        // path. Pin DEL explicitly (it's the most-likely-smuggled byte
+        // from a terminal-control-char accidentally landing in a vendor
+        // label) AND a representative spread of high-ASCII codepoints
+        // (rendered as Rust chars, which are Unicode codepoints, not
+        // raw bytes — so each spans 1-2 UTF-8 bytes per char). A
+        // refactor that narrowed the closure's reject set to "control
+        // chars and whitespace only" would silently let DEL through
+        // to the NATS subject wire, breaking some NATS clients on the
+        // 0x7F boundary.
+        let del = '\u{7f}';
+        assert_eq!(sanitize_token(&format!("a{del}b")), "a_b");
+        for ch in ['\u{80}', '\u{a0}', '\u{ff}', '\u{100}'] {
+            let s = format!("a{ch}b");
+            let out = sanitize_token(&s);
+            assert_eq!(
+                out, "a_b",
+                "high-ASCII codepoint U+{:04X} must sanitize, got {out:?}",
+                ch as u32,
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_token_is_idempotent_applying_twice_equals_applying_once() {
+        // The sanitizer's output is ALWAYS in the allow-list (every
+        // non-allow-listed char becomes `_`, which IS on the allow-list).
+        // Pin idempotency: `sanitize_token(sanitize_token(s)) ==
+        // sanitize_token(s)` for any input. This matters because the
+        // PIC executor and the SIEM forwarder both call sanitize on
+        // their own copies of the vendor / action labels — a refactor
+        // that swapped the reject byte to a multi-pass-mangled output
+        // (e.g. percent-escape `%5F` for `_` "to disambiguate from
+        // user-supplied underscores") would silently make the second
+        // sanitization re-mangle and the two call sites produce
+        // different subjects. Pin across a spread of input shapes.
+        for input in [
+            "google",
+            "drive.files.get",
+            "a*b>c d",
+            "café→x",
+            "*invalid*",
+            "",
+            "....",
+            "v1_alpha-beta",
+        ] {
+            let once = sanitize_token(input);
+            let twice = sanitize_token(&once);
+            assert_eq!(once, twice, "idempotency broke on input {input:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_token_all_rejected_input_becomes_all_underscores_same_char_count() {
+        // When every input char is on the reject path, the output is
+        // all-underscores AND the char count is preserved (one `_` per
+        // input char, regardless of multibyte width). Pin this so a
+        // refactor that collapsed consecutive `_` runs "for tidiness"
+        // would surface here as a length mismatch — operators rely on
+        // the 1:1 char-to-char mapping to grep "how many invalid chars
+        // did the upstream send". For an all-multibyte input the byte
+        // length still shrinks (multibyte → 1-byte underscore) but the
+        // CHAR count is preserved.
+        let input = "*>< |&^!";
+        let out = sanitize_token(input);
+        assert_eq!(out, "_".repeat(input.chars().count()));
+        // Multibyte spread: 4 chars (`é`, `→`, `🔥`, `α`), all rejected,
+        // 4 underscores out.
+        let mb = "é→🔥α";
+        let out = sanitize_token(mb);
+        assert_eq!(out.chars().count(), mb.chars().count());
+        assert_eq!(out, "____");
+    }
+
+    #[test]
+    fn sanitize_token_preserves_dot_at_leading_trailing_and_consecutive_positions() {
+        // The dot pin (`sanitize_dot_passthrough_preserves_subject_hierarchy`)
+        // covers `.leading` / `trailing.` / interior dots. Pin the
+        // boundary case the existing tests skipped: CONSECUTIVE dots
+        // (e.g. `..` from an empty subject token) AND a leading + trailing
+        // combo on the same input. The NATS subject parser treats `..`
+        // as an empty token and rejects the publish — a refactor that
+        // collapsed `..` to a single `.` "for hygiene" would silently
+        // change the wire shape AND hide the upstream's empty-token bug
+        // from operators. Pin verbatim passthrough of pathological dot
+        // sequences.
+        assert_eq!(sanitize_token(".."), "..");
+        assert_eq!(sanitize_token("...end"), "...end");
+        assert_eq!(sanitize_token("start..."), "start...");
+        assert_eq!(sanitize_token(".a.b."), ".a.b.");
+        // Sanity: dots mixed with reject chars — dots through, the rest
+        // become underscores, no collapsing of either run.
+        assert_eq!(sanitize_token(".a*.b>.c"), ".a_.b_.c");
+    }
+
+    #[test]
     fn connect_error_debug_includes_struct_name_for_grep() {
         // The `#[derive(Debug)]` on `ConnectError` feeds `?e` in
         // `tracing::warn!(?e, "nats connect failed")` at the boot path

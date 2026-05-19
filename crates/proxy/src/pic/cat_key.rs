@@ -330,4 +330,112 @@ mod tests {
         assert_eq!(info.kid, "k1");
         assert_eq!(info.public_key, "AAA");
     }
+
+    #[test]
+    fn cat_key_registry_is_send_sync_static_for_app_state_arc_path() {
+        // `CatKeyRegistry` is held in AppState and consulted from
+        // async request-handler paths (tokio task boundaries). A
+        // refactor that gave `Inner` an `Rc<String>` field "for cheap
+        // clone of trust_plane_url" would break Sync at the AppState
+        // assembly site as a far-removed trait-bound error. Pin the
+        // three-trait combo here so the failure surfaces at the right
+        // module.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<CatKeyRegistry>();
+    }
+
+    #[test]
+    fn cat_key_error_is_send_sync_static_for_anyhow_chain_walk() {
+        // `CatKeyError` flows through `anyhow::Error` chains at the
+        // OAuth callback path, which requires `Send + Sync + 'static`.
+        // The symmetric round-N `cat_key_error_implements_std_error_trait`
+        // pin covered the trait impl; this one pins the marker bounds.
+        // A refactor that introduced a !Send field (e.g.
+        // `Decode(Rc<String>)`) would surface here rather than as a
+        // chain-walk type mismatch deeper in the callback.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<CatKeyError>();
+    }
+
+    #[test]
+    fn cat_key_error_debug_carries_variant_names_for_grep() {
+        // Operators grep error logs by variant name to bucket Status
+        // (Trust Plane refused) vs Decode (key material malformed) vs
+        // Fetch (network); the `derive(Debug)` lands variant names in
+        // the formatted output. A refactor that swapped to a hand-rolled
+        // `impl Debug` that compacted the line "for log brevity" would
+        // silently break every bucket. Pin Status + Decode variant
+        // names verbatim (the Fetch arm requires a synthesized
+        // reqwest::Error and is already covered by the existing
+        // fetch-prefix Display test).
+        let s = format!("{:?}", CatKeyError::Status(503));
+        assert!(s.contains("Status"), "got: {s}");
+        let d = format!("{:?}", CatKeyError::Decode("x".into()));
+        assert!(d.contains("Decode"), "got: {d}");
+    }
+
+    #[test]
+    fn cat_key_error_status_display_renders_full_u16_range_verbatim() {
+        // `Status(u16)` renders the integer verbatim — no bucketing
+        // into status-classes. The existing 4xx/5xx + zero/u16::MAX
+        // pins cover the canonical boundary; pin the inter-class
+        // gap (99 / 100 / 599 / 600 / 999 / 1000) so a refactor that
+        // gated on `100..=599` and rendered "out of range" for
+        // anything else would surface here on every boundary. Some
+        // upstream HTTP libraries clamp at 100 / 999; we MUST surface
+        // the raw code instead so operators can triage upstream
+        // misbehavior.
+        for code in [99u16, 100, 599, 600, 999, 1000] {
+            let s = CatKeyError::Status(code).to_string();
+            assert!(s.contains(&code.to_string()), "missing {code} in: {s}");
+        }
+    }
+
+    #[test]
+    fn cat_key_error_decode_display_passes_through_unicode_newline_quote_inner() {
+        // `Decode(String)` Display is `"CAT public key decode failed: {0}"`.
+        // The existing `cat_key_error_decode_display_carries_inner_detail`
+        // pin walks three plain-ASCII inner strings; pin that arbitrary
+        // inner content survives byte-for-byte — including unicode
+        // (Trust Plane debug messages may surface non-ASCII), newlines
+        // (some inner errors include line-broken context), and quote
+        // chars (the operator log layer may JSON-escape these, but the
+        // Display impl itself must not pre-quote). A refactor that
+        // swapped `{0}` to `{0:?}` "for safety" would silently wrap
+        // every inner in escape sequences and break exact-match
+        // operator-log assertions.
+        for inner in [
+            "café decoding failed",
+            "line1\nline2",
+            r#"quoted "value" here"#,
+            "α-β-γ",
+        ] {
+            let s = CatKeyError::Decode(inner.into()).to_string();
+            assert!(s.contains(inner), "verbatim survival: {s}");
+        }
+    }
+
+    #[test]
+    fn info_resp_rejects_non_string_kid_and_public_key_field_types() {
+        // The `InfoResp { kid: String, public_key: String }` fields
+        // are strictly typed — a Trust Plane response that emitted
+        // `kid: 42` (numeric) or `public_key: 12345` (numeric) MUST
+        // reject at decode time. The existing missing-field pins cover
+        // absence; pin the wrong-type axis here. A refactor that
+        // swapped to `Value` or a `#[serde(deserialize_with =
+        // "..coerce_to_string..")]` shim "for robustness" would
+        // silently accept type-mismatched wire data and the verifier
+        // would later mis-key on the stringified integer rather than
+        // surface the wire-shape mismatch at decode time.
+        let raw_kid = r#"{"kid":42,"public_key":"AAA"}"#;
+        assert!(
+            serde_json::from_str::<InfoResp>(raw_kid).is_err(),
+            "numeric kid must reject",
+        );
+        let raw_pk = r#"{"kid":"k1","public_key":12345}"#;
+        assert!(
+            serde_json::from_str::<InfoResp>(raw_pk).is_err(),
+            "numeric public_key must reject",
+        );
+    }
 }

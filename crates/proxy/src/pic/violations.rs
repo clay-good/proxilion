@@ -210,6 +210,181 @@ mod tests {
     }
 
     #[test]
+    fn pic_violation_record_debug_carries_struct_name_and_key_field_names() {
+        // PicViolationRecord flows through `tracing::warn!(?r, "failed to
+        // persist pic_violation")` on the persistence failure path; the
+        // PIC executor and the audit-mode logger both pass the same
+        // Record to multiple sinks. Operators grep the resulting log
+        // line by struct name + by `request_id` / `session_id` /
+        // `vendor` / `action` / `pic_mode` selectors to bucket "which
+        // PIC violation, which mode, which adapter" when triaging.
+        // A manual Debug that hid any of them "to compact" the line
+        // would break every operator bucket. Pin the six-way shape
+        // (struct name + five load-bearing field names).
+        let req = Uuid::new_v4();
+        let sess = Uuid::new_v4();
+        let pred = Uuid::new_v4();
+        let ops: Vec<String> = vec![];
+        let atoms: Vec<String> = vec![];
+        let r = PicViolationRecord {
+            request_id: req,
+            session_id: sess,
+            p_0: None,
+            vendor: "google",
+            action: "drive.files.get",
+            method: "GET",
+            path: "/drive/v3/files/x",
+            policy_id: None,
+            predecessor_pca_id: Some(pred),
+            attempted_ops: &ops,
+            missing_atoms: &atoms,
+            pic_mode: "audit",
+            detail: None,
+        };
+        let s = format!("{r:?}");
+        assert!(s.contains("PicViolationRecord"), "got: {s}");
+        assert!(s.contains("request_id"), "got: {s}");
+        assert!(s.contains("session_id"), "got: {s}");
+        assert!(s.contains("vendor"), "got: {s}");
+        assert!(s.contains("action"), "got: {s}");
+        assert!(s.contains("pic_mode"), "got: {s}");
+        // pic_mode value also visible — operators bucket on "audit" vs
+        // "runtime_gate" directly in the log line.
+        assert!(s.contains("audit"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_atoms_trim_matches_strips_multiple_consecutive_quote_chars() {
+        // `trim_matches(|c| c == '"' || c == '\'')` is a greedy multi-pass
+        // strip, NOT a single-char trim. The Trust Plane has been
+        // observed emitting double-wrapped atoms (`""x""`) when one
+        // serializer stringifies and another re-wraps. Pin that all
+        // four leading + four trailing quote chars are stripped on the
+        // greedy path so the result is the bare atom `x`. A refactor
+        // that swapped to `strip_prefix("\"").and_then(strip_suffix)`
+        // (a "single-pass tidy" change) would silently leak the outer
+        // wrap chars into the result string.
+        assert_eq!(
+            parse_missing_atoms(r#"missing [""""x""""]"#),
+            vec!["x".to_string()],
+        );
+        // Mixed single + double on the same atom — greedy strip handles
+        // either side independently.
+        assert_eq!(
+            parse_missing_atoms(r#"missing ['"a:b:c"']"#),
+            vec!["a:b:c".to_string()],
+        );
+    }
+
+    #[test]
+    fn parse_atoms_handles_tab_and_newline_as_whitespace_via_trim() {
+        // The Trust Plane refusal body sometimes wraps onto multiple
+        // lines (`"missing [a:1,\n b:2,\tc:3]"`) when the upstream
+        // serializer pretty-prints. `str::trim()` strips ASCII tab,
+        // newline, carriage-return, and form-feed as well as space,
+        // so all four atoms must surface cleanly. A refactor that
+        // hardcoded `trim_start_matches(' ')` only would let the
+        // tab / newline through and silently include them in the
+        // atom string, breaking exact-match `missing_atoms`
+        // comparisons in the operator UI.
+        assert_eq!(
+            parse_missing_atoms("missing [a:1,\n b:2,\tc:3,\rd:4]"),
+            vec![
+                "a:1".to_string(),
+                "b:2".to_string(),
+                "c:3".to_string(),
+                "d:4".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn pic_violation_record_with_all_none_optionals_constructs_and_clones() {
+        // All four `Option<_>` fields (p_0, policy_id, predecessor_pca_id,
+        // detail) can simultaneously be None — this is the PIC-violation
+        // shape for an unauthenticated probe that tripped the executor
+        // before any of those fields were populated. Pin construction +
+        // Clone on the all-None shape so a refactor that started requiring
+        // any of them at compile-time (e.g. removing `Option<>` on detail
+        // "since the Trust Plane always emits one") would surface here
+        // rather than at the call site that builds the record from an
+        // empty refusal body.
+        let req = Uuid::new_v4();
+        let sess = Uuid::new_v4();
+        let ops: Vec<String> = vec![];
+        let atoms: Vec<String> = vec![];
+        let r = PicViolationRecord {
+            request_id: req,
+            session_id: sess,
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "GET",
+            path: "/",
+            policy_id: None,
+            predecessor_pca_id: None,
+            attempted_ops: &ops,
+            missing_atoms: &atoms,
+            pic_mode: "audit",
+            detail: None,
+        };
+        assert!(r.p_0.is_none());
+        assert!(r.policy_id.is_none());
+        assert!(r.predecessor_pca_id.is_none());
+        assert!(r.detail.is_none());
+        let c = r.clone();
+        assert!(c.p_0.is_none());
+        assert!(c.policy_id.is_none());
+        assert!(c.predecessor_pca_id.is_none());
+        assert!(c.detail.is_none());
+        assert_eq!(c.request_id, req);
+        assert_eq!(c.session_id, sess);
+        assert_eq!(c.pic_mode, "audit");
+    }
+
+    #[test]
+    fn parse_atoms_returns_owned_strings_independent_of_input_lifetime() {
+        // `parse_missing_atoms` returns `Vec<String>` — every atom is an
+        // OWNED allocation, not a borrowed slice over the input. Pin
+        // this contract by dropping the input string BEFORE inspecting
+        // the atoms: the result must still be readable. A refactor that
+        // returned `Vec<&'a str>` "to avoid the per-atom allocation"
+        // would silently introduce a lifetime constraint that the
+        // current `persist()` call shape (which builds a temporary
+        // refusal-body String, then parses it, then passes the parsed
+        // atoms to the binding) couldn't satisfy — borrow-checker
+        // failure at the bind site, not here.
+        let atoms = {
+            let detail = String::from("missing [drive:read:a, drive:write:b, gmail:send:c]");
+            parse_missing_atoms(&detail)
+            // `detail` dropped here.
+        };
+        assert_eq!(atoms.len(), 3);
+        assert_eq!(atoms[0], "drive:read:a");
+        assert_eq!(atoms[1], "drive:write:b");
+        assert_eq!(atoms[2], "gmail:send:c");
+    }
+
+    #[test]
+    fn parse_atoms_handles_one_hundred_atom_list_preserving_first_middle_last() {
+        // The Trust Plane can produce wide missing-atoms lists when the
+        // requested ops set spans many resources (e.g. a `*` glob on a
+        // 100-file folder under a tight policy). Pin scale correctness:
+        // a 100-comma-separated list produces 100 atoms with boundary
+        // positions 0/50/99 byte-equal to the input. A refactor that
+        // capped the split at N atoms "for log line length" would
+        // surface here as a truncated result rather than as a silently
+        // partial pic_violations row.
+        let atoms_in: Vec<String> = (0..100).map(|i| format!("op:tier{i}:r/{i}")).collect();
+        let detail = format!("missing [{}]", atoms_in.join(", "));
+        let atoms_out = parse_missing_atoms(&detail);
+        assert_eq!(atoms_out.len(), 100);
+        assert_eq!(atoms_out[0], "op:tier0:r/0");
+        assert_eq!(atoms_out[50], "op:tier50:r/50");
+        assert_eq!(atoms_out[99], "op:tier99:r/99");
+    }
+
+    #[test]
     fn pic_violation_record_clone_preserves_all_borrowed_slices() {
         // PicViolationRecord is `Clone` and carries five `&str`/`&[]`
         // borrows + a `Uuid` + a `&'static str` mode tag. The Clone

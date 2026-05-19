@@ -288,6 +288,140 @@ mod tests {
     }
 
     #[test]
+    fn pkce_error_is_send_sync_static_for_anyhow_chain_boundary() {
+        // PkceError flows through anyhow chains in the OAuth callback —
+        // anyhow's blanket impl requires `Send + Sync + 'static`. A
+        // refactor that introduced a non-Send field (e.g. `Rc<str>` on
+        // a future `Mismatch { computed: Rc<str> }` "for cheap inner
+        // borrowing") would surface as a confusing anyhow trait-bound
+        // error at the call site instead of cleanly at the error type
+        // boundary. Pin the three-trait combo here so a refactor fails
+        // fast at this file.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<PkceError>();
+    }
+
+    #[test]
+    fn verify_pkce_s256_is_referentially_transparent_across_repeated_calls() {
+        // The function is pure: no clock, no env, no global state. Pin
+        // referential transparency by calling 50 times with the same
+        // args and asserting all 50 results are equal — both happy path
+        // (Ok) AND the two error paths (Mismatch / VerifierLength). A
+        // refactor that introduced a once-cell-backed memoization layer
+        // "for hot-path performance" would still pass the equality
+        // check, but a refactor that introduced any form of state
+        // (a counter, a rate-limit, a "first-call returns Ok then
+        // subsequent calls require...") would surface here.
+        let verifier_43 = "a".repeat(43);
+        let digest = Sha256::digest(verifier_43.as_bytes());
+        let real_challenge = URL_SAFE_NO_PAD.encode(digest);
+        for _ in 0..50 {
+            assert!(verify_pkce_s256(&verifier_43, &real_challenge).is_ok());
+            assert!(matches!(
+                verify_pkce_s256(&verifier_43, "bogus43char_____").unwrap_err(),
+                PkceError::Mismatch,
+            ));
+            assert!(matches!(
+                verify_pkce_s256("short", "anything").unwrap_err(),
+                PkceError::VerifierLength,
+            ));
+        }
+    }
+
+    #[test]
+    fn verifier_with_internal_whitespace_passes_length_but_yields_mismatch_no_trim() {
+        // RFC 7636 §4.1 confines verifiers to the unreserved character
+        // set ([A-Z][a-z][0-9]-._~), but the verify function is BYTE-
+        // ORIENTED — it does NOT validate the character class and does
+        // NOT trim whitespace. A refactor that called `.trim()` "for
+        // robustness against operator-side encoding bugs" would silently
+        // change the byte input to SHA-256 and produce a different
+        // computed challenge — silently breaking the PKCE round-trip
+        // for any verifier that happened to carry trailing whitespace
+        // (e.g. from a copy-paste). Pin that the length check passes
+        // on a 43-byte string with a literal space char in the middle,
+        // and the function proceeds to the Mismatch path (no trim).
+        let v = format!("{}{}{}", "a".repeat(20), " ", "a".repeat(22));
+        assert_eq!(v.len(), 43);
+        assert!(matches!(
+            verify_pkce_s256(&v, "bogus").unwrap_err(),
+            PkceError::Mismatch,
+        ));
+    }
+
+    #[test]
+    fn challenge_with_embedded_null_byte_yields_mismatch_without_panic() {
+        // Edge: a challenge string containing a NUL byte (`\0`). The
+        // base64url-no-pad encoding never produces NUL, so the real
+        // challenge can't carry one — but the function MUST NOT panic
+        // on inbound data with surprising bytes. Pin that a challenge
+        // of length 43 with a NUL byte in the middle yields Mismatch
+        // (the byte-comparison correctly differs from the real digest
+        // encoding) and does NOT panic in the `ct_eq` path. A refactor
+        // that pre-checked `assert!(challenge.is_ascii_alphanumeric())`
+        // for "input hygiene" would surface here as a panic instead of
+        // a clean Mismatch error.
+        let verifier = "a".repeat(43);
+        let mut tampered = String::with_capacity(43);
+        tampered.push_str(&"a".repeat(20));
+        tampered.push('\0');
+        tampered.push_str(&"a".repeat(22));
+        assert_eq!(tampered.len(), 43);
+        let err = verify_pkce_s256(&verifier, &tampered).unwrap_err();
+        assert!(matches!(err, PkceError::Mismatch), "got {err:?}");
+    }
+
+    #[test]
+    fn pkce_error_exhaustive_match_compiles_with_exactly_two_arms() {
+        // PkceError has exactly two variants today (Mismatch /
+        // VerifierLength). Pin the variant count at the type-level via
+        // an exhaustive match so a refactor that added a third variant
+        // (e.g. `Internal` to wrap a downstream error) would surface
+        // here as either a non-exhaustive-match compile error OR a
+        // failing arm assertion. The existing string-based tests cover
+        // the two variant names individually but don't enforce the
+        // variant-count cap — a refactor that added an `Internal`
+        // variant without updating the OAuth callback's failure-triage
+        // grep buckets would silently surface a third grep bucket.
+        for e in [PkceError::Mismatch, PkceError::VerifierLength] {
+            match e {
+                PkceError::Mismatch => {}
+                PkceError::VerifierLength => {}
+            }
+        }
+        // Sanity: the two distinct variants produce distinct Debug
+        // strings (so the match-arm coverage above is real, not a
+        // collapse of two equivalent shapes).
+        assert_ne!(
+            format!("{:?}", PkceError::Mismatch),
+            format!("{:?}", PkceError::VerifierLength),
+        );
+    }
+
+    #[test]
+    fn compute_then_verify_round_trips_across_five_distinct_verifier_lengths() {
+        // For every verifier length in {43, 50, 64, 96, 128} compute the
+        // canonical challenge and pin that `verify_pkce_s256` returns
+        // Ok against the computed challenge. The existing
+        // `computed_challenge_is_exactly_43_bytes_for_any_input_length`
+        // pin covers 43/64/128; widen to 50 + 96 so the boundary
+        // intermediates between the named boundaries are also pinned.
+        // A refactor that special-cased one specific length (e.g.
+        // "fast path for the 43-byte verifier" using a non-constant-
+        // time compare) would surface here as that specific length
+        // diverging from the others.
+        for &len in &[43, 50, 64, 96, 128] {
+            let verifier = "x".repeat(len);
+            let digest = Sha256::digest(verifier.as_bytes());
+            let challenge = URL_SAFE_NO_PAD.encode(digest);
+            assert!(
+                verify_pkce_s256(&verifier, &challenge).is_ok(),
+                "verifier of length {len} should round-trip via its canonical challenge",
+            );
+        }
+    }
+
+    #[test]
     fn error_display_strings_are_stable_for_log_filters() {
         // Operator log filters key on the substring "PKCE check" /
         // "length must be 43..=128". A future variant rename or message

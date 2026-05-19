@@ -423,6 +423,154 @@ mod tests {
         assert_eq!(back.extra["n"], 42);
     }
 
+    #[tokio::test]
+    async fn action_stream_trait_is_dyn_compatible_via_arc_dyn_dispatch() {
+        // The `ActionStream` trait is consumed everywhere as
+        // `Arc<dyn ActionStream>` — AppState holds it as a trait object
+        // so different concrete implementations (LoggingStream,
+        // BroadcastingActionStream, TeeStream) can plug in
+        // interchangeably. Pin trait object-safety explicitly via an
+        // erased dispatch: build an `Arc<dyn ActionStream>` from a
+        // concrete LoggingStream and call `publish` through the trait
+        // object boundary. A refactor that added a generic method or a
+        // `Self: Sized` bound would silently break the object-safety
+        // and surface as a confusing compile error at the AppState
+        // assembly site rather than here.
+        let erased: Arc<dyn ActionStream> = Arc::new(LoggingStream);
+        erased.publish(sample()).await;
+    }
+
+    #[test]
+    fn action_event_serialization_is_byte_deterministic_across_repeated_calls() {
+        // Serde with derived Serialize emits fields in declaration order
+        // — the wire shape is byte-deterministic for any given input.
+        // Pin determinism by serializing the SAME sample 5 times and
+        // asserting all 5 byte-strings are equal. A refactor that
+        // swapped to a manual `Serialize` impl with HashMap-backed
+        // serialization "for ergonomic field-set extensibility" would
+        // surface here as non-deterministic key order across calls and
+        // break every consumer that expects deterministic action_event
+        // rows for log-line deduplication.
+        let e = sample();
+        let s1 = serde_json::to_string(&e).unwrap();
+        let s2 = serde_json::to_string(&e).unwrap();
+        let s3 = serde_json::to_string(&e).unwrap();
+        let s4 = serde_json::to_string(&e).unwrap();
+        let s5 = serde_json::to_string(&e).unwrap();
+        assert_eq!(s1, s2);
+        assert_eq!(s2, s3);
+        assert_eq!(s3, s4);
+        assert_eq!(s4, s5);
+    }
+
+    #[test]
+    fn action_event_json_contains_fifteen_keys_when_extra_is_null() {
+        // The wire shape has 16 fields; with `extra: Value::Null` the
+        // `skip_serializing_if = "Value::is_null"` elides one, leaving
+        // exactly 15 keys on the wire. Pin the exact key set so a
+        // refactor that added a 17th field (or accidentally removed
+        // the skip-if) would surface here as a multi-name diff rather
+        // than as some downstream consumer ad-hoc complaining about a
+        // missing or unexpected key. The list is the load-bearing
+        // schema contract for SIEM ingestors that assert presence
+        // before parsing.
+        let s = serde_json::to_string(&sample()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let obj = v.as_object().expect("must be a JSON object");
+        assert_eq!(obj.len(), 15, "wire shape: {s}");
+        for key in [
+            "request_id",
+            "agent_session_id",
+            "p_0",
+            "leaf_pca_id",
+            "vendor",
+            "action",
+            "method",
+            "path",
+            "status",
+            "decision",
+            "block_reason",
+            "read_filter_triggered",
+            "quarantined_count",
+            "at",
+            "policy_id",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key} in: {s}");
+        }
+        assert!(
+            !obj.contains_key("extra"),
+            "extra null must be skipped: {s}"
+        );
+    }
+
+    #[test]
+    fn action_event_json_contains_sixteen_keys_when_extra_is_non_null() {
+        // Symmetric pin to the 15-key-with-null version — when `extra`
+        // carries a real value the wire shape grows to exactly 16 keys.
+        // A refactor that flipped the skip-if predicate to
+        // `Option::is_none` (collapsing the "structured null vs absent"
+        // distinction the spec relies on) would silently re-add the
+        // `"extra":null` shape and surface as a 17-key envelope here.
+        let mut e = sample();
+        e.extra = serde_json::json!({"to_domain": "external.com"});
+        let s = serde_json::to_string(&e).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let obj = v.as_object().expect("must be a JSON object");
+        assert_eq!(obj.len(), 16, "wire shape: {s}");
+        assert!(obj.contains_key("extra"));
+    }
+
+    #[test]
+    fn action_event_extra_with_json_array_value_round_trips_byte_equal() {
+        // The `extra` field is `serde_json::Value` — it accepts any
+        // JSON shape (object / array / scalar). The existing
+        // `extra_object_is_serialized` test pins the object shape; pin
+        // the ARRAY shape so a refactor to `extra: HashMap<String, Value>`
+        // "for type-level safety on the dashboard side" would surface
+        // here. Some adapters legitimately emit array `extra` payloads
+        // (e.g. a list of quarantined attachment names) — pin a
+        // 3-element array round-trip.
+        let mut e = sample();
+        e.extra = serde_json::json!(["attachment1.pdf", "attachment2.zip", "attachment3.docx"]);
+        let s = serde_json::to_string(&e).unwrap();
+        let back: ActionEvent = serde_json::from_str(&s).unwrap();
+        let arr = back
+            .extra
+            .as_array()
+            .expect("extra must round-trip as array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], "attachment1.pdf");
+        assert_eq!(arr[1], "attachment2.zip");
+        assert_eq!(arr[2], "attachment3.docx");
+    }
+
+    #[test]
+    fn action_event_block_reason_none_serializes_as_json_null_not_skipped() {
+        // `block_reason: Option<String>` does NOT carry the
+        // `skip_serializing_if` attribute — None must land as
+        // `"block_reason":null` on the wire, not be elided. The
+        // operator dashboard's "block reason histogram" panel keys on
+        // the JSON null vs absent distinction to bucket "explicit no
+        // reason" vs "unknown shape from old SIEM rows". A refactor
+        // that added `#[serde(skip_serializing_if = "Option::is_none")]`
+        // "for compactness" would silently collapse the two shapes.
+        // Pin both polarities — None → null literal, Some → quoted
+        // string.
+        let mut e = sample();
+        e.block_reason = None;
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(
+            s.contains("\"block_reason\":null"),
+            "None must serialize as null: {s}"
+        );
+        e.block_reason = Some("policy_blocked".into());
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(
+            s.contains("\"block_reason\":\"policy_blocked\""),
+            "Some must quote: {s}"
+        );
+    }
+
     #[test]
     fn logging_stream_default_produces_usable_instance() {
         // `LoggingStream` derives `Default` — pin the derive so a

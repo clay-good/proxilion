@@ -703,6 +703,122 @@ mod tests {
     }
 
     #[test]
+    fn notifier_public_state_is_clone_send_sync_static_for_axum_state_boundary() {
+        // `NotifierPublicState` is wired into `Router::with_state(...)`
+        // — axum's `State` extractor requires (Clone + Send + Sync + 'static).
+        // A refactor that gave it an `Rc<...>` field "for cheap shared
+        // BlockedApiState" would break Send + Sync but the breakage would
+        // surface at router assembly with an unrelated `tower::Service`
+        // trait-bound error referencing some opaque future type. Pin the
+        // bound combo at this file so the type boundary fails fast at
+        // the right call site.
+        fn require_clone_send_sync_static<T: Clone + Send + Sync + 'static>() {}
+        require_clone_send_sync_static::<NotifierPublicState>();
+    }
+
+    #[test]
+    fn html_escape_each_of_the_five_special_chars_individually_maps_to_correct_entity() {
+        // The existing `payload_attacks` pin asserts presence of all five
+        // entities in one combined string. Pin the per-character mapping
+        // explicitly — a refactor that introduced an off-by-one in the
+        // match arms (e.g. `'<' => "&gt;"` swapped with `'>' => "&lt;"`)
+        // would still pass the combined-string assertion (both entities
+        // are present) but flip the semantic meaning of every escaped
+        // angle bracket in the rendered HTML. Pin the five mappings
+        // byte-exact via `assert_eq!`:
+        //   `<` → `&lt;`   `>` → `&gt;`   `&` → `&amp;`
+        //   `"` → `&quot;` `'` → `&#39;`
+        assert_eq!(html_escape("<"), "&lt;");
+        assert_eq!(html_escape(">"), "&gt;");
+        assert_eq!(html_escape("&"), "&amp;");
+        assert_eq!(html_escape("\""), "&quot;");
+        assert_eq!(html_escape("'"), "&#39;");
+    }
+
+    #[test]
+    fn html_escape_passes_non_special_ascii_bytes_through_byte_for_byte() {
+        // The `_ => out.push(c)` catch-all branch preserves all non-
+        // special ASCII byte-for-byte. Pin a wide spread of common
+        // characters in operator-facing strings (digits, letters, space,
+        // punctuation that ISN'T in the five-char escape set) so a
+        // refactor that "expanded the escape set for extra safety" (e.g.
+        // started escaping `/` to `&#x2F;` for some "XSS safety in HTML
+        // attributes" guidance) would surface here as a no-longer-byte-
+        // equal pass-through and break the rendered HTML's visual
+        // appearance for paths like `/drive/v3/files/abc`.
+        let plain = "abcXYZ 0123456789 .,;:!?/-_+=()[]{}";
+        assert_eq!(html_escape(plain), plain);
+    }
+
+    #[tokio::test]
+    async fn render_error_response_content_type_is_text_html() {
+        // The approver landing is rendered as `Html(...)` which axum
+        // ships as `content-type: text/html; charset=utf-8` — pin the
+        // prefix so a refactor that swapped to a raw `String` response
+        // (which defaults to `text/plain`) would silently un-render the
+        // HTML in every approver's browser as raw markup. The exact
+        // suffix `; charset=utf-8` is axum's choice and may shift; pin
+        // the meaningful prefix `text/html`.
+        let r = render_error("oops");
+        let ct = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/html"),
+            "expected text/html content-type, got: {ct}",
+        );
+    }
+
+    #[tokio::test]
+    async fn render_error_returns_status_ok_not_4xx_for_approver_self_service_fix() {
+        // Error pages return `StatusCode::OK` rather than 4xx — the
+        // approver page is a human-facing UI, not an API; surfacing a
+        // 4xx would let some browsers display the bare status text
+        // instead of the rendered HTML, AND some corporate proxies
+        // suppress 4xx response bodies wholesale ("hide error pages
+        // from end users"). The rendered HTML carries the error
+        // message and the suggested operator action — the response
+        // MUST land in the browser. Pin `200` directly. A refactor
+        // that swapped to `StatusCode::BAD_REQUEST` "for proper REST
+        // semantics" would silently break the approver UX behind
+        // those proxies.
+        for msg in [
+            "Link unknown or already used",
+            "Link expired",
+            "Internal error: db down",
+        ] {
+            let r = render_error(msg);
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "render_error({msg:?}) should return 200, got {:?}",
+                r.status(),
+            );
+        }
+    }
+
+    #[test]
+    fn html_escape_preserves_byte_length_of_each_special_char_replacement_relative_to_input() {
+        // Each of the five entities expands by a known byte delta from
+        // its single-byte input: `<` (1 byte) → `&lt;` (4) → +3; `>` → +3;
+        // `&` → +4; `"` → +5; `'` → +4. Pin the deltas so a refactor that
+        // introduced shorter HTML5-named entities (e.g. `&apos;` instead
+        // of `&#39;` for the apostrophe, which would change +4 to +5) or
+        // longer "extra-defensive" entities (e.g. `&#x26;` instead of
+        // `&amp;`, +4 → +5) would surface here. The renderer's
+        // String::with_capacity sizing (currently `s.len()`) would also
+        // need updating in lockstep — a shorter capacity hint would
+        // cause realloc; a longer one would waste memory.
+        assert_eq!(html_escape("<").len(), 1 + 3);
+        assert_eq!(html_escape(">").len(), 1 + 3);
+        assert_eq!(html_escape("&").len(), 1 + 4);
+        assert_eq!(html_escape("\"").len(), 1 + 5);
+        assert_eq!(html_escape("'").len(), 1 + 4);
+    }
+
+    #[test]
     fn template_substitutions_fill_all_placeholders() {
         let row = TokenRow {
             token_id: Uuid::new_v4(),

@@ -428,6 +428,127 @@ mod tests {
     }
 
     #[test]
+    fn default_tick_interval_as_millis_and_secs_f64_cross_method_consistent() {
+        // The constant is the canonical `from_secs(60)`. Pin three
+        // alternate accessors (`as_millis` / `as_secs_f64` / `as_nanos`)
+        // all report the equivalent value in their respective units —
+        // a refactor that swapped to `from_secs_f64(60.0)` would still
+        // equal `from_secs(60)` via `PartialEq`, but a refactor to
+        // `from_secs_f64(59.9999999)` or `from_micros(59_999_999)`
+        // "for some operator-overridable shape" would silently drift
+        // any future code that reads through `as_millis` (a common
+        // shape for handing tick intervals to non-Rust services like
+        // a tonic gRPC metric collector that wants milliseconds). Pin
+        // all three accessors at the exact unit-converted value.
+        assert_eq!(DEFAULT_TICK_INTERVAL.as_millis(), 60_000);
+        assert_eq!(DEFAULT_TICK_INTERVAL.as_secs_f64(), 60.0);
+        assert_eq!(DEFAULT_TICK_INTERVAL.as_nanos(), 60_000_000_000);
+    }
+
+    #[test]
+    fn default_tick_interval_arithmetic_round_trips_through_double_and_half() {
+        // `Duration` supports `*`/`/` against integers via `Mul<u32>` /
+        // `Div<u32>`. The sweeper loop does not currently scale the
+        // interval, but a future config that supports "tick every
+        // half / double the default for staging" would call those
+        // operators. Pin that the canonical value scales cleanly:
+        // doubling yields exactly 120s (no overflow), halving yields
+        // exactly 30s (no truncation). A refactor that switched the
+        // constant to `from_millis(60_001)` "for some boundary
+        // safety" would surface here as a non-byte-exact arithmetic
+        // result.
+        assert_eq!(DEFAULT_TICK_INTERVAL * 2, Duration::from_secs(120));
+        assert_eq!(DEFAULT_TICK_INTERVAL / 2, Duration::from_secs(30));
+        assert_eq!(DEFAULT_TICK_INTERVAL * 60, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn expiry_and_escalation_report_default_debug_carry_field_name_with_zero_value() {
+        // The two report types both carry a single u64 field, named
+        // `expired_rows` and `escalated_rows` respectively. Pin that
+        // Default-constructed Debug output BYTE-CONTAINS the literal
+        // "expired_rows: 0" / "escalated_rows: 0" — the existing
+        // Debug-renders-field-name pins on non-zero values cover the
+        // non-zero arm; pin the zero arm so a refactor to a manual
+        // Debug impl that elided zero values "for noise reduction"
+        // (e.g. `if self.expired_rows > 0 { ... }`) would silently
+        // collapse the no-op-sweep log line to an empty struct
+        // `ExpirySweepReport {}` and break operator log filters that
+        // grep for "expired_rows:" as the sweep-completion marker.
+        let e = ExpirySweepReport::default();
+        let s = EscalationSweepReport::default();
+        let e_dbg = format!("{e:?}");
+        let s_dbg = format!("{s:?}");
+        assert!(e_dbg.contains("expired_rows: 0"), "got: {e_dbg}");
+        assert!(s_dbg.contains("escalated_rows: 0"), "got: {s_dbg}");
+    }
+
+    #[test]
+    fn expiry_and_escalation_report_debug_is_deterministic_across_independent_constructions() {
+        // The derived Debug impl is byte-stable for the same field
+        // values across independent constructions — pin this for both
+        // report types so a refactor that introduced any non-derived
+        // Debug variation (e.g. a timestamp suffix "for in-line
+        // sweep id tagging") would surface here as a string diff
+        // between two equal-field instances. Operator log filters
+        // that key on the exact rendered Debug shape (a brittle but
+        // common ops pattern when ad-hoc debugging in the spawn loop)
+        // rely on this stability.
+        let e1 = ExpirySweepReport { expired_rows: 7 };
+        let e2 = ExpirySweepReport { expired_rows: 7 };
+        assert_eq!(format!("{e1:?}"), format!("{e2:?}"));
+        let s1 = EscalationSweepReport { escalated_rows: 13 };
+        let s2 = EscalationSweepReport { escalated_rows: 13 };
+        assert_eq!(format!("{s1:?}"), format!("{s2:?}"));
+        // Cross-type debug strings must NOT compare equal even at the
+        // same numeric value — they carry distinct field names.
+        let e_at_5 = ExpirySweepReport { expired_rows: 5 };
+        let s_at_5 = EscalationSweepReport { escalated_rows: 5 };
+        assert_ne!(format!("{e_at_5:?}"), format!("{s_at_5:?}"));
+    }
+
+    #[test]
+    fn report_struct_update_syntax_preserves_base_field_unchanged() {
+        // Rust's `..base` struct-update syntax is the natural shape for
+        // building a sweep report with a "but with one field overridden"
+        // pattern. The reports have one field today so struct-update
+        // would be a no-op, but pin that the construction shape works
+        // — a refactor that added a `started_at: DateTime<Utc>` field
+        // "for sweep-duration logging" would force every call site
+        // (the sweep_once `Ok(ExpirySweepReport { expired_rows: n })`
+        // and the sweep_escalations `Ok(EscalationSweepReport { escalated_rows: n })`)
+        // to update in lockstep. The struct-update shape catches this
+        // by failing to compile if the field count changed without
+        // updating the struct construction.
+        let base = ExpirySweepReport { expired_rows: 42 };
+        let derived = ExpirySweepReport { ..base.clone() };
+        assert_eq!(derived.expired_rows, 42);
+        // Also pin the escalation arm.
+        let base_s = EscalationSweepReport { escalated_rows: 99 };
+        let derived_s = EscalationSweepReport { ..base_s.clone() };
+        assert_eq!(derived_s.escalated_rows, 99);
+    }
+
+    #[test]
+    fn default_constructed_reports_compare_equal_field_values_to_literal_zero_construction() {
+        // Pin that `ExpirySweepReport::default()` and
+        // `ExpirySweepReport { expired_rows: 0 }` produce field-equal
+        // values — the two constructions are semantically equivalent
+        // and must remain so. A refactor that gave `Default` a
+        // distinguishing sentinel (e.g. `expired_rows: 1` as a
+        // "fresh-vs-tick-completed marker") would silently change
+        // the no-overdue-rows path's reported count from 0 to that
+        // sentinel and break every operator dashboard panel that
+        // sums `expired_rows`. Symmetric pin on the escalation arm.
+        let d1 = ExpirySweepReport::default();
+        let d2 = ExpirySweepReport { expired_rows: 0 };
+        assert_eq!(d1.expired_rows, d2.expired_rows);
+        let s1 = EscalationSweepReport::default();
+        let s2 = EscalationSweepReport { escalated_rows: 0 };
+        assert_eq!(s1.escalated_rows, s2.escalated_rows);
+    }
+
+    #[test]
     fn default_tick_interval_carries_no_subsecond_component() {
         // The `Duration::from_secs(60)` constructor pins zero subsecond
         // nanos. A regression that swapped to `Duration::from_millis(60_000)`

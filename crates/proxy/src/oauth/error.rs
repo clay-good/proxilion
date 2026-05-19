@@ -538,6 +538,169 @@ mod tests {
     }
 
     #[test]
+    fn oauth_error_is_send_sync_static_for_axum_into_response_boundary() {
+        // `OAuthError` is the return-error type for every OAuth handler
+        // (`/authorize`, `/callback`, `/token`) — it flows through
+        // `IntoResponse` from handler futures that cross tokio task
+        // boundaries, which mandates `Send + Sync + 'static`. Symmetric
+        // to the AppError pin on [crates/proxy/src/adapters/error.rs] and
+        // the ApiError + KillswitchApiState pin on
+        // [crates/proxy/src/api/killswitch.rs]. A refactor that introduced
+        // a !Send field (e.g. `Internal(Rc<String>)` "for cheap clone")
+        // would break Sync at the router site rather than as a
+        // far-removed trait-bound error.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<OAuthError>();
+    }
+
+    #[test]
+    fn oauth_error_status_across_all_variants_is_4xx_or_5xx_never_2xx_or_3xx() {
+        // Symmetric to the same-axis pin on [crates/proxy/src/adapters/error.rs]
+        // (round 143). Every OAuthError variant surfaces a non-success
+        // status — a refactor that registered a new variant mapping to
+        // 200 OK "for the silent-acknowledgement case" would silently
+        // exclude that variant from operator dashboard error-rate
+        // metrics. Pin both is_client_error || is_server_error AND
+        // !is_success AND !is_redirection across all variants.
+        let variants: Vec<OAuthError> = vec![
+            OAuthError::BadRequest("x".into()),
+            OAuthError::UnknownClient,
+            OAuthError::SessionGone,
+            OAuthError::BridgeRejected("x".into()),
+            OAuthError::PkceFail,
+            OAuthError::BadAuthCode,
+            OAuthError::PicInvariant("x".into()),
+            OAuthError::Db(sqlx::Error::RowNotFound),
+            OAuthError::Crypto,
+            OAuthError::Internal("x".into()),
+        ];
+        for v in &variants {
+            let s = v.status();
+            assert!(!s.is_success(), "variant {:?} surfaced 2xx {}", v, s);
+            assert!(!s.is_redirection(), "variant {:?} surfaced 3xx {}", v, s);
+            assert!(
+                s.is_client_error() || s.is_server_error(),
+                "variant {:?} surfaced non-4xx/5xx {}",
+                v,
+                s,
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_error_body_code_is_lowercase_snake_case_across_all_variants() {
+        // Symmetric to the same-axis pin on [crates/proxy/src/adapters/error.rs]
+        // (round 143). The wire convention is lowercase snake_case
+        // (e.g. `pkce_fail`, `bridge_rejected`, `pic_invariant_violation`).
+        // A refactor that surfaced one as PascalCase OR kebab-case would
+        // silently break every operator dashboard regex bucket. Pin
+        // absence of uppercase ASCII AND absence of `-` across all
+        // canonical OAuthError variants.
+        let variants: Vec<OAuthError> = vec![
+            OAuthError::BadRequest("x".into()),
+            OAuthError::UnknownClient,
+            OAuthError::SessionGone,
+            OAuthError::BridgeRejected("x".into()),
+            OAuthError::PkceFail,
+            OAuthError::BadAuthCode,
+            OAuthError::PicInvariant("x".into()),
+            OAuthError::Db(sqlx::Error::RowNotFound),
+            OAuthError::Crypto,
+            OAuthError::Internal("x".into()),
+        ];
+        for v in &variants {
+            let code = v.body().code;
+            assert!(!code.is_empty(), "variant {:?} surfaced empty code", v);
+            assert!(
+                !code.chars().any(|c| c.is_ascii_uppercase()),
+                "variant {:?} surfaced uppercase in code `{}`",
+                v,
+                code,
+            );
+            assert!(
+                !code.contains('-'),
+                "variant {:?} surfaced kebab in code `{}`",
+                v,
+                code,
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_error_body_detail_carries_multibyte_unicode_verbatim_through_bad_request_arm() {
+        // The `BadRequest(String)` and `BridgeRejected(String)` and
+        // `PicInvariant(String)` arms all surface their inner String
+        // directly into body().detail (the existing pins use ASCII-only
+        // inner content). Internationalized error contexts surface
+        // multibyte unicode through OAuth flows occasionally (e.g. an
+        // upstream Google error message with localized text, or an
+        // operator-authored policy id with a non-ASCII slug). Pin all
+        // three arms preserve multibyte unicode (3-byte é + 3-byte → +
+        // 4-byte 🔥) verbatim through body().detail. A refactor that
+        // `.to_ascii_lowercase()`-ed the inner string "for SIEM
+        // hygiene" would silently mangle every non-ASCII detail.
+        let needle = "ops missing café → 🔥";
+        for body in [
+            OAuthError::BadRequest(needle.into()).body(),
+            OAuthError::BridgeRejected(needle.into()).body(),
+            OAuthError::PicInvariant(needle.into()).body(),
+        ] {
+            assert_eq!(body.detail.as_deref(), Some(needle));
+        }
+    }
+
+    #[test]
+    fn oauth_error_debug_carries_variant_names_for_grep_bucketing() {
+        // The `#[derive(Debug)]` on `OAuthError` feeds `?err` /
+        // `error = %self` in the `into_response` log path. Operators
+        // grep the log line by variant name to bucket PkceFail vs
+        // BadAuthCode vs SessionGone vs Db vs Internal. A hand-rolled
+        // `impl Debug` that hid variant names "to compact" the line
+        // would break every operator bucket. Symmetric to the
+        // `app_error_debug_carries_variant_names_for_grep_bucketing`
+        // pin on [crates/proxy/src/adapters/error.rs] and the
+        // `api_error_debug_carries_variant_names_for_grep_bucketing`
+        // pin on [crates/proxy/src/api/killswitch.rs] — keep the
+        // three operator-facing Error enums symmetric.
+        for (variant, name) in [
+            (OAuthError::PkceFail, "PkceFail"),
+            (OAuthError::BadAuthCode, "BadAuthCode"),
+            (OAuthError::SessionGone, "SessionGone"),
+            (OAuthError::Crypto, "Crypto"),
+            (OAuthError::UnknownClient, "UnknownClient"),
+        ] {
+            let s = format!("{:?}", variant);
+            assert!(s.contains(name), "expected `{name}` in Debug, got: {s}");
+        }
+    }
+
+    #[test]
+    fn oauth_error_status_500_branch_is_internal_server_error_not_service_unavailable() {
+        // The Db / Crypto / Internal trio collapse to
+        // `INTERNAL_SERVER_ERROR` (500), NOT `SERVICE_UNAVAILABLE` (503).
+        // The choice is deliberate: the agent's retry classifier
+        // distinguishes 500 (proxy bug — don't retry, file an issue)
+        // from 503 (transient — retry with backoff). A refactor that
+        // re-classified Db to 503 "since pool exhaustion is transient"
+        // would silently flip every operator's alert pager from
+        // "code=internal_error status=500" to a transient-class
+        // notification that misses the underlying outage. Pin the
+        // exact status for all three arms via the `as_u16()` integer
+        // (NOT just the .is_server_error() class) so a one-step drift
+        // from 500 to 503 surfaces here. The existing
+        // `status_codes_match_variant_classification` test pins
+        // Crypto + Internal via `INTERNAL_SERVER_ERROR` constant but
+        // NOT Db; widen with the integer-level pin across all three.
+        for v in [
+            OAuthError::Db(sqlx::Error::RowNotFound),
+            OAuthError::Crypto,
+            OAuthError::Internal("x".into()),
+        ] {
+            assert_eq!(v.status().as_u16(), 500, "variant {:?} drifted from 500", v,);
+        }
+    }
+
+    #[test]
     fn body_fix_strings_are_actionable_for_unique_variants() {
         // Pin the fix text for the four variants whose fix strings are
         // their stable contract with the operator-docs page (the docs page

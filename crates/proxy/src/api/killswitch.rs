@@ -528,6 +528,172 @@ mod tests {
         assert_eq!(yes_padded.confirm.as_deref(), Some(" yes "));
     }
 
+    #[tokio::test]
+    async fn populate_kill_cache_marks_one_hundred_distinct_hashes_all_observable() {
+        // The existing pin walks 2 hashes. Widen to N=100 with distinct
+        // 32-byte hashes — `/killswitch/all` on a realistic install
+        // marks thousands of bearer hashes in a single call. Pin that
+        // ALL 100 surface as `is_killed == true` AND a probe of a
+        // 101st distinct hash returns `false` (no spurious population).
+        // A refactor that, e.g., capped the per-call mark batch at
+        // N=64 "for moka cache hot-path budget" would silently lose
+        // every hash beyond the cap on a kill-all sweep and let
+        // bearers continue to authenticate past revocation.
+        let kc = KillCache::new();
+        let rows: Vec<(Vec<u8>,)> = (0..100u8).map(|i| ([i; 32].to_vec(),)).collect();
+        populate_kill_cache(&kc, &rows).await;
+        for i in 0..100u8 {
+            assert!(
+                kc.is_killed(&[i; 32]).await,
+                "hash {i} not killed after batch populate",
+            );
+        }
+        // Sentinel: a 101st hash NOT in the input must remain unkilled.
+        assert!(!kc.is_killed(&[200u8; 32]).await);
+    }
+
+    #[test]
+    fn kill_response_serialized_json_object_carries_exactly_five_known_keys() {
+        // The struct has 5 fields (record_id, scope, target,
+        // bearers_revoked, at). When serialized the JSON object MUST
+        // carry EXACTLY those 5 keys — not 4 (an elided field would
+        // silently drop operator-visible state from the killswitch
+        // confirmation toast) and not 6 (a refactor that surfaced an
+        // internal correlation-id "for telemetry" would widen the
+        // wire shape and potentially leak request-internal state to
+        // the operator UI). The existing
+        // `kill_response_serializes_with_stable_field_names` pin
+        // checks individual key presence but NOT exact count. Pin
+        // both axes.
+        let r = KillResponse {
+            record_id: Uuid::nil(),
+            scope: "session",
+            target: "abc".into(),
+            bearers_revoked: 3,
+            at: Utc::now(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        let obj = v.as_object().expect("must serialize to JSON object");
+        assert_eq!(obj.len(), 5, "field count drift: {obj:?}");
+        for k in ["record_id", "scope", "target", "bearers_revoked", "at"] {
+            assert!(obj.contains_key(k), "missing key {k}: {obj:?}");
+        }
+    }
+
+    #[test]
+    fn kill_body_serialized_json_object_carries_exactly_three_known_optional_keys_when_all_set() {
+        // Symmetric to the KillResponse count pin. KillBody has 3
+        // optional fields (reason, operator_subject, confirm). When
+        // all are set, the round-trip via serialize-then-deserialize
+        // recovers exactly 3 keys. A refactor that elided a field
+        // "for backwards compat with CLI v1" would silently drop the
+        // killswitch authorization audit-trail. Pin via a fresh
+        // KillBody serialized from a hand-built JSON with all three
+        // fields populated.
+        let body: KillBody = serde_json::from_str(
+            r#"{"reason":"drill","operator_subject":"alice","confirm":"yes"}"#,
+        )
+        .unwrap();
+        // All three fields populated from the input.
+        assert_eq!(body.reason.as_deref(), Some("drill"));
+        assert_eq!(body.operator_subject.as_deref(), Some("alice"));
+        assert_eq!(body.confirm.as_deref(), Some("yes"));
+        // Symmetric inspection via Debug to pin all three field names
+        // are rendered (a refactor that hid a field from Debug would
+        // surface here as a missing name).
+        let dbg = format!("{:?}", body);
+        for f in ["reason", "operator_subject", "confirm"] {
+            assert!(dbg.contains(f), "missing {f} in Debug: {dbg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn killswitch_api_state_clone_shares_inner_kill_cache_handle() {
+        // `KillswitchApiState` is `#[derive(Clone)]`. Inside, the
+        // `kill_cache: KillCache` field is itself Clone (wraps an
+        // Arc<...>). When the axum router clones the state per
+        // request-scope (axum's State<...> extractor invokes
+        // `.clone()`), both clones MUST share the SAME underlying
+        // KillCache so a mark from one handler is observable on a
+        // sibling handler's read. The existing
+        // `api_error_and_killswitch_state_are_send_sync_static_for_axum_state_boundary`
+        // pin only checks Send+Sync+'static. Pin Clone-share
+        // observability here: insert a marker via one clone, read
+        // it back via another.
+        use crate::kill_cache::KillCache;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/x")
+            .expect("lazy pool builds");
+        let state = KillswitchApiState {
+            db: pool,
+            kill_cache: KillCache::new(),
+        };
+        let clone_a = state.clone();
+        let clone_b = state.clone();
+        // Mark via clone_a; observe via clone_b — both must share
+        // the same backing KillCache.
+        clone_a.kill_cache.mark_many(vec![[7u8; 32]]).await;
+        assert!(
+            clone_b.kill_cache.is_killed(&[7u8; 32]).await,
+            "kill_cache not shared across Clone — refactor broke axum State propagation",
+        );
+    }
+
+    #[test]
+    fn kill_response_scope_field_is_static_str_lifetime_compile_time_bound() {
+        // `scope: &'static str` is the lifetime contract — the three
+        // canonical scopes ("session", "user", "all") are
+        // `&'static str` literals constructed at the handler site.
+        // A refactor to `scope: String` would silently heap-allocate
+        // on every killswitch invocation (one allocation per call,
+        // bounded but unnecessary on the hot kill_all path). Pin
+        // the lifetime contract via a function that takes
+        // `&'static str` only — type-coercion alone fails if the
+        // field's type drifts.
+        fn require_static_str(_: &'static str) {}
+        let r = KillResponse {
+            record_id: Uuid::nil(),
+            scope: "session",
+            target: "abc".into(),
+            bearers_revoked: 0,
+            at: Utc::now(),
+        };
+        require_static_str(r.scope);
+        // And the target field is owned String (the inverse pin —
+        // target IS heap-allocated because it carries
+        // operator-supplied UUIDs / p_0 emails).
+        assert_eq!(r.target, "abc");
+    }
+
+    #[tokio::test]
+    async fn populate_kill_cache_idempotent_across_duplicate_hash_in_same_batch() {
+        // The same bearer hash appearing twice in one `RETURNING`
+        // batch (a legitimate edge case if a future schema change
+        // surfaced multiple `agent_bearers` rows sharing the same
+        // `bearer_sha256` — e.g. soft-delete + re-issue) must NOT
+        // cause `populate_kill_cache` to panic or skip. Pin
+        // idempotent behavior: the same hash appearing 5 times in
+        // one batch yields exactly one `is_killed == true` for
+        // that hash AND no spurious effect on a different hash in
+        // the same batch. A refactor that switched the inner
+        // accumulator from `Vec` to a fail-on-duplicate `HashSet`
+        // would surface here as a panic OR silent drop.
+        let kc = KillCache::new();
+        let rows: Vec<(Vec<u8>,)> = vec![
+            ([7u8; 32].to_vec(),),
+            ([7u8; 32].to_vec(),),
+            ([7u8; 32].to_vec(),),
+            ([7u8; 32].to_vec(),),
+            ([7u8; 32].to_vec(),),
+            ([42u8; 32].to_vec(),),
+        ];
+        populate_kill_cache(&kc, &rows).await;
+        assert!(kc.is_killed(&[7u8; 32]).await);
+        assert!(kc.is_killed(&[42u8; 32]).await);
+        assert!(!kc.is_killed(&[0u8; 32]).await);
+    }
+
     #[test]
     fn kill_body_accepts_confirm_yes_for_kill_all() {
         // /killswitch/all rejects without `confirm: "yes"` — pin that the

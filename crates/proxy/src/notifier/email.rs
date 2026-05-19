@@ -770,4 +770,112 @@ mod tests {
         let out = parse_or_fallback(&[], &fallback, "to");
         assert!(out.is_empty());
     }
+
+    #[test]
+    fn email_notifier_and_build_error_are_send_sync_static_for_app_state_arc_path() {
+        // `EmailNotifier` is wired into `Notifiers` (held by AppState as
+        // `Arc<Notifiers>`) and its async send path crosses tokio task
+        // boundaries via TeeStream + the escalation sweeper. `EmailBuildError`
+        // flows through `anyhow::Error` chains at boot. Pin the three-trait
+        // combo on both types so a refactor that introduced a `Cell<...>`
+        // field on the notifier (e.g. "for in-process retry tracking") or
+        // an `Rc<String>` inside `EmailBuildError` would break Send/Sync at
+        // the AppState site rather than as a far-removed trait-bound error.
+        // Symmetric to the
+        // `siem_forwarder_and_key_types_are_send_sync_static_for_app_state_arc_path`
+        // pin on [crates/proxy/src/forwarder/siem.rs].
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<EmailNotifier>();
+        require_send_sync_static::<EmailBuildError>();
+    }
+
+    #[test]
+    fn email_build_error_implements_std_error_trait_with_no_source_leaf_contract() {
+        // `EmailBuildError` is a `thiserror::Error` derive with the
+        // `#[error("email build: {0}")]` shape — a leaf arm carrying
+        // only a `String`. Pin the `std::error::Error` impl via dyn-cast
+        // AND confirm `source() == None` so a refactor that swapped to
+        // a `#[from] lettre::transport::smtp::Error` wrapping shape
+        // "for richer triage" would surface here at the trait cast
+        // (source becomes Some) rather than as a silently-doubled
+        // detail string in operator logs (the inner Display would
+        // duplicate via the chain walk AND via the wrapper Display).
+        let e = EmailBuildError("smtp url: bad scheme".into());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(
+            std::error::Error::source(dyn_err).is_none(),
+            "EmailBuildError must be leaf arm with no source",
+        );
+    }
+
+    #[test]
+    fn email_build_error_debug_carries_struct_name_for_grep_bucketing() {
+        // `EmailBuildError` feeds `?e` in `tracing::warn!` call sites
+        // at boot and at notifier-driver hot-swap (`/api/v1/notifier/config`)
+        // paths. Operators grep the resulting log line by struct name to
+        // bucket "email driver build fault" separately from the sibling
+        // KeyError / BuildError / ConnectError shapes that share the
+        // `?e` log convention. A hand-rolled `impl Debug` that hid the
+        // struct name "to compact" the line would break the bucket.
+        // Pin the struct-name shape — symmetric to the
+        // `key_error_and_build_error_debug_carries_struct_name_for_grep`
+        // pin on [crates/proxy/src/forwarder/siem.rs].
+        let s = format!("{:?}", EmailBuildError("inner reason".into()));
+        assert!(s.contains("EmailBuildError"), "got: {s}");
+    }
+
+    #[test]
+    fn email_build_error_display_carries_byte_exact_email_build_prefix_with_inner() {
+        // `#[error("email build: {0}")]` — pin the byte-exact
+        // prefix-plus-inner Display shape via `assert_eq!`. The existing
+        // `invalid_smtp_url_errors` / `malformed_from_errors` / `empty_recipients_errors`
+        // tests use `.contains(...)` substring checks on the INNER half;
+        // pin the full wrapper shape here so a refactor that softened
+        // to `"email config: {0}"` (matching a config-layer rename) or
+        // dropped the colon ("email build {0}") would silently slip past
+        // a `.contains(...)` check but surface here. Operator log
+        // filters historically grep `"email build:"` to bucket email-
+        // driver boot failures separately from SMTP-send failures.
+        let e = EmailBuildError("smtp url: bad scheme".into());
+        assert_eq!(e.to_string(), "email build: smtp url: bad scheme");
+    }
+
+    #[test]
+    fn html_escape_preserves_char_order_across_interleaved_safe_and_unsafe_chars() {
+        // The escaper is a per-char pass that emits ONE entity (or the
+        // raw char) per input char. Pin that the OUTPUT preserves input
+        // CHAR ORDER across an interleaved safe/unsafe sequence — a
+        // refactor that swapped to a regex `replace_all` pass per
+        // entity (the "looks tidier" form) would silently re-order
+        // matches when entity matches overlap in non-obvious ways.
+        // Cross-pin against the previous tests which exercise pure-
+        // unsafe input only — this one fuses safe interior chars
+        // between every unsafe char.
+        let input = "a<b>c&d\"e'f";
+        let out = html_escape(input);
+        assert_eq!(out, "a&lt;b&gt;c&amp;d&quot;e&#39;f");
+    }
+
+    #[test]
+    fn parse_or_fallback_preserves_input_order_across_three_element_happy_path() {
+        // The existing happy-path test uses a 2-element list. Pin
+        // ORDER PRESERVATION across a 3-element list so a refactor that
+        // collected into a `HashSet` "for dedup" would silently change
+        // the recipient order in the To: header (operators recognize
+        // their team by which name appears first in mail-client lists).
+        // The existing test pins length + per-position equality on 2
+        // elements; this extends to 3 to catch a refactor that worked
+        // on a 2-element fixture but broke at 3.
+        let fallback = vec![mbox("fallback@example.com")];
+        let list = vec![
+            "alice@example.com".to_string(),
+            "Bob <bob@example.com>".to_string(),
+            "carol@example.com".to_string(),
+        ];
+        let out = parse_or_fallback(&list, &fallback, "to");
+        assert_eq!(out.len(), 3, "got: {out:?}");
+        assert_eq!(out[0].email.to_string(), "alice@example.com");
+        assert_eq!(out[1].email.to_string(), "bob@example.com");
+        assert_eq!(out[2].email.to_string(), "carol@example.com");
+    }
 }

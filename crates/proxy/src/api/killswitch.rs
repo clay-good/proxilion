@@ -410,6 +410,125 @@ mod tests {
     }
 
     #[test]
+    fn api_error_and_killswitch_state_are_send_sync_static_for_axum_state_boundary() {
+        // `KillswitchApiState` is wrapped in `Arc<...>` and passed via
+        // `with_state(...)` into the axum Router; axum requires
+        // `Send + Sync + 'static` on State types. `ApiError` flows
+        // through `IntoResponse` from handler futures crossing the
+        // tokio task boundary and also requires the same bounds. A
+        // refactor that gave `KillswitchApiState` an `Rc<...>` field
+        // "for cheap clone of a config bag" would break Sync at the
+        // router site with a far-removed trait-bound error. Pin all
+        // three trait bounds on both types here so the failure
+        // surfaces at the right module.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<KillswitchApiState>();
+        require_send_sync_static::<ApiError>();
+    }
+
+    #[test]
+    fn api_error_db_arm_display_passes_inner_sqlx_error_through_via_transparent_derive() {
+        // `Db(#[from] sqlx::Error)` uses `#[error(transparent)]` — the
+        // wrapper's Display MUST equal the inner sqlx::Error's Display
+        // byte-for-byte (no prefix, no formatting wrapper). A refactor
+        // that swapped `#[error(transparent)]` for an explicit
+        // `#[error("db: {0}")]` (the natural shape for "add context")
+        // would silently prepend "db: " to every Db-error log line and
+        // break operator log filters that already grep on the raw sqlx
+        // Display substrings. Pin transparent passthrough on a known
+        // sqlx::Error variant with a distinctive Display string.
+        let inner = sqlx::Error::RowNotFound;
+        let inner_s = inner.to_string();
+        let wrapped = ApiError::Db(sqlx::Error::RowNotFound);
+        assert_eq!(
+            wrapped.to_string(),
+            inner_s,
+            "transparent derive must passthrough Display verbatim",
+        );
+    }
+
+    #[test]
+    fn api_error_bad_request_arm_is_leaf_with_no_source() {
+        // Symmetric to the Db chain pin — `BadRequest(String)` is a
+        // leaf arm with no inner error. Pin source() == None so a
+        // refactor that wrapped the message in an `anyhow::Error` for
+        // "richer chain context" would surface here rather than as a
+        // duplicated detail in operator logs (the inner anyhow chain
+        // would render via source() AND duplicate via the Display).
+        let e = ApiError::BadRequest("missing field".into());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(
+            std::error::Error::source(dyn_err).is_none(),
+            "BadRequest leaf arm must not expose a source",
+        );
+    }
+
+    #[test]
+    fn api_error_debug_carries_variant_names_for_grep_bucketing() {
+        // The `#[derive(Debug)]` on `ApiError` feeds `?e` in
+        // `tracing::warn!(?err, ...)` call sites and the killswitch
+        // 500-branch logs. Operators grep the log line by variant
+        // name to bucket BadRequest (operator typo) vs Db (Postgres
+        // outage). A hand-rolled `impl Debug` that hid variant names
+        // "to compact" the line would break every operator bucket.
+        // Pin both variant names — symmetric to the
+        // `connect_error_debug_includes_struct_name_for_grep` pin on
+        // [crates/proxy/src/forwarder/nats.rs] and the
+        // `key_error_and_build_error_debug_carries_struct_name_for_grep`
+        // pin on [crates/proxy/src/forwarder/siem.rs].
+        let br = format!("{:?}", ApiError::BadRequest("x".into()));
+        assert!(br.contains("BadRequest"), "got: {br}");
+        let db = format!("{:?}", ApiError::Db(sqlx::Error::RowNotFound));
+        assert!(db.contains("Db"), "got: {db}");
+    }
+
+    #[test]
+    fn kill_response_scope_field_serializes_as_string_not_integer() {
+        // `scope: &'static str` lands on the wire as a JSON string.
+        // Pin the type tag explicitly — a refactor that promoted
+        // `scope` to an enum with `#[serde(into = "u8")]` "for compact
+        // wire bytes" or a `#[serde(serialize_with = ...)]` that
+        // emitted a numeric discriminant would silently break every
+        // dashboard filter keyed on `scope == "session"` /
+        // `scope == "user"` / `scope == "all"`. The existing
+        // `kill_response_serializes_with_stable_field_names` test pins
+        // the field NAME but not its TYPE tag.
+        let r = KillResponse {
+            record_id: Uuid::nil(),
+            scope: "all",
+            target: "*".into(),
+            bearers_revoked: 42,
+            at: Utc::now(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v["scope"].is_string(), "scope must be string: {v}");
+        assert_eq!(v["scope"], "all");
+        // target is also a string — symmetric pin on the runtime String.
+        assert!(v["target"].is_string(), "target must be string: {v}");
+    }
+
+    #[test]
+    fn kill_body_confirm_preserves_case_verbatim_no_normalization() {
+        // The `/killswitch/all` handler checks
+        // `body.confirm.as_deref() == Some("yes")` — a case-sensitive
+        // exact-match against the lowercase literal. The serde
+        // deserialization MUST preserve case verbatim (no lowercasing,
+        // no trimming) so the handler-level check can fail-safe on
+        // "YES" / " yes " / "Yes" inputs (the operator typed the wrong
+        // case and the killswitch must refuse, not silently fire). A
+        // refactor that added `#[serde(deserialize_with =
+        // "lowercase")]` "for ergonomic CLI use" would silently let
+        // every case variant past the handler's exact-match check —
+        // pin verbatim preservation across three case shapes.
+        let yes_upper: KillBody = serde_json::from_str(r#"{"confirm":"YES"}"#).unwrap();
+        assert_eq!(yes_upper.confirm.as_deref(), Some("YES"));
+        let yes_title: KillBody = serde_json::from_str(r#"{"confirm":"Yes"}"#).unwrap();
+        assert_eq!(yes_title.confirm.as_deref(), Some("Yes"));
+        let yes_padded: KillBody = serde_json::from_str(r#"{"confirm":" yes "}"#).unwrap();
+        assert_eq!(yes_padded.confirm.as_deref(), Some(" yes "));
+    }
+
+    #[test]
     fn kill_body_accepts_confirm_yes_for_kill_all() {
         // /killswitch/all rejects without `confirm: "yes"` — pin that the
         // deserializer accepts the field (vs. an accidental rename in serde

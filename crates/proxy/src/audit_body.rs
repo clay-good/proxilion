@@ -452,4 +452,128 @@ mod tests {
         // appended a sentinel ("<EMPTY>") would surface here.
         assert_eq!(redact_pii_text(""), "");
     }
+
+    #[test]
+    fn audit_body_mode_is_send_sync_static_for_persist_await_boundary() {
+        // `persist(...)` takes `mode: AuditBodyMode` by value and holds it
+        // across the `sqlx::query(...).execute(db).await` suspension point.
+        // An `Rc<...>` or `Cell<...>` field added to a future variant
+        // "for cheaper match arm dispatch" would break Send and surface at
+        // the call site (the adapter middleware spawn) with an opaque
+        // tower::Service trait-bound rather than here. Pin the three-trait
+        // combo at this file boundary so a refactor lands clean
+        // diagnostics. The enum is re-exported from policy-engine; the
+        // bound MUST hold at the proxy's use site.
+        fn require_send_sync_static<T: Send + Sync + 'static>(_: &T) {}
+        for m in [
+            AuditBodyMode::Hash,
+            AuditBodyMode::RedactPii,
+            AuditBodyMode::Full,
+        ] {
+            require_send_sync_static(&m);
+        }
+    }
+
+    #[test]
+    fn sha256_hex_output_width_pinned_at_sixty_four_lowercase_hex_chars_for_arbitrary_input() {
+        // The existing `sha256_hex_empty_input_matches_known_digest_and_is_lowercase_width_64`
+        // pin checks width + alphabet for the EMPTY input only. Pin the
+        // same invariants across four arbitrary inputs (single byte, ASCII
+        // word, 1KB of `0xFF`, mixed unicode) — a refactor that switched
+        // to uppercase hex "for vendor compat" OR that emitted truncated
+        // digest on long inputs "for postgres VARCHAR(32) compat" would
+        // surface here on any of the four shapes. The `request_hash`
+        // column in `action_event_bodies` is `CHAR(64)`-shaped and
+        // downstream replay tools key on the lowercase contract — pin
+        // both arms across multiple inputs.
+        for input in [
+            &b"x"[..],
+            &b"hello world"[..],
+            &vec![0xFFu8; 1024][..],
+            "café → 🔥".as_bytes(),
+        ] {
+            let h = sha256_hex(input);
+            assert_eq!(h.len(), 64, "wrong width for input len={}", input.len());
+            assert!(
+                h.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "non-lowercase-hex char in output: {h}",
+            );
+        }
+    }
+
+    #[test]
+    fn base64_encode_of_empty_input_yields_empty_string() {
+        // Boundary symmetric to the SHA-256 empty pin: STANDARD base64
+        // of zero bytes is exactly `""` (RFC 4648 §4 — no padding for
+        // zero-length input). A refactor that prepended a sentinel
+        // (e.g. `base64::engine::general_purpose::STANDARD_NO_PAD` with
+        // a leading version byte "for forward compatibility") would
+        // surface here as a non-empty output AND break replay tools
+        // that decode the column on every audit row regardless of
+        // shape. Pin the empty-in → empty-out contract explicitly.
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn redact_pii_text_is_idempotent_across_two_passes_on_pii_heavy_input() {
+        // The `<REDACTED_*>` sentinels MUST not themselves match any
+        // redactor regex — running the redactor on its own output
+        // should be a no-op. A refactor that, e.g., changed the
+        // sentinel to `[REDACTED_EMAIL@x.com]` (which the email
+        // pattern would re-match) would surface here as a divergence
+        // between one-pass and two-pass output. Pin idempotence on
+        // a multi-PII input that exercises every redactor arm.
+        let input = "alice@acme.com 415-555-1234 ssn 123-45-6789 \
+                     Bearer ya29.a0AfH6SMABcDefGhIjKlMnOpQrStUv0123 \
+                     card 4111 1111 1111 1111";
+        let once = redact_pii_text(input);
+        let twice = redact_pii_text(&once);
+        assert_eq!(once, twice, "redact_pii_text is not idempotent");
+        // And the one-pass output really did redact — sanity that we
+        // didn't pin the trivial "input has no PII" case.
+        assert!(once.contains("<REDACTED_EMAIL>"));
+        assert!(once.contains("<REDACTED_PHONE>"));
+        assert!(once.contains("<REDACTED_SSN>"));
+    }
+
+    #[test]
+    fn redact_pii_bytes_null_byte_at_offset_zero_short_circuits_to_passthrough() {
+        // The binary-detector reads `take(256).any(|b| b == 0)`. A null
+        // byte at byte 0 must short-circuit the iterator on the first
+        // step (`.any()` is short-circuiting) and return the input
+        // verbatim — including its embedded ASCII email. The existing
+        // `binary_input_unchanged` pin uses `\x00\x01\x02alice@acme.com`;
+        // pin the LEADING-null boundary explicitly so a refactor that
+        // swapped the predicate to `.all(|b| b != 0)` (which inverts
+        // the binary classification) would surface here. Also pin a
+        // null at offset 255 (last byte in the scan window) for the
+        // far end of the boundary.
+        let leading = b"\x00 hello alice@acme.com";
+        assert_eq!(redact_pii_bytes(leading), leading.to_vec());
+        let mut at_255 = vec![b' '; 255];
+        at_255.push(0); // index 255 — last byte of the 256-byte window
+        at_255.extend_from_slice(b" alice@acme.com");
+        let copy = at_255.clone();
+        assert_eq!(redact_pii_bytes(&at_255), copy);
+    }
+
+    #[test]
+    fn redact_pii_text_no_pii_input_returns_byte_equal_string() {
+        // For an input with zero PII matches across all six redactors,
+        // the output MUST byte-equal the input — a refactor that
+        // accidentally surrounded the result with sentinel braces
+        // (`{output}`) OR that lowercased the whole string "for
+        // consistency with downstream tooling" would surface here. Pin
+        // a multi-line input with words, ASCII punctuation, and
+        // multibyte unicode so the byte-equality covers a realistic
+        // body shape (not just `"abc"`).
+        let clean = "Quarterly review notes (rev 7):\n\
+                     - shipped feature flag\n\
+                     - tracked 99.95% uptime\n\
+                     - café → 🔥 launch event\n";
+        let out = redact_pii_text(clean);
+        assert_eq!(out, clean);
+        assert_eq!(out.as_bytes(), clean.as_bytes());
+    }
 }

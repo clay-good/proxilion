@@ -647,6 +647,156 @@ mod tests {
         assert_eq!(s, "internal: unexpected state at session-handoff");
     }
 
+    #[test]
+    fn auth_state_and_fail_and_refresh_coordinator_are_send_sync_static_for_axum_boundary() {
+        // `AuthState` is passed via `with_state(...)` into the axum
+        // Router and across `from_fn_with_state` middleware boundaries
+        // — axum mandates `Send + Sync + 'static`. `AuthFail` flows
+        // through `?`-chain returns from `build_session` awaited
+        // inside the middleware future; tokio task boundaries require
+        // the same bounds. `RefreshCoordinator` is held inside
+        // `AuthState` AND is cloned into per-bearer mutex acquisition
+        // futures. A refactor that introduced a !Sync field on any of
+        // the three (e.g. `RefreshCoordinator { locks: RefCell<...> }`
+        // "for cheap interior mutability") would break Sync at the
+        // AppState site with a far-removed trait-bound error. Pin all
+        // three trait bounds on all three types here — extends the
+        // existing `auth_state_is_clone_for_axum_state_propagation`
+        // pin which covers Clone only.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<AuthState>();
+        require_send_sync_static::<AuthFail>();
+        require_send_sync_static::<RefreshCoordinator>();
+    }
+
+    #[test]
+    fn auth_fail_debug_carries_variant_names_for_grep_bucketing() {
+        // The `#[derive(Debug)]` on `AuthFail` feeds `?why` in
+        // `tracing::warn!(reason = %why, "bearer rejected")` indirectly
+        // and any ad-hoc `?err` spans in tests / future call sites.
+        // Operators grep `AuthFail::*` variant names to bucket
+        // BadFormat (agent typo) vs NotFound (revoked) vs Decrypt
+        // (cipher fault) vs PcaCacheMiss (Trust Plane gap) vs
+        // PcaTampered (signature). A hand-rolled `impl Debug` that
+        // hid variant names "to compact" the line would break every
+        // operator bucket. Pin five distinct variant names — symmetric
+        // to the ConnectError / KeyError / ApiError struct-name pins
+        // on other modules.
+        let bf = format!("{:?}", AuthFail::BadFormat);
+        assert!(bf.contains("BadFormat"), "got: {bf}");
+        let nf = format!("{:?}", AuthFail::NotFound);
+        assert!(nf.contains("NotFound"), "got: {nf}");
+        let dc = format!("{:?}", AuthFail::Decrypt);
+        assert!(dc.contains("Decrypt"), "got: {dc}");
+        let pm = format!("{:?}", AuthFail::PcaCacheMiss);
+        assert!(pm.contains("PcaCacheMiss"), "got: {pm}");
+        let pt = format!("{:?}", AuthFail::PcaTampered);
+        assert!(pt.contains("PcaTampered"), "got: {pt}");
+    }
+
+    #[test]
+    fn auth_fail_db_arm_display_masks_inner_sqlx_error_for_no_secret_leak() {
+        // `#[error("database error")]` on `Db(#[from] sqlx::Error)` —
+        // the inner sqlx::Error carries schema column names, query
+        // fragments, and constraint identifiers that could leak into
+        // operator-shared log lines or tickets. Pin that Display is
+        // the fixed "database error" string with NO inner content,
+        // regardless of which sqlx variant is wrapped. The existing
+        // `auth_fail_from_sqlx_via_question_mark` test pins the
+        // string for one variant only; pin three distinct variants
+        // here to catch a refactor that swapped to
+        // `#[error("database error: {0}")]` "for richer triage" which
+        // would silently leak the inner sqlx text. Symmetric to the
+        // `oauth_error_db_display_does_not_carry_inner_sqlx_string`
+        // pin on [crates/proxy/src/oauth/error.rs].
+        for inner in [
+            sqlx::Error::RowNotFound,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+        ] {
+            let e = AuthFail::Db(inner);
+            assert_eq!(e.to_string(), "database error");
+        }
+    }
+
+    #[test]
+    fn refresh_coordinator_clone_shares_underlying_moka_cache() {
+        // `RefreshCoordinator` is `#[derive(Clone)]` — moka's `Cache`
+        // is internally Arc'd, so a clone of the coordinator wraps
+        // the SAME underlying cache. A refactor that swapped the
+        // field to a deep-copy "for isolation between AppState
+        // clones" would silently make every clone start with an empty
+        // lock table, breaking the per-bearer single-flight contract
+        // (50 concurrent requests with the same bearer would each see
+        // a distinct mutex and all 50 would hit Google's refresh
+        // endpoint instead of coalescing to one). Pin via the
+        // observable: two clones of the coordinator return the SAME
+        // Arc<Mutex<()>> for the same bearer hash.
+        let c = RefreshCoordinator::default();
+        let clone = c.clone();
+        let hash = [99u8; 32];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let a = c.lock_for(hash).await;
+            let b = clone.lock_for(hash).await;
+            assert!(
+                Arc::ptr_eq(&a, &b),
+                "clones of RefreshCoordinator must share underlying cache",
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn unauthorized_helper_response_content_type_is_text_plain() {
+        // The 401 body is plain text — the existing
+        // `unauthorized_helper_returns_401_with_plain_body` test pins
+        // status + body bytes but NOT the content-type header. Agent
+        // clients (Cursor, Claude Code) branch on `content-type` to
+        // decide whether to surface the body as a structured error or
+        // as a fallback "auth required" message. A refactor that
+        // promoted to `Json(...)` "for consistency with other 4xx
+        // shapes" would silently change the content-type and break
+        // every agent-side parser keyed on the plain-text fallback
+        // path. Pin the content-type header explicitly.
+        let r = unauthorized();
+        let ct = r
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("content-type header present");
+        let s = ct.to_str().expect("content-type is ASCII");
+        assert!(s.starts_with("text/plain"), "expected text/plain, got: {s}",);
+    }
+
+    #[test]
+    fn auth_fail_refresh_display_passes_inner_through_unicode_and_newline_verbatim() {
+        // The `#[error("google token refresh failed: {0}")]` Display
+        // passes the inner String through `{0}` (no `{0:?}` debug
+        // escape). The existing
+        // `auth_fail_refresh_display_carries_google_token_refresh_failed_prefix`
+        // test pins the prefix shape against one plain-ASCII inner
+        // ("network timeout"). Pin that arbitrary inner content
+        // survives byte-for-byte across unicode (Google's regional
+        // error messages may surface non-ASCII), newline (some
+        // upstream errors include line-broken context), AND quote
+        // chars. A refactor that swapped `{0}` to `{0:?}` "for
+        // safety" would silently wrap the inner in escape sequences
+        // and break exact-match operator log assertions.
+        for inner in [
+            "café network timeout",
+            "line1\nline2",
+            r#"quoted "value" here"#,
+            "α-β-γ",
+        ] {
+            let e = AuthFail::Refresh(inner.into());
+            let s = e.to_string();
+            let expected = format!("google token refresh failed: {inner}");
+            assert_eq!(s, expected, "inner verbatim survival: {s}");
+        }
+    }
+
     #[tokio::test]
     async fn refresh_coordinator_default_starts_empty_then_populates() {
         // `Default` builds an empty moka cache; the first `lock_for` is

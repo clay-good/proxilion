@@ -644,6 +644,196 @@ mod canonical_request_json_tests {
     }
 
     #[test]
+    fn blocked_action_record_debug_carries_struct_name_and_key_field_names() {
+        // `BlockedActionRecord` derives `Debug` — the persist failure
+        // path `tracing::warn!(error = %e, "failed to persist blocked_action")`
+        // does NOT render the record itself today, but the type is
+        // also passed to spawned notifier tasks via `OwnedBlockedNotification`
+        // and operator-actionable debug spans in tests and ad-hoc traces
+        // render the record via `?r`. Pin the struct name + four
+        // operator-essential field names (request_id / session_id /
+        // vendor / action) so a hand-rolled `impl Debug` that hid them
+        // "to compact" the line would break every operator grep target.
+        let ops: Vec<String> = vec![];
+        let r = BlockedActionRecord {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            p_0: Some("alice@acme.com"),
+            vendor: "google",
+            action: "drive.files.get",
+            method: "GET",
+            path: "/drive/v3/files/x",
+            layer: "policy",
+            policy_id: Some("p1"),
+            detail: Some("d"),
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        let s = format!("{r:?}");
+        assert!(s.contains("BlockedActionRecord"), "got: {s}");
+        assert!(s.contains("request_id"), "got: {s}");
+        assert!(s.contains("session_id"), "got: {s}");
+        assert!(s.contains("vendor"), "got: {s}");
+        assert!(s.contains("action"), "got: {s}");
+    }
+
+    #[test]
+    fn owned_blocked_notification_is_send_sync_static_for_tokio_spawn_boundary() {
+        // `OwnedBlockedNotification` is the materialized snapshot that
+        // the persist_and_notify path clones into each `tokio::spawn`
+        // future (one per webhook / slack / email driver fan-out). The
+        // spawn boundary requires `Send + 'static`; the clone-into-
+        // multiple-tasks design also relies on `Sync` for safety. A
+        // refactor that introduced a !Send field (e.g. swapped
+        // `String` for `Rc<str>` "for cheap clone") would break the
+        // spawn site with a far-removed trait-bound error. Pin all
+        // three traits here so the failure surfaces at the right
+        // module — symmetric to the `tee.rs` Send+Sync+'static pins.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<OwnedBlockedNotification>();
+    }
+
+    #[test]
+    fn canonical_request_json_non_truncated_carries_exactly_six_top_level_keys() {
+        // The non-truncated envelope has SIX top-level keys: method +
+        // path + vendor + action + path_params + body. Operator audit
+        // queries iterate the keys to render a deterministic table.
+        // Pin the exact key set so a refactor that added a seventh
+        // (e.g. `timestamp` "for ergonomic ordering") would silently
+        // widen every audit row — a wire-shape change SIEM ingestors
+        // would need to acknowledge. The existing tests pin individual
+        // key presence (method, path, vendor, action, body) but never
+        // pin the exhaustive set.
+        let (path_params, body) = empty_maps();
+        let s = canonical_request_json(
+            "GET",
+            "/x",
+            "google",
+            "drive.files.get",
+            &path_params,
+            &body,
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let obj = v.as_object().expect("top-level must be object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::HashSet<&str> =
+            ["method", "path", "vendor", "action", "path_params", "body"]
+                .into_iter()
+                .collect();
+        assert_eq!(keys, expected, "got: {keys:?}");
+    }
+
+    #[test]
+    fn canonical_request_json_truncation_envelope_carries_exactly_six_expected_keys() {
+        // The truncation envelope has SIX keys: truncated + original_len
+        // + method + path + vendor + action — NO body, NO path_params
+        // (the existing `truncation_envelope_elides_body_and_path_params`
+        // pin covers the elision). Pin the exhaustive key set so a
+        // refactor that added a seventh (e.g. `policy_id` "for
+        // forensic context") would silently re-inflate truncated rows
+        // and defeat the size-cap. Operators auto-expand truncated
+        // rows in the UI and depend on the fixed-shape envelope.
+        let path_params = std::collections::HashMap::new();
+        let mut body = std::collections::HashMap::new();
+        body.insert("blob".into(), serde_json::Value::String("z".repeat(8192)));
+        let s = canonical_request_json(
+            "POST",
+            "/drive/v3/files",
+            "google",
+            "drive.files.create",
+            &path_params,
+            &body,
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let obj = v.as_object().expect("top-level must be object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::HashSet<&str> = [
+            "truncated",
+            "original_len",
+            "method",
+            "path",
+            "vendor",
+            "action",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected, "got: {keys:?}");
+    }
+
+    #[test]
+    fn blocked_action_record_with_all_none_optionals_constructs_cleanly() {
+        // All four `Option<_>` fields (p_0, policy_id, detail,
+        // predecessor_pca_id, escalation_after_minutes,
+        // request_canonical_json) AND policy_id / detail simultaneously
+        // None — the unauthenticated-probe / pic_invariant-only shape
+        // that the read_filter layer produces. Pin that the type
+        // constructs cleanly with no required-field gap. A refactor
+        // that removed `Option<>` on `detail` "since the policy layer
+        // always emits one" would surface here rather than at the
+        // read_filter call site that builds the record without a
+        // policy-supplied detail. Symmetric to the
+        // `pic_violation_record_with_all_none_optionals_constructs_and_clones`
+        // pin on [crates/proxy/src/pic/violations.rs].
+        let ops: Vec<String> = vec![];
+        let r = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "google",
+            action: "drive.files.get",
+            method: "GET",
+            path: "/x",
+            layer: "read_filter",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        assert!(r.p_0.is_none());
+        assert!(r.policy_id.is_none());
+        assert!(r.detail.is_none());
+        assert!(r.predecessor_pca_id.is_none());
+        assert!(r.escalation_after_minutes.is_none());
+        assert!(r.request_canonical_json.is_none());
+        // Clone preserves all None polarities.
+        let c = r.clone();
+        assert!(c.p_0.is_none());
+        assert!(c.escalation_after_minutes.is_none());
+    }
+
+    #[test]
+    fn canonical_request_json_preserves_multibyte_unicode_in_body_string_value() {
+        // The canonical-request snapshot is operator-visible in the
+        // approver UI; non-ASCII content in policy-exposed body fields
+        // (e.g. a localized email subject "café reminder →") must
+        // survive the JSON round-trip byte-for-byte. The existing
+        // tests cover ASCII bodies; pin multibyte passthrough across
+        // 2-byte / 3-byte / 4-byte codepoints. A refactor that called
+        // `.replace(non_ascii, "?")` "for SIEM ASCII-only ingest" would
+        // silently mangle every non-English audit row.
+        let path_params = std::collections::HashMap::new();
+        let mut body = std::collections::HashMap::new();
+        body.insert(
+            "subject".into(),
+            serde_json::Value::String("café reminder → 🔥".into()),
+        );
+        let s = canonical_request_json("POST", "/x", "google", "a", &path_params, &body);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["body"]["subject"], "café reminder → 🔥");
+        // And the snapshot must not be the truncation envelope (the
+        // 2-byte / 3-byte / 4-byte chars together are < 32 bytes, well
+        // under the 4 KB cap).
+        assert!(
+            v["truncated"].is_null(),
+            "small unicode body must not truncate"
+        );
+    }
+
+    #[test]
     fn blocked_action_record_clone_preserves_borrowed_fields() {
         let ops = vec!["gmail:send:bob@external.com".to_string()];
         let r = BlockedActionRecord {

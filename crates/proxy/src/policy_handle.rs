@@ -923,6 +923,138 @@ mod tests {
     }
 
     #[test]
+    fn policy_handle_and_reload_report_and_set_mode_error_send_sync_static() {
+        // `PolicyHandle` is the single source of truth read by every
+        // adapter on every request — held in AppState and cloned per
+        // request scope. `ReloadReport` flows through `tokio::spawn`-ed
+        // watcher tasks. `SetModeError` flows through `Result` chains
+        // across `.await` points in the API handler. All three MUST be
+        // Send+Sync+'static — a refactor adding an `Rc<...>` field on
+        // any one would break Sync at the AppState wire site rather
+        // than as a far-removed trait-bound error. Pin all three at
+        // this file boundary.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<PolicyHandle>();
+        require_send_sync_static::<ReloadReport>();
+        require_send_sync_static::<SetModeError>();
+    }
+
+    #[test]
+    fn reload_report_serializes_with_exactly_four_known_keys() {
+        // `ReloadReport` is serialized into the operator-facing
+        // `/api/v1/policy/reload` response body — the dashboard
+        // surfaces all 4 fields by name (`ok`, `source`,
+        // `policy_count`, `error`). The JSON object MUST carry
+        // EXACTLY 4 keys. A refactor that elided one (e.g. adding
+        // `skip_serializing_if = "Option::is_none"` to `error` "for
+        // clean wire on success") would silently drop operator-
+        // visible state from the reload toast; an addition would
+        // widen the wire shape. Pin both axes — count AND each name —
+        // across BOTH polarities (success: ok=true error=None +
+        // failure: ok=false error=Some).
+        for r in [
+            ReloadReport {
+                ok: true,
+                source: Some("path".into()),
+                policy_count: 3,
+                error: None,
+            },
+            ReloadReport {
+                ok: false,
+                source: None,
+                policy_count: 0,
+                error: Some("yaml parse error".into()),
+            },
+        ] {
+            let v = serde_json::to_value(&r).unwrap();
+            let obj = v.as_object().expect("must be JSON object");
+            assert_eq!(obj.len(), 4, "field count drift: {obj:?}");
+            for k in ["ok", "source", "policy_count", "error"] {
+                assert!(obj.contains_key(k), "missing {k}: {obj:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn watch_interval_constant_is_five_seconds_per_documented_fallback_semantics() {
+        // The module docstring + ui-less-surfaces.md §2.3 commit to
+        // 5-second polling as the watcher's fallback cadence. A refactor
+        // to 1s "for snappier reload" would silently 5x the IO load on
+        // every install; a refactor to 30s "for hygiene" would silently
+        // delay every operator-visible reload by half a minute. Pin
+        // the exact `Duration::from_secs(5)` value AND the type via
+        // require_duration so a refactor to `u64` raw seconds "for
+        // arithmetic ergonomics" surfaces as a type-coercion failure.
+        fn require_duration(_: Duration) {}
+        require_duration(WATCH_INTERVAL);
+        assert_eq!(WATCH_INTERVAL, Duration::from_secs(5));
+        assert_eq!(WATCH_INTERVAL.as_secs(), 5);
+        assert_eq!(WATCH_INTERVAL.subsec_nanos(), 0);
+    }
+
+    #[test]
+    fn policy_handle_clone_shares_inner_arc_swap_engine_via_load() {
+        // `PolicyHandle` derives `Clone` — the Arc<ArcSwap<Engine>>
+        // field is cloned by Arc::clone (cheap ref-count bump) so
+        // BOTH clones see the same underlying engine. A refactor that
+        // accidentally deep-copied the ArcSwap "for engine isolation
+        // per request scope" would silently break the live-reload
+        // contract — operators would issue a reload, the clone in
+        // each request scope would never see the new engine. Pin via
+        // Arc::ptr_eq on the loaded engines: both clones must produce
+        // pointer-equal Arc<Engine> handles on `load()`.
+        let yaml = "[]";
+        let h = PolicyHandle::new(engine_with(yaml), None, yaml.into());
+        let clone = h.clone();
+        let a = h.load();
+        let b = clone.load();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "Clone must share inner Engine via Arc — broke if deep-copied",
+        );
+    }
+
+    #[test]
+    fn raw_yaml_accessor_returns_owned_arc_string_for_cross_thread_sharing() {
+        // `raw_yaml()` returns `Arc<String>` (NOT `&str` or `&String`)
+        // — the operator API endpoint `/api/v1/policy/{id}` reads it
+        // and holds it across the `.await` for the response
+        // serialize. The returned Arc clones at zero copy (refcount
+        // bump). A refactor to `&str` "for zero-alloc reads" would
+        // surface as a borrow-checker error at the API call site
+        // (lifetime tied to the handle, can't be held across .await).
+        // Pin the Arc<String> return type via a helper.
+        fn require_arc_string(_: Arc<String>) {}
+        let yaml = "- id: x\n  vendor: g\n  action: a\n  decision: allow\n  required_ops: []\n";
+        let h = PolicyHandle::new(engine_with(yaml), None, yaml.into());
+        let got = h.raw_yaml();
+        require_arc_string(got.clone());
+        // Sanity that the content survives the round-trip.
+        assert_eq!(&*got, yaml);
+    }
+
+    #[test]
+    fn set_mode_error_debug_carries_variant_names_for_grep_bucketing() {
+        // `SetModeError` is the operator-facing error for the
+        // `/api/v1/policy/{id}/mode` endpoint — operators grep
+        // tracing log lines by variant name to bucket NotFound
+        // (operator typo on policy id) vs Parse (YAML hand-edit
+        // damaged the file) vs Reload (mutation applied but the
+        // resulting engine refused to compile). A hand-rolled
+        // `impl Debug` that hid variant names "to compact" the line
+        // would break every operator bucket. Symmetric to the
+        // AppError + OAuthError + ApiError variant-name Debug pins.
+        for (variant, name) in [
+            (SetModeError::NotFound("p".into()), "NotFound"),
+            (SetModeError::Parse("scanner".into()), "Parse"),
+            (SetModeError::Reload("schema".into()), "Reload"),
+        ] {
+            let s = format!("{:?}", variant);
+            assert!(s.contains(name), "expected `{name}` in Debug, got: {s}");
+        }
+    }
+
+    #[test]
     fn set_mode_via_serde_fallback_round_trips_when_yaml_is_a_flow_mapping() {
         // The line-oriented walker only recognizes block-style YAML; an
         // operator who hand-edits to flow style would otherwise hit

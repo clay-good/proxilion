@@ -705,6 +705,163 @@ mod tests {
     }
 
     #[test]
+    fn pic_executor_and_error_and_outcome_are_send_sync_static_for_axum_boundary() {
+        // `PicExecutor` lives in `AppState` and crosses tokio task boundaries
+        // on every adapter call; `ExecutorError` flows through anyhow chains
+        // and is held across `.await` in handler `Result<_, _>` shapes;
+        // `SuccessorOutcome` is the audit-mode wrapper held across the
+        // adapter's `?`-propagation chain. All three need (Send + Sync +
+        // 'static). A refactor that introduced an `Rc<...>` on Inner "for
+        // cheaper clone of the http client config" would break Send without
+        // surfacing here; the breakage would land at AppState assembly with
+        // an unrelated trait-bound error. Pin all three bounds at this file.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<PicExecutor>();
+        require_send_sync_static::<ExecutorError>();
+        require_send_sync_static::<SuccessorOutcome>();
+    }
+
+    #[test]
+    fn dev_ephemeral_yields_twenty_distinct_kids_under_burst() {
+        // The existing `dev_ephemeral_yields_distinct_kids_per_call` pin
+        // checks distinctness across TWO calls. Pin the broader contract:
+        // 20 back-to-back ephemeral executors yield 20 distinct kids — a
+        // refactor that re-seeded the UUIDv4 RNG with the process pid + a
+        // tight-loop counter (a fringe but real pattern from "deterministic
+        // tests please") would surface here as the burst losing entropy
+        // within a single second. UUIDv4 collision probability at N=20 is
+        // negligible; any collision under this load is a real regression.
+        // Also pin every kid carries the `proxy-dev-` prefix so a refactor
+        // that changed the marker would surface in lockstep.
+        let mut kids = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let exec = PicExecutor::dev_ephemeral("http://127.0.0.1:1/".into()).unwrap();
+            assert!(exec.executor_kid().starts_with("proxy-dev-"));
+            assert!(
+                kids.insert(exec.executor_kid().to_string()),
+                "kid collision: {}",
+                exec.executor_kid()
+            );
+        }
+        assert_eq!(kids.len(), 20);
+    }
+
+    #[test]
+    fn executor_kid_returns_byte_equal_value_across_repeated_calls_on_same_executor() {
+        // `executor_kid(&self) -> &str` borrows from `self.inner.kid` via
+        // an `Arc<Inner>`. Repeated calls on the SAME executor MUST return
+        // byte-equal strings — pin via three sequential calls + collected
+        // values compared all-equal. A refactor that introduced any form
+        // of interior mutation (e.g. a debug-mode counter appended to the
+        // kid for tracing) would surface here. The middleware code path
+        // calls executor_kid() multiple times per request (once at audit
+        // log, once at PoC binding); the value MUST be stable across
+        // those calls or the audit row and the PoC's executor_binding
+        // would silently disagree.
+        let exec = PicExecutor::new(
+            "http://127.0.0.1:1/".into(),
+            "proxy-stable-1".into(),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let a = exec.executor_kid().to_string();
+        let b = exec.executor_kid().to_string();
+        let c = exec.executor_kid().to_string();
+        assert_eq!(a, "proxy-stable-1");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn executor_error_debug_carries_all_five_variant_names_for_grep_bucketing() {
+        // Operator log filters bucket adapter failures by Debug variant
+        // name (`?err` in handler error logs). The existing pins cover
+        // Display strings for Upstream/Invariant/Core/Transport/Base64,
+        // but Debug for grep bucketing is independently load-bearing —
+        // a manual Debug impl that collapsed all variants to a single
+        // "ExecutorError(_)" rendering would silently break grep-based
+        // alerting that splits transport-flake from invariant-violation
+        // from base64-corruption. Pin all five variant names render in
+        // Debug.
+        let upstream = ExecutorError::Upstream {
+            status: 503,
+            body: "x".into(),
+        };
+        assert!(format!("{upstream:?}").contains("Upstream"));
+        let invariant = ExecutorError::Invariant("x".into());
+        assert!(format!("{invariant:?}").contains("Invariant"));
+        let core = ExecutorError::Core("x".into());
+        assert!(format!("{core:?}").contains("Core"));
+        // Transport: real reqwest::Error via 1ms timeout against
+        // localhost:1 (immediate connect-refuse).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let reqwest_err = rt.block_on(async {
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(1))
+                .build()
+                .unwrap()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("must error")
+        });
+        let transport = ExecutorError::from(reqwest_err);
+        assert!(format!("{transport:?}").contains("Transport"));
+        // Base64: real DecodeError from non-b64 input.
+        let b64_err = base64::engine::general_purpose::STANDARD
+            .decode("@@@")
+            .expect_err("non-b64 must error");
+        let b64 = ExecutorError::from(b64_err);
+        assert!(format!("{b64:?}").contains("Base64"));
+    }
+
+    #[test]
+    fn process_poc_response_with_empty_ops_vec_deserializes_successfully() {
+        // The wire contract allows `ops: []` — a successor PCA that
+        // happens to be a no-op narrowing (the caller asked for nothing
+        // beyond the predecessor's ops set, validly). The existing
+        // `process_poc_response_round_trips_ops_and_hop` test pins the
+        // multi-element ops path; pin the empty-ops boundary so a
+        // refactor that swapped `Vec<String>` to a `NonEmptyVec<String>`
+        // wrapper "for type-level safety" would surface here. Operator-
+        // facing test fixtures (audit-mode replay) frequently use
+        // empty-ops PCAs to test the no-op-but-still-attested path.
+        let raw = r#"{"pca":"b64","hop":3,"p_0":"carol","ops":[]}"#;
+        let resp: ProcessPocResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.hop, 3);
+        assert_eq!(resp.p_0, "carol");
+        assert!(
+            resp.ops.is_empty(),
+            "expected empty ops, got: {:?}",
+            resp.ops
+        );
+        assert!(resp.exp.is_none());
+    }
+
+    #[test]
+    fn pic_executor_new_with_kid_containing_unicode_round_trips_byte_for_byte() {
+        // Production operators today use ASCII-only kid values, but the
+        // signature is `kid: String` — Trust Plane accepts UTF-8 kids.
+        // Pin that a kid carrying multibyte unicode (`é` 2-byte +
+        // `→` 3-byte + `🔥` 4-byte) round-trips through executor_kid()
+        // byte-for-byte. A refactor that called `.to_ascii_lowercase()`
+        // or `.replace(non_ascii, "?")` "for SIEM ingest hygiene" at the
+        // constructor boundary would silently mangle every non-ASCII
+        // kid before it reached the upstream Trust Plane's
+        // RegisterExecutorRequest body — making the registered key
+        // unfindable by the upstream-side lookup against the operator's
+        // configured kid.
+        let unicode_kid = "proxy-é-→-🔥";
+        let exec =
+            PicExecutor::new("http://127.0.0.1:1/".into(), unicode_kid.into(), &[5u8; 32]).unwrap();
+        assert_eq!(exec.executor_kid(), unicode_kid);
+        // Clone preserves the multibyte kid too — the Arc-share semantics
+        // mustn't drop the UTF-8 bytes at the clone boundary.
+        let c = exec.clone();
+        assert_eq!(c.executor_kid(), unicode_kid);
+    }
+
+    #[test]
     fn pic_executor_clone_shares_inner_arc() {
         // `Clone` is part of the design contract — adapters hold a
         // per-handler clone of the executor, and the `OnceCell<()>` for

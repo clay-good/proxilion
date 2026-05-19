@@ -350,6 +350,147 @@ mod tests {
     }
 
     #[test]
+    fn oauth_state_and_google_client_are_send_sync_static_for_axum_state_boundary() {
+        // `OAuthState` is wired into the OAuth handler `Router::with_state(...)`,
+        // and `GoogleClient` lives inside it. Axum's State extractor requires
+        // (Clone + Send + Sync + 'static). A refactor that gave either type an
+        // `Rc<...>` field "for cheap shared HTTP-client handle" would break
+        // Send + Sync but the breakage would surface at router assembly with
+        // an opaque `tower::Service` trait-bound error. Pin both type bounds
+        // at this file so the type boundary fails fast at the right call site.
+        fn require_clone_send_sync_static<T: Clone + Send + Sync + 'static>() {}
+        require_clone_send_sync_static::<OAuthState>();
+        require_clone_send_sync_static::<GoogleClient>();
+    }
+
+    #[test]
+    fn from_env_preserves_multibyte_unicode_in_client_id_and_secret_verbatim() {
+        // `std::env::var` returns the raw bytes from the env (interpreted as
+        // UTF-8); a client_id or secret with multibyte unicode (rare but
+        // legal — e.g. a test fixture's `tëst-client-id-é`) must round-trip
+        // byte-for-byte through `from_env`. Pin three multibyte spreads:
+        // 2-byte `é`, 3-byte `→`, 4-byte `🔥` in BOTH client_id AND secret.
+        // A refactor that called `.replace(non_ascii, "?")` "for SIEM
+        // ASCII-only env-var ingest" or a hash-and-replace "for redaction"
+        // would silently mangle every UTF-8-bearing test fixture.
+        with_clean_env(|| {
+            // SAFETY: serialized by ENV_GUARD via `with_clean_env`.
+            unsafe {
+                std::env::set_var("GOOGLE_CLIENT_ID", "client-é-→-🔥");
+                std::env::set_var("GOOGLE_CLIENT_SECRET", "secret-é-→-🔥");
+            }
+            let c = GoogleClient::from_env().unwrap();
+            assert_eq!(c.client_id, "client-é-→-🔥");
+            assert_eq!(c.client_secret, "secret-é-→-🔥");
+        });
+    }
+
+    #[test]
+    fn from_env_accepts_non_https_auth_url_override_without_validation() {
+        // `from_env` is a verbatim passthrough — no URL parsing or scheme
+        // validation. An operator pointing the override at an `http://` host
+        // (a wiremock fixture under TLS-termination at a sidecar, say) MUST
+        // see the bytes preserved as-is so the downstream reqwest client
+        // sees the operator's literal scheme. A refactor that introduced
+        // `url::Url::parse(...).require_https()` "for security" would
+        // silently break every test fixture using http:// and surface as a
+        // downstream reqwest error rather than as a clean boot-time error.
+        with_clean_env(|| {
+            // SAFETY: serialized by ENV_GUARD via `with_clean_env`.
+            unsafe {
+                std::env::set_var("GOOGLE_CLIENT_ID", "id");
+                std::env::set_var("GOOGLE_CLIENT_SECRET", "secret");
+                std::env::set_var(
+                    "GOOGLE_AUTH_URL",
+                    "http://insecure-wiremock.local:8080/auth",
+                );
+                std::env::set_var(
+                    "GOOGLE_TOKEN_URL",
+                    "http://insecure-wiremock.local:8080/token",
+                );
+            }
+            let c = GoogleClient::from_env().unwrap();
+            assert_eq!(c.auth_url, "http://insecure-wiremock.local:8080/auth");
+            assert_eq!(c.token_url, "http://insecure-wiremock.local:8080/token");
+        });
+    }
+
+    #[test]
+    fn google_client_clone_is_reflexive_double_clone_yields_field_equal_value() {
+        // The existing `google_client_clone_yields_independent_owned_strings`
+        // pin checks ownership independence after ONE clone. Pin reflexivity
+        // across TWO chained clones — the OAuth handler chain currently
+        // clones once at router wiring and once more on per-request scoping;
+        // a refactor that introduced a "first clone deep-copies, subsequent
+        // clones alias" optimization (a fringe pattern but real in some
+        // Cow-based libraries) would surface here as the second clone NOT
+        // matching the original field-for-field. Pin all four fields
+        // byte-equal across the chained clone path.
+        let orig = GoogleClient {
+            client_id: "id-double".into(),
+            client_secret: "secret-double".into(),
+            auth_url: "https://double.example/auth".into(),
+            token_url: "https://double.example/token".into(),
+        };
+        let c1 = orig.clone();
+        let c2 = c1.clone();
+        assert_eq!(c2.client_id, orig.client_id);
+        assert_eq!(c2.client_secret, orig.client_secret);
+        assert_eq!(c2.auth_url, orig.auth_url);
+        assert_eq!(c2.token_url, orig.token_url);
+    }
+
+    #[test]
+    fn google_client_debug_carries_all_four_field_names_in_single_render() {
+        // The existing `google_client_debug_carries_client_id` and
+        // `google_client_debug_carries_auth_url_and_token_url_field_names`
+        // tests pin THREE of the four field names individually. Pin all
+        // FOUR in one render so a manual Debug impl that surfaced three of
+        // four (e.g. omitted `client_secret` "for defense-in-depth secret
+        // hygiene at the trait level") would surface here. Note: the
+        // operator-facing log call sites use `?google` and rely on the
+        // derive — pinning at the trait level documents the four-field
+        // shape; redaction belongs at the call-site formatter, not at the
+        // Debug impl.
+        let g = GoogleClient {
+            client_id: "id-quad".into(),
+            client_secret: "secret-quad".into(),
+            auth_url: "https://quad.example/auth".into(),
+            token_url: "https://quad.example/token".into(),
+        };
+        let s = format!("{g:?}");
+        for field in ["client_id", "client_secret", "auth_url", "token_url"] {
+            assert!(s.contains(field), "missing field {field} in: {s}");
+        }
+    }
+
+    #[test]
+    fn from_env_default_urls_match_published_google_oauth_endpoints_byte_exact() {
+        // The two URL defaults are the published Google OAuth 2.0 endpoints
+        // from developers.google.com/identity/protocols/oauth2 — operator
+        // onboarding docs link to these literals. The existing tests pin
+        // both as `assert_eq!` strings but in isolation; pin BOTH literals
+        // in lockstep AND assert their byte-length so a refactor that
+        // introduced a typo (e.g. `oauth2/v3` instead of `v2`, a one-char
+        // diff that's easy to miss in review) would surface here as a
+        // multi-axis equality failure. A trailing slash or query string
+        // appended "for some boot-time normalization" would surface at the
+        // byte-length pin even if the substring match still held.
+        with_clean_env(|| {
+            // SAFETY: serialized by ENV_GUARD via `with_clean_env`.
+            unsafe {
+                std::env::set_var("GOOGLE_CLIENT_ID", "id");
+                std::env::set_var("GOOGLE_CLIENT_SECRET", "secret");
+            }
+            let c = GoogleClient::from_env().unwrap();
+            assert_eq!(c.auth_url, "https://accounts.google.com/o/oauth2/v2/auth");
+            assert_eq!(c.auth_url.len(), 44);
+            assert_eq!(c.token_url, "https://oauth2.googleapis.com/token");
+            assert_eq!(c.token_url.len(), 35);
+        });
+    }
+
+    #[test]
     fn from_env_respects_url_overrides() {
         with_clean_env(|| {
             // SAFETY: serialized by ENV_GUARD via `with_clean_env`.

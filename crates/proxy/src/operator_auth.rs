@@ -638,6 +638,157 @@ mod tests {
     }
 
     #[test]
+    fn operator_principal_and_scope_error_and_state_are_send_sync_static_for_axum_bounds() {
+        // `OperatorPrincipal` is held in axum request extensions
+        // (Send+Sync+'static-bound bag) and cloned across spawned
+        // metrics/audit tasks; `ScopeError` flows through `thiserror`'s
+        // `std::error::Error` impl and into anyhow chains in the
+        // require_scope path; `OperatorAuthState` is the `State<...>`
+        // extractor's stored value on every middleware invocation. The
+        // existing `operator_auth_state_is_clone_for_axum_state_propagation`
+        // pin only checks the Clone bound; widen the same boundary to
+        // include Send+Sync+'static across all three types. A refactor
+        // that gave any one an `Rc<...>` field "for cheap clone on the
+        // hot path" would break Send and surface at the router assembly
+        // site with an opaque tower::Service trait-bound rather than at
+        // this file. Pin all three at compile time.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<OperatorPrincipal>();
+        require_send_sync_static::<ScopeError>();
+        require_send_sync_static::<OperatorAuthState>();
+    }
+
+    #[test]
+    fn wildcard_constant_is_byte_exact_single_asterisk_one_char() {
+        // The `WILDCARD` constant is the load-bearing comparison in
+        // `require_scope` (`if scopes.iter().any(|s| s == WILDCARD || s ==
+        // scope)`) — a refactor that drifted it to `"**"` (npm-glob
+        // double-star "for ergonomic match-everything") OR to `"any"`
+        // (English-word "for operator-friendliness") would silently
+        // either narrow every wildcard token to deny-by-default OR
+        // collide with a literal scope name `any:*`. Pin the byte-exact
+        // `"*"` literal AND the length=1 AND that the constant is
+        // `&'static str` not String. The existing tests exercise WILDCARD
+        // behaviorally; pin the LITERAL here so a one-byte drift surfaces
+        // at this file, not as a cascading deny on every wildcard token.
+        fn require_static_str(_: &'static str) {}
+        require_static_str(WILDCARD);
+        assert_eq!(WILDCARD, "*");
+        assert_eq!(WILDCARD.len(), 1);
+        assert_eq!(WILDCARD.as_bytes(), b"*");
+    }
+
+    #[test]
+    fn generate_emits_prefix_exactly_once_at_offset_zero_across_burst() {
+        // The generator concats PREFIX + 52-char base32 body — across a
+        // burst of 100 generations the prefix MUST appear exactly once
+        // at offset 0 in every token, with no internal duplication. A
+        // refactor that, e.g., changed `format!("{PREFIX}{body}")` to
+        // `format!("{PREFIX}{PREFIX}{body}")` (a copy-paste mistake when
+        // splitting the helper between proxy + CLI) would surface here
+        // on iteration 1. Pin both invariants (count == 1 + offset == 0)
+        // across the burst so a stateful regression — e.g. a once-cell
+        // that wrapped after N calls — surfaces too.
+        for i in 0..100 {
+            let t = generate();
+            let count = t.matches(PREFIX).count();
+            assert_eq!(count, 1, "iter {i}: PREFIX count drift, got {count}");
+            assert_eq!(
+                &t[..PREFIX.len()],
+                PREFIX,
+                "iter {i}: PREFIX not at offset 0"
+            );
+            assert_eq!(t.len(), TOKEN_LEN);
+        }
+    }
+
+    #[test]
+    fn parse_token_rejects_body_length_plus_one_off_by_one_boundary() {
+        // The existing `parse_token_rejects_wrong_length` pin only checks
+        // BODY_LEN-1 (52-1 = 51 char body). Pin the symmetric BODY_LEN+1
+        // (53-char body) boundary so a refactor that loosened the
+        // length check to `>= TOKEN_LEN` (the natural shape of a "tolerate
+        // operator-typed trailing whitespace" change) would surface here.
+        // Both boundaries fail-closed via the `input.len() != TOKEN_LEN`
+        // fast-path. The CLI's `tokens issue` rendering depends on the
+        // exact 65-byte total — a one-byte off-by-one in either direction
+        // would silently produce a token the CLI accepts but the proxy
+        // rejects.
+        let too_long = format!("{PREFIX}{}", "A".repeat(BODY_LEN + 1));
+        assert_eq!(too_long.len(), TOKEN_LEN + 1);
+        assert!(parse_token(&too_long).is_none(), "53-char body must reject");
+        let way_too_long = format!("{PREFIX}{}", "A".repeat(BODY_LEN + 100));
+        assert!(
+            parse_token(&way_too_long).is_none(),
+            "152-char body must reject"
+        );
+        // Also pin the trailing-whitespace shape — a 52-char valid body
+        // with one trailing space (53 chars total). The CLI's HTTP
+        // header parsing strips trailing whitespace at the
+        // axum/header layer, so the proxy receives the canonical 52-char
+        // body — but pin the validator's behavior on raw +1-with-trailing
+        // -space input as a defense-in-depth check.
+        let with_trailing_space = format!("{PREFIX}{} ", "A".repeat(BODY_LEN));
+        assert_eq!(with_trailing_space.len(), TOKEN_LEN + 1);
+        assert!(parse_token(&with_trailing_space).is_none());
+    }
+
+    #[test]
+    fn require_scope_error_have_preserves_input_scope_order() {
+        // `ScopeError::have` is rendered into the 403 response body's
+        // `have` array — operator dashboards parse the array and
+        // re-render it in the order the token's scope catalog defined.
+        // A refactor that, e.g., sorted the array "for stable JSON
+        // output" OR that deduplicated "for compactness" would surface
+        // here on a known order-preserving input. Pin both axes: order
+        // preserved across a 5-scope input AND duplicates retained (the
+        // catalog may legitimately list a scope twice if it spans two
+        // logical buckets in the operator's mental model). The existing
+        // `scope_error_message_carries_required` pin walks ONE scope;
+        // widen to N=5 with deliberate ordering + a deliberate duplicate.
+        let scopes = vec![
+            "policy:read".to_string(),
+            "actions:read".to_string(),
+            "blocks:read".to_string(),
+            "actions:read".to_string(), // intentional duplicate
+            "pca:read".to_string(),
+        ];
+        let p = OperatorPrincipal {
+            token_id: Uuid::new_v4(),
+            name: "multi-scope-bot".into(),
+            scopes: Arc::new(scopes.clone()),
+            last_used_at: None,
+        };
+        let err = p.require_scope("policy:write").unwrap_err();
+        // Element-wise byte-equal — order preserved AND duplicate
+        // retained.
+        assert_eq!(err.have, scopes);
+        assert_eq!(err.have.len(), 5);
+        assert_eq!(err.have[3], "actions:read", "duplicate dropped");
+    }
+
+    #[test]
+    fn hash_byte_exact_for_canonical_operator_token_via_well_known_sha256_vector_abc() {
+        // `hash()` is `sha256(token.as_bytes())` — pin against the
+        // canonical FIPS 180-4 §B.1 / RFC 6234 §A.5 vector for input
+        // "abc" so the operator-token SHA-256 is verified against a
+        // published cross-checked digest (NOT just a self-consistency
+        // pin of `hash(t) == hash(t)`, which the existing
+        // `hash_is_stable` pin covers). A refactor that swapped to
+        // BLAKE3 "for speed" OR that prepended a per-process salt "for
+        // cache-key uniqueness" would silently invalidate every
+        // operator token already in the `operator_tokens` table — pin
+        // the deterministic mapping against an outside reference.
+        let h = hash("abc");
+        let expected: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(h, expected);
+    }
+
+    #[test]
     fn operator_auth_state_is_clone_for_axum_state_propagation() {
         // axum's `State<OperatorAuthState>` extractor requires Clone on
         // every middleware invocation — a `!Clone` field landing on the

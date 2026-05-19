@@ -372,6 +372,170 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tee_stream_new_with_no_sinks_reports_zero_sink_count() {
+        // Symmetric pin to `sink_count_tracks_with_sink_chaining`: pin
+        // the BASE case of the builder explicitly. A fresh
+        // `TeeStream::new(primary)` MUST report zero secondary sinks
+        // before any `with_sink` call. A refactor that initialized
+        // `sinks: Vec::with_capacity(1)` "to amortize the first push"
+        // and accidentally `push`-ed a placeholder would surface here.
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary);
+        assert_eq!(tee.sink_count(), 0);
+    }
+
+    #[test]
+    fn tee_stream_with_sink_increments_sink_count_by_exactly_one() {
+        // The existing `sink_count_tracks_with_sink_chaining` pin checks
+        // the cumulative count after two calls. Pin the per-call delta
+        // explicitly across a wider range (0 → 1 → 2 → 3 → 4) so a
+        // refactor that started skipping registration when the sink
+        // pointer matched an existing entry (a `HashSet`-style dedup)
+        // OR that started double-pushing (e.g. accidentally registering
+        // a wrapper alongside the inner sink) would surface here on the
+        // very first off-by-one delta.
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let mut tee = TeeStream::new(primary);
+        for expected in 1..=4 {
+            tee = tee.with_sink(Arc::new(Collector::default()));
+            assert_eq!(
+                tee.sink_count(),
+                expected,
+                "sink_count drift after {expected} registrations",
+            );
+        }
+    }
+
+    #[test]
+    fn tee_stream_erased_to_arc_dyn_is_send_sync_static() {
+        // The boot path stores `TeeStream` as `Arc<dyn ActionStream>`
+        // inside AppState — the dyn-object MUST itself satisfy
+        // `Send + Sync + 'static` (not just the concrete type). The
+        // existing `tee_stream_is_send_sync_static_for_app_state_arc_dyn_path`
+        // pin asserts the bounds on the concrete `TeeStream`; pin the
+        // SAME bounds on the erased trait-object handle so a refactor
+        // that left the bounds on `ActionStream` itself unchanged but
+        // accidentally tightened them via a where-clause on `TeeStream`
+        // would surface at exactly the AppState wire site this test
+        // mirrors.
+        fn require_send_sync_static<T: Send + Sync + 'static>(_: &T) {}
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary).with_sink(Arc::new(Collector::default()));
+        let erased: Arc<dyn ActionStream> = Arc::new(tee);
+        require_send_sync_static(&erased);
+    }
+
+    #[tokio::test]
+    async fn tee_stream_repeated_publish_accumulates_one_event_per_call() {
+        // The existing `no_sinks_publish_skips_join_all_branch_without_panic`
+        // pin asserts three sequential publishes accumulate three primary
+        // events when there are zero sinks. Pin the symmetric WITH-sinks
+        // case: across N=10 sequential publishes, each registered sink
+        // sees exactly N events, and the primary also sees exactly N. A
+        // refactor that introduced any form of dedup-by-event-id "for
+        // SIEM idempotence" would silently drop the second through Nth
+        // publish — pin N>3 so any small hard-coded cap (1, 2) would
+        // surface clearly.
+        let primary = Arc::new(Collector::default());
+        let s1 = Arc::new(Collector::default());
+        let s2 = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary.clone())
+            .with_sink(s1.clone())
+            .with_sink(s2.clone());
+        for _ in 0..10 {
+            tee.publish(sample()).await;
+        }
+        assert_eq!(primary.0.lock().unwrap().len(), 10);
+        assert_eq!(s1.0.lock().unwrap().len(), 10);
+        assert_eq!(s2.0.lock().unwrap().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn tee_stream_with_sink_chaining_preserves_registration_order() {
+        // `with_sink` pushes to a Vec — the fan-out order matches
+        // registration order. Pin that the recorded order at each
+        // sink's first-publish-position survives across three
+        // registrations. The existing `primary_publishes_before_secondary_sinks`
+        // pin only asserts primary-first; pin the SECONDARY ordering
+        // here so a refactor that swapped to `iter().rev()` (a
+        // "publish newest sink first" tweak someone might make
+        // chasing throughput) would surface in the recorded label
+        // sequence.
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct Tag {
+            label: &'static str,
+            order: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ActionStream for Tag {
+            async fn publish(&self, _e: ActionEvent) {
+                self.order.lock().unwrap().push(self.label);
+            }
+        }
+
+        let primary = Arc::new(Tag {
+            label: "p",
+            order: order.clone(),
+        });
+        let a = Arc::new(Tag {
+            label: "a",
+            order: order.clone(),
+        });
+        let b = Arc::new(Tag {
+            label: "b",
+            order: order.clone(),
+        });
+        let c = Arc::new(Tag {
+            label: "c",
+            order: order.clone(),
+        });
+        let tee = TeeStream::new(primary)
+            .with_sink(a)
+            .with_sink(b)
+            .with_sink(c);
+        tee.publish(sample()).await;
+        let v = order.lock().unwrap().clone();
+        // Primary first; the three secondaries appear in registration
+        // order. `join_all` polls in iteration order, and our `Tag`
+        // sinks complete synchronously inside `publish` (no `.await`
+        // suspension point between the `lock()` and the push), so the
+        // order is deterministic at this layer.
+        assert_eq!(v, vec!["p", "a", "b", "c"], "registration order drift");
+    }
+
+    #[tokio::test]
+    async fn tee_stream_publish_through_shared_arc_handle_does_not_deadlock() {
+        // Production wraps the `TeeStream` in `Arc<dyn ActionStream>`
+        // and clones the handle into every request scope — concurrent
+        // `publish` calls on independent `Arc` clones must NOT contend
+        // on any internal lock (the sinks Vec is read-only after boot;
+        // `&self.sinks` in the publish path borrows shared). Pin this
+        // by spawning ten tasks that each hold their own Arc clone
+        // and publish concurrently — every clone must complete and
+        // each sink must see exactly ten events. A refactor that
+        // introduced a `Mutex<Vec<…>>` "to allow runtime sink
+        // registration" would surface here as either a hang under
+        // contention or a deadlock if any sink's `publish` itself
+        // tried to register.
+        let primary = Arc::new(Collector::default());
+        let s1 = Arc::new(Collector::default());
+        let tee: Arc<dyn ActionStream> =
+            Arc::new(TeeStream::new(primary.clone()).with_sink(s1.clone()));
+        let mut handles = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let t = tee.clone();
+            handles.push(tokio::spawn(async move { t.publish(sample()).await }));
+        }
+        for h in handles {
+            h.await.expect("publish task panicked");
+        }
+        assert_eq!(primary.0.lock().unwrap().len(), 10);
+        assert_eq!(s1.0.lock().unwrap().len(), 10);
+    }
+
     #[tokio::test]
     async fn fan_out_handles_mixed_concrete_sink_types_via_arc_dyn() {
         // The `sinks: Vec<Arc<dyn ActionStream>>` field accepts any

@@ -137,4 +137,116 @@ mod tests {
             "http://127.0.0.1:8080",
         );
     }
+
+    #[test]
+    fn google_api_base_production_fallback_is_byte_exact_canonical_literal() {
+        // The existing `falls_back_to_production_googleapis_when_unset` pin
+        // asserts equality against the canonical literal once. Pin three
+        // additional shape-invariants on the same canonical string in
+        // lockstep so a refactor that "normalized" the URL (lowercasing the
+        // already-lowercase host, appending a `/`, swapping `www` for
+        // `api`) would surface here as a multi-line diff rather than a
+        // single-character change someone could miss in review: byte-length
+        // is exactly 26 (`https://` 8 + `www.googleapis.com` 18); contains
+        // exactly two `.` separators (between www/googleapis and
+        // googleapis/com); ends with `.com` not `.com/` or `.com.`. The
+        // adapter call sites APPEND their own path segments (e.g.
+        // `/calendar/v3/calendars/...`) so a trailing slash here would
+        // produce `//calendar/...` and break upstream routing.
+        let s = resolve(None);
+        assert_eq!(s.len(), 26, "fallback URL byte-length drifted: {s}");
+        assert_eq!(s.matches('.').count(), 2, "expected two dots: {s}");
+        assert!(s.ends_with(".com"), "fallback must end with .com: {s}");
+        assert!(
+            !s.ends_with(".com/") && !s.ends_with(".com."),
+            "fallback must not have trailing punctuation: {s}",
+        );
+    }
+
+    #[test]
+    fn google_api_base_repeated_calls_are_byte_stable() {
+        // The helper is pure (no interior mutability, no clock, no env
+        // lookup at call time — the env is read once at `AdapterState`
+        // assembly and stored in the field). Pin that 100 sequential
+        // calls return byte-equal strings for BOTH None and a Some
+        // override — a refactor that introduced a once-cell with a
+        // racy default ("read GOOGLE_API_BASE_URL lazily on first
+        // call") would surface here as either a flaky equality or
+        // a wholly different return on a later call.
+        let first_none = resolve(None);
+        for _ in 0..100 {
+            assert_eq!(resolve(None), first_none);
+        }
+        let override_url = "http://wiremock.local:8080/v1".to_string();
+        let first_some = resolve(Some(override_url.clone()));
+        for _ in 0..100 {
+            assert_eq!(resolve(Some(override_url.clone())), first_some);
+        }
+    }
+
+    #[test]
+    fn google_api_base_override_preserves_query_and_fragment_verbatim() {
+        // The helper is a pure `Option<String> → &str` passthrough — it
+        // does NOT parse the override as a URL or normalize query/fragment
+        // segments. Pin that a query string (`?proxy=1`) AND a fragment
+        // (`#tag`) both survive byte-for-byte. The adapter call sites
+        // append their own path under the base; an operator who chose to
+        // smuggle query state via the override (an unusual but valid
+        // operator escape hatch) MUST see that state preserved. A refactor
+        // that called `url::Url::parse(...).set_path("")` "to normalize"
+        // would silently strip both, and the adapter would call a
+        // wholly-different upstream.
+        assert_eq!(
+            resolve(Some("http://wiremock.local:8080/v1?proxy=1#tag".into())),
+            "http://wiremock.local:8080/v1?proxy=1#tag",
+        );
+    }
+
+    #[test]
+    fn google_api_base_override_preserves_uppercase_host_verbatim() {
+        // RFC 3986 says host components are case-insensitive, but the
+        // helper does NOT lowercase — it is a pure passthrough. Pin
+        // that an UPPERCASE-host override (the kind a copy-paste from a
+        // shouted-into-Slack URL might produce) survives byte-equal so
+        // the adapter call sites see the operator's literal string. A
+        // refactor that added `.to_lowercase()` "to canonicalize for
+        // TLS SNI" would silently mutate every adapter request URL by
+        // multiple bytes and break exact-match wiremock matchers.
+        assert_eq!(
+            resolve(Some("HTTP://WIREMOCK.LOCAL:8080".into())),
+            "HTTP://WIREMOCK.LOCAL:8080",
+        );
+    }
+
+    #[test]
+    fn google_api_base_override_preserves_unicode_path_verbatim() {
+        // The helper passes the override through byte-for-byte without
+        // percent-encoding or unicode normalization. Pin that a multibyte
+        // unicode path segment (`café` 5 bytes, `→` 3 bytes, `🔥` 4 bytes)
+        // survives byte-equal. The hyper/reqwest layer downstream will
+        // percent-encode at send time; the AdapterState helper itself
+        // must not touch the bytes. A refactor that called
+        // `percent_encoding::utf8_percent_encode(...)` here "to be safe"
+        // would double-encode at the request-build site and break the
+        // URL the operator configured.
+        let unicode = "http://wiremock.local:8080/café/→/🔥";
+        assert_eq!(resolve(Some(unicode.into())), unicode);
+    }
+
+    #[test]
+    fn google_api_base_override_with_whitespace_only_returns_whitespace_not_fallback() {
+        // Symmetric to `empty_string_returns_empty_not_fallback` — a
+        // whitespace-only override (` `, `   `, `\t`) is NOT a None and
+        // MUST NOT trigger the fallback. The helper returns the literal
+        // whitespace verbatim. Pin three distinct whitespace shapes
+        // (single space, multiple spaces, tab) — a refactor that added
+        // `.filter(|s| !s.trim().is_empty())` "for ergonomic operator
+        // misconfig handling" would silently route every adapter call
+        // to production from a misconfigured test fixture, and the
+        // test fixture's wiremock would never see a request. Today's
+        // contract: whitespace is the operator's explicit choice.
+        for ws in [" ", "   ", "\t"] {
+            assert_eq!(resolve(Some(ws.into())), ws, "whitespace input {ws:?}");
+        }
+    }
 }

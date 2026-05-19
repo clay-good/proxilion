@@ -633,6 +633,161 @@ mod tests {
     }
 
     #[test]
+    fn federation_claims_is_send_sync_static_for_oauth_callback_handler_boundary() {
+        // `FederationClaims` is built by the OAuth `/callback` handler
+        // and passed across the `tokio::spawn`-ed audit-write boundary
+        // (the audit row carrying `pca_0_id` + `p_0` + the bridge
+        // `state` correlation id is dispatched async). axum + tokio
+        // require Send+Sync+'static on values held across await points
+        // in spawned tasks. A refactor that, e.g., added an `Rc<...>`
+        // on a future field "for cheap clone of the ops list" would
+        // break Send and surface at the audit-spawn site with an opaque
+        // tower::Service trait-bound. Pin the three-trait combo at
+        // this file boundary so the failure surfaces here.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<FederationClaims>();
+    }
+
+    #[test]
+    fn infer_idp_returns_static_str_from_canonical_five_label_set() {
+        // `infer_idp` returns `&'static str` (the metric-label set is
+        // fixed at compile time). Pin the lifetime contract via a
+        // helper that takes `&'static str` only — a refactor to
+        // `String` "for ergonomic dynamic labels" would silently start
+        // heap-allocating on every OAuth callback. AND pin the
+        // canonical 5-label set `{okta, azure, google, oidc, unknown}`
+        // exhaustively. The existing pins exercise individual labels
+        // but never pin the type bound NOR the closed-set invariant.
+        fn require_static_str(_: &'static str) {}
+        for iss in [
+            Some("https://acme.okta.com"),
+            Some("https://login.microsoftonline.com/abc/v2.0"),
+            Some("https://accounts.google.com"),
+            Some("https://keycloak.internal/auth"),
+            Some(""),
+            None,
+        ] {
+            let label = infer_idp(iss);
+            require_static_str(label);
+            assert!(
+                matches!(label, "okta" | "azure" | "google" | "oidc" | "unknown"),
+                "non-canonical label `{label}` for iss {iss:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_federation_token_empty_string_rejects_with_malformed_message() {
+        // An empty string is the boundary input — `split('.').next()`
+        // yields `Some("")` and the second/third `.next()` yield None,
+        // so the destructure fails with the malformed-JWT branch. Pin
+        // both the rejection AND the operator-facing `"malformed"`
+        // substring (the OAuth `/callback` handler's log filter keys on
+        // this substring to bucket "agent sent nothing" separately from
+        // "agent sent something that wasn't a JWT"). A refactor that
+        // pre-checked `is_empty()` and returned a distinct
+        // `BridgeRejected("empty token")` variant would silently
+        // split the bucket; pin the existing path explicitly.
+        let err = validate_federation_token("").unwrap_err();
+        match err {
+            OAuthError::BridgeRejected(m) => {
+                assert!(m.contains("malformed"), "missing `malformed`: {m}")
+            }
+            other => panic!("expected BridgeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn federation_claims_ops_field_round_trips_fifty_element_vec_verbatim() {
+        // The `ops` field is `Vec<String>` — production federation
+        // bridges occasionally surface wide grants (a service principal
+        // with 50+ ops covering Drive + Calendar + Gmail at multiple
+        // scope shapes). The existing pins exercise 1-2 ops only —
+        // widen to N=50 so a refactor that capped the inner Vec at N
+        // "for postgres array column safety" OR that deduplicated "for
+        // RBAC hygiene" would surface here. Element-wise byte-equal
+        // across 50 distinct strings with mixed colon-separated +
+        // wildcard-suffix shapes.
+        let now = chrono::Utc::now().timestamp();
+        let ops: Vec<String> = (0..50)
+            .map(|i| format!("vendor{i}:read:path/{i}/*"))
+            .collect();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:wide@demo.local",
+            "ops": ops,
+            "state": "s",
+            "iat": now,
+            "exp": now + 60,
+        }));
+        let claims = validate_federation_token(&jwt).unwrap();
+        assert_eq!(claims.ops.len(), 50, "ops count drift");
+        for (i, op) in claims.ops.iter().enumerate() {
+            assert_eq!(op, &format!("vendor{i}:read:path/{i}/*"));
+        }
+    }
+
+    #[test]
+    fn infer_idp_does_not_match_okta_io_or_microsoft_com_false_positives() {
+        // The infer_idp substring matches are deliberately conservative:
+        // `okta.com` + `oktapreview.com` → okta; `microsoftonline.com` +
+        // `windows.net` → azure; `accounts.google.com` + `googleapis.com`
+        // → google. A look-alike domain like `okta.io` (the docs domain,
+        // NOT an IdP) MUST NOT match okta — it falls through to oidc.
+        // Similarly `microsoft.com` (Microsoft corp marketing site, NOT
+        // an IdP) MUST NOT match azure. Pin the negative side so a
+        // refactor that loosened `okta.com` to `okta` (substring
+        // alone) would surface here as a false-positive label drift,
+        // which would silently flip operators' metric panels to attribute
+        // unrelated traffic to the wrong IdP.
+        assert_eq!(infer_idp(Some("https://www.okta.io/docs")), "oidc");
+        assert_eq!(infer_idp(Some("https://www.microsoft.com/")), "oidc");
+        assert_eq!(infer_idp(Some("https://google.com/search")), "oidc");
+        // The leading "https://accounts.google.something-else.com"
+        // also must NOT match google (since the substring `accounts.google.com`
+        // wouldn't be in there if `.something-else.com` interposes).
+        assert_eq!(
+            infer_idp(Some("https://accounts.google.evilcorp.com/x")),
+            "oidc",
+        );
+    }
+
+    #[test]
+    fn validate_federation_token_preserves_iss_field_byte_equal_through_payload_round_trip() {
+        // The existing `claims_iss_round_trips_through_payload` pin
+        // checks the inferred IdP label (azure) — pin the byte-equal
+        // round-trip of the RAW `iss` string itself across an upper-
+        // case variant + a URL with path + query. Operators key on the
+        // raw iss for cross-system join (Grafana's IdP-side dashboard
+        // uses the exact issuer string the IdP emits in its own logs).
+        // A refactor that normalized iss (lowercase, trim, strip path)
+        // would silently break the join.
+        let now = chrono::Utc::now().timestamp();
+        for raw_iss in [
+            "https://Tenant.OKTA.com",
+            "https://login.microsoftonline.com/abc/v2.0?token=x",
+            "https://accounts.google.com/oauth/v2",
+        ] {
+            let jwt = make_jwt(&serde_json::json!({
+                "pca_0_id": "00000000-0000-0000-0000-000000000001",
+                "p_0": "user:alice@demo.local",
+                "ops": [],
+                "state": "s",
+                "iat": now,
+                "exp": now + 60,
+                "iss": raw_iss,
+            }));
+            let claims = validate_federation_token(&jwt).unwrap();
+            assert_eq!(
+                claims.iss.as_deref(),
+                Some(raw_iss),
+                "iss must round-trip byte-equal, got {:?}",
+                claims.iss,
+            );
+        }
+    }
+
+    #[test]
     fn accepts_fresh_token() {
         let now = chrono::Utc::now().timestamp();
         let jwt = make_jwt(&serde_json::json!({

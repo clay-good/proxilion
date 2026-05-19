@@ -937,6 +937,177 @@ mod tests {
     }
 
     #[test]
+    fn blocked_api_error_is_send_sync_static_for_axum_into_response_boundary() {
+        // `ApiError` is the return-error type for every blocked-action
+        // handler (list / show / approve / reject / issue-link) — it
+        // flows through `IntoResponse` from handler futures crossing
+        // tokio task boundaries, which mandates Send+Sync+'static.
+        // Symmetric to the same-axis pins on
+        // [crates/proxy/src/adapters/error.rs] (AppError),
+        // [crates/proxy/src/oauth/error.rs] (OAuthError), and
+        // [crates/proxy/src/api/killswitch.rs] (sibling ApiError + state).
+        // A refactor giving any variant an `Rc<...>` field "for cheap
+        // clone of the detail string" would break Sync at the router
+        // site rather than as a far-removed trait-bound error.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ApiError>();
+    }
+
+    #[test]
+    fn blocked_api_error_status_across_all_variants_is_4xx_or_5xx_never_2xx_or_3xx() {
+        // Symmetric to the same-axis pins on adapters/error.rs (round
+        // 143) and oauth/error.rs (round 145). Every ApiError variant
+        // surfaces a non-success status — a refactor that registered
+        // a new variant mapping to 200 OK "for the silent-success case"
+        // would silently exclude that variant from operator dashboard
+        // error-rate metrics. Pin !is_success AND !is_redirection
+        // AND (is_client_error || is_server_error) across the full
+        // variant sweep.
+        for v in [
+            ApiError::NotFound,
+            ApiError::BadRequest("x".into()),
+            ApiError::Conflict("x".into()),
+            ApiError::PicRefused("x".into()),
+            ApiError::Internal("x".into()),
+            ApiError::Db(sqlx::Error::RowNotFound),
+        ] {
+            let label = format!("{v:?}");
+            let r = v.into_response();
+            let s = r.status();
+            assert!(!s.is_success(), "variant {label} surfaced 2xx {s}");
+            assert!(!s.is_redirection(), "variant {label} surfaced 3xx {s}");
+            assert!(
+                s.is_client_error() || s.is_server_error(),
+                "variant {label} surfaced non-4xx/5xx {s}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_api_error_body_code_is_lowercase_snake_case_across_all_variants() {
+        // Symmetric to the same-axis pin on adapters/error.rs (round
+        // 143) and oauth/error.rs (round 145). The wire `code` field
+        // operators grep on MUST be lowercase snake_case across all
+        // ApiError variants. A refactor that surfaced one as
+        // PascalCase OR kebab-case would silently break every operator
+        // dashboard regex bucket. Pin absence of uppercase ASCII AND
+        // absence of `-` exhaustively.
+        let variants: Vec<ApiError> = vec![
+            ApiError::NotFound,
+            ApiError::BadRequest("x".into()),
+            ApiError::Conflict("x".into()),
+            ApiError::PicRefused("x".into()),
+            ApiError::Internal("x".into()),
+            ApiError::Db(sqlx::Error::RowNotFound),
+        ];
+        for v in variants {
+            let r = v.into_response();
+            let body = body_json(r).await;
+            let code = body["code"].as_str().unwrap_or("");
+            assert!(!code.is_empty(), "empty code surfaced");
+            assert!(
+                !code.chars().any(|c| c.is_ascii_uppercase()),
+                "uppercase in code `{code}`",
+            );
+            assert!(!code.contains('-'), "kebab in code `{code}`");
+        }
+    }
+
+    #[test]
+    fn approve_response_serializes_with_exactly_seven_known_keys_and_static_status() {
+        // The struct has 7 fields (blocked_id, override_pca_id, p_0,
+        // granted_ops, hop, predecessor_pca_id, status). When serialized
+        // the JSON object MUST carry EXACTLY those 7 keys — a refactor
+        // that elided one would silently drop operator-visible state
+        // from the confirmation toast; an addition would widen the wire
+        // shape unannounced. AND pin that `status: &'static str` is a
+        // string literal — `"overridden"` constructed at the handler
+        // site (NOT heap-allocated on every approval). A refactor to
+        // `status: String` would silently allocate on every call.
+        fn require_static_str(_: &'static str) {}
+        let r = ApproveResponse {
+            blocked_id: Uuid::nil(),
+            override_pca_id: Uuid::nil(),
+            p_0: "user:alice@x".into(),
+            granted_ops: vec!["drive:read:x".into()],
+            hop: 1,
+            predecessor_pca_id: Uuid::nil(),
+            status: "overridden",
+        };
+        require_static_str(r.status);
+        let v = serde_json::to_value(&r).unwrap();
+        let obj = v.as_object().expect("must serialize to JSON object");
+        assert_eq!(obj.len(), 7, "field count drift: {obj:?}");
+        for k in [
+            "blocked_id",
+            "override_pca_id",
+            "p_0",
+            "granted_ops",
+            "hop",
+            "predecessor_pca_id",
+            "status",
+        ] {
+            assert!(obj.contains_key(k), "missing key {k}: {obj:?}");
+        }
+        // And the status string serializes verbatim, not under a tag
+        // wrapper (a refactor to an enum with `#[serde(tag)]` would
+        // silently change the wire shape to a nested object).
+        assert!(v["status"].is_string());
+        assert_eq!(v["status"], "overridden");
+    }
+
+    #[test]
+    fn api_error_debug_carries_variant_names_for_grep_bucketing() {
+        // Symmetric to the AppError + OAuthError + sibling ApiError
+        // Debug pins. Operators grep tracing log lines by ApiError
+        // variant name to bucket NotFound (operator typo) vs Conflict
+        // (race) vs PicRefused (Trust Plane refusal) vs Internal
+        // (proxy bug) vs Db (postgres outage). A hand-rolled
+        // `impl Debug` that hid variant names "to compact" the line
+        // would break every operator bucket.
+        for (variant, name) in [
+            (ApiError::NotFound, "NotFound"),
+            (ApiError::BadRequest("x".into()), "BadRequest"),
+            (ApiError::Conflict("x".into()), "Conflict"),
+            (ApiError::PicRefused("x".into()), "PicRefused"),
+            (ApiError::Internal("x".into()), "Internal"),
+            (ApiError::Db(sqlx::Error::RowNotFound), "Db"),
+        ] {
+            let s = format!("{:?}", variant);
+            assert!(s.contains(name), "expected `{name}` in Debug, got: {s}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_error_pic_refused_body_carries_pic_invariant_code_and_fix_field_present() {
+        // The PicRefused 422 envelope is the only ApiError variant
+        // whose body carries a `fix` field — the existing
+        // `api_error_pic_refused_is_422_with_fix_hint` and
+        // `api_error_pic_refused_fix_mentions_re_root_chain_hint`
+        // pins exercise the fix text. Pin the wire SHAPE
+        // distinguisher: the body MUST carry `code:
+        // "pic_invariant"` (not `internal_error` or `conflict`) AND
+        // the `fix` field MUST be present on the wire (not None,
+        // not skipped). A refactor that collapsed PicRefused into
+        // the generic Conflict arm "since both are 4xx and operator-
+        // actionable" would surface here as code drift OR fix
+        // absence — both would silently break the operator dashboard
+        // panel that anchors on `code == "pic_invariant"`.
+        let r = ApiError::PicRefused("ops not subset".into()).into_response();
+        let v = body_json(r).await;
+        assert_eq!(v["code"], "pic_invariant");
+        assert!(
+            v.get("fix").is_some(),
+            "fix field must be present for PicRefused: {v}",
+        );
+        assert!(
+            v["fix"].is_string(),
+            "fix must be a string, got: {}",
+            v["fix"],
+        );
+    }
+
+    #[test]
     fn blocked_row_includes_request_canonical_json_when_set() {
         let mut row = BlockedRow {
             id: Uuid::nil(),

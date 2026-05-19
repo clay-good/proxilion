@@ -347,4 +347,158 @@ mod tests {
         kc.mark_many(std::iter::empty()).await;
         assert!(!kc.is_killed(&[0u8; 32]).await);
     }
+
+    #[tokio::test]
+    async fn mark_many_accepts_array_iterator_not_only_vec() {
+        // `mark_many` signature is `impl IntoIterator<Item = [u8; 32]>` —
+        // it must accept ANY `IntoIterator` shape, not just `Vec`. The
+        // killswitch handler currently passes a `Vec`, but a future
+        // caller might inline a stack-allocated array literal for a
+        // small known set. Pin that an array-literal IntoIterator
+        // marks the elements correctly — a refactor to a `Vec`-only
+        // signature (`hashes: Vec<[u8; 32]>`) would force callers to
+        // allocate at every call site and would break the generic
+        // contract this signature documents.
+        let kc = KillCache::new();
+        let h1 = [10u8; 32];
+        let h2 = [20u8; 32];
+        let h3 = [30u8; 32];
+        kc.mark_many([h1, h2, h3]).await;
+        assert!(kc.is_killed(&h1).await);
+        assert!(kc.is_killed(&h2).await);
+        assert!(kc.is_killed(&h3).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_marks_across_independent_tasks_all_observable() {
+        // The kill_cache is shared across every middleware invocation
+        // via `AppState.clone()` — concurrent marks (e.g. several
+        // killswitch endpoints firing in parallel against distinct
+        // bearer sets) must all land in the same observable cache.
+        // Pin this by spawning 10 tasks that each mark a distinct
+        // hash through a clone of the cache; all 10 hashes are
+        // observable from the parent handle afterwards. A refactor
+        // that introduced any per-task-local mutation buffer
+        // ("batch flush every N marks") would surface here as a
+        // missing hash on a race-loss boundary.
+        let kc = KillCache::new();
+        let mut handles = Vec::with_capacity(10);
+        for i in 0..10u8 {
+            let kc = kc.clone();
+            handles.push(tokio::spawn(async move {
+                kc.mark([i + 100; 32]).await;
+            }));
+        }
+        for h in handles {
+            h.await.expect("mark task panicked");
+        }
+        for i in 0..10u8 {
+            assert!(
+                kc.is_killed(&[i + 100; 32]).await,
+                "mark from task {i} not visible on parent handle",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_many_with_256_distinct_hashes_all_observable() {
+        // The existing `mark_many_with_one_hundred_distinct_hashes` pin
+        // covers 100 entries. Pin a wider 256-entry bulk — the
+        // killswitch `/killswitch/all` endpoint can return the entire
+        // active-bearer table, and 256 is below the moka 100k capacity
+        // bound by three orders of magnitude (so eviction is NOT a
+        // factor) but is wider than any small hard-coded cap (16, 32,
+        // 64, 128) a "batched insert for performance" refactor might
+        // introduce. Iterate the full 0..=255 byte value range so
+        // every all-N-fill pattern is exercised.
+        let kc = KillCache::new();
+        let hashes: Vec<[u8; 32]> = (0..=255u8).map(|i| [i; 32]).collect();
+        kc.mark_many(hashes.clone()).await;
+        for (i, h) in hashes.iter().enumerate() {
+            assert!(kc.is_killed(h).await, "hash at index {i} missing");
+        }
+    }
+
+    #[tokio::test]
+    async fn default_and_new_constructors_produce_observably_equivalent_empty_state() {
+        // The existing `default_constructor_yields_empty_cache` pin
+        // checks `Default::default()` is empty. Pin DIRECT equivalence
+        // between `KillCache::new()` AND `Default::default()` — both
+        // must yield empty observable state across multiple probe
+        // hashes, AND both must accept the same `mark` + `is_killed`
+        // call sequence symmetrically. A refactor that gave Default
+        // a divergent code path ("Default uses a smaller capacity for
+        // tests") would silently change the boot-time cache shape
+        // depending on which constructor AppState happened to call.
+        let new_cache = KillCache::new();
+        let default_cache: KillCache = Default::default();
+        let probes = [[0u8; 32], [1u8; 32], [0xffu8; 32], [42u8; 32]];
+        for p in &probes {
+            assert!(!new_cache.is_killed(p).await);
+            assert!(!default_cache.is_killed(p).await);
+        }
+        let h = [77u8; 32];
+        new_cache.mark(h).await;
+        default_cache.mark(h).await;
+        assert!(new_cache.is_killed(&h).await);
+        assert!(default_cache.is_killed(&h).await);
+        // Non-matching probe still unkilled on both — the mark didn't
+        // leak across hashes on either constructor.
+        let neighbor = [78u8; 32];
+        assert!(!new_cache.is_killed(&neighbor).await);
+        assert!(!default_cache.is_killed(&neighbor).await);
+    }
+
+    #[tokio::test]
+    async fn marking_one_hash_does_not_kill_any_of_a_hundred_distinct_neighbors() {
+        // The existing `neighbor_hash_differing_by_one_byte_is_not_killed`
+        // pin checks ONE neighbor. Pin the broader anti-leakage contract:
+        // marking exactly one hash must leave 100 distinct random-pattern
+        // neighbors all unkilled. A regression that hashed only a prefix
+        // for cache lookup, or that used a Bloom-filter-style approximate
+        // set under the hood "to reduce memory", would surface here as
+        // false-positive kills across a wide neighbor sweep — even if
+        // the one-byte-flip neighbor happened to land in a clean cell.
+        let kc = KillCache::new();
+        let marked = [123u8; 32];
+        kc.mark(marked).await;
+        assert!(kc.is_killed(&marked).await);
+        for i in 0..100u8 {
+            // Build a neighbor by setting byte i (mod 32) to a value
+            // different from 123; tile the index across the 32-byte
+            // hash so we exercise every byte position over the sweep.
+            let mut neighbor = [123u8; 32];
+            let pos = (i as usize) % 32;
+            neighbor[pos] = i.wrapping_add(7);
+            if neighbor == marked {
+                continue;
+            }
+            assert!(
+                !kc.is_killed(&neighbor).await,
+                "false-positive kill on neighbor i={i} pos={pos}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn is_killed_returns_bool_not_optional_on_unmarked_hash() {
+        // The middleware's hot path uses `if kc.is_killed(&h).await { ... }`
+        // — the return type MUST be `bool`, not `Option<bool>` or `Result<bool>`.
+        // A refactor that added a "cache failure" error variant ("propagate
+        // moka shutdown errors") would force every call site to add
+        // `.unwrap_or(false)` and would change the fail-open vs fail-closed
+        // posture on the hot path. Pin the return type at the call site
+        // by using the value DIRECTLY in a boolean context with no
+        // unwrap/match — if the signature ever changes, this test fails
+        // to compile rather than silently downgrading the safety posture.
+        let kc = KillCache::new();
+        let h = [88u8; 32];
+        let observed: bool = kc.is_killed(&h).await;
+        assert!(!observed);
+        // Negation also works without coercion — pin that `bool` is the
+        // raw type, not `IntoFuture<Output=bool>` (already awaited).
+        if kc.is_killed(&h).await {
+            panic!("unmarked hash should not be killed");
+        }
+    }
 }

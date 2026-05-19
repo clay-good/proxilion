@@ -606,6 +606,118 @@ mod tests {
     }
 
     #[test]
+    fn slack_interact_state_is_clone_send_sync_static_for_axum_state_boundary() {
+        // `SlackInteractState` is held in `Router::with_state(...)` and
+        // cloned into every request — the (Clone + Send + Sync + 'static)
+        // four-trait combo is the axum-State contract. A refactor that
+        // gave it an `Rc<...>` field "for cheap shared notifier handle"
+        // would break Send + Sync without surfacing here; the breakage
+        // would appear at router assembly with an unrelated
+        // `tower::Service` trait-bound error. Pin the bound combo so
+        // the type boundary fails fast at the right file.
+        fn require_clone_send_sync_static<T: Clone + Send + Sync + 'static>() {}
+        require_clone_send_sync_static::<SlackInteractState>();
+    }
+
+    #[tokio::test]
+    async fn slack_err_content_type_is_application_json_with_no_charset_suffix() {
+        // The existing `carries_application_json_content_type_header` pin
+        // checks the prefix matches `application/json`. Pin the BYTE-EXACT
+        // shape with NO `; charset=utf-8` suffix — Slack's signed-request
+        // verification path normalizes JSON bodies on its side, and a
+        // charset suffix would not break the wire, but the proxy's
+        // operator dashboard groups Slack-bound responses by exact
+        // content-type string. A refactor that switched to axum's
+        // `Json(...)` extractor (which appends `; charset=utf-8`) would
+        // silently bucket every Slack response under a new content-type
+        // and break the dashboard count.
+        let r = slack_err(StatusCode::BAD_REQUEST, "missing payload");
+        let ct = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+    }
+
+    #[tokio::test]
+    async fn slack_ok_message_content_type_is_application_json_with_no_charset_suffix() {
+        // Symmetric to the err-helper byte-exact content-type pin: the
+        // success-path helper MUST move in lockstep on the exact
+        // header value (not just the prefix). A refactor that fixed
+        // only one of the two helpers' content-type would silently
+        // diverge them and break the dashboard's "Slack responses"
+        // group-by-content-type tile.
+        let r = slack_ok_message("Approved.");
+        let ct = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+    }
+
+    #[tokio::test]
+    async fn slack_ok_message_preserves_multibyte_unicode_in_text_field() {
+        // The success-path text is rendered into a Slack mrkdwn message
+        // bubble — multibyte unicode (operator's email contains an `é`,
+        // a `→` separator in a synthesized success line, an emoji like
+        // `🔥` for a flagged action) MUST survive byte-for-byte through
+        // `serde_json::json!` AND the `to_string()` serialization. A
+        // refactor that swapped to a manual `format!("{{\"text\":\"{t}\"}}")`
+        // "for speed" would silently fail to escape interior quotes AND
+        // could mangle non-ASCII under some `ascii_safe`-style escape
+        // mode. Pin a three-codepoint spread (`é` 2 bytes, `→` 3 bytes,
+        // `🔥` 4 bytes) round-trips byte-equal through the wire.
+        let payload = "café → 🔥 approved by alice@demo.local";
+        let r = slack_ok_message(payload);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["text"], payload);
+    }
+
+    #[tokio::test]
+    async fn slack_err_escapes_backslash_and_control_byte_in_message_round_trip() {
+        // The existing escape-pin (`slack_err_escapes_special_chars_in_msg_via_serde_json`)
+        // covers quote + newline. Pin the OTHER two JSON-special bytes
+        // operators see in the wild — a literal backslash (`C:\path` in
+        // a Windows-shell-derived error message that bubbled up via
+        // sqlx connection string) and a tab character (sqlx uses tabs in
+        // some multiline error renderings). A refactor to `format!` would
+        // surface here as either an invalid-JSON parse error OR a corrupted
+        // round-trip where the backslash got doubled or the tab got
+        // stripped. Pin both round-trip byte-equal through serde.
+        let msg = "fail: C:\\Users\\bob\twith\ttabs";
+        let r = slack_err(StatusCode::BAD_REQUEST, msg);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], msg);
+    }
+
+    #[test]
+    fn header_str_returns_first_value_when_header_has_multiple_inserts() {
+        // axum's HeaderMap supports multi-valued headers (`.append(...)`);
+        // `.get(...)` returns the FIRST value. The signature verification
+        // path treats `x-slack-signature` as single-valued — a refactor
+        // that switched to `.get_all(...)` and joined "for completeness"
+        // would silently concatenate all signatures and break v0 verify
+        // (which compares against ONE HMAC). Pin that the helper sees
+        // the first inserted value verbatim, even after a subsequent
+        // append. Slack's SDKs send exactly one signature header, but
+        // a misbehaving proxy in front of us could double-add the header
+        // — we must not concatenate.
+        let mut h = HeaderMap::new();
+        h.insert("x-slack-signature", HeaderValue::from_static("v0=first"));
+        h.append("x-slack-signature", HeaderValue::from_static("v0=second"));
+        let got = header_str(&h, "x-slack-signature");
+        assert_eq!(
+            got,
+            Some("v0=first"),
+            "header_str must return the first inserted value, not a join"
+        );
+    }
+
+    #[test]
     fn header_str_returns_some_empty_for_empty_header_value() {
         // Boundary: an HTTP header with an empty value is legal
         // (`X-Slack-Signature:` with no value after the colon). The

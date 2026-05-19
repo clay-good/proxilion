@@ -327,6 +327,139 @@ mod tests {
     }
 
     #[test]
+    fn policy_api_state_is_send_sync_static_for_axum_state_boundary() {
+        // `PolicyApiState` is passed via `with_state(...)` into the axum
+        // Router; axum requires `Send + Sync + 'static`. A refactor that
+        // gave `PolicyApiState` an `Rc<...>` field (e.g. wrapping the
+        // hot-reload handle "for cheap clone") would break Sync at the
+        // router site with a far-removed trait-bound error. Pin the
+        // three-trait combo here — symmetric to the
+        // `api_error_and_killswitch_state_are_send_sync_static_for_axum_state_boundary`
+        // pin on [crates/proxy/src/api/killswitch.rs] and the
+        // `setup_api_state_and_setup_error_are_send_sync_static_for_axum_boundary`
+        // pin on [crates/proxy/src/api/setup.rs].
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<PolicyApiState>();
+    }
+
+    #[test]
+    fn policy_view_and_list_response_debug_carry_struct_names_for_grep() {
+        // Both `PolicyView` and `ListResponse` derive `Debug` — the
+        // hot-reload code path uses `tracing::debug!(?listing, ...)`
+        // when reload reports return non-empty Vecs. Operators grep
+        // the log line by struct name to bucket policy-list rendering
+        // events. A hand-rolled `impl Debug` that hid struct names "to
+        // compact" the line would break the bucket. Pin both struct
+        // names — symmetric to the variant-name pins on api/killswitch.rs.
+        let v = PolicyView {
+            id: "p1".into(),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            mode: "enforce".into(),
+            pic_mode: "audit".into(),
+        };
+        let s = format!("{v:?}");
+        assert!(s.contains("PolicyView"), "got: {s}");
+        let r = ListResponse {
+            source: None,
+            policy_count: 0,
+            policies: vec![],
+        };
+        let s = format!("{r:?}");
+        assert!(s.contains("ListResponse"), "got: {s}");
+    }
+
+    #[test]
+    fn policy_view_clone_preserves_every_field_byte_equal() {
+        // `PolicyView` derives `Clone` — the listing handler clones
+        // views into JSON envelopes (via Vec collect). Pin that every
+        // field round-trips a clone without aliasing or truncation. A
+        // refactor that switched any field to `Arc<str>` or `Cow<str>`
+        // for "cheaper clone" would silently change the mutation safety
+        // contract — pin via mutation independence: mutating the source
+        // post-clone MUST NOT alias the clone.
+        let mut v = PolicyView {
+            id: "id-original".into(),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            mode: "enforce".into(),
+            pic_mode: "audit".into(),
+        };
+        let c = v.clone();
+        v.id.push_str("-MUTATED");
+        v.vendor.push_str("-MUTATED");
+        v.action.push_str("-MUTATED");
+        v.mode.push_str("-MUTATED");
+        v.pic_mode.push_str("-MUTATED");
+        assert_eq!(c.id, "id-original");
+        assert_eq!(c.vendor, "google");
+        assert_eq!(c.action, "drive.files.get");
+        assert_eq!(c.mode, "enforce");
+        assert_eq!(c.pic_mode, "audit");
+    }
+
+    #[test]
+    fn parse_listing_preserves_multibyte_unicode_in_id_vendor_action_verbatim() {
+        // YAML supports utf-8 in scalars. Operators sometimes use
+        // non-ASCII policy ids (e.g. localized rule names) or vendor
+        // tags. Pin that `parse_listing` passes multibyte chars
+        // through byte-for-byte rather than lossy-converting (a
+        // refactor that called `.replace(non_ascii, "?")` "for log
+        // hygiene" would silently mangle every non-ASCII policy
+        // surface and break the admin UI's display). Walk through
+        // 2-byte (`é`), 3-byte (`→`), and 4-byte (`🔥`) codepoints in
+        // distinct fields.
+        let yaml = "- id: café-rule\n  vendor: googlé\n  action: drive→files🔥get\n";
+        let out = parse_listing(yaml);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "café-rule");
+        assert_eq!(out[0].vendor, "googlé");
+        assert_eq!(out[0].action, "drive→files🔥get");
+    }
+
+    #[test]
+    fn set_mode_body_deserializes_arbitrary_mode_string_verbatim_no_case_normalization() {
+        // The `SetModeBody { mode: String }` deserializer is a plain
+        // String — case + whitespace preservation is operator-visible
+        // through the handler's exact-match arms ("enforce" / "observe"
+        // / "disabled" all-lowercase). Pin that serde does NOT
+        // lowercase or trim, so the handler's match-arm rejection of
+        // "ENFORCE" or " enforce " produces a 400 with a useful
+        // operator-facing message rather than silently accepting the
+        // case variant. A refactor that added
+        // `#[serde(deserialize_with = "lowercase")]` "for ergonomic
+        // CLI" would silently accept "ENFORCE" past the handler's
+        // exact-match.
+        let upper: SetModeBody = serde_json::from_str(r#"{"mode":"ENFORCE"}"#).unwrap();
+        assert_eq!(upper.mode, "ENFORCE");
+        let padded: SetModeBody = serde_json::from_str(r#"{"mode":" enforce "}"#).unwrap();
+        assert_eq!(padded.mode, " enforce ");
+        let bogus: SetModeBody = serde_json::from_str(r#"{"mode":"warp-speed"}"#).unwrap();
+        assert_eq!(bogus.mode, "warp-speed");
+    }
+
+    #[test]
+    fn parse_listing_skips_entries_where_id_is_not_a_string() {
+        // The `as_str()` call on the `id` field returns None for
+        // numeric or boolean YAML scalars, and `filter_map` drops the
+        // entry. Pin that an operator typo (`id: 42` instead of
+        // `id: "p42"`) doesn't surface as a numeric "id" in the admin
+        // UI's listing — it gets silently dropped. A refactor that
+        // surfaced the entry with `id: ""` (the natural `unwrap_or`
+        // default applied to `id` "for consistency with vendor /
+        // action") would silently render an empty-id row in the
+        // admin table that no `set_mode` call could target.
+        let yaml = "- id: 42\n  vendor: google\n- id: true\n  vendor: google\n- id: real\n  vendor: google\n";
+        let out = parse_listing(yaml);
+        assert_eq!(
+            out.len(),
+            1,
+            "non-string id entries must be dropped: {out:?}"
+        );
+        assert_eq!(out[0].id, "real");
+    }
+
+    #[test]
     fn parse_listing_preserves_source_order_across_multiple_policies() {
         // The admin UI's policy table relies on the source YAML's order
         // being preserved verbatim (operators sort their policies by

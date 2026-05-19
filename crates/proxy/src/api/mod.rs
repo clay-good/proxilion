@@ -352,6 +352,169 @@ mod tests {
     }
 
     #[test]
+    fn api_state_and_api_error_are_send_sync_static_for_axum_boundary() {
+        // `ApiState` is passed via `with_state(...)` into the axum
+        // Router (axum requires `Send + Sync + 'static` on State).
+        // `ApiError` flows through `IntoResponse` from handler futures
+        // crossing tokio task boundaries and needs the same bounds.
+        // A refactor that wrapped `pca_cache` in `Rc<...>` for "cheap
+        // clone" would break Sync at the router site. Pin both bounds
+        // — symmetric to the
+        // `api_error_and_killswitch_state_are_send_sync_static_for_axum_state_boundary`
+        // pin on [crates/proxy/src/api/killswitch.rs].
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ApiState>();
+        require_send_sync_static::<ApiError>();
+    }
+
+    #[test]
+    fn api_error_db_arm_display_passes_inner_cache_error_via_transparent_derive() {
+        // `Db(#[from] CacheError)` uses `#[error(transparent)]` — the
+        // wrapper's Display MUST equal the inner `CacheError`'s
+        // Display byte-for-byte (no prefix, no formatting wrapper).
+        // The Verifier arm sibling uses `#[error("verifier: {0}")]`
+        // (explicit prefix) which the existing
+        // `api_error_display_renders_verifier_prefix_with_inner_message`
+        // test pins. Pin transparent passthrough on Db here so a
+        // refactor that swapped `#[error(transparent)]` for
+        // `#[error("db: {0}")]` "for symmetry with verifier" would
+        // silently prepend "db: " to every Db-error log line and break
+        // operator log filters that grep on raw CacheError Display
+        // substrings — symmetric to the killswitch + setup transparent-
+        // pass-through pins on api/killswitch.rs + api/setup.rs.
+        let inner = crate::pic::cache::CacheError::Db(sqlx::Error::RowNotFound);
+        let inner_s = inner.to_string();
+        let wrapped = ApiError::Db(crate::pic::cache::CacheError::Db(sqlx::Error::RowNotFound));
+        assert_eq!(
+            wrapped.to_string(),
+            inner_s,
+            "Db arm transparent derive must passthrough Display verbatim",
+        );
+    }
+
+    #[test]
+    fn api_error_debug_carries_all_three_variant_names_for_grep_bucketing() {
+        // The `#[derive(Debug)]` on `ApiError` feeds `?err` in
+        // `tracing::warn!(?err, ...)` call sites. Operators grep the
+        // log line by variant name to bucket NotFound (eviction or
+        // never-landed) vs Db (postgres outage) vs Verifier (chain-
+        // walker fault). A hand-rolled Debug that hid any variant
+        // name "to compact" the line would break the bucket. Pin all
+        // three names — extends the existing per-variant Display pins
+        // with the Debug-axis coverage that operator grep keys on.
+        let nf = format!("{:?}", ApiError::NotFound);
+        assert!(nf.contains("NotFound"), "got: {nf}");
+        let db = format!(
+            "{:?}",
+            ApiError::Db(crate::pic::cache::CacheError::Db(sqlx::Error::RowNotFound))
+        );
+        assert!(db.contains("Db"), "got: {db}");
+        let verifier = format!(
+            "{:?}",
+            ApiError::Verifier(crate::pic::VerifierError::Missing(Uuid::nil()))
+        );
+        assert!(verifier.contains("Verifier"), "got: {verifier}");
+    }
+
+    #[test]
+    fn pca_view_ops_serializes_as_json_array_preserving_order_across_multi_element() {
+        // The `ops: Vec<String>` field renders the granted-ops list on
+        // the dashboard's chain-walker panel. Pin that the wire shape
+        // is a JSON array (NOT a comma-joined string) AND that the
+        // input order is preserved verbatim — operators read the ops
+        // top-to-bottom expecting the same order as the source PCA's
+        // ops. A refactor that collected into a `HashSet<String>` for
+        // dedup or sorted for "tidy display" would silently scramble
+        // the order. Walk a 5-element non-alphabetical fixture.
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: "alice@demo.local".into(),
+            ops: vec![
+                "zeta:read".into(),
+                "alpha:read".into(),
+                "mu:write".into(),
+                "beta:delete".into(),
+                "tau:list".into(),
+            ],
+            hop: 1,
+            predecessor_id: None,
+            pic_profile: "proxilion.v1".into(),
+            cbor_hex: String::new(),
+        };
+        let s = serde_json::to_value(&v).unwrap();
+        let arr = s["ops"].as_array().expect("ops must serialize as array");
+        assert_eq!(arr.len(), 5);
+        assert_eq!(arr[0], "zeta:read");
+        assert_eq!(arr[1], "alpha:read");
+        assert_eq!(arr[2], "mu:write");
+        assert_eq!(arr[3], "beta:delete");
+        assert_eq!(arr[4], "tau:list");
+    }
+
+    #[test]
+    fn pca_view_hop_serializes_as_json_number_type_not_string() {
+        // `hop: i32` MUST land on the wire as a JSON number. Pin the
+        // type tag explicitly — the dashboard's chain-walker arithmetic
+        // (`hop + 1` for next-link navigation) strictly dispatches on
+        // JSON's number type. A refactor that swapped to
+        // `#[serde(serialize_with = "to_string")]` "for display
+        // formatting consistency" would silently break arithmetic at
+        // every consumer. The existing
+        // `pca_view_serializes_with_stable_field_names` test pins the
+        // numeric VALUE but not its TYPE tag.
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: "p".into(),
+            ops: vec![],
+            hop: 42,
+            predecessor_id: None,
+            pic_profile: "proxilion.v1".into(),
+            cbor_hex: String::new(),
+        };
+        let s = serde_json::to_value(&v).unwrap();
+        assert!(s["hop"].is_number(), "hop must be JSON number: {s}");
+        assert_eq!(s["hop"], 42);
+        // The `pca_id` is a Uuid — pin it serializes as JSON string
+        // (NOT a binary array or object) for symmetric coverage.
+        assert!(s["pca_id"].is_string(), "pca_id must be JSON string: {s}");
+    }
+
+    #[test]
+    fn hex_encode_emits_no_interior_separators_across_known_byte_runs() {
+        // `hex_encode` is a tight loop emitting `{:02x}` per byte —
+        // there's deliberately NO `:` or `-` or space separator
+        // between bytes. Pin the absence so a refactor that swapped
+        // to `format!("{:02x}-{:02x}")` "for readability" or used
+        // `Vec::join(":")` "for grouping" would silently change the
+        // wire shape and break downstream `hex::decode` consumers
+        // expecting contiguous chars. The existing `hex_encode_covers_all_byte_values`
+        // test checks every char is a hex digit (catches ANY non-
+        // hexdigit char like `:` or `-` or space implicitly) — pin
+        // explicitly here for clarity AND walk an additional length
+        // boundary to surface a "every Nth byte" separator pattern.
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let s = hex_encode(&bytes);
+        assert!(!s.contains(':'), "no colon separator allowed: {}", &s[..32]);
+        assert!(
+            !s.contains('-'),
+            "no hyphen separator allowed: {}",
+            &s[..32]
+        );
+        assert!(!s.contains(' '), "no space separator allowed: {}", &s[..32]);
+        assert!(
+            !s.contains('_'),
+            "no underscore separator allowed: {}",
+            &s[..32]
+        );
+        // And the 16-byte boundary specifically — a refactor that inserted
+        // a separator every 16 bytes "for hexdump-like display" would
+        // surface here at position 32 (16 bytes × 2 hex chars).
+        let sixteen = hex_encode(&[0xaau8; 16]);
+        assert_eq!(sixteen, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(sixteen.len(), 32);
+    }
+
+    #[test]
     fn pca_view_predecessor_id_serializes_null_when_none_for_root_hop() {
         // A chain-root PCA has `predecessor_id = None` (hop 0). The
         // dashboard's chain-walker keys on `predecessor_id === null`

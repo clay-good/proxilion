@@ -648,6 +648,216 @@ mod tests {
     }
 
     #[test]
+    fn app_error_status_across_all_variants_is_4xx_or_5xx_never_2xx_or_3xx() {
+        // Every AppError variant flows through `into_response` and surfaces
+        // a non-success status — pin that across all canonical variants
+        // (the enum surface the proxy hits on the request hot path). A
+        // refactor that registered a new ErrorCode with a `default_status`
+        // of 200 "for the 'allowed but log' case" would silently slip
+        // past as `AppError::into_response().status().is_success()` and
+        // every operator dashboard's "error rate" metric would silently
+        // exclude that variant. Pin both axes — neither success NOR
+        // redirect — across the full variant sweep.
+        let variants: Vec<AppError> = vec![
+            AppError::PolicyBlocked {
+                policy_id: None,
+                reason: "r".into(),
+                override_allowed: false,
+            },
+            AppError::RequireConfirmation("x".into()),
+            AppError::RateLimit,
+            AppError::PicInvariantViolation("x".into()),
+            AppError::UpstreamTooLarge,
+            AppError::ReadFilterBlocked,
+            AppError::Db(sqlx::Error::RowNotFound),
+            AppError::Internal("x".into()),
+        ];
+        for v in &variants {
+            let s = v.status();
+            assert!(
+                !s.is_success(),
+                "variant {:?} surfaced 2xx status {}",
+                v,
+                s.as_u16(),
+            );
+            assert!(
+                !s.is_redirection(),
+                "variant {:?} surfaced 3xx status {}",
+                v,
+                s.as_u16(),
+            );
+            assert!(
+                s.is_client_error() || s.is_server_error(),
+                "variant {:?} surfaced non-4xx/5xx {}",
+                v,
+                s.as_u16(),
+            );
+        }
+    }
+
+    #[test]
+    fn app_error_code_as_str_is_snake_case_across_all_variants_for_wire_contract() {
+        // Each `ErrorCode::as_str()` is the on-wire `code` field operators
+        // grep on. The wire convention is lowercase `snake_case` (e.g.
+        // `policy_blocked`, `pic_invariant_violation`). A refactor that
+        // surfaced one as `PolicyBlocked` (PascalCase, the natural Rust
+        // ident) OR `policy-blocked` (kebab, the YAML convention) would
+        // silently break every operator dashboard's regex bucket. Pin
+        // BOTH absence of uppercase ASCII AND absence of `-` across all
+        // canonical AppError variants — exhaustive sweep.
+        let variants: Vec<AppError> = vec![
+            AppError::PolicyBlocked {
+                policy_id: None,
+                reason: "r".into(),
+                override_allowed: false,
+            },
+            AppError::RequireConfirmation("x".into()),
+            AppError::RateLimit,
+            AppError::PicInvariantViolation("x".into()),
+            AppError::UpstreamTooLarge,
+            AppError::ReadFilterBlocked,
+            AppError::Db(sqlx::Error::RowNotFound),
+            AppError::Internal("x".into()),
+        ];
+        for v in &variants {
+            let s = v.code().as_str();
+            assert!(!s.is_empty(), "variant {:?} surfaced empty code string", v);
+            assert!(
+                !s.chars().any(|c| c.is_ascii_uppercase()),
+                "variant {:?} surfaced uppercase in code `{}`",
+                v,
+                s,
+            );
+            assert!(
+                !s.contains('-'),
+                "variant {:?} surfaced kebab in code `{}`",
+                v,
+                s,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_error_kind_returns_static_str_from_canonical_three_label_set() {
+        // The `upstream_error_kind` helper's return type is
+        // `&'static str` (the metric-label set is fixed and lives in
+        // the binary's read-only segment). Pin the lifetime contract
+        // via a helper that takes `&'static str` only — a refactor to
+        // `String` would surface here as a type-mismatch + would
+        // silently start heap-allocating on every adapter failure
+        // path. Also pin via a concrete reqwest::Error (build a 1ms-
+        // timeout request against the RFC 5737 documentation range so
+        // the result is deterministic) that the returned label is one
+        // of the three canonical bucket strings.
+        fn require_static_str(_: &'static str) {}
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        let err = client.get("http://203.0.113.1/").send().await.unwrap_err();
+        let kind = upstream_error_kind(&err);
+        require_static_str(kind);
+        assert!(
+            matches!(kind, "timeout" | "network" | "other"),
+            "kind `{kind}` not in canonical set"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_error_body_upstream_arm_carries_no_detail_to_avoid_leaking_vendor_internal_state()
+    {
+        // `AppError::Upstream(reqwest::Error)` surfaces a generic
+        // "upstream temporarily unavailable" message — the inner
+        // reqwest error CAN carry vendor-internal state (e.g. a 503
+        // response body with rate-limit-headers naming an internal
+        // service id, or a DNS error naming an internal resolver). Pin
+        // that the body's `detail` field stays `None` regardless of
+        // the inner error's payload — symmetric to the Db / Internal
+        // arms (existing `app_error_body_db_and_internal_collapse_to_internal_error_envelope`
+        // pin walks those). A refactor that surfaced `detail:
+        // Some(err.to_string())` "for richer agent triage" would
+        // silently leak the inner reqwest error text on every
+        // upstream failure. Build a real reqwest::Error and pin the
+        // no-detail contract on its body envelope.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        let inner = client.get("http://203.0.113.1/").send().await.unwrap_err();
+        let body = AppError::Upstream(inner).body();
+        assert_eq!(body.code, "upstream_unavailable");
+        assert!(
+            body.detail.is_none(),
+            "Upstream arm must not surface inner reqwest detail",
+        );
+        // And the fix-text still points at the troubleshooting docs.
+        assert!(body.docs.unwrap().contains("troubleshooting"));
+    }
+
+    #[test]
+    fn app_error_policy_blocked_extras_policy_id_serializes_as_json_string_when_some() {
+        // `extras: serde_json::json!({"policy_id": policy_id, ...})` —
+        // when `policy_id` is `Some("p1")`, serde serializes the inner
+        // String DIRECTLY (NOT as an Option-wrapped `{"Some": "p1"}`).
+        // The dashboard's renderer keys on a flat JSON string at this
+        // path. A refactor that swapped `policy_id` from `Option<String>`
+        // to a wrapper type with a Serialize impl emitting an `Option`
+        // tag would silently change the wire shape from `"p1"` to a
+        // nested object. Pin BOTH the string-type AND the byte-exact
+        // value. The existing
+        // `app_error_body_carries_policy_id_and_override_allowed_in_extras`
+        // pin checks one Some value; this pin checks the JSON TYPE
+        // (is_string) — distinct axis.
+        let e = AppError::PolicyBlocked {
+            policy_id: Some("gmail-external-send-gate".into()),
+            reason: "external".into(),
+            override_allowed: true,
+        };
+        let body = e.body();
+        let pid = &body.extras["policy_id"];
+        assert!(
+            pid.is_string(),
+            "policy_id must serialize as JSON string, got: {pid}",
+        );
+        assert_eq!(pid.as_str().unwrap(), "gmail-external-send-gate");
+    }
+
+    #[test]
+    fn app_error_body_envelope_code_field_equals_code_as_str_across_all_variants() {
+        // The `body().code` field is `self.code().as_str()` — a stable
+        // bidirectional consistency the dashboard relies on (operators
+        // can grep tracing logs for `code()` and join against the wire
+        // `body.code` field on a stored audit row). A refactor that
+        // introduced a per-variant override on `body()` (e.g.
+        // `PolicyBlocked` returning a more specific code while
+        // `code()` returned the umbrella one) would silently break
+        // the join. Pin equality across all canonical variants.
+        let variants: Vec<AppError> = vec![
+            AppError::PolicyBlocked {
+                policy_id: None,
+                reason: "r".into(),
+                override_allowed: false,
+            },
+            AppError::RequireConfirmation("x".into()),
+            AppError::RateLimit,
+            AppError::PicInvariantViolation("x".into()),
+            AppError::UpstreamTooLarge,
+            AppError::ReadFilterBlocked,
+            AppError::Db(sqlx::Error::RowNotFound),
+            AppError::Internal("x".into()),
+        ];
+        for v in &variants {
+            let body = v.body();
+            assert_eq!(
+                body.code,
+                v.code().as_str(),
+                "body.code drift for variant {:?}",
+                v,
+            );
+        }
+    }
+
+    #[test]
     fn app_error_body_read_filter_blocked_has_no_detail_but_dashboard_hint() {
         // ReadFilterBlocked is intentionally generic to the agent — the
         // matched pattern lives in `/admin/` (Live feed → row). Pin

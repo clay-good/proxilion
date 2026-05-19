@@ -856,6 +856,181 @@ mod tests {
         assert_eq!(out, "a&lt;b&gt;c&amp;d&quot;e&#39;f");
     }
 
+    #[tokio::test]
+    async fn email_notifier_constructor_accepts_three_recipient_to_list_with_display_names() {
+        // The existing constructor tests use a 1-element `to:` list.
+        // Pin a 3-element to-list (a real install: security + ops + a
+        // shared on-call alias) including a display-name shape on one
+        // entry — `Bob <bob@example.com>`. A refactor that started
+        // rejecting display-name shapes "for SMTP-strict compatibility"
+        // OR that capped to-list at N=1 "for fan-out hygiene" would
+        // silently break every operator install with > 1 approver.
+        // Pin both axes: the constructor succeeds AND each parsed
+        // mailbox surfaces the expected email field byte-for-byte
+        // through `resolve_recipients(None)` (the global default
+        // path).
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new(
+            "smtp://localhost:25",
+            "sec@acme.com",
+            &[
+                "alice@acme.com".into(),
+                "Bob <bob@acme.com>".into(),
+                "oncall@acme.com".into(),
+            ],
+            "https://proxy.acme.com".into(),
+            pool,
+        )
+        .expect("3-recipient to-list with display-name must construct");
+        let (to, _cc, _bcc) = n.resolve_recipients(None);
+        assert_eq!(to.len(), 3);
+        assert_eq!(to[0].email.to_string(), "alice@acme.com");
+        assert_eq!(to[1].email.to_string(), "bob@acme.com");
+        assert_eq!(to[2].email.to_string(), "oncall@acme.com");
+    }
+
+    #[test]
+    fn html_escape_preserves_whitespace_newline_carriage_return_and_tab_unchanged() {
+        // The escaper handles only the five "dangerous" HTML chars —
+        // ASCII whitespace (`\n`, `\r`, `\t`, ` `) MUST pass through
+        // verbatim. Policy descriptions and detail strings carry
+        // multi-line content (operators paste shell output into YAML);
+        // a refactor that escaped `\n` to `&#10;` "for HTML attribute
+        // safety in the wrong context" would silently mangle every
+        // multi-line policy description rendered in the approver
+        // email body. Pin all four whitespace bytes round-trip
+        // byte-equal. The existing pins exercise non-whitespace
+        // (alphanumerics + multibyte unicode) only.
+        assert_eq!(html_escape("a\nb"), "a\nb");
+        assert_eq!(html_escape("a\rb"), "a\rb");
+        assert_eq!(html_escape("a\tb"), "a\tb");
+        assert_eq!(html_escape("a b"), "a b");
+        // Multi-line interleaved with one entity — newline preserved
+        // even when an entity fires elsewhere in the same input.
+        assert_eq!(html_escape("line1\n<b>line2"), "line1\n&lt;b&gt;line2");
+    }
+
+    #[test]
+    fn html_escape_byte_length_delta_per_special_char_matches_capacity_hint() {
+        // `String::with_capacity(s.len())` is the capacity hint for the
+        // output buffer; the actual output is LARGER by an exact delta
+        // per escaped char: `<` → 4 (3 extra), `>` → 4 (3 extra), `&` →
+        // 5 (4 extra), `"` → 6 (5 extra), `'` → 5 (4 extra). Pin the
+        // per-arm delta so a refactor that swapped `&#39;` for `&apos;`
+        // ("HTML5-native name") would change `'` → 6 (+5 instead of
+        // +4) AND trigger realloc-on-every-render. Symmetric to the
+        // notifier_public.rs pin in round 130; pin the same surface
+        // at the email rendering site so a cross-module drift surfaces
+        // here too.
+        assert_eq!(html_escape("<").len() - "<".len(), 3);
+        assert_eq!(html_escape(">").len() - ">".len(), 3);
+        assert_eq!(html_escape("&").len() - "&".len(), 4);
+        assert_eq!(html_escape("\"").len() - "\"".len(), 5);
+        assert_eq!(html_escape("'").len() - "'".len(), 4);
+    }
+
+    #[test]
+    fn email_build_error_inner_string_field_carries_multibyte_unicode_verbatim() {
+        // `EmailBuildError(pub String)` — the inner String is operator-
+        // facing (it surfaces via `tracing::warn!("{e}", ...)` at boot
+        // when the SMTP URL parse fails). Operators occasionally land a
+        // multibyte unicode policy id or hostname in the SMTP URL via
+        // internationalized DNS (e.g. `smtp://relay.café-prod.local:25`);
+        // pin the inner field carries multibyte unicode verbatim through
+        // Display + Debug + struct-field access without truncation OR
+        // lossy ASCII conversion "for SIEM hygiene". The existing
+        // `email_build_error_display_carries_byte_exact_email_build_prefix_with_inner`
+        // pin uses ASCII-only inner content; widen here to multibyte
+        // (3-byte é + 3-byte → + 4-byte 🔥) so a `.to_ascii_lowercase()`
+        // OR `.replace(non_ascii, '?')` refactor surfaces.
+        let inner = "smtp host café-prod → 🔥 unreachable";
+        let e = EmailBuildError(inner.into());
+        // Public field carries the bytes verbatim.
+        assert_eq!(e.0, inner);
+        // Display wraps in the `email build: ` prefix without altering
+        // the inner bytes.
+        assert_eq!(e.to_string(), format!("email build: {inner}"));
+        // Debug includes the multibyte bytes too (struct-name + field).
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("EmailBuildError"), "got: {dbg}");
+        assert!(dbg.contains("café"), "multibyte truncated in Debug: {dbg}");
+        assert!(dbg.contains("🔥"), "4-byte emoji truncated in Debug: {dbg}");
+    }
+
+    #[tokio::test]
+    async fn email_notifier_new_with_recipients_with_empty_cc_and_bcc_equivalent_to_new() {
+        // The `new_with_recipients` doc comment promises:
+        //   "Empty `cc` / `bcc` slices are equivalent to `Self::new`."
+        // Pin the equivalence behaviorally: build BOTH constructors
+        // with the same `to` list and inspect `resolve_recipients(None)`
+        // to confirm the global cc + bcc are both empty Vecs. A refactor
+        // that started seeding `cc` with the `from` address "for audit
+        // hygiene" via the `new_with_recipients` path but NOT the
+        // `new` path (the natural shape of a partial-only update)
+        // would surface here as an asymmetric divergence in the
+        // returned `(to, cc, bcc)` tuple lengths.
+        let pool_a = make_dummy_pool();
+        let na = EmailNotifier::new(
+            "smtp://localhost:25",
+            "sec@acme.com",
+            &["a@acme.com".into()],
+            "https://proxy.acme.com".into(),
+            pool_a,
+        )
+        .expect("new constructs");
+        let pool_b = make_dummy_pool();
+        let nb = EmailNotifier::new_with_recipients(
+            "smtp://localhost:25",
+            "sec@acme.com",
+            &["a@acme.com".into()],
+            &[],
+            &[],
+            "https://proxy.acme.com".into(),
+            pool_b,
+        )
+        .expect("new_with_recipients constructs");
+        let (ta, ca, ba) = na.resolve_recipients(None);
+        let (tb, cb, bb) = nb.resolve_recipients(None);
+        assert_eq!(ta.len(), tb.len());
+        assert_eq!(ta[0].email.to_string(), tb[0].email.to_string());
+        assert!(ca.is_empty() && cb.is_empty(), "cc must be empty for both");
+        assert!(ba.is_empty() && bb.is_empty(), "bcc must be empty for both");
+    }
+
+    #[tokio::test]
+    async fn email_notifier_with_recipients_resolver_is_consuming_fluent_setter() {
+        // `with_recipients_resolver` takes `Arc<dyn Fn(...) + Send +
+        // Sync>` by value and returns Self — symmetric to
+        // `with_max_retries`. Pin the consuming-fluent shape so a
+        // refactor to `&mut self` would surface here as a compile
+        // error rather than break test setup at every call site. AND
+        // pin that attaching a resolver THEN calling
+        // `resolve_recipients` on a policy the resolver handles
+        // surfaces the override — proves the field write took effect.
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new(
+            "smtp://localhost:25",
+            "sec@acme.com",
+            &["default-to@acme.com".into()],
+            "https://proxy.acme.com".into(),
+            pool,
+        )
+        .expect("builds");
+        let resolver: EmailRecipientsResolver = Arc::new(|policy_id| {
+            if policy_id == "p1" {
+                Some((Some(vec!["override-to@acme.com".into()]), None, None))
+            } else {
+                None
+            }
+        });
+        // Consume + return Self — chain another fluent call to prove
+        // the return type is Self not &Self.
+        let n = n.with_recipients_resolver(resolver).with_max_retries(0);
+        let (to, _, _) = n.resolve_recipients(Some("p1"));
+        assert_eq!(to.len(), 1);
+        assert_eq!(to[0].email.to_string(), "override-to@acme.com");
+    }
+
     #[test]
     fn parse_or_fallback_preserves_input_order_across_three_element_happy_path() {
         // The existing happy-path test uses a 2-element list. Pin

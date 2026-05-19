@@ -419,6 +419,142 @@ mod tests {
     }
 
     #[test]
+    fn pca_cache_and_cached_pca_and_cache_error_are_send_sync_static() {
+        // `PcaCache` lives in AppState; `CachedPca` is held across .await
+        // points in adapter chain-walk handlers; `CacheError` flows through
+        // anyhow chains. All three need (Send + Sync + 'static). A refactor
+        // that swapped any field for an `Rc<...>` "for cheap clone" would
+        // break Send + Sync but surface at AppState assembly with an opaque
+        // tower::Service trait-bound error. Pin all three bounds.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<PcaCache>();
+        require_send_sync_static::<CachedPca>();
+        require_send_sync_static::<CacheError>();
+    }
+
+    #[test]
+    fn current_pic_profile_byte_length_pinned_at_twelve_with_ascii_only_contract() {
+        // The existing `current_pic_profile_is_stable_v1_string` test
+        // pins byte-exact equality but doesn't pin the byte-length.
+        // Migration scripts that pre-allocate `pic_profile` column
+        // capacity (VARCHAR(N)) need a stable N — pin len() == 12. AND
+        // pin ASCII-only via `is_ascii()` so a refactor to a multibyte
+        // version-marker (`proxilion.v1²` or `proxilion.v1·`) would
+        // surface here as either a length OR an ASCII contract failure
+        // and force a conscious migration-script update.
+        assert_eq!(CURRENT_PIC_PROFILE.len(), 12);
+        assert!(CURRENT_PIC_PROFILE.is_ascii(), "must be ASCII-only");
+        // chars().count() == len() iff every codepoint is single-byte.
+        assert_eq!(
+            CURRENT_PIC_PROFILE.chars().count(),
+            CURRENT_PIC_PROFILE.len(),
+            "ASCII-only ⇒ char count == byte count",
+        );
+    }
+
+    #[test]
+    fn cached_pca_with_one_kb_max_filled_cbor_survives_clone_byte_equal() {
+        // The cbor field is `Vec<u8>` — production PCAs are typically
+        // 200-800 bytes; pin that a 1KB all-0xFF buffer (the upper
+        // boundary of the realistic size range, with byte values that
+        // exercise every bit position) survives Clone byte-for-byte.
+        // A refactor that switched to `bytes::Bytes` (ref-counted) +
+        // accidentally introduced a copy-on-write that didn't preserve
+        // the full buffer "for cold-path optimization" would surface
+        // here as a byte-length or content diff after clone. The
+        // existing `cached_pca_is_clone_with_disjoint_buffers` pin
+        // covers 3 bytes; pin 1024 bytes too so any size-dependent
+        // truncation surfaces.
+        let large_cbor = vec![0xFFu8; 1024];
+        let pca = CachedPca::new(
+            Uuid::new_v4(),
+            large_cbor.clone(),
+            "alice@acme.com".into(),
+            vec!["drive:read:file/x".into()],
+            0,
+            None,
+        );
+        let c = pca.clone();
+        assert_eq!(c.cbor.len(), 1024);
+        assert_eq!(c.cbor, large_cbor);
+        // Spot-check every byte is 0xFF (the buffer wasn't zero-padded
+        // by a sneaky resize).
+        assert!(c.cbor.iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn cache_error_debug_carries_db_variant_name_for_grep_bucketing() {
+        // Operator log filters bucket cache-failure logs by Debug variant
+        // name (`?err` rendering). CacheError has one variant today (Db)
+        // but the Debug surface is independently load-bearing — a future
+        // refactor that added a variant (e.g. `Decode` for CBOR parse
+        // errors) would let operators add a new bucket only if the
+        // variant name surfaces in Debug. Pin "Db" in the Debug render
+        // so a manual Debug impl that collapsed everything to
+        // `CacheError(_)` would surface here.
+        let e = CacheError::Db(sqlx::Error::RowNotFound);
+        let s = format!("{e:?}");
+        assert!(s.contains("Db"), "got: {s}");
+    }
+
+    #[test]
+    fn cached_pca_new_across_one_hundred_distinct_uuids_yields_distinct_pca_id_fields() {
+        // The constructor is a pass-through: each call's `pca_id`
+        // parameter lands in the `pca_id` field byte-for-byte. The
+        // existing `cached_pca_new_round_trips_distinct_predecessor_uuids_independently`
+        // pin walks 10 predecessor UUIDs through; pin the WIDER pca_id
+        // sweep (100 distinct UUIDs) so a refactor that introduced any
+        // form of pca_id rewriting at construction (e.g. "deterministic
+        // re-hashing for some sharding scheme") would surface across
+        // a wider statistical sample. Pairwise-distinct sanity check
+        // on the inputs guards against a degenerate Uuid::new_v4
+        // regression.
+        let ids: Vec<Uuid> = (0..100).map(|_| Uuid::new_v4()).collect();
+        let pcas: Vec<CachedPca> = ids
+            .iter()
+            .map(|i| CachedPca::new(*i, vec![], "p".into(), vec![], 0, None))
+            .collect();
+        for (i, pca) in pcas.iter().enumerate() {
+            assert_eq!(pca.pca_id, ids[i], "pca_id at index {i} drifted");
+        }
+        // Pairwise distinctness on inputs (sanity).
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 100, "test fixture: 100 distinct UUIDs");
+    }
+
+    #[test]
+    fn cached_pca_clone_preserves_pic_profile_and_signature_byte_equal() {
+        // The existing `cached_pca_is_clone_with_disjoke_buffers` pin
+        // covers cbor + ops independence under mutation. The two
+        // OTHER load-bearing fields — `pic_profile` (which the verifier
+        // compares against `CURRENT_PIC_PROFILE` to gate "this row was
+        // minted under a profile we know how to verify") and
+        // `signature` (the canonical signed bytes) — must ALSO
+        // survive Clone byte-equal. A refactor that lazily shared
+        // either via `Arc<...>` "for memory savings" would surface
+        // here as the cloned values aliasing back to the original on
+        // mutation. Pin field-equal post-clone on both, plus mutation-
+        // independence on `signature` (the load-bearing one — a refactor
+        // that shared the signature buffer across clones would let one
+        // adapter's mutation poison another's verification).
+        let mut pca = CachedPca::new(Uuid::new_v4(), vec![0xAA], "p".into(), vec![], 0, None);
+        pca.signature = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        pca.pic_profile = "proxilion.v1".into();
+        let c = pca.clone();
+        // Field-equal post-clone.
+        assert_eq!(c.signature, pca.signature);
+        assert_eq!(c.pic_profile, pca.pic_profile);
+        // Mutation-independence on signature.
+        let original_sig = pca.signature.clone();
+        let mut c2 = pca.clone();
+        c2.signature.push(0xFF);
+        assert_eq!(pca.signature, original_sig, "original signature unchanged");
+        assert_eq!(c2.signature.len(), 9);
+    }
+
+    #[test]
     fn cache_error_from_sqlx_via_question_mark() {
         // `?`-conversion is what the public `insert` / `get` methods use;
         // pin the `#[from]` blanket-impl path so a future refactor that

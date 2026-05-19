@@ -524,6 +524,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn webhook_secret_and_build_error_and_notifier_are_send_sync_static() {
+        // `WebhookSecret` is held inside `WebhookNotifier` which is wired
+        // into AppState as part of the Notifiers bundle. `NotifierBuildError`
+        // flows through anyhow chains at boot. `WebhookNotifier` itself
+        // crosses tokio task boundaries when adapter handlers fire it.
+        // All three need (Send + Sync + 'static). A refactor that
+        // introduced an `Rc<Vec<u8>>` on WebhookSecret "for cheap clone of
+        // the inner key bytes" would break Send + Sync but the breakage
+        // would surface at AppState assembly with an unrelated
+        // tower::Service trait-bound error. Pin all three bounds here.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<WebhookSecret>();
+        require_send_sync_static::<NotifierBuildError>();
+        require_send_sync_static::<WebhookNotifier>();
+    }
+
+    #[test]
+    fn webhook_secret_from_hex_accepts_long_64_byte_key_128_hex_chars() {
+        // HMAC-SHA256 RFC 2104 §3 recommends a key length ≥ the hash
+        // output length (32 bytes); operators following best practice
+        // generate 64-byte keys via `openssl rand -hex 64`. The existing
+        // tests pin the 16-byte minimum (32-hex-char) boundary but never
+        // exercise the larger keys real operators actually use. Pin a
+        // 64-byte key (128 hex chars) constructs cleanly AND signs to a
+        // valid 71-char signature shape — a refactor that capped the key
+        // size at 32 bytes "for fixed-buffer-size hot-path performance"
+        // would silently truncate every long key and produce wrong-MAC
+        // signatures every receiver would 401.
+        let long_hex = "0".repeat(128); // 64 zero bytes
+        let s = WebhookSecret::from_hex(&long_hex).unwrap();
+        let sig = s.sign(b"payload");
+        assert!(sig.starts_with("sha256="));
+        assert_eq!(sig.len(), 7 + 64, "signature is 'sha256=' + 64 hex chars");
+        // And the long-key signature must DIFFER from a short-key
+        // signature on the same body (sanity: the key bytes do flow
+        // into the MAC, no silent truncation to a fixed prefix).
+        let short = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        assert_ne!(sig, short.sign(b"payload"));
+    }
+
+    #[test]
+    fn webhook_signature_prefix_is_byte_exact_seven_chars_lowercase_sha256_equals() {
+        // The `sha256=` prefix is the de-facto wire shape that Slack,
+        // GitHub, Stripe, and most webhook receivers parse via
+        // `strip_prefix("sha256=")` before hex-decoding the rest.
+        // The existing `signature_is_lowercase_hex_with_sha256_prefix`
+        // pin checks that the suffix has the right length and case, but
+        // doesn't pin the prefix shape byte-exact. A refactor that
+        // emitted `SHA256=` (uppercase, the X-Hub-Signature-256
+        // pre-2020 shape) or `sha2_256=` (no-such-shape) would silently
+        // break every receiver. Pin the prefix at byte-exact "sha256="
+        // (7 chars) so a one-char drift surfaces here.
+        let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let sig = s.sign(b"any");
+        assert_eq!(&sig.as_bytes()[..7], b"sha256=");
+        // The total signature is exactly 71 bytes (7-char prefix + 64
+        // hex chars of HMAC-SHA256 output). A refactor that introduced
+        // any byte drift surfaces.
+        assert_eq!(sig.len(), 71);
+    }
+
+    #[test]
+    fn webhook_secret_sign_with_multibyte_unicode_body_bytes_produces_valid_signature_shape() {
+        // The `sign` signature is `&[u8]` — HMAC operates on raw bytes,
+        // not Unicode codepoints. Pin that a body containing multibyte
+        // UTF-8 (`café → 🔥` mixed with policy JSON) signs to a valid
+        // 71-byte sha256= signature with no panic and byte-deterministic
+        // output. A refactor that called `.to_ascii_lowercase()` or
+        // `.replace(non_ascii, '?')` on the body bytes "for SIEM
+        // ASCII-only ingest hygiene" would silently change every MAC for
+        // bodies carrying non-ASCII policy fields (a multi-tenant
+        // deployment where a tenant's policy detail contains the tenant's
+        // name in a non-Latin script would silently 401 every event).
+        let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let unicode_body = "café → 🔥 {\"policy_id\":\"é-tenant\"}".as_bytes();
+        let sig = s.sign(unicode_body);
+        assert!(sig.starts_with("sha256="));
+        assert_eq!(sig.len(), 71);
+        // Determinism — two calls with same unicode bytes produce
+        // byte-equal signatures.
+        assert_eq!(sig, s.sign(unicode_body));
+        // And the unicode-body signature DIFFERS from the ASCII-stripped
+        // version (sanity: the non-ASCII bytes do flow into the MAC).
+        let stripped = "policy_id".as_bytes();
+        assert_ne!(sig, s.sign(stripped));
+    }
+
+    #[test]
+    fn notifier_build_error_implements_std_error_trait_for_anyhow_chains() {
+        // The boot-path error surface from notifier construction bubbles
+        // through anyhow chains in `server::run` — pin that the
+        // `thiserror::Error` derive lands the `std::error::Error` impl
+        // via a dyn-cast. A refactor that dropped `#[derive(thiserror::Error)]`
+        // (e.g. swapped to a plain `impl Display` for "less macro
+        // surface") would surface as a confusing anyhow trait-bound
+        // error at the boot site rather than here. Symmetric to the
+        // existing `pkce_error_implements_std_error_trait_for_anyhow_chains`
+        // and `cache_error_implements_std_error_trait_and_source_carries_inner_sqlx`
+        // pins on sibling error types — round out the error-type triad
+        // at the notifier path.
+        let e = NotifierBuildError("test build failure".into());
+        let dyn_err: &dyn std::error::Error = &e;
+        assert!(dyn_err.to_string().contains("notifier build:"));
+        assert!(dyn_err.to_string().contains("test build failure"));
+        // Leaf — no inner source (the inner is a String, not an Error).
+        assert!(dyn_err.source().is_none(), "NotifierBuildError is a leaf");
+    }
+
+    #[test]
+    fn webhook_notifier_proxy_public_url_accessor_preserves_trailing_slash_verbatim() {
+        // The approve-URL builder reads `proxy_public_url()` and appends
+        // `/api/v1/blocked/{id}/approve` — the proxy_public_url is used
+        // VERBATIM with no normalization (no trim of trailing `/`). The
+        // existing `webhook_proxy_public_url_round_trips_through_accessor`
+        // test pins a no-slash URL ("https://proxy.example"); pin the
+        // trailing-slash shape symmetrically. A refactor that started
+        // `.trim_end_matches('/')` here "for ergonomic URL joining"
+        // would silently change every approve_url generated against an
+        // operator who configured the public URL with a trailing slash
+        // (producing `https://proxy.example/api/...` becoming
+        // `https://proxy.example//api/...` if the trim were dropped, or
+        // shifting bytes if added). Pin both axes.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(
+            "https://webhook.example/hook".into(),
+            secret,
+            "https://proxy.example/".into(),
+        )
+        .unwrap();
+        assert_eq!(n.proxy_public_url(), "https://proxy.example/");
+        // Symmetric on a deeper sub-path with trailing slash.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(
+            "https://webhook.example/hook".into(),
+            secret,
+            "https://proxy.example/sub/path/".into(),
+        )
+        .unwrap();
+        assert_eq!(n.proxy_public_url(), "https://proxy.example/sub/path/");
+    }
+
     #[tokio::test]
     async fn posts_with_signature_and_schema_headers() {
         let server = MockServer::start().await;

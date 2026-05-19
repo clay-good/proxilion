@@ -335,6 +335,130 @@ mod tests {
     }
 
     #[test]
+    fn token_cipher_and_cipher_error_and_ciphertext_are_send_sync_static() {
+        // `TokenCipher` is held as `Arc<TokenCipher>` inside both AuthState
+        // and OAuthState — axum's State + tokio task boundaries require
+        // `Send + Sync + 'static`. `CipherError` flows through anyhow
+        // chains at the OAuth callback + token-refresh paths.
+        // `Ciphertext` crosses tokio task boundaries between the
+        // OAuth-token persist write and the decrypt read. A refactor
+        // that introduced a !Send field (e.g. `nonce: Rc<[u8]>` "for
+        // cheap clone") would break Send at the AppState site rather
+        // than as a far-removed trait-bound error. Pin all three
+        // trait bounds on all three types here — symmetric to the
+        // siem/email/cat_key send-sync pins on other modules.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<TokenCipher>();
+        require_send_sync_static::<CipherError>();
+        require_send_sync_static::<Ciphertext>();
+    }
+
+    #[test]
+    fn cipher_error_debug_carries_variant_names_for_grep_bucketing() {
+        // `CipherError` derives Debug — the OAuth-token-persist path
+        // bubbles cipher faults through `?e` log spans and operators
+        // grep by variant name to bucket "operator misconfigured the
+        // key" (BadKeyLen, at-boot) vs "persisted row corrupted"
+        // (Aead, at-runtime). A hand-rolled `impl Debug` that hid
+        // variant names "to compact" the line would break the bucket.
+        // Pin both variant names — symmetric to the AuthFail / ApiError
+        // variant-name pins on other modules.
+        let bkl = format!("{:?}", CipherError::BadKeyLen(17));
+        assert!(bkl.contains("BadKeyLen"), "got: {bkl}");
+        let aead = format!("{:?}", CipherError::Aead);
+        assert!(aead.contains("Aead"), "got: {aead}");
+    }
+
+    #[test]
+    fn ciphertext_clone_preserves_both_nonce_and_bytes_byte_equal() {
+        // The existing `ciphertext_clone_yields_independent_buffer`
+        // test pins independence of the bytes buffer post-mutation,
+        // but does NOT pin that the clone starts byte-equal across
+        // BOTH the nonce AND the bytes fields. A refactor that
+        // swapped any field to `Vec::new()` "for compactness" or
+        // `nonce: Arc<[u8]>` (which would alias) would surface here.
+        // Pin field-by-field byte equality immediately post-clone
+        // before any mutation, on a non-trivial ciphertext.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let original = c.encrypt(b"some non-trivial plaintext").unwrap();
+        let cloned = original.clone();
+        assert_eq!(
+            cloned.nonce, original.nonce,
+            "nonce must round-trip clone byte-equal"
+        );
+        assert_eq!(
+            cloned.bytes, original.bytes,
+            "bytes must round-trip clone byte-equal"
+        );
+        // And the clone must decrypt to the same plaintext as the original.
+        assert_eq!(c.decrypt(&original).unwrap(), c.decrypt(&cloned).unwrap(),);
+    }
+
+    #[test]
+    fn cipher_error_bad_key_len_display_carries_byte_exact_prefix_with_actual_length() {
+        // `#[error("encryption key must be exactly 32 bytes; got {0}")]`
+        // — the existing `bad_key_len_error_display_includes_actual_length`
+        // pin uses substring checks (`.contains("32")` +
+        // `.contains("17")`); pin the byte-exact full Display via
+        // `assert_eq!` so a refactor that softened the message to
+        // "key must be 32 bytes (got N)" (paren-wrapping the actual
+        // length) would still satisfy `.contains("17")` but surface
+        // here. Operator-onboarding docs link to the exact "must be
+        // exactly 32 bytes; got N" string as the canonical "your env
+        // var is wrong size" hint.
+        for n in [17usize, 0, 31, 33, 64, 1024] {
+            let s = CipherError::BadKeyLen(n).to_string();
+            let expected = format!("encryption key must be exactly 32 bytes; got {n}");
+            assert_eq!(s, expected);
+        }
+    }
+
+    #[test]
+    fn decrypt_with_empty_bytes_and_valid_12_byte_nonce_errors_without_panic() {
+        // Boundary: a corrupt-row scenario where the persisted
+        // `bytes` column got NULL-treated-as-empty by a deserializer,
+        // but the `nonce` survived intact at the correct 12-byte
+        // length. The 12-byte nonce passes the pre-check, so
+        // `cipher.decrypt(nonce, &[])` is invoked — AES-GCM rejects
+        // a zero-byte input (no room for the 16-byte auth tag) AND
+        // must NOT panic. The existing zero-length-nonce pin covers
+        // the nonce-side; pin the bytes-side here so a refactor that
+        // swapped to `unsafe { ct.bytes.get_unchecked(..16) }` "for
+        // hot-path elision" would surface here.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let probe = c.encrypt(b"hi").unwrap();
+        let truncated = Ciphertext {
+            nonce: probe.nonce, // valid 12-byte nonce
+            bytes: Vec::new(),  // empty ciphertext bytes
+        };
+        assert!(matches!(c.decrypt(&truncated), Err(CipherError::Aead)));
+    }
+
+    #[test]
+    fn encrypt_ciphertext_overhead_is_always_plaintext_len_plus_sixteen() {
+        // AES-GCM appends a 16-byte authentication tag to the ciphertext
+        // — pin that `ct.bytes.len() == plaintext.len() + 16` for a
+        // spread of plaintext sizes. The existing pins cover empty (0)
+        // and 4096 bytes only; pin the intermediate sizes (1, 32, 100,
+        // 1024) so a refactor that swapped to a longer tag (e.g.
+        // GCM-SIV's 16+16 nonce-misuse-resistance shape) "for safety
+        // margin" would silently change wire shape and break every
+        // existing persisted Ciphertext row's length invariant. SIEM
+        // ingestors that pre-compute `bytes - 16` to recover plaintext
+        // length would silently drift by 16 bytes per row.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        for size in [1usize, 32, 100, 1024] {
+            let pt = vec![0xa5u8; size];
+            let ct = c.encrypt(&pt).unwrap();
+            assert_eq!(
+                ct.bytes.len(),
+                pt.len() + 16,
+                "GCM tag overhead must be exactly 16 bytes for pt.len()={size}",
+            );
+        }
+    }
+
+    #[test]
     fn empty_key_rejected_with_zero_length() {
         // Boundary: a missing env var sometimes shows up as an empty byte
         // slice. The variant must carry `0`, not panic on the indexing path.

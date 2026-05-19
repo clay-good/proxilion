@@ -501,6 +501,153 @@ mod tests {
     }
 
     #[test]
+    fn app_error_is_send_sync_static_for_axum_into_response_boundary() {
+        // `AppError` is the return-error type for every Drive / Gmail /
+        // Calendar adapter handler — it flows through `IntoResponse`
+        // from handler futures that cross tokio task boundaries, which
+        // mandates `Send + Sync + 'static`. A refactor that introduced
+        // a !Send field (e.g. `Internal(Rc<String>)` "for cheap clone")
+        // would break Sync at the AppState site rather than as a
+        // far-removed trait-bound error. Pin the three-trait combo —
+        // symmetric to the
+        // `setup_api_state_and_setup_error_are_send_sync_static_for_axum_boundary`
+        // pin on [crates/proxy/src/api/setup.rs] and the
+        // `api_error_and_killswitch_state_are_send_sync_static_for_axum_state_boundary`
+        // pin on [crates/proxy/src/api/killswitch.rs].
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<AppError>();
+    }
+
+    #[test]
+    fn app_error_debug_carries_variant_names_for_grep_bucketing() {
+        // The `#[derive(Debug)]` on `AppError` feeds `?err` in
+        // `tracing::warn!(error = %self, ...)` and the 500-branch logs
+        // emitted by `into_response`. Operators grep the log line by
+        // variant name to bucket PolicyBlocked (Layer-B refusal) vs
+        // RateLimit (429) vs ReadFilterBlocked (Layer-C quarantine) vs
+        // Db (postgres outage) vs Internal (proxy bug). A hand-rolled
+        // `impl Debug` that hid variant names "to compact" the line
+        // would break every operator bucket. Pin five distinct names
+        // — symmetric to the ConnectError / KeyError / ApiError /
+        // AuthFail variant-name pins on other modules.
+        let pb = format!(
+            "{:?}",
+            AppError::PolicyBlocked {
+                policy_id: Some("p1".into()),
+                reason: "r".into(),
+                override_allowed: true,
+            }
+        );
+        assert!(pb.contains("PolicyBlocked"), "got: {pb}");
+        let rl = format!("{:?}", AppError::RateLimit);
+        assert!(rl.contains("RateLimit"), "got: {rl}");
+        let rf = format!("{:?}", AppError::ReadFilterBlocked);
+        assert!(rf.contains("ReadFilterBlocked"), "got: {rf}");
+        let db = format!("{:?}", AppError::Db(sqlx::Error::RowNotFound));
+        assert!(db.contains("Db"), "got: {db}");
+        let internal = format!("{:?}", AppError::Internal("x".into()));
+        assert!(internal.contains("Internal"), "got: {internal}");
+    }
+
+    #[test]
+    fn app_error_db_arm_display_masks_inner_sqlx_error_across_three_variants() {
+        // `#[error("database error")]` on `Db(#[from] sqlx::Error)` —
+        // the inner sqlx::Error carries schema column names + query
+        // fragments + constraint identifiers (operator-internal
+        // surface). Pin that Display is the fixed "database error"
+        // string with NO inner content, regardless of which sqlx
+        // variant is wrapped. Symmetric to the
+        // `auth_fail_db_arm_display_masks_inner_sqlx_error_for_no_secret_leak`
+        // pin on [crates/proxy/src/auth_middleware.rs] and the
+        // `oauth_error_db_display_does_not_carry_inner_sqlx_string`
+        // pin on [crates/proxy/src/oauth/error.rs] — keep all three
+        // sites symmetric so a refactor that "harmonized" one of
+        // them to `"database error: {0}"` "for richer triage"
+        // surfaces at the matching pin in this module too. Walk
+        // three distinct sqlx variants.
+        for inner in [
+            sqlx::Error::RowNotFound,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+        ] {
+            let e = AppError::Db(inner);
+            assert_eq!(e.to_string(), "database error");
+        }
+    }
+
+    #[test]
+    fn app_error_read_filter_blocked_display_is_byte_exact_for_log_filters() {
+        // `#[error("read filter blocked response body")]` on the
+        // ReadFilterBlocked unit variant — pin the byte-exact Display
+        // via `assert_eq!`. Operator log filters bucket Layer-C
+        // quarantines on this exact substring; a refactor that
+        // softened to `"read-filter blocked"` (hyphen rename) or
+        // dropped the trailing `"response body"` qualifier "for
+        // brevity" would silently break Loki filters historically
+        // keyed on the canonical message. The body-no-detail contract
+        // is already pinned by
+        // `app_error_body_read_filter_blocked_has_no_detail_but_dashboard_hint`
+        // — this pins the Display surface.
+        assert_eq!(
+            AppError::ReadFilterBlocked.to_string(),
+            "read filter blocked response body",
+        );
+    }
+
+    #[test]
+    fn app_error_upstream_too_large_display_is_byte_exact_with_size_cap_qualifier() {
+        // `#[error("upstream returned a body larger than the 10MB cap")]`
+        // on the UpstreamTooLarge unit variant — pin the byte-exact
+        // Display shape. The `10MB` qualifier in the message is the
+        // operator-facing log substring AND aligns with the body
+        // fix-text `10MB` mention (pinned by
+        // `app_error_body_upstream_too_large_carries_size_hint`). A
+        // refactor that swapped to "10 MB" (with a space) or "10485760
+        // bytes" "for precision" would silently break operator log
+        // filters keyed on the exact `"10MB cap"` substring AND drift
+        // the Display + body fix-text apart.
+        assert_eq!(
+            AppError::UpstreamTooLarge.to_string(),
+            "upstream returned a body larger than the 10MB cap",
+        );
+    }
+
+    #[test]
+    fn app_error_policy_blocked_extras_override_allowed_false_serializes_verbatim() {
+        // The existing `app_error_body_carries_policy_id_and_override_allowed_in_extras`
+        // pin walks `override_allowed: true`. Pin the symmetric `false`
+        // polarity here — the dashboard's "request override" button
+        // strictly dispatches on the JSON `false` literal to hide the
+        // button (a `null` or absent field would either show the
+        // button incorrectly or crash the renderer). A refactor that
+        // started skip-serializing the field when false (the natural
+        // `#[serde(skip_serializing_if = "..is_false..")]` shape) would
+        // silently break the dashboard's override gate. Pin presence
+        // + JSON-`false` literal + the `policy_id` field's None
+        // serialization as JSON null.
+        let e = AppError::PolicyBlocked {
+            policy_id: None,
+            reason: "default-deny".into(),
+            override_allowed: false,
+        };
+        let body = e.body();
+        let extras = &body.extras;
+        assert!(
+            extras.get("override_allowed").is_some(),
+            "override_allowed key must be present even when false: {extras}",
+        );
+        assert_eq!(extras["override_allowed"], false);
+        assert!(
+            extras["override_allowed"].is_boolean(),
+            "must be JSON boolean: {extras}",
+        );
+        // None policy_id serializes as JSON null for the dashboard's
+        // "(no policy)" rendering branch — pin presence + null type.
+        assert!(extras.get("policy_id").is_some());
+        assert!(extras["policy_id"].is_null());
+    }
+
+    #[test]
     fn app_error_body_read_filter_blocked_has_no_detail_but_dashboard_hint() {
         // ReadFilterBlocked is intentionally generic to the agent — the
         // matched pattern lives in `/admin/` (Live feed → row). Pin

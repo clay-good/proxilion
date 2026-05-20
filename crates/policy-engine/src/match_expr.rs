@@ -782,4 +782,183 @@ body.external_recipient: { equals: false }
         // pass through the same substring as the wrapper's Display.
         assert!(src.to_string().contains("ctx.x"), "got: {}", src);
     }
+
+    // ─── round 180 (2026-05-20): MatchError + evaluate operator-actionable surfaces ───
+
+    #[test]
+    fn match_error_is_send_sync_static_for_axum_evaluate_boundary() {
+        // `MatchError` propagates up through `rego::Error::Match` and
+        // then through `AppError::Policy` across the `.await`
+        // boundary in the axum request handler before flowing into
+        // the tokio::spawn'd audit-sink task. ALL three traits
+        // (Send + Sync + 'static) are load-bearing for those call
+        // sites — a refactor that gave `BadShape` a `Cell<u8>` field
+        // "for an in-process unique-shape counter" would silently
+        // break Sync at this boundary. Symmetric to round-176 +
+        // round-177 + round-179 Send+Sync+'static pins extended to
+        // the match-expression error type.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<MatchError>();
+    }
+
+    #[test]
+    fn evaluate_is_referentially_transparent_across_fifty_repeated_calls() {
+        // The hot path calls `evaluate(expr, &ctx)` once per policy
+        // per request — the result MUST depend only on `(expr, ctx)`,
+        // never on hidden per-call state (a once-cell match-result
+        // LRU, a per-eval counter, a regex-compile cache that aliased
+        // across calls). Pin referential transparency across 50
+        // back-to-back calls on a multi-clause expression that
+        // exercises both top-level AND (`user.email` + `body.size`)
+        // and a nested `in:` operator. A refactor that introduced
+        // a stateful between-call cache would surface here as a
+        // divergence on call #2..#50. Symmetric to round-179
+        // engine_evaluate referential-transparency pin one layer up.
+        let expr: Yaml = serde_yaml::from_str(
+            "\
+user.email:
+  equals: alice@acme.test
+body.tier:
+  in:
+    - gold
+    - silver
+",
+        )
+        .unwrap();
+        let mut ctx = RequestContext {
+            vendor: "v".into(),
+            action: "a".into(),
+            customer_domain: "acme.test".into(),
+            ..Default::default()
+        };
+        ctx.user.email = "alice@acme.test".into();
+        ctx.body
+            .insert("tier".into(), serde_json::Value::String("gold".into()));
+        let first = evaluate(&expr, &ctx).unwrap();
+        assert!(first, "fixture must match — sanity");
+        for i in 1..50 {
+            let next = evaluate(&expr, &ctx).unwrap();
+            assert_eq!(next, first, "diverged on call #{i}");
+        }
+    }
+
+    #[test]
+    fn evaluate_with_null_yaml_matches_irrespective_of_ctx_contents() {
+        // The doc-comment on `evaluate` pins: "Empty / null match
+        // matches everything (true)." This is the vacuous-AND base
+        // case the engine's `match:` clause depends on when the YAML
+        // omits the block entirely (every-request policy). A
+        // refactor that flipped null to `false` (the natural
+        // "be safe by default" mistake) would silently disable
+        // every match-less policy in the file. Pin the contract
+        // across three distinct ctxs so a fold over `ctx` into the
+        // result surfaces here. Symmetric to round-91 `allowed()`
+        // empty-layers vacuous-true pin extended to the
+        // match-expression base case one module down.
+        let null_expr: Yaml = serde_yaml::from_str("~").unwrap();
+        assert!(null_expr.is_null(), "fixture sanity");
+        for vendor in ["drive", "gmail", ""] {
+            let ctx = RequestContext {
+                vendor: vendor.into(),
+                action: "a".into(),
+                ..Default::default()
+            };
+            assert!(
+                evaluate(&null_expr, &ctx).unwrap(),
+                "null expr must match vendor={vendor:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn match_error_unsupported_op_inner_field_is_owned_string_for_arc_share_safety() {
+        // `UnsupportedOp(String)` — the inner is OWNED `String`, not
+        // `&'static str` or `Cow<'_, str>`. The error propagates
+        // across an `.await` boundary up through `rego::Error::Match`
+        // into `AppError::Policy`, and the YAML source bytes (the
+        // origin of the operator name) are dropped before the
+        // audit-sink consumes the error. A refactor to a borrowed
+        // form for "zero-alloc on the happy-path-never-hit branch"
+        // would silently introduce a lifetime parameter that would
+        // cascade through every consuming type. Pin the owned-String
+        // type via the canonical require_string helper. Symmetric to
+        // round-176 + round-177 + round-179 owned-String pins
+        // extended to this error variant.
+        fn require_string(_: &String) {}
+        let inner = match MatchError::UnsupportedOp("weird_op".into()) {
+            MatchError::UnsupportedOp(s) => s,
+            other => panic!("expected UnsupportedOp, got {other:?}"),
+        };
+        require_string(&inner);
+        assert_eq!(inner, "weird_op");
+    }
+
+    #[test]
+    fn match_error_bad_shape_op_and_got_fields_are_owned_string_for_cross_await_propagation() {
+        // `BadShape { op: String, expected: &'static str, got: String }`
+        // — the `op` and `got` fields are OWNED `String` while
+        // `expected` is `&'static str` (round-85 pinned the latter).
+        // The asymmetry is load-bearing: `expected` is always a
+        // compile-time literal ("mapping", "sequence", "string", ...)
+        // so a static slice keeps the variant cheap to Clone for
+        // retry tracing; `op` and `got` are runtime-derived from the
+        // YAML and the actual value's `type_name`, so they MUST be
+        // owned to survive the YAML source drop across the `.await`
+        // boundary. Pin both owned-String fields via the canonical
+        // require_string helper (round-85 didn't separately pin the
+        // type, only the dotted-path acceptance). A refactor to a
+        // borrowed form on either field would break cross-await
+        // propagation. Symmetric to round-176 + round-177 + round-179
+        // owned-String pins extended to BadShape's runtime-derived
+        // sibling fields.
+        fn require_string(_: &String) {}
+        let (op, got) = match (MatchError::BadShape {
+            op: "user.contact.email".into(),
+            expected: "mapping",
+            got: "string".into(),
+        }) {
+            MatchError::BadShape { op, got, .. } => (op, got),
+            other => panic!("expected BadShape, got {other:?}"),
+        };
+        require_string(&op);
+        require_string(&got);
+        assert_eq!(op, "user.contact.email");
+        assert_eq!(got, "string");
+    }
+
+    #[test]
+    fn match_error_debug_carries_variant_name_for_operator_log_grep_bucketing() {
+        // Operator alert filters in Loki / CloudWatch bucket match-
+        // expression faults by Debug-variant-name (the dashboard's
+        // "policy authoring errors" panel renders Display, but the
+        // alert pipeline keys on Debug because it survives across
+        // future variant additions without re-tuning the regex).
+        // Pin the three variant-name substrings (UnsupportedOp /
+        // BadShape / Template) in Debug output so a `#[derive(Debug)]`
+        // drift to a hand-rolled impl that elided variant names
+        // "for compactness" would silently merge all three into one
+        // bucket. Symmetric to round-163 ConfigError + round-168
+        // PicViolationRecord + round-173 ErrorCode + round-176
+        // PolicyLoadError Debug variant-name sweeps extended to
+        // MatchError.
+        let unsupported = MatchError::UnsupportedOp("weird_op".into());
+        assert!(
+            format!("{unsupported:?}").contains("UnsupportedOp"),
+            "Debug missing UnsupportedOp variant name: {unsupported:?}",
+        );
+        let bad_shape = MatchError::BadShape {
+            op: "in".into(),
+            expected: "sequence",
+            got: "number".into(),
+        };
+        assert!(
+            format!("{bad_shape:?}").contains("BadShape"),
+            "Debug missing BadShape variant name: {bad_shape:?}",
+        );
+        let template: MatchError = crate::ops::OpsParseError::UnknownVar("ctx.x".into()).into();
+        assert!(
+            format!("{template:?}").contains("Template"),
+            "Debug missing Template variant name: {template:?}",
+        );
+    }
 }

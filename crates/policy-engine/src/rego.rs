@@ -757,4 +757,254 @@ mod helper_tests {
             "transparent forwards to inner leaf — no further source link",
         );
     }
+
+    // ─── round 179 (2026-05-20): Engine + Outcome + Error operator-actionable surfaces ───
+
+    #[test]
+    fn engine_and_outcome_and_error_are_all_send_sync_static_for_axum_router_state() {
+        // `Engine` is held as `Arc<Engine>` in the axum router state and
+        // re-cloned across every request handler; `Outcome` flows back
+        // through `tokio::spawn`'d audit-sink tasks and a future
+        // `Arc<Outcome>` cache; `Error` propagates up through
+        // `AppError::Policy` across the same `.await` boundaries.
+        // ALL three need `Send + Sync + 'static` for those call sites
+        // to compile — a refactor that introduced a `Cell` field "for
+        // an in-process eval counter" or an `Rc` field would silently
+        // break Sync at this type boundary, surface as a flood of
+        // borrow-check errors at hundreds of call sites in the proxy.
+        // Pin the three-trait combo on all three types so the boundary
+        // fails fast here. Symmetric to round-168 / 169 / 173 / 175 /
+        // 176 / 177 / 178 Send+Sync+'static pins extended to the
+        // remaining engine entrypoint types.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<Engine>();
+        require_send_sync_static::<Outcome>();
+        require_send_sync_static::<Error>();
+    }
+
+    #[test]
+    fn engine_evaluate_is_referentially_transparent_across_fifty_repeated_calls() {
+        // The hot path calls `Engine::evaluate(&ctx)` for every inbound
+        // request; the result MUST depend only on the (policies, ctx)
+        // pair, never on hidden per-call state (a once-cell
+        // matched-rule LRU, a per-eval counter wired into the trace,
+        // etc.). Pin referential transparency across 50 back-to-back
+        // calls on a 2-policy multi-mode fixture (the first matches
+        // and blocks; the second is a fallback allow that should NOT
+        // surface because the first short-circuits). A refactor that
+        // introduced a stateful cache between calls would surface
+        // here as a divergence on call #2..#50.
+        // Symmetric to round-161 / 175 / 178 referential-transparency
+        // pins extended to the engine evaluate path.
+        let yaml = "\
+- id: p-block
+  vendor: drive
+  action: read
+  decision: block
+  required_ops: []
+- id: p-allow-fallback
+  vendor: drive
+  action: read
+  decision: allow
+  required_ops: []
+";
+        let engine = Engine::new(yaml).unwrap();
+        let ctx = RequestContext {
+            vendor: "drive".into(),
+            action: "read".into(),
+            ..Default::default()
+        };
+        let first = engine.evaluate(&ctx).unwrap();
+        for i in 1..50 {
+            let next = engine.evaluate(&ctx).unwrap();
+            assert_eq!(
+                next.matched_policy_id, first.matched_policy_id,
+                "matched_policy_id diverged on call #{i}",
+            );
+            assert_eq!(
+                next.decision, first.decision,
+                "decision diverged on call #{i}",
+            );
+            assert_eq!(next.mode, first.mode, "mode diverged on call #{i}");
+            assert_eq!(
+                next.pic_mode, first.pic_mode,
+                "pic_mode diverged on call #{i}",
+            );
+        }
+        assert_eq!(first.matched_policy_id.as_deref(), Some("p-block"));
+    }
+
+    #[test]
+    fn engine_policy_count_returns_usize_matching_loaded_length_across_zero_one_three_policies() {
+        // `policy_count` is surfaced on the setup-status page (the
+        // installer-UI's "policies loaded: N" indicator) and is a
+        // simple `usize` passthrough. Pin the contract across three
+        // sizes (0/1/3) so a refactor that subtracted disabled
+        // policies "for accuracy" would silently make the setup
+        // page disagree with the YAML the operator wrote — the
+        // operator's mental model is "every policy in the file is
+        // counted; mode is orthogonal." Symmetric to round-161
+        // PolicyView.policy_count exhaustive-count extended to the
+        // engine method one layer up.
+        let zero = Engine::new("[]").unwrap();
+        assert_eq!(zero.policy_count(), 0);
+        let one = Engine::new(
+            "\
+- id: p1
+  vendor: v
+  action: a
+  decision: allow
+  required_ops: []
+",
+        )
+        .unwrap();
+        assert_eq!(one.policy_count(), 1);
+        let three = Engine::new(
+            "\
+- id: p1
+  vendor: v
+  action: a
+  decision: allow
+  required_ops: []
+- id: p2
+  vendor: v
+  action: a
+  mode: disabled
+  decision: allow
+  required_ops: []
+- id: p3
+  vendor: v
+  action: b
+  decision: allow
+  required_ops: []
+",
+        )
+        .unwrap();
+        // Disabled policies are still counted — `policy_count` is the
+        // file-shape count, not the active-rule count.
+        assert_eq!(three.policy_count(), 3);
+    }
+
+    #[test]
+    fn engine_evaluate_no_match_path_returns_default_allow_outcome_byte_exact() {
+        // When no policy matches (vendor/action mismatch, all
+        // policies disabled, or empty list), `evaluate` returns a
+        // canonical default Outcome: matched_policy_id=None,
+        // decision=Allow, required_ops=Default, read_filter=None,
+        // pic_mode=Audit, mode=Enforce, observe_would_have=None,
+        // audit_body=None. This is the load-bearing "no policy
+        // gates this call" passthrough — the adapter's hot path
+        // depends on `matched_policy_id.is_none()` AND
+        // `decision == Allow` AND `pic_mode == Audit` to skip
+        // both the Trust-Plane round-trip and the audit-body
+        // capture. A refactor that promoted `pic_mode` to
+        // `RuntimeGate` "for safe default" would silently start
+        // forcing the Trust Plane round-trip on every unmatched
+        // request. Pin EVERY field on the default-outcome shape.
+        let engine = Engine::new(
+            "\
+- id: p1
+  vendor: drive
+  action: read
+  decision: block
+  required_ops: []
+",
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            vendor: "gmail".into(),
+            action: "send".into(),
+            ..Default::default()
+        };
+        let out = engine.evaluate(&ctx).unwrap();
+        assert!(out.matched_policy_id.is_none());
+        assert_eq!(out.decision, Decision::Allow);
+        assert!(out.required_ops.required.is_empty());
+        assert!(out.read_filter.is_none());
+        assert_eq!(out.pic_mode, PicMode::Audit);
+        assert_eq!(out.mode, Mode::Enforce);
+        assert!(out.observe_would_have.is_none());
+        assert!(out.audit_body.is_none());
+    }
+
+    #[test]
+    fn engine_burst_override_for_returns_none_for_unknown_policy_id_and_for_missing_block() {
+        // `burst_override_for(policy_id)` is the lookup the notifier
+        // burst limiter performs on every blocked event to recover
+        // the per-policy override (ui-less-surfaces.md §5.6). Two
+        // distinct None-paths must be preserved: unknown policy_id
+        // (the notifier was handed an id that doesn't exist in the
+        // current YAML — a stale reference after a hot-reload) AND
+        // an existing policy whose YAML omits the `notifier_burst:`
+        // block (the common default — fall back to the global
+        // notifier burst threshold). A refactor that collapsed the
+        // two paths to a single `unwrap_or_default()` would silently
+        // substitute the global threshold for both — the operator
+        // would lose the "you referenced an unknown policy id"
+        // diagnostic. Pin both None-paths plus a Some-path so all
+        // three branches surface here. Symmetric to round-91
+        // matched_rule_id Option pin extended to a sibling Option
+        // lookup one layer up.
+        let engine = Engine::new(
+            "\
+- id: p-no-burst
+  vendor: v
+  action: a
+  decision: block
+  required_ops: []
+- id: p-with-burst
+  vendor: v
+  action: a
+  decision: block
+  required_ops: []
+  notifier_burst:
+    threshold: 3
+    window_seconds: 60
+",
+        )
+        .unwrap();
+        assert!(engine.burst_override_for("p-no-burst").is_none());
+        assert!(engine.burst_override_for("p-unknown").is_none());
+        let (threshold, window) = engine.burst_override_for("p-with-burst").unwrap();
+        assert_eq!(threshold, Some(3));
+        assert_eq!(window, Some(60));
+    }
+
+    #[test]
+    fn outcome_matched_policy_id_some_arm_carries_owned_string_for_arc_share_safety() {
+        // `Outcome.matched_policy_id: Option<String>` — the Some-arm
+        // inner is an OWNED `String`, not a borrowed `&str`. The
+        // adapter clones the Outcome into the audit-sink task across
+        // a tokio `.await` boundary, and the original YAML byte
+        // slice (the source of the policy id) is dropped at the end
+        // of the request. A refactor to `Option<&'a str>` for "zero-
+        // alloc" would silently break the cross-await ownership and
+        // surface as borrow-check errors at the audit-sink site, but
+        // also Some adapters Arc-share the matched_policy_id between
+        // workers — owned String is the load-bearing shape there.
+        // Pin the owned-String type via the canonical require_string
+        // helper. Symmetric to round-176 PolicyBundle.yaml + version
+        // and round-177 Decision.reason owned-String pins extended
+        // to Outcome.matched_policy_id.
+        fn require_string(_: &String) {}
+        let engine = Engine::new(
+            "\
+- id: p-owned
+  vendor: v
+  action: a
+  decision: allow
+  required_ops: []
+",
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            vendor: "v".into(),
+            action: "a".into(),
+            ..Default::default()
+        };
+        let out = engine.evaluate(&ctx).unwrap();
+        let id = out.matched_policy_id.as_ref().expect("matched p-owned");
+        require_string(id);
+        assert_eq!(id, "p-owned");
+    }
 }

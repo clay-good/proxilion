@@ -237,4 +237,179 @@ mod tests {
         let r: Result<ErrorCode, _> = serde_json::from_str("\"banhammer\"");
         assert!(r.is_err());
     }
+
+    #[test]
+    fn as_str_returns_static_str_lifetime_for_zero_alloc_metric_label_propagation() {
+        // `ErrorCode::as_str()` is called on every error response path
+        // to attach a stable label to the `proxilion_errors_total{code,
+        // ...}` metric counter. The label must be `&'static str` so the
+        // metrics SDK can intern + reuse the string across an unbounded
+        // number of error emissions per second without allocation. The
+        // existing pins walk the VALUE across every variant but never
+        // the LIFETIME. A refactor returning `String` "for variant-
+        // specific dynamic labels" would silently allocate one String
+        // per error response — symmetric to round-163 + round-165 +
+        // round-168 + round-169 + round-170 + round-171 static-str pins
+        // extended to ErrorCode::as_str return.
+        fn require_static_str(_: &'static str) {}
+        // Cross-variant sweep: every variant must produce a 'static label.
+        for c in [
+            ErrorCode::PicInvariantViolation,
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RequireConfirmation,
+            ErrorCode::RateLimited,
+            ErrorCode::ReadFilterBlocked,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::UpstreamTooLarge,
+            ErrorCode::PolicyEngineError,
+            ErrorCode::DatabaseError,
+            ErrorCode::InternalError,
+        ] {
+            require_static_str(c.as_str());
+        }
+    }
+
+    #[test]
+    fn error_code_is_send_sync_static_for_axum_error_envelope_propagation() {
+        // ErrorCode is carried on AppError variants (`pub fn code(&self)
+        // -> ErrorCode`) and flows through `tokio::spawn` blocks (the
+        // tee-to-audit-sink path persists error rows asynchronously).
+        // The Copy + Hash derives already imply Send + Sync, but a
+        // future refactor to a #[non_copy] variant carrying owned
+        // state ("for richer diagnostic context") would silently break
+        // the Send bound at a remote `tower::Service` trait-bound. Pin
+        // Send + Sync + 'static via require_send_sync_static —
+        // symmetric to round-168 PicViolationRecord + round-169
+        // BlockedNotification Send+Sync pins extended to ErrorCode.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ErrorCode>();
+    }
+
+    #[test]
+    fn as_str_byte_exact_lowercase_snake_case_no_kebab_no_uppercase_across_all_ten_variants() {
+        // Operator dashboards bucket metrics on `code == "policy_blocked"`
+        // via lowercase snake_case regex. The existing wire_strings_are_stable
+        // pin walks values byte-equal but never the SHAPE invariant —
+        // a refactor adding `#[serde(rename_all = "kebab-case")]` "for
+        // hyphen-friendly URLs" on a sibling shared types enum would
+        // silently break every dashboard bucket if it leaked to this
+        // file. Pin no-uppercase + no-kebab across all 10 variants —
+        // symmetric to round-143 oauth_error code lowercase sweep +
+        // round-161 PolicyView/ListResponse JSON-keys snake_case sweep
+        // extended to ErrorCode wire form.
+        for c in [
+            ErrorCode::PicInvariantViolation,
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RequireConfirmation,
+            ErrorCode::RateLimited,
+            ErrorCode::ReadFilterBlocked,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::UpstreamTooLarge,
+            ErrorCode::PolicyEngineError,
+            ErrorCode::DatabaseError,
+            ErrorCode::InternalError,
+        ] {
+            let s = c.as_str();
+            assert!(
+                s.chars().all(|ch| !ch.is_ascii_uppercase()),
+                "variant {c:?} wire string `{s}` contains uppercase",
+            );
+            assert!(
+                !s.contains('-'),
+                "variant {c:?} wire string `{s}` contains kebab-case `-`",
+            );
+            // Defensive: shell-safe (no spaces, no shell metachars).
+            assert!(
+                !s.contains(' ') && !s.contains('"') && !s.contains('$'),
+                "variant {c:?} wire string `{s}` contains shell-unsafe char",
+            );
+        }
+    }
+
+    #[test]
+    fn as_str_is_referentially_transparent_across_fifty_repeated_calls_per_variant() {
+        // Symmetric to round-161 + round-162 + round-166 + round-168 +
+        // round-169 + round-170 + round-171 + round-172 referential-
+        // transparency pins extended to ErrorCode::as_str. A refactor
+        // that introduced a once-cell-backed string interner "for hot-
+        // path perf" might silently return the wrong cached value if
+        // the cache key was hashed incorrectly. Pin 50 calls per
+        // variant produce byte-equal output.
+        for c in [
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RateLimited,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::InternalError,
+        ] {
+            let baseline = c.as_str();
+            for i in 0..50 {
+                let again = c.as_str();
+                assert_eq!(
+                    again, baseline,
+                    "iteration {i} on {c:?}: as_str must be referentially transparent",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_status_returns_u16_type_not_status_code_for_adapter_override_freedom() {
+        // The function returns `u16` (not `http::StatusCode`) so
+        // adapters can override with arbitrary numeric codes (e.g.
+        // 202 Accepted for queued RequireConfirmation requests per the
+        // docstring). A refactor to return StatusCode "for stricter
+        // typing" would silently force every caller to extract `.as_u16()`
+        // at the override site AND would prevent customer-extension
+        // adapters from returning non-standard codes that http::StatusCode
+        // rejects. Pin via require_u16 generic fn.
+        fn require_u16(_: u16) {}
+        for c in [
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RateLimited,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::InternalError,
+        ] {
+            require_u16(c.default_status());
+        }
+    }
+
+    #[test]
+    fn default_status_returns_only_4xx_or_5xx_codes_never_2xx_3xx_across_all_variants() {
+        // Every ErrorCode represents an OPERATOR-FACING FAILURE — by
+        // definition, the recommended HTTP status MUST be in the 4xx
+        // or 5xx class. A refactor adding a hypothetical
+        // `Self::AcceptedQueued => 202` "for ergonomic async response
+        // shape" would silently leak a success-class status through
+        // the error envelope and confuse dashboards that filter
+        // `status >= 400` to count errors. Pin no-2xx + no-3xx across
+        // every variant — symmetric to round-143 AppError::status all-
+        // variants 4xx/5xx pin extended to the canonical ErrorCode
+        // registry one layer up.
+        for c in [
+            ErrorCode::PicInvariantViolation,
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RequireConfirmation,
+            ErrorCode::RateLimited,
+            ErrorCode::ReadFilterBlocked,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::UpstreamTooLarge,
+            ErrorCode::PolicyEngineError,
+            ErrorCode::DatabaseError,
+            ErrorCode::InternalError,
+        ] {
+            let s = c.default_status();
+            assert!(
+                (400..600).contains(&s),
+                "variant {c:?} default_status {s} must be 4xx or 5xx",
+            );
+            assert!(
+                !(200..300).contains(&s),
+                "variant {c:?} status {s} must NOT be 2xx"
+            );
+            assert!(
+                !(300..400).contains(&s),
+                "variant {c:?} status {s} must NOT be 3xx"
+            );
+        }
+    }
 }

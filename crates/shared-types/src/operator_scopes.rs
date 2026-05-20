@@ -208,4 +208,132 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn scope_catalogue_entries_all_use_static_str_lifetime_for_zero_alloc_cli_render() {
+        // The CLI renders `tokens scopes` by iterating SCOPE_CATALOGUE
+        // and printing each tuple's scope + description + endpoints.
+        // All three field types MUST be `&'static str` so the catalogue
+        // can be stored in `.rodata` and read across an unbounded number
+        // of CLI invocations without allocation. A refactor that lifted
+        // the catalogue to runtime construction (e.g. for i18n-aware
+        // descriptions) would silently allocate three Strings per entry
+        // per CLI startup. Pin lifetime via require_static_str on every
+        // field of every tuple — symmetric to round-163 + round-165 +
+        // round-168 + round-169 + round-170 + round-171 + round-173
+        // static-str pins extended to operator scope catalogue.
+        fn require_static_str(_: &'static str) {}
+        for (scope, desc, endpoints) in SCOPE_CATALOGUE {
+            require_static_str(scope);
+            require_static_str(desc);
+            require_static_str(endpoints);
+        }
+    }
+
+    #[test]
+    fn scope_catalogue_const_field_type_is_static_slice_of_three_tuple_for_compile_time_embed() {
+        // SCOPE_CATALOGUE is `pub const` (not `pub static`) — the value
+        // is compile-time-embedded into every binary that consumes the
+        // crate (proxy + CLI + future SCIM bridge). A refactor to
+        // `pub static SCOPE_CATALOGUE: Lazy<Vec<...>>` "for ergonomic
+        // dynamic-loading" would silently move the catalogue from
+        // .rodata into the heap AND would let i18n-aware descriptions
+        // mutate per-binary, breaking the cross-tool consistency
+        // contract. Pin the const-ness via a `const _: &[(&str, &str,
+        // &str)] = SCOPE_CATALOGUE;` const-block which fails compile
+        // if the type ever drifts.
+        const _CATALOGUE_TYPE_PIN: &[(&str, &str, &str)] = SCOPE_CATALOGUE;
+        // Type-level pin via direct slice access (the const block
+        // above already checks at compile time; the runtime check
+        // below is the corresponding value-level assertion).
+        assert_eq!(_CATALOGUE_TYPE_PIN.len(), SCOPE_CATALOGUE.len());
+    }
+
+    #[test]
+    fn scope_strings_returns_owned_vec_of_static_str_not_borrowed_slice() {
+        // The helper returns `Vec<&'static str>` (owned outer Vec, but
+        // borrowed-with-static-lifetime elements) — the &'static
+        // elements let consumers store the result in a long-lived
+        // HashSet without re-cloning. The existing pins walk the
+        // count + ordering but never the TYPE-level contract. A
+        // refactor returning `&'static [&'static str]` "to avoid the
+        // Vec allocation" would silently let consumers Box and ship
+        // it but break callers that mutate the Vec (the operator_auth
+        // crate dedup-extends it with custom scopes). Pin
+        // Vec<&'static str> via require_vec_static_str.
+        fn require_vec_static_str(_: &Vec<&'static str>) {}
+        let strs = scope_strings();
+        require_vec_static_str(&strs);
+        // Per-element 'static lifetime.
+        fn require_static_str(_: &'static str) {}
+        for s in &strs {
+            require_static_str(s);
+        }
+    }
+
+    #[test]
+    fn scope_strings_is_referentially_transparent_across_fifty_repeated_calls() {
+        // Symmetric to round-161 + round-162 + round-166 + round-168 +
+        // round-169 + round-170 + round-171 + round-172 + round-173
+        // referential-transparency pins extended to scope_strings. The
+        // CLI's `tokens scopes` renderer may call this helper multiple
+        // times during a single render (once for the table + once for
+        // a per-scope lookup); a refactor caching results in a thread-
+        // local mutable Vec "for hot-path perf" would silently return
+        // a shared mutable reference if the lock was acquired
+        // incorrectly. Pin 50 calls return byte-equal Vec contents.
+        let baseline = scope_strings();
+        for i in 0..50 {
+            let again = scope_strings();
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: scope_strings must be referentially transparent",
+            );
+        }
+        // Defensive: same length each time.
+        assert_eq!(baseline.len(), SCOPE_CATALOGUE.len());
+    }
+
+    #[test]
+    fn every_scope_string_is_at_least_one_char_and_at_most_thirty_two_chars_for_cli_table_layout() {
+        // The CLI `tokens scopes` table renders scope strings in a
+        // fixed-width column; the maximum is 32 chars (`killswitch:revoke`
+        // is 17, the longest current). A refactor that introduced an
+        // arbitrarily-long scope (`actions:export:csv:streaming:cursor:v2`)
+        // "for ergonomic versioned scopes" would silently overflow the
+        // table column AND silently widen the JWT bearer scope claim
+        // beyond what existing IdPs allow (Okta caps custom claims at
+        // ~256 bytes per scope). Pin a min-1 / max-32 length sweep so
+        // a regression surfaces here on the CLI-layout + IdP-compat
+        // contract.
+        for (s, _, _) in SCOPE_CATALOGUE {
+            assert!(!s.is_empty(), "scope must be at least 1 char: {s}");
+            assert!(
+                s.len() <= 32,
+                "scope `{s}` is {} chars — exceeds 32-char CLI column",
+                s.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn scope_catalogue_carries_exactly_twelve_entries_pinning_the_documented_set_byte_exact() {
+        // The existing pin (`catalogue_carries_at_least_twelve_entries_per_documented_spec`)
+        // walks a `>= 12` floor — never catches an accidental ADDITION
+        // of a 13th scope that a future PR landed without updating
+        // operator runbooks. Operator-runbook drift is one of the
+        // top-3 ways a scope-write regression has historically
+        // surfaced: someone adds `policy:delete` "to test a feature"
+        // and ships to production without updating the CLI help, the
+        // docs/error-codes.md catalogue, or the SCIM sync. Pin
+        // EXACTLY 12 — symmetric to round-161 + round-165 + round-169
+        // + round-171 + round-172 exhaustive-set pins extended to
+        // SCOPE_CATALOGUE cardinality.
+        assert_eq!(
+            SCOPE_CATALOGUE.len(),
+            12,
+            "catalogue length changed to {} — add to docs/error-codes.md + operator runbook + bump this assertion",
+            SCOPE_CATALOGUE.len(),
+        );
+    }
 }

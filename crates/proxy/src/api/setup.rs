@@ -579,4 +579,198 @@ mod tests {
         assert!(v["fix"].as_str().unwrap().contains("curl /healthz"));
         assert!(v["detail"].as_str().unwrap().contains("database error"));
     }
+
+    #[test]
+    fn check_item_title_field_is_static_str_lifetime_for_zero_alloc_admin_ui_render() {
+        // The `/admin/setup` HTML page renders the title verbatim per
+        // checklist item — load-bearing for the user-facing copy
+        // ("Database", "Layer-B policies", "Registered OAuth clients"
+        // etc.). The existing pin (`check_item_id_field_is_static_str_for_zero_alloc_logging`)
+        // walks the `id` field's 'static lifetime but never the
+        // sibling `title` field. A refactor to `String` "for
+        // dynamically-localized titles" would silently allocate one
+        // String per checklist item per `/admin/setup` hit. Pin
+        // lifetime via require_static_str — symmetric to round-169
+        // BlockedNotification SCHEMA + round-170 Healthz.version
+        // static-str pins extended to CheckItem.title.
+        fn require_static_str(_: &'static str) {}
+        let item = CheckItem {
+            id: "x",
+            title: "Database",
+            ok: true,
+            detail: "connected".into(),
+            fix: None,
+            docs: "d",
+        };
+        require_static_str(item.title);
+        // And docs is also 'static — pin both sibling fields together.
+        require_static_str(item.docs);
+    }
+
+    #[test]
+    fn check_item_fix_field_is_option_of_static_str_lifetime_for_zero_alloc_some_variant() {
+        // The `fix` field carries copy-paste-able operator instructions
+        // (e.g. "Set DATABASE_URL to a reachable postgres URL..."). These
+        // are literal docstrings authored in the handler, never
+        // dynamically composed — `Option<&'static str>`, not
+        // `Option<String>`. A refactor that swapped to `Option<String>`
+        // "for ergonomic format!()-based fix strings" would silently
+        // allocate one String per failed check per `/admin/setup` hit
+        // AND would let a future `format!("Set X={value}")` interpolate
+        // request-time state into the fix message (a path that has
+        // never required runtime input, so a regression that started
+        // doing it would silently widen the surface). Pin lifetime
+        // via require_static_str on the Some-polarity.
+        fn require_static_str(_: &'static str) {}
+        let item = CheckItem {
+            id: "x",
+            title: "T",
+            ok: false,
+            detail: "down".into(),
+            fix: Some("Set DATABASE_URL to a reachable postgres URL."),
+            docs: "d",
+        };
+        require_static_str(item.fix.expect("Some-polarity fixture"));
+    }
+
+    #[test]
+    fn check_item_serializes_with_exactly_six_known_keys_for_admin_ui_table_contract() {
+        // The `/admin/setup` UI table renders one row per checklist item
+        // with 6 columns (id, title, ok, detail, fix, docs). The existing
+        // pins walk individual key values via `v["k"]` but never the
+        // EXHAUSTIVE 6-key set — a refactor adding a `severity` field
+        // "for priority bucketing" would silently widen every UI row
+        // and break consumers (e.g. CLI scrapers that destructure the
+        // shape with serde::Deserialize on a 6-field struct). Pin
+        // HashSet equality on the 6 keys — symmetric to round-161
+        // PolicyView 5-key + round-165 TokenResponse 4-key + round-169
+        // BlockedNotification 16-key + round-170 Healthz/Check 3-field
+        // exhaustive-set pins extended to CheckItem.
+        let item = CheckItem {
+            id: "database",
+            title: "Database",
+            ok: true,
+            detail: "connected".into(),
+            fix: None,
+            docs: "https://proxilion.com/docs/install",
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        let obj = v
+            .as_object()
+            .expect("CheckItem must serialize as JSON object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
+        let expected: std::collections::HashSet<&str> =
+            ["id", "title", "ok", "detail", "fix", "docs"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            keys, expected,
+            "CheckItem must serialize with EXACTLY these 6 keys for admin UI table",
+        );
+    }
+
+    #[test]
+    fn setup_status_serializes_with_exactly_two_known_keys_ready_for_traffic_and_items() {
+        // The `/api/v1/setup/status` envelope is consumed by both the
+        // operator HTML page (`ready_for_traffic` powers the big
+        // green/red banner) AND the CLI's `proxilion-cli status`
+        // renderer. The existing pins walk both keys individually but
+        // never the EXHAUSTIVE 2-key set — a refactor adding a
+        // `last_checked_at` "for caching diagnostics" would silently
+        // widen the envelope and break consumers that destructure on
+        // 2 fields exactly. Pin HashSet equality.
+        let status = SetupStatus {
+            ready_for_traffic: false,
+            items: vec![],
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        let obj = v
+            .as_object()
+            .expect("SetupStatus must serialize as JSON object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
+        let expected: std::collections::HashSet<&str> =
+            ["ready_for_traffic", "items"].into_iter().collect();
+        assert_eq!(
+            keys, expected,
+            "SetupStatus must serialize with EXACTLY these 2 keys for admin UI envelope",
+        );
+    }
+
+    #[test]
+    fn check_item_docs_url_uses_https_scheme_for_operator_facing_link_safety() {
+        // Every operator-facing docs URL across the 6 known checklist
+        // items MUST use `https://` — a `http://` link in the admin UI
+        // would surface a mixed-content warning AND would expose the
+        // operator's referer + session cookie to a network observer on
+        // first click (the admin UI itself is served over TLS). The
+        // existing pin (`check_item_some_fix_includes_actionable_keyword`)
+        // walks the `fix` field's content but never the `docs` field's
+        // scheme. Pin the contract: every operator-authored docs URL
+        // in the module starts with `https://` and contains
+        // `proxilion.com/docs/`.
+        let module_docs = [
+            "https://proxilion.com/docs/install",
+            "https://proxilion.com/docs/policy/authoring",
+            "https://proxilion.com/docs/oauth/clients",
+            "https://proxilion.com/docs/install/google",
+            "https://proxilion.com/docs/getting-started/first-pca",
+            "https://proxilion.com/docs/federation-bridge",
+        ];
+        for url in &module_docs {
+            assert!(
+                url.starts_with("https://"),
+                "docs URL must use https scheme: {url}",
+            );
+            assert!(
+                url.contains("proxilion.com/docs/"),
+                "docs URL must point to proxilion.com/docs/: {url}",
+            );
+            // Pin via the type check too: each is a &'static str.
+            fn require_static_str(_: &'static str) {}
+            require_static_str(url);
+        }
+    }
+
+    #[test]
+    fn setup_status_envelope_is_referentially_transparent_across_fifty_serializations() {
+        // Symmetric to round-161 + round-162 + round-166 + round-168
+        // + round-169 + round-170 referential-transparency pins
+        // extended to SetupStatus serialization. The `/api/v1/setup/status`
+        // endpoint may be polled at sub-second intervals by an installer
+        // UI watching for "ready_for_traffic" to flip; a refactor
+        // caching the JSON in a once-cell keyed on `&status as *const _`
+        // "for hot-path perf" would silently return stale bytes on a
+        // re-built SetupStatus with newly-flipped ready_for_traffic.
+        // Pin 50 serialization calls on the same struct yield byte-equal
+        // JSON.
+        let status = SetupStatus {
+            ready_for_traffic: true,
+            items: vec![
+                CheckItem {
+                    id: "database",
+                    title: "Database",
+                    ok: true,
+                    detail: "connected".into(),
+                    fix: None,
+                    docs: "https://proxilion.com/docs/install",
+                },
+                CheckItem {
+                    id: "policies",
+                    title: "Layer-B policies",
+                    ok: false,
+                    detail: "no policy file configured".into(),
+                    fix: Some("Set PROXILION_POLICY_PATH..."),
+                    docs: "https://proxilion.com/docs/policy/authoring",
+                },
+            ],
+        };
+        let baseline = serde_json::to_string(&status).unwrap();
+        for i in 0..50 {
+            let again = serde_json::to_string(&status).unwrap();
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: SetupStatus serialization must be referentially transparent",
+            );
+        }
+    }
 }

@@ -545,4 +545,183 @@ mod tests {
             s["predecessor_id"],
         );
     }
+
+    #[test]
+    fn pca_view_serializes_with_exactly_seven_known_keys_for_cli_renderer_contract() {
+        // The `proxilion-cli pca <id>` renderer destructures the JSON
+        // shape from `/api/v1/pca/{id}` into a 7-field display table.
+        // The existing pin (`pca_view_serializes_with_stable_field_names`)
+        // walks individual keys via `v["k"]` but never the EXHAUSTIVE
+        // 7-key set — a refactor adding a `verified_at` "for ergonomic
+        // freshness display" field would silently widen every
+        // CLI response and break consumers that destructure with
+        // serde::Deserialize on a 7-field struct. Pin HashSet equality
+        // on the 7 keys — symmetric to round-161 PolicyView 5-key +
+        // round-165 TokenResponse 4-key + round-169 BlockedNotification
+        // 16-key + round-170 Healthz/Check + round-171 CheckItem 6-key
+        // + SetupStatus 2-key exhaustive-set pins extended to PcaView.
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: "alice@demo.local".into(),
+            ops: vec!["drive:read:a".into()],
+            hop: 1,
+            predecessor_id: Some(Uuid::nil()),
+            pic_profile: "proxilion.v1".into(),
+            cbor_hex: "abcd".into(),
+        };
+        let j = serde_json::to_value(&v).unwrap();
+        let obj = j
+            .as_object()
+            .expect("PcaView must serialize as JSON object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
+        let expected: std::collections::HashSet<&str> = [
+            "pca_id",
+            "p_0",
+            "ops",
+            "hop",
+            "predecessor_id",
+            "pic_profile",
+            "cbor_hex",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            keys, expected,
+            "PcaView must serialize with EXACTLY these 7 keys for CLI renderer contract",
+        );
+    }
+
+    #[test]
+    fn hex_encode_is_referentially_transparent_across_fifty_repeated_calls() {
+        // Symmetric to round-161 + round-162 + round-166 + round-168 +
+        // round-169 + round-170 + round-171 referential-transparency
+        // pins extended to hex_encode. The `/api/v1/pca/{id}` handler
+        // calls hex_encode on every fetch; a refactor caching results
+        // in a once-cell keyed on input pointer "for hot-path perf"
+        // would silently return stale bytes on a re-fetched PCA whose
+        // CBOR blob got rewritten by a downstream `/api/v1/pca/{id}/
+        // refresh` admin path. Pin 50 calls on a 256-byte fixture
+        // covering every byte value produce byte-equal output.
+        let input: Vec<u8> = (0..=255).collect();
+        let baseline = hex_encode(&input);
+        for i in 0..50 {
+            let again = hex_encode(&input);
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: hex_encode must be referentially transparent",
+            );
+        }
+        // Defensive: 512 chars for 256-byte input.
+        assert_eq!(baseline.len(), 512);
+    }
+
+    #[test]
+    fn pca_view_pic_profile_field_is_owned_string_type_not_borrowed_for_async_response_outlives() {
+        // The `get_pca` handler returns `Json<PcaView>` AFTER awaiting
+        // `state.pca_cache.get(id)`; the awaited row is consumed and
+        // `pic_profile: row.pic_profile` MOVES the String out. A
+        // refactor to `pic_profile: &'a str` "to avoid the clone"
+        // would surface a lifetime constraint that the async response
+        // path (where Row is consumed mid-fn) couldn't satisfy. The
+        // existing pin walks the VALUE but never the TYPE-level
+        // ownership contract — pin via a generic fn whose signature
+        // only compiles when the field is `String` (owned), not
+        // `&str` (borrowed). Symmetric to round-168 parse_missing_atoms
+        // require_vec_string + Vec<String> owned-type pin extended to
+        // PcaView.pic_profile.
+        fn require_string(_: &String) {}
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: "x".into(),
+            ops: vec![],
+            hop: 0,
+            predecessor_id: None,
+            pic_profile: "proxilion.v1".into(),
+            cbor_hex: String::new(),
+        };
+        require_string(&v.pic_profile);
+        // And p_0 + cbor_hex are also owned String (the response
+        // outlives the Row from cache).
+        require_string(&v.p_0);
+        require_string(&v.cbor_hex);
+    }
+
+    #[test]
+    fn pca_view_cbor_hex_field_length_is_exactly_two_per_input_byte_for_round_trip_safety() {
+        // hex_encode emits 2 chars per input byte (no separators, no
+        // prefix). The PcaView.cbor_hex field carries the CBOR blob
+        // for round-trip safety on operator inspection (CLI `pca-show`
+        // pipes it back through `xxd -r -p` for byte-equal decode).
+        // The existing pin (`hex_encode_byte_count_matches_two_per_input_byte`)
+        // walks the helper but never the field-level invariant — pin
+        // that PcaView.cbor_hex.len() == 2 * input.len() across 4
+        // representative sizes (empty / 1 byte / 16-byte block /
+        // 257-byte odd size) so a refactor adding a `0x` prefix or
+        // colon-separators to hex_encode "for ergonomic display"
+        // surfaces here on the field-level contract.
+        for &n in &[0usize, 1, 16, 257] {
+            let input: Vec<u8> = (0..n as u32).map(|i| (i & 0xff) as u8).collect();
+            let v = PcaView {
+                pca_id: Uuid::nil(),
+                p_0: "x".into(),
+                ops: vec![],
+                hop: 0,
+                predecessor_id: None,
+                pic_profile: "p".into(),
+                cbor_hex: hex_encode(&input),
+            };
+            assert_eq!(
+                v.cbor_hex.len(),
+                n * 2,
+                "cbor_hex length must be 2 * input.len() for n={n}",
+            );
+        }
+    }
+
+    #[test]
+    fn api_state_is_clone_for_axum_router_with_state_fan_out() {
+        // `ApiState` is held by every axum router built via
+        // `.with_state(state)`; the router build clones it once per
+        // route layer. The Clone derive is load-bearing — without it,
+        // axum's `State<T>` extractor would fail to compile across the
+        // dozens of routes that share it. The existing pin
+        // (`api_state_and_api_error_are_send_sync_static_for_axum_boundary`)
+        // walks Send + Sync + 'static but never the Clone trait —
+        // a refactor that landed a non-Clone field (e.g. a `OnceLock<...>`
+        // for a lazy cache) on ApiState would surface at every router
+        // build site rather than at this single compile-time assertion.
+        // Pin Clone via require_clone — symmetric to round-22 OperatorAuthState
+        // Clone-bound pin extended to ApiState.
+        fn require_clone<T: Clone>() {}
+        require_clone::<ApiState>();
+    }
+
+    #[test]
+    fn pca_view_ops_field_is_owned_vec_string_for_zero_borrow_response_boundary() {
+        // PcaView.ops is `Vec<String>` (owned per-element AND owned
+        // outer Vec) — the awaited Row is consumed mid-handler and
+        // the response Json<PcaView> outlives the borrow. A refactor
+        // to `Vec<&'a str>` or `&'a [String]` "to avoid the clone"
+        // would either fail to compile against the async outlives
+        // chain or silently introduce a stale-data window if the row
+        // got hot-swapped underneath. The existing pin
+        // (`pca_view_ops_serializes_as_json_array_preserving_order_across_multi_element`)
+        // walks the VALUE but never the TYPE — pin via require_vec_string
+        // symmetric to round-168 parse_missing_atoms + round-172
+        // PcaView.pic_profile owned-type pins.
+        fn require_vec_string(_: &Vec<String>) {}
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: "x".into(),
+            ops: vec!["a".into(), "b".into()],
+            hop: 0,
+            predecessor_id: None,
+            pic_profile: "p".into(),
+            cbor_hex: String::new(),
+        };
+        require_vec_string(&v.ops);
+        // And each element is String (owned).
+        fn require_string(_: &String) {}
+        require_string(&v.ops[0]);
+    }
 }

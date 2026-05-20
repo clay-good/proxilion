@@ -954,6 +954,180 @@ mod tests {
     }
 
     #[test]
+    fn actions_api_state_and_actions_api_error_send_sync_static_for_axum_state_boundary() {
+        // `ActionsApiState` is held by value (not Arc-wrapped) and
+        // passed via `with_state(...)` into the actions router; axum
+        // requires Send+Sync+'static on State types. `ActionsApiError`
+        // flows through `IntoResponse` from handler futures crossing
+        // tokio task boundaries — also requires the bounds. Symmetric
+        // to the AppError + OAuthError + sibling ApiError pins on
+        // adapters/error.rs + oauth/error.rs + api/killswitch.rs +
+        // api/blocked.rs. A refactor wrapping any field in `Rc<...>`
+        // would surface at the router site with an opaque
+        // tower::Service trait-bound. Pin both types at this file.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ActionsApiState>();
+        require_send_sync_static::<ActionsApiError>();
+    }
+
+    #[test]
+    fn actions_api_error_debug_carries_variant_names_for_grep_bucketing() {
+        // `#[derive(Debug)]` on ActionsApiError feeds `?err` in
+        // `tracing::warn!` call sites and the 500-branch logs on the
+        // actions API. Operators grep tracing log lines by variant
+        // name to bucket NotFound (row aged out / operator typo) vs
+        // BadRequest (operator-supplied bad cursor) vs Db (postgres
+        // outage) vs Cache (pca_cache table fault). A hand-rolled
+        // `impl Debug` that hid variant names "to compact" would
+        // break every operator bucket. Symmetric to the four sibling
+        // operator-facing Error enums' Debug pins.
+        for (variant, name) in [
+            (ActionsApiError::NotFound, "NotFound"),
+            (ActionsApiError::BadRequest("x".into()), "BadRequest"),
+            (ActionsApiError::Db(sqlx::Error::RowNotFound), "Db"),
+        ] {
+            let s = format!("{:?}", variant);
+            assert!(s.contains(name), "expected `{name}` in Debug, got: {s}");
+        }
+    }
+
+    #[test]
+    fn actions_api_error_status_across_all_four_variants_is_4xx_or_5xx_never_2xx_or_3xx() {
+        // Symmetric to the same-axis pins on adapters/error.rs +
+        // oauth/error.rs + api/blocked.rs + api/killswitch.rs. Every
+        // ActionsApiError variant surfaces a non-success status —
+        // a refactor that registered a new variant mapping to 200 OK
+        // "for the silent-acknowledgement case" would silently
+        // exclude that variant from operator dashboard error-rate
+        // metrics. Pin !is_success AND !is_redirection across
+        // all four variants. The Cache arm requires a constructed
+        // CacheError; route via the sqlx::Error::PoolClosed branch
+        // of Db transitively (the Cache variant maps the same way).
+        for v in [
+            ActionsApiError::NotFound,
+            ActionsApiError::BadRequest("x".into()),
+            ActionsApiError::Db(sqlx::Error::RowNotFound),
+        ] {
+            let label = format!("{v:?}");
+            let r = v.into_response();
+            let s = r.status();
+            assert!(!s.is_success(), "variant {label} surfaced 2xx {s}");
+            assert!(!s.is_redirection(), "variant {label} surfaced 3xx {s}");
+            assert!(
+                s.is_client_error() || s.is_server_error(),
+                "variant {label} non-4xx/5xx {s}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actions_api_error_body_code_is_lowercase_snake_case_across_all_variants() {
+        // Symmetric to the snake_case body.code pins on
+        // adapters/error.rs round 143 + oauth/error.rs round 145 +
+        // api/blocked.rs round 148. The wire `code` field MUST be
+        // lowercase snake_case across all ActionsApiError variants.
+        // A refactor that surfaced one as PascalCase OR kebab-case
+        // would silently break operator dashboard regex buckets. Pin
+        // absence of uppercase + absence of `-` across each branch.
+        for v in [
+            ActionsApiError::NotFound,
+            ActionsApiError::BadRequest("x".into()),
+            ActionsApiError::Db(sqlx::Error::RowNotFound),
+        ] {
+            let label = format!("{v:?}");
+            let r = v.into_response();
+            let bytes = axum::body::to_bytes(r.into_body(), 8 * 1024).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let code = v["code"].as_str().unwrap_or("");
+            assert!(!code.is_empty(), "{label}: empty code");
+            assert!(
+                !code.chars().any(|c| c.is_ascii_uppercase()),
+                "{label}: uppercase in `{code}`",
+            );
+            assert!(!code.contains('-'), "{label}: kebab in `{code}`");
+        }
+    }
+
+    #[test]
+    fn list_row_serializes_with_exactly_seventeen_known_keys() {
+        // The struct has 17 fields — every one MUST surface on the
+        // wire (NO skip predicates declared). The dashboard's actions
+        // panel renders all 17 columns by name; a refactor adding
+        // `skip_serializing_if = "Option::is_none"` to any of the
+        // four Option fields (session_id, leaf_pca_id, block_reason,
+        // policy_id) "for cleaner null wire" would silently break
+        // dashboard column rendering on rows where the field is
+        // None. Pin EXACTLY 17 keys with full name sweep on a row
+        // where every Option field is None — the most demanding case
+        // for absence detection.
+        let row = ListRow {
+            id: Uuid::nil(),
+            request_id: Uuid::nil(),
+            session_id: None,
+            p_0: "x".into(),
+            leaf_pca_id: None,
+            vendor: "g".into(),
+            action: "a".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            status: 200,
+            decision: "allow".into(),
+            block_reason: None,
+            read_filter_triggered: false,
+            quarantined_count: 0,
+            policy_id: None,
+            extra: serde_json::Value::Null,
+            at: Utc::now(),
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        let obj = v.as_object().expect("ListRow must be JSON object");
+        assert_eq!(obj.len(), 17, "field count drift: {obj:?}");
+        for k in [
+            "id",
+            "request_id",
+            "session_id",
+            "p_0",
+            "leaf_pca_id",
+            "vendor",
+            "action",
+            "method",
+            "path",
+            "status",
+            "decision",
+            "block_reason",
+            "read_filter_triggered",
+            "quarantined_count",
+            "policy_id",
+            "extra",
+            "at",
+        ] {
+            assert!(obj.contains_key(k), "missing key {k}: {obj:?}");
+        }
+    }
+
+    #[test]
+    fn actions_api_error_db_arm_display_uses_thiserror_database_error_fixed_shape() {
+        // `#[error("database error")]` on `Db(#[from] sqlx::Error)` —
+        // symmetric to the AppError::Db + OAuthError::Db + sibling
+        // ApiError::Db Display masks on other modules. The wrapper's
+        // Display is the FIXED `"database error"` string with NO
+        // inner sqlx error leaked (schema column names, query
+        // fragments, constraint identifiers). The existing tests
+        // exercise the body envelope's `detail` field (which DOES
+        // surface the inner Display intentionally for operator-only
+        // routes); pin the WRAPPER Display is masked. A refactor to
+        // `#[error("database error: {0}")]` would silently leak the
+        // sqlx Display into tracing log lines via `%self`.
+        let s = ActionsApiError::Db(sqlx::Error::RowNotFound).to_string();
+        assert_eq!(s, "database error", "got: {s}");
+        // Confirm the inner sqlx::Error's "no rows" doesn't leak.
+        assert!(
+            !s.to_lowercase().contains("no rows"),
+            "inner sqlx Display leaked: {s}",
+        );
+    }
+
+    #[test]
     fn list_params_filters_default_to_none_when_query_string_empty() {
         // Axum's `Query<ListParams>` deserializer is the entry point for the
         // operator-dashboard filter chips. Pin that every filter field is

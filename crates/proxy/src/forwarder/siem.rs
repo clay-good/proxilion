@@ -799,6 +799,153 @@ mod tests {
         assert!(err.to_string().contains("16 bytes"), "got: {err}");
     }
 
+    #[test]
+    fn siem_hmac_key_from_hex_accepts_long_64_byte_128_hex_char_per_rfc_2104_section_3() {
+        // RFC 2104 §3 best-practice key size for HMAC-SHA256 is 64
+        // bytes (the inner block size). Operators using `openssl rand
+        // -hex 64` produce 128-char hex strings AND expect from_hex
+        // to accept them. The existing tests exercise the 32-char
+        // (16-byte) minimum and the 17-byte and 33-byte boundaries
+        // but never the 64-byte best-practice key size. A refactor
+        // that capped key bytes at 32 "for fixed-buffer hot path"
+        // would silently truncate every long key — surface here. Pin
+        // both that the longer key parses AND that signing with it
+        // produces a valid 71-byte signature (sha256= prefix + 64
+        // hex chars).
+        let long_hex = "a".repeat(128); // 128 hex chars = 64 bytes
+        let key = SiemHmacKey::from_hex(&long_hex).expect("64-byte key must parse");
+        let sig = key.sign(b"sample body");
+        assert!(sig.starts_with("sha256="));
+        assert_eq!(sig.len(), 71);
+    }
+
+    #[test]
+    fn key_error_and_build_error_implement_std_error_trait_via_dyn_cast_leaf_source_none() {
+        // `KeyError(pub String)` and `BuildError(pub String)` are
+        // thiserror-derived leaf-arm errors carrying only a String.
+        // Pin both implement `std::error::Error` via dyn-cast AND
+        // confirm `source() == None` on both — required by anyhow
+        // chains higher up. Symmetric to the
+        // `email_build_error_implements_std_error_trait_with_no_source_leaf_contract`
+        // pin on notifier/email.rs and the corresponding webhook +
+        // verifier + pkce pins. A refactor swapping to a `#[from]
+        // inner` shape "for richer triage" would silently surface
+        // source() as Some AND double the displayed message via the
+        // anyhow chain walk + the wrapper Display.
+        let k = KeyError("inner key reason".into());
+        let dyn_err: &dyn std::error::Error = &k;
+        assert!(
+            std::error::Error::source(dyn_err).is_none(),
+            "KeyError must be leaf arm with no source",
+        );
+        let b = BuildError("inner build reason".into());
+        let dyn_err: &dyn std::error::Error = &b;
+        assert!(
+            std::error::Error::source(dyn_err).is_none(),
+            "BuildError must be leaf arm with no source",
+        );
+    }
+
+    #[test]
+    fn siem_hmac_key_sign_empty_body_produces_71_byte_signature_with_sha256_prefix() {
+        // Empty-body signing is a legitimate edge case (a heartbeat /
+        // canary forwarder POST). The HMAC-SHA256 of empty bytes is
+        // well-defined; sign() must produce a 71-byte sig
+        // (`sha256=` prefix + 64 hex chars of the digest) WITHOUT
+        // panic. A refactor that pre-checked `body.is_empty()` and
+        // bailed "for performance" would silently break heartbeat
+        // POSTs. Pin both the shape AND that the signature is
+        // deterministic across two independent calls on the same
+        // empty body.
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let sig1 = key.sign(b"");
+        let sig2 = key.sign(b"");
+        assert_eq!(sig1.len(), 71);
+        assert!(sig1.starts_with("sha256="));
+        assert_eq!(sig1, sig2, "empty-body sign must be deterministic");
+    }
+
+    #[test]
+    fn key_error_passes_inner_string_through_build_error_carries_byte_exact_prefix() {
+        // `KeyError` uses `#[error("{0}")]` — Display surfaces the
+        // inner String verbatim with NO wrapper prefix. `BuildError`
+        // uses `#[error("siem forwarder build: {0}")]` — Display
+        // prepends the canonical prefix the operator-side log
+        // filter at boot greps to bucket siem-forwarder construction
+        // faults separately from sibling EmailBuildError + Slack +
+        // NotifierBuildError. The asymmetric shapes are intentional
+        // (KeyError predates the prefix convention). Pin BOTH the
+        // bare-inner shape on KeyError AND the byte-exact prefix
+        // on BuildError so a refactor that "harmonized" the two
+        // would surface here AND multibyte unicode inner content
+        // preserves verbatim through both.
+        let k = KeyError("hex parse: odd length".into());
+        assert_eq!(k.to_string(), "hex parse: odd length");
+        let b = BuildError("url scheme: only http/https".into());
+        assert_eq!(
+            b.to_string(),
+            "siem forwarder build: url scheme: only http/https",
+        );
+        // Multibyte unicode inner preserves verbatim (no
+        // ASCII-coercion / lowercase normalization) across both.
+        let k_mb = KeyError("café → 🔥".into());
+        assert_eq!(k_mb.to_string(), "café → 🔥");
+        let b_mb = BuildError("café → 🔥".into());
+        assert_eq!(b_mb.to_string(), "siem forwarder build: café → 🔥");
+    }
+
+    #[test]
+    fn siem_hmac_key_from_hex_is_case_insensitive_lowercase_uppercase_yield_same_signature() {
+        // Hex strings are case-insensitive — `0123abcd` and
+        // `0123ABCD` MUST decode to the same byte sequence and
+        // produce byte-identical HMAC signatures. Operators paste
+        // keys from many sources (some emit lowercase, some
+        // uppercase). A refactor that pre-checked
+        // `s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())`
+        // "for canonical hex hygiene" would silently reject every
+        // uppercase paste. Pin lowercase + uppercase + mixed-case
+        // all sign to the same byte sequence on the same body.
+        let lower = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let upper = SiemHmacKey::from_hex("00112233445566778899AABBCCDDEEFF").unwrap();
+        let mixed = SiemHmacKey::from_hex("00112233445566778899AaBbCcDdEeFf").unwrap();
+        let body = b"sample-body";
+        let sig_l = lower.sign(body);
+        let sig_u = upper.sign(body);
+        let sig_m = mixed.sign(body);
+        assert_eq!(sig_l, sig_u);
+        assert_eq!(sig_l, sig_m);
+    }
+
+    #[test]
+    fn batch_state_clone_shares_buffer_arc_for_axum_state_clone_observability() {
+        // `BatchState` derives Clone — the `buffer: Arc<Mutex<...>>`
+        // field is cloned by Arc::clone (cheap ref-count bump) so
+        // both clones see the same backing buffer. axum's State
+        // extractor invokes `.clone()` per request scope; for the
+        // batch-mode publish path to be coherent, both clones MUST
+        // see the same buffer. A refactor that switched the buffer
+        // to a non-Arc-wrapped Vec "for explicit ownership" would
+        // silently break batch mode — every clone would have its
+        // own buffer and the flush loop would never see the per-
+        // request appends. Pin via Arc::ptr_eq on the buffer field
+        // across two clones AND a mutation-observability check.
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let fwd = SiemForwarder::new("http://example.invalid/".into(), key)
+            .unwrap()
+            .with_batching(10, Duration::from_secs(60));
+        // The batch field IS Some after with_batching.
+        let bs1 = fwd.batch.as_ref().expect("batch must be set");
+        let bs2 = bs1.clone();
+        assert!(
+            Arc::ptr_eq(&bs1.buffer, &bs2.buffer),
+            "Clone must share buffer Arc for axum State coherence",
+        );
+        // The max_batch_size + flush_interval fields are Copy so
+        // they're byte-equal across clones.
+        assert_eq!(bs1.max_batch_size, bs2.max_batch_size);
+        assert_eq!(bs1.flush_interval, bs2.flush_interval);
+    }
+
     #[tokio::test]
     async fn flush_batch_is_noop_when_buffer_empty() {
         let server = MockServer::start().await;

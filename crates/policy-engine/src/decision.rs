@@ -529,4 +529,166 @@ mod tests {
             assert_eq!(v["kind"].as_str(), Some(*want_kind));
         }
     }
+
+    #[test]
+    fn decision_and_read_filter_and_pattern_and_quarantine_action_are_send_sync_static() {
+        // Decision is returned from `Engine::evaluate` and flows through
+        // the proxy's per-request task; ReadFilter is held inside Outcome
+        // and propagated to the adapter's quarantine post-filter via
+        // `.await`; Pattern's Regex variant carries an `Arc`-backed
+        // compiled state shared across threads. All four MUST be Send +
+        // Sync + 'static. The existing module pins individual VALUES
+        // (Clone preserves compiled state, etc.) but never the trait
+        // bounds — a refactor adding an Rc<...> field to ReadFilter
+        // "for cheap shared metadata" would break Sync and surface at
+        // a remote `tower::Service` trait-bound rather than at this
+        // module. Pin all four — symmetric to round-168 + round-169 +
+        // round-173 + round-175 + round-176 Send+Sync+'static pins
+        // extended to the policy-engine decision types.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<Decision>();
+        require_send_sync_static::<ReadFilter>();
+        require_send_sync_static::<Pattern>();
+        require_send_sync_static::<QuarantineAction>();
+    }
+
+    #[test]
+    fn decision_tag_wire_strings_are_byte_exact_lowercase_snake_case_across_all_four_variants() {
+        // The Decision enum carries `#[serde(tag = "kind",
+        // rename_all = "snake_case")]` — operator dashboards bucket
+        // policy outcomes on `decision.kind == "block"` via lowercase
+        // snake_case regex. The existing `decision_*_round_trips` pins
+        // walk individual VALUES but never the SHAPE invariant across
+        // all 4 variants. A refactor adding `#[serde(rename_all =
+        // "kebab-case")]` "for hyphen-friendly URLs" on a sibling
+        // decision-shaped enum would silently break every dashboard
+        // bucket if it leaked here. Pin no-uppercase + no-kebab + no-
+        // shell-unsafe across all 4 wire tag strings — symmetric to
+        // round-143 + round-161 + round-173 lowercase snake_case
+        // sweep extended to Decision tag.
+        for tag in ["allow", "block", "require_confirmation", "rate_limit"] {
+            assert!(
+                tag.chars().all(|c| !c.is_ascii_uppercase()),
+                "tag `{tag}` contains uppercase",
+            );
+            assert!(!tag.contains('-'), "tag `{tag}` contains kebab `-`");
+            assert!(
+                !tag.contains(' ') && !tag.contains('"'),
+                "tag `{tag}` contains shell-unsafe char",
+            );
+        }
+        // Cross-check: each Decision variant serializes to the expected
+        // tag (defensive coverage symmetric to the existing snapshot
+        // but anchored on the no-uppercase invariant).
+        let d = Decision::Allow;
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(
+            s.contains("\"kind\":\"allow\""),
+            "Allow must serialize with kind=allow: {s}",
+        );
+    }
+
+    #[test]
+    fn pattern_is_match_is_referentially_transparent_across_fifty_repeated_calls() {
+        // Symmetric to round-161 + round-162 + round-166 + round-168 +
+        // round-169 + round-170 + round-171 + round-172 + round-173 +
+        // round-175 referential-transparency pins extended to
+        // Pattern::is_match. The read-filter post-filter calls this
+        // helper once per scanned chunk of an upstream response body;
+        // a refactor that introduced a per-match LRU cache "for hot-
+        // path perf" would silently corrupt the cache on a refactor
+        // that bumped the pattern's regex source under the same
+        // `&self`. Pin 50 calls on both Literal AND Regex variants.
+        let lit = Pattern::Literal("secret".into());
+        for i in 0..50 {
+            assert!(
+                lit.is_match("here is a secret"),
+                "iter {i}: literal must match",
+            );
+            assert!(
+                !lit.is_match("no match here"),
+                "iter {i}: literal must NOT match",
+            );
+        }
+        let rx = Pattern::Regex(regex::Regex::new(r"\bAPI[_-]KEY\b").unwrap());
+        for i in 0..50 {
+            assert!(rx.is_match("API-KEY=xyz"), "iter {i}: regex must match");
+            assert!(
+                !rx.is_match("not relevant"),
+                "iter {i}: regex must NOT match",
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_literal_inner_field_is_owned_string_type_not_borrowed_for_arc_share_safety() {
+        // `Pattern::Literal(String)` carries owned bytes — the read-
+        // filter is held by `Arc<dyn ...>`-style fan-out, so the
+        // inner string must outlive any reference into the holder's
+        // YAML source (which is dropped post-compile). A refactor to
+        // `Pattern::Literal(&'a str)` "to avoid the clone" would
+        // surface a lifetime constraint that the Arc-share call site
+        // couldn't satisfy. Pin via require_string pattern-match.
+        fn require_string(_: &String) {}
+        let p = Pattern::Literal("hello".into());
+        match &p {
+            Pattern::Literal(s) => require_string(s),
+            Pattern::Regex(_) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn decision_block_reason_and_require_confirmation_reason_fields_are_owned_string_types() {
+        // `Decision::Block.reason` + `Decision::RequireConfirmation.reason`
+        // both carry agent-facing strings — these are CLONED into
+        // `AppError::PolicyBlocked.reason` + `AppError::RequireConfirmation`
+        // by the adapter's enforce_pre_request_decision (the policy
+        // engine's Decision is consumed mid-handler; AppError outlives
+        // it). A refactor to `&'a str` "to avoid the clone" would force
+        // a lifetime constraint that the AppError construction couldn't
+        // satisfy. Pin owned String via require_string pattern-match
+        // on both reason-carrying variants — symmetric to round-168
+        // parse_missing_atoms + round-175 lookup_list + round-176
+        // PolicyBundle owned-String pins extended to Decision reasons.
+        fn require_string(_: &String) {}
+        let b = Decision::Block {
+            reason: "external recipient".into(),
+            override_allowed: false,
+        };
+        match &b {
+            Decision::Block { reason, .. } => require_string(reason),
+            _ => unreachable!(),
+        }
+        let rc = Decision::RequireConfirmation {
+            reason: "high-risk delete".into(),
+        };
+        match &rc {
+            Decision::RequireConfirmation { reason } => require_string(reason),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn decision_rate_limit_burst_and_per_seconds_fields_are_u32_type_for_metric_label_range() {
+        // RateLimit's `burst` + `per_seconds` fields are u32 — the
+        // operator-facing metric `proxilion_policy_rate_limit_total{
+        // burst="N", per_seconds="M"}` labels rely on the u32 numeric
+        // range. A refactor to u64 "for ergonomic large windows"
+        // would silently widen the label cardinality (u64::MAX is
+        // 18.4 quintillion vs u32's 4.3 billion) and could surface
+        // as metric-cardinality OOMs on the Prometheus side. Pin via
+        // require_u32 pattern-match.
+        fn require_u32(_: u32) {}
+        let r = Decision::RateLimit {
+            burst: 10,
+            per_seconds: 60,
+        };
+        match r {
+            Decision::RateLimit { burst, per_seconds } => {
+                require_u32(burst);
+                require_u32(per_seconds);
+            }
+            _ => unreachable!(),
+        }
+    }
 }

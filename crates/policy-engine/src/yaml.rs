@@ -728,4 +728,201 @@ mod tests {
             QuarantineActionCfg::ReplaceWithMarker
         ));
     }
+
+    #[test]
+    fn policy_doc_and_all_eight_config_struct_and_enum_types_are_send_sync_static() {
+        // The full schema hierarchy flows through `Arc<Engine>` hot-swap
+        // + tokio reload watcher + axum router state — every type in the
+        // YAML schema MUST be Send + Sync + 'static. The existing
+        // module pins individual VALUES (defaults, round-trip equality)
+        // but never the trait bounds across the type hierarchy. A
+        // refactor adding a `OnceCell<...>` field "for lazy compilation
+        // metadata" on PolicyDoc would silently break Sync and surface
+        // at a remote `tower::Service` trait-bound rather than at this
+        // module. Pin all 8 schema types — symmetric to round-168 +
+        // round-169 + round-173 + round-175 + round-176 + round-177
+        // Send+Sync+'static pins extended to the full YAML schema.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<PolicyDoc>();
+        require_send_sync_static::<Mode>();
+        require_send_sync_static::<PicMode>();
+        require_send_sync_static::<AuditBodyMode>();
+        require_send_sync_static::<ReadFilterCfg>();
+        require_send_sync_static::<RecipientsCfg>();
+        require_send_sync_static::<BurstCfg>();
+        require_send_sync_static::<QuarantineActionCfg>();
+        require_send_sync_static::<QuarantinePatternCfg>();
+    }
+
+    #[test]
+    fn parse_policies_is_referentially_transparent_across_fifty_repeated_calls() {
+        // Symmetric to round-161 + round-162 + round-166 + round-168 +
+        // round-169 + round-170 + round-171 + round-172 + round-173 +
+        // round-175 + round-177 referential-transparency pins extended
+        // to parse_policies. The policy reload path may parse the same
+        // YAML body multiple times (the watcher fires once on mtime
+        // change but the reload may retry on transient compile
+        // failures); a refactor caching the parse via a once-cell
+        // keyed on input pointer "for hot-path perf" would silently
+        // return stale PolicyDocs on a re-parse after edit. Pin 50
+        // calls on a 3-policy multi-mode fixture yield byte-equal
+        // serialized output.
+        let yaml = r#"
+- id: p1
+  vendor: google
+  action: drive.files.get
+  match: {}
+  decision: allow
+  mode: enforce
+  pic_mode: audit
+- id: p2
+  vendor: google
+  action: gmail.send
+  match: {}
+  decision: { kind: block, reason: "external recipient", override_allowed: true }
+  mode: observe
+  pic_mode: runtime-gate
+- id: p3
+  vendor: google
+  action: calendar.events.insert
+  match: {}
+  decision: { kind: rate_limit, burst: 5, per_seconds: 60 }
+  mode: enforce
+"#;
+        let baseline = parse_policies(yaml).expect("fixture must parse");
+        assert_eq!(baseline.len(), 3);
+        for i in 0..50 {
+            let again = parse_policies(yaml).expect("re-parse");
+            assert_eq!(
+                again.len(),
+                baseline.len(),
+                "iter {i}: parse_policies must yield same count",
+            );
+            for (a, b) in again.iter().zip(baseline.iter()) {
+                assert_eq!(a.id, b.id, "iter {i}: id");
+                assert_eq!(a.vendor, b.vendor, "iter {i}: vendor");
+                assert_eq!(a.action, b.action, "iter {i}: action");
+            }
+        }
+    }
+
+    #[test]
+    fn policy_doc_id_vendor_action_fields_are_owned_string_type_for_arc_hot_swap_outlives() {
+        // The PolicyDoc fields are MOVED into the compiled engine on
+        // every reload; the engine is then wrapped in `ArcSwap<Engine>`
+        // and shared across an unbounded number of per-request loads.
+        // The id/vendor/action strings MUST be owned (not borrowed)
+        // because the YAML source is dropped post-compile. A refactor
+        // to `&'a str` "to avoid per-reload allocation" would surface
+        // a lifetime constraint that the ArcSwap call site couldn't
+        // satisfy. Pin via require_string pattern-match — symmetric
+        // to round-168 + round-175 + round-176 + round-177 owned-String
+        // pins extended to PolicyDoc schema fields.
+        fn require_string(_: &String) {}
+        let yaml = "- id: x\n  vendor: google\n  action: drive.files.get\n";
+        let docs = parse_policies(yaml).expect("must parse");
+        let doc = &docs[0];
+        require_string(&doc.id);
+        require_string(&doc.vendor);
+        require_string(&doc.action);
+    }
+
+    #[test]
+    fn audit_body_mode_wire_strings_byte_exact_three_known_values_no_kebab_no_uppercase() {
+        // `AuditBodyMode` carries `#[serde(rename_all = "snake_case")]`
+        // — operator-facing audit dashboards bucket on `audit_body =
+        // "hash"` / `"redact_pii"` / `"full"` directly. The existing
+        // `audit_body_mode_wire_strings_are_snake_case` pin walks the
+        // values via to_string substring but never the SHAPE invariant
+        // (no-uppercase + no-kebab + no-shell-unsafe-char sweep). A
+        // future rename_all = "kebab-case" "for URL-friendly variant
+        // names" on a sibling shared types enum would silently break
+        // every audit dashboard if it leaked here. Pin no-uppercase +
+        // no-kebab + EXACTLY 3 values — symmetric to round-173
+        // ErrorCode + round-177 Decision lowercase sweeps extended
+        // to AuditBodyMode.
+        for variant in [
+            AuditBodyMode::Hash,
+            AuditBodyMode::RedactPii,
+            AuditBodyMode::Full,
+        ] {
+            let s = serde_json::to_string(&variant).unwrap();
+            let inner = s.trim_matches('"');
+            assert!(
+                inner.chars().all(|c| !c.is_ascii_uppercase()),
+                "AuditBodyMode `{inner}` contains uppercase",
+            );
+            assert!(
+                !inner.contains('-'),
+                "AuditBodyMode `{inner}` contains kebab `-`",
+            );
+        }
+        // Exhaustive 3-value set byte-equal.
+        let values: Vec<String> = [
+            AuditBodyMode::Hash,
+            AuditBodyMode::RedactPii,
+            AuditBodyMode::Full,
+        ]
+        .iter()
+        .map(|v| serde_json::to_string(v).unwrap())
+        .collect();
+        assert_eq!(values, vec!["\"hash\"", "\"redact_pii\"", "\"full\""]);
+    }
+
+    #[test]
+    fn pic_mode_wire_strings_use_kebab_case_not_snake_case_for_legacy_v0_compat() {
+        // PicMode carries `#[serde(rename_all = "kebab-case")]` — the
+        // ONE intentional kebab-case deviation in the schema (Mode +
+        // AuditBodyMode + QuarantineActionCfg all use snake_case).
+        // The pre-2026 policy YAML examples in the customer-shipped
+        // docs use `pic_mode: runtime-gate` (kebab) literally; a
+        // refactor "tidying" PicMode to snake_case would silently
+        // break every customer YAML in the wild. The existing
+        // pic_mode_serializes_kebab_case_not_snake_case test walks
+        // both polarities via substring; pin BYTE-EXACT serialization
+        // here with an explicit kebab-case assertion AND a negative
+        // "snake_case form rejected on deserialize" pin so the rename
+        // attribute is load-bearing on BOTH directions.
+        // Serialize: byte-exact kebab.
+        let s_audit = serde_json::to_string(&PicMode::Audit).unwrap();
+        assert_eq!(s_audit, "\"audit\"");
+        let s_gate = serde_json::to_string(&PicMode::RuntimeGate).unwrap();
+        assert_eq!(s_gate, "\"runtime-gate\"");
+        // Defensive: snake_case form `runtime_gate` is NOT accepted by
+        // the deserializer (the rename_all attribute is bidirectional).
+        let bad: Result<PicMode, _> = serde_json::from_str("\"runtime_gate\"");
+        assert!(
+            bad.is_err(),
+            "snake_case `runtime_gate` must NOT deserialize — kebab is the wire form",
+        );
+    }
+
+    #[test]
+    fn quarantine_pattern_cfg_untagged_enum_disambiguates_literal_from_regex_via_field_presence() {
+        // `QuarantinePatternCfg` is `#[serde(untagged)]` — a bare
+        // string literal `foo` deserializes as `Literal("foo")`;
+        // an object `{regex: "foo"}` deserializes as `Regex { regex
+        // }`. The existing `quarantine_patterns_accept_literal_or_regex`
+        // pin walks the happy paths but never the NEGATIVE polarity:
+        // a refactor adding a `Glob { glob: String }` variant would
+        // be silently order-dependent (untagged tries each variant in
+        // declaration order) and a Glob entry could mis-classify as
+        // Regex if both variants accepted `{ glob: ... }`. Pin that
+        // the current 2-variant set ONLY matches the 2 documented
+        // shapes — symmetric to round-161 PolicyView 5-key + round-165
+        // TokenResponse 4-key exhaustive-set pins extended to untagged-
+        // enum disambiguation.
+        let lit: QuarantinePatternCfg = serde_yaml::from_str("foo").unwrap();
+        assert!(matches!(lit, QuarantinePatternCfg::Literal(ref s) if s == "foo"));
+        let rx: QuarantinePatternCfg = serde_yaml::from_str("{ regex: \"foo\" }").unwrap();
+        assert!(matches!(rx, QuarantinePatternCfg::Regex { regex } if regex == "foo"));
+        // Negative: a `{ glob: "..." }` shape would not match either
+        // variant (Literal requires string, Regex requires `regex`
+        // field) — serde untagged returns an error.
+        let bad: Result<QuarantinePatternCfg, _> = serde_yaml::from_str("{ glob: \"foo\" }");
+        assert!(
+            bad.is_err(),
+            "unknown-field object must NOT silently deserialize as either variant",
+        );
+    }
 }

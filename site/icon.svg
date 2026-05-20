@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Proxilion">
+  <title>Proxilion</title>
+  <rect width="512" height="512" rx="112" fill="#0d1117"/>
+  <!-- Capability chain motif: three bars shrinking monotonically — reflects the
+       PIC monotonicity invariant (each successor authority ⊆ predecessor). -->
+  <g fill="#00e5a8">
+    <rect x="112" y="144" rx="24" width="288" height="48"/>
+    <rect x="112" y="232" rx="24" width="224" height="48"/>
+    <rect x="112" y="320" rx="24" width="160" height="48"/>
+  </g>
+</svg>

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Proxilion">
+  <title>Proxilion</title>
+  <!-- Maskable: full-bleed background so the safe-zone crop on Android (80% inner)
+       still leaves a coherent mark visible. -->
+  <rect width="512" height="512" fill="#0d1117"/>
+  <g fill="#00e5a8">
+    <rect x="144" y="184" rx="20" width="224" height="40"/>
+    <rect x="144" y="248" rx="20" width="176" height="40"/>
+    <rect x="144" y="312" rx="20" width="128" height="40"/>
+  </g>
+</svg>

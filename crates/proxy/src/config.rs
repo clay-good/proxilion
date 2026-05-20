@@ -969,4 +969,199 @@ operator_auth_enforced = false
         assert!(s.contains("/tmp/proxilion.toml"));
         assert!(s.contains("syntax error at line 3"));
     }
+
+    #[test]
+    fn config_and_config_builder_and_log_format_and_config_error_send_sync_static() {
+        // `Config` is constructed at boot then cloned into AppState; the
+        // axum router + tokio task boundaries require (Send + Sync + 'static).
+        // `ConfigBuilder` lives the same flow on the embed path. `LogFormat`
+        // is held inside Config and propagated into the tracing subscriber
+        // init. `ConfigError` bubbles through `anyhow::Error` chains at the
+        // `Config::load()` boot path (anyhow's blanket impl requires the
+        // three-trait combo). A refactor that gave any of them an `Rc<...>`
+        // field "for cheap shared boot config" would break Send + Sync but
+        // surface at a far-removed `tower::Service` trait-bound at the
+        // router assembly site rather than at this file. Pin all four
+        // bounds here so the boundary fails fast — symmetric to the
+        // `auth_state_and_fail_and_refresh_coordinator_are_send_sync_static_for_axum_boundary`
+        // pin on `crates/proxy/src/auth_middleware.rs`.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<Config>();
+        require_send_sync_static::<ConfigBuilder>();
+        require_send_sync_static::<LogFormat>();
+        require_send_sync_static::<ConfigError>();
+    }
+
+    #[test]
+    fn log_format_derives_copy_and_debug_for_zero_alloc_field_propagation() {
+        // `LogFormat` derives `Copy + Clone + Debug` — load-bearing for the
+        // `Config { log_format, .. }` propagation path: the boot routine
+        // reads `cfg.log_format` and hands it to the tracing subscriber
+        // init by value, relying on Copy to avoid moving out of `cfg`
+        // (which is still needed for downstream wiring). A refactor that
+        // dropped `Copy` "for explicit clone semantics" would surface at
+        // every `let f = cfg.log_format;` site as a move-out-of-borrowed
+        // error after a partial-move on `cfg`. Pin the trait bound via a
+        // generic fn whose signature requires Copy AND Debug, on both
+        // variants, AND pin Debug surfaces the variant name for grep
+        // (operator logs render `?cfg` and bucket on `Json` / `Pretty`).
+        fn require_copy_debug<T: Copy + std::fmt::Debug>(_: T) {}
+        require_copy_debug(LogFormat::Json);
+        require_copy_debug(LogFormat::Pretty);
+        // Debug carries the variant name byte-equal (not a numeric fallback).
+        assert_eq!(format!("{:?}", LogFormat::Json), "Json");
+        assert_eq!(format!("{:?}", LogFormat::Pretty), "Pretty");
+        // Copy semantics: take the value, then take it again — the second
+        // take would fail with a move error if Copy were dropped.
+        let f = LogFormat::Json;
+        let _a = f;
+        let _b = f;
+    }
+
+    #[test]
+    fn config_error_debug_carries_all_five_variant_names_for_grep_bucketing() {
+        // Operator log filters bucket boot failures by Debug variant name
+        // (`?err` rendering in the `Config::load()` boot path's match
+        // arm). The existing
+        // `config_error_display_strings_include_field_or_path_context` pin
+        // walks DISPLAY substrings but does NOT pin the Debug variant
+        // names — a manual Debug impl that collapsed all five variants
+        // to `ConfigError(_)` "for compact boot logs" would silently
+        // break grep-based alerting that splits "TLS cert missing"
+        // (operational; redeploy with certs) from "bad bind addr"
+        // (operator typo in env) from "config file syntax error"
+        // (operator typo in TOML). Pin all five variant names render in
+        // Debug — symmetric to the `executor_error_debug_carries_all_five_variant_names_for_grep_bucketing`
+        // pin on `crates/proxy/src/pic/executor.rs`.
+        let bind =
+            ConfigError::BindAddr("bad".to_string(), "bad".parse::<SocketAddr>().unwrap_err());
+        assert!(format!("{bind:?}").contains("BindAddr"));
+        let cert = ConfigError::MissingCert(PathBuf::from("/x"));
+        assert!(format!("{cert:?}").contains("MissingCert"));
+        let key = ConfigError::MissingKey(PathBuf::from("/y"));
+        assert!(format!("{key:?}").contains("MissingKey"));
+        let inv = ConfigError::InvalidValue {
+            field: "F",
+            reason: "r".into(),
+        };
+        assert!(format!("{inv:?}").contains("InvalidValue"));
+        let file = ConfigError::FileLoad {
+            path: PathBuf::from("/z"),
+            reason: "r".into(),
+        };
+        assert!(format!("{file:?}").contains("FileLoad"));
+    }
+
+    #[test]
+    fn config_error_invalid_value_field_is_static_str_lifetime_for_zero_alloc_log_filter() {
+        // `ConfigError::InvalidValue.field` is `&'static str` (not
+        // `String`) — load-bearing for the operator-facing setup-status
+        // page which reads the field name through to a Grafana panel
+        // label without allocation, AND for the docs-page deep link
+        // that keys on the env-var name as a stable string ID. A
+        // refactor that widened to `String` "for consistency with
+        // reason" would silently land an allocation per boot error AND
+        // could let a refactor smuggle a non-literal field name (e.g.
+        // a `format!("PROXILION_{kind}_URL")` "for ergonomic URL field
+        // generation") which would break the docs deep-link's stable
+        // anchor. Pin the &'static str lifetime via a generic fn whose
+        // signature requires the 'static bound. Symmetric to the
+        // `check_item_id_field_is_static_str_for_zero_alloc_logging`
+        // pin on `crates/proxy/src/api/setup.rs`.
+        fn require_static_str(_: &'static str) {}
+        let e = ConfigError::InvalidValue {
+            field: "PROXILION_TRUST_PLANE_URL",
+            reason: "bad scheme".into(),
+        };
+        if let ConfigError::InvalidValue { field, .. } = e {
+            require_static_str(field);
+            // And the literal flows through unchanged byte-for-byte.
+            assert_eq!(field, "PROXILION_TRUST_PLANE_URL");
+        } else {
+            panic!("expected InvalidValue variant");
+        }
+    }
+
+    #[test]
+    fn config_error_implements_std_error_trait_via_dyn_cast_with_leaf_source_none_on_simple_variants()
+     {
+        // ConfigError flows through `anyhow::Error` chains at the boot
+        // path — `anyhow::Error::from` requires the `std::error::Error`
+        // trait, which the `thiserror::Error` derive lands. The existing
+        // `config_error_display_strings_include_field_or_path_context`
+        // pin walks Display only; pin the `std::error::Error` trait via
+        // dyn-cast on the four leaf variants (InvalidValue / MissingCert
+        // / MissingKey / FileLoad — all carry inner data but none
+        // chains a `#[source]`/`#[from]` to another error). A refactor
+        // that swapped `#[derive(thiserror::Error)]` for a hand-rolled
+        // `impl Display` "for less macro surface" would surface here at
+        // the trait-object cast rather than at a far-removed call site.
+        // Pin `source() == None` on each leaf so a future refactor that
+        // wrapped any of them with a `#[source]` inner would surface as
+        // a chain-walk shape change. (BindAddr carries an
+        // `AddrParseError` not via `#[source]` so it ALSO has
+        // `source() == None`.) Symmetric to the
+        // `pkce_error_source_is_none_for_both_variants_leaf_contract`
+        // pin on `crates/proxy/src/crypto/pkce.rs`.
+        for e in [
+            ConfigError::InvalidValue {
+                field: "F",
+                reason: "r".into(),
+            },
+            ConfigError::MissingCert(PathBuf::from("/x")),
+            ConfigError::MissingKey(PathBuf::from("/y")),
+            ConfigError::FileLoad {
+                path: PathBuf::from("/z"),
+                reason: "r".into(),
+            },
+            ConfigError::BindAddr("bad".into(), "bad".parse::<SocketAddr>().unwrap_err()),
+        ] {
+            let dyn_err: &dyn std::error::Error = &e;
+            // Display surfaces something non-empty (the trait is wired).
+            assert!(!dyn_err.to_string().is_empty(), "Display empty: {e:?}");
+            // Each variant is a leaf — no #[source]/#[from] inner Error.
+            assert!(
+                std::error::Error::source(dyn_err).is_none(),
+                "expected leaf source None, got Some for: {e:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn config_builder_defaults_pins_un_pinned_path_url_prefix_constants_byte_exact() {
+        // The existing `defaults_build_in_dev_mode` pin walks 4 fields
+        // (bind_addr / trust_plane_url / operator_auth_enforced /
+        // customer_domain). The remaining defaults fields are SILENTLY
+        // load-bearing for operator-onboarding scripts that read the
+        // defaults via `ConfigBuilder::defaults().build()` — a refactor
+        // that changed `./certs/dev.crt` to `./tls/cert.pem` "for
+        // ecosystem convention" would silently break every dev workflow
+        // that pre-seeded certs at the documented path. Pin the six
+        // un-pinned defaults byte-exact in one sweep so a single-byte
+        // drift surfaces in the test that documents the operator
+        // contract. The `siem_batch_max_age_secs` default (5s) is the
+        // load-bearing flush cadence that the `from_file_siem_batch_max_age_secs_zero_clamps_to_one`
+        // pin tests the override path of — pin the DEFAULT here so
+        // both directions are anchored.
+        let c = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .build()
+            .unwrap();
+        assert_eq!(c.tls_cert_path, PathBuf::from("./certs/dev.crt"));
+        assert_eq!(c.tls_key_path, PathBuf::from("./certs/dev.key"));
+        assert_eq!(c.proxy_base_url, "https://localhost:8443");
+        assert_eq!(c.federation_bridge_url, "http://federation-bridge:8081");
+        assert_eq!(c.nats_subject_prefix, "actions");
+        assert_eq!(c.siem_batch_max_age_secs, 5);
+        // log_format defaults to JSON (operator-facing setup docs say
+        // "structured-by-default; opt into pretty for local dev").
+        assert!(matches!(c.log_format, LogFormat::Json));
+        // The five Option-shaped defaults all None (no leaky shipped
+        // credentials / no surprise webhook URLs).
+        assert!(c.database_url.is_none());
+        assert!(c.token_encryption_key_hex.is_none());
+        assert!(c.policy_path.is_none());
+        assert!(c.nats_url.is_none());
+        assert!(c.siem_webhook_url.is_none());
+    }
 }

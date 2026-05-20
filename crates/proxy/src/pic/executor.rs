@@ -871,4 +871,183 @@ mod tests {
         let b = a.clone();
         assert!(Arc::ptr_eq(&a.inner, &b.inner));
     }
+
+    #[test]
+    fn executor_error_upstream_display_byte_exact_trust_plane_returned_status_body_shape() {
+        // `#[error("Trust Plane returned {status}: {body}")]` — the
+        // operator-facing log filter buckets Trust Plane outages by this
+        // exact prefix. The existing `executor_error_implements_std_error_trait_for_anyhow_chains`
+        // pin only checks `.contains("500")`; pin the BYTE-EXACT full
+        // Display shape via `assert_eq!` across three status codes (400,
+        // 500, 503) so a refactor that softened the message to "trust
+        // plane: {status}: {body}" (dropping the proper-noun prefix) OR
+        // that swapped the colon for a dash would silently break every
+        // operator alert filter keyed on `"Trust Plane returned"`. The
+        // integer renders with no zero-padding (status 503 → "503" not
+        // "0503"). Symmetric to the `email_build_error_display_carries_byte_exact_email_build_prefix_with_inner`
+        // pin on `crates/proxy/src/notifier/email.rs` and the cat_key
+        // Status arm pin on `crates/proxy/src/pic/cat_key.rs`.
+        for (status, body) in [
+            (400u16, "bad credential"),
+            (500u16, "trust plane internal"),
+            (503u16, "service unavailable"),
+        ] {
+            let e = ExecutorError::Upstream {
+                status,
+                body: body.to_string(),
+            };
+            let expected = format!("Trust Plane returned {status}: {body}");
+            assert_eq!(e.to_string(), expected);
+            // No zero-padding on the status integer (a refactor to
+            // `{status:04}` "for fixed-width log columns" would surface
+            // here as a non-equal string).
+            assert!(
+                !e.to_string().contains(&format!("0{status}")),
+                "zero-padding leaked: {}",
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn issue_pca_response_with_explicit_exp_field_deserializes_to_some_string() {
+        // The existing `process_poc_response_with_empty_ops_vec_deserializes_successfully`
+        // pin walks `exp.is_none()` on the missing-field path via
+        // `ProcessPocResponse`. Pin the SYMMETRIC `Some` path on
+        // `IssuePcaResponse` so a refactor that swapped
+        // `#[serde(default)] exp: Option<String>` for the stricter
+        // `exp: String` "to require the field on the wire" would
+        // silently start rejecting every Trust Plane response carrying
+        // an exp claim. The Trust Plane returns `exp` as an RFC 3339
+        // timestamp string (NOT a u64 epoch) — pin both that the field
+        // deserializes as Some AND that the inner string round-trips
+        // byte-for-byte (no normalization smuggled in via a serde
+        // visitor).
+        let raw = r#"{"pca":"b64-blob","hop":0,"p_0":"alice","ops":["drive:read:x"],"exp":"2026-12-31T23:59:59Z"}"#;
+        let resp: IssuePcaResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.exp.as_deref(), Some("2026-12-31T23:59:59Z"));
+        // The other four fields round-trip too (sanity: the exp field
+        // didn't displace any other field via a serde ordering quirk).
+        assert_eq!(resp.pca, "b64-blob");
+        assert_eq!(resp.hop, 0);
+        assert_eq!(resp.p_0, "alice");
+        assert_eq!(resp.ops, vec!["drive:read:x".to_string()]);
+    }
+
+    #[test]
+    fn process_poc_response_missing_exp_field_via_serde_default_yields_none() {
+        // `ProcessPocResponse.exp` carries `#[serde(default)]` — when
+        // Trust Plane omits the `exp` claim (e.g. for a session-bound
+        // PCA with no absolute expiry), the field MUST deserialize to
+        // None without surfacing a parse error. The existing
+        // `process_poc_response_round_trips_ops_and_hop` pin walks an
+        // input without `exp` and reads through, but does NOT assert
+        // `exp == None` explicitly (it only checks hop/p_0/ops). Pin
+        // the `#[serde(default)]` contract directly: a refactor that
+        // dropped the attribute "for explicit wire shape" would surface
+        // here as `serde_json::from_str` returning Err on the
+        // missing-field path. Symmetric to the
+        // `issue_pca_response_with_explicit_exp_field_deserializes_to_some_string`
+        // pin on the IssuePcaResponse side.
+        let raw = r#"{"pca":"b64","hop":1,"p_0":"bob","ops":["a:write:y"]}"#;
+        let resp: ProcessPocResponse = serde_json::from_str(raw).unwrap();
+        assert!(resp.exp.is_none(), "exp must default to None when missing");
+        // Symmetric pin on IssuePcaResponse — both wire shapes carry the
+        // same `#[serde(default)]` attribute on `exp` and must move in
+        // lockstep on the missing-field contract.
+        let raw_issue = r#"{"pca":"b64","hop":0,"p_0":"alice","ops":[]}"#;
+        let resp: IssuePcaResponse = serde_json::from_str(raw_issue).unwrap();
+        assert!(
+            resp.exp.is_none(),
+            "IssuePcaResponse exp must default to None"
+        );
+    }
+
+    #[test]
+    fn successor_outcome_audit_fallback_debug_carries_detail_field_name_for_grep_selector() {
+        // The existing `successor_outcome_debug_carries_variant_name_and_detail`
+        // pin checks the variant name AND the inner detail string body,
+        // but does NOT pin the `detail:` field NAME render in the
+        // Debug struct format. Operator log filters bucket
+        // `?outcome` rendering on `detail=` / `detail:` selectors to
+        // pull the audit-mode-fallback rationale out of structured
+        // logs — a manual Debug impl that hid the field name
+        // (rendering just the body as `AuditFallback("ops not subset")`
+        // tuple-style instead of `AuditFallback { detail: "..." }`
+        // struct-style) would silently strip the grep handle. Pin
+        // the `detail` field-name substring directly. Symmetric to the
+        // `cached_pca_debug_carries_pca_id_ops_hop_and_predecessor_field_names`
+        // pin on `crates/proxy/src/pic/cache.rs`.
+        let af = SuccessorOutcome::AuditFallback {
+            detail: "ops not subset of predecessor".into(),
+        };
+        let s = format!("{af:?}");
+        assert!(s.contains("detail"), "field name absent: {s}");
+        assert!(s.contains("AuditFallback"), "variant name absent: {s}");
+        // The body still surfaces (sanity: the field-name addition
+        // doesn't strip the value).
+        assert!(s.contains("ops not subset"), "body absent: {s}");
+    }
+
+    #[test]
+    fn pic_executor_clone_executor_kid_returns_byte_equal_to_original_across_arc_share() {
+        // The existing `pic_executor_clone_shares_inner_arc` pin checks
+        // `Arc::ptr_eq` on the inner Arc, AND the existing
+        // `executor_kid_returns_byte_equal_value_across_repeated_calls_on_same_executor`
+        // pin checks repeated calls on ONE executor — but neither pin
+        // checks that A.clone().executor_kid() == A.executor_kid()
+        // byte-for-byte across the Arc-share boundary. A refactor that
+        // introduced any clone-time mutation of the kid (e.g. appending
+        // a clone-index "for per-clone trace disambiguation") would
+        // surface here as the clone's kid drifting from the original's.
+        // Pin the cross-clone consistency contract directly.
+        let a = PicExecutor::new(
+            "http://127.0.0.1:1/".into(),
+            "proxy-original-kid".into(),
+            &[7u8; 32],
+        )
+        .unwrap();
+        let b = a.clone();
+        let c = b.clone(); // chain of two clones
+        assert_eq!(a.executor_kid(), "proxy-original-kid");
+        assert_eq!(b.executor_kid(), a.executor_kid());
+        assert_eq!(c.executor_kid(), a.executor_kid());
+        // And the underlying inner Arc is shared across the chain.
+        assert!(Arc::ptr_eq(&a.inner, &b.inner));
+        assert!(Arc::ptr_eq(&b.inner, &c.inner));
+    }
+
+    #[test]
+    fn dev_ephemeral_kid_suffix_after_proxy_dev_prefix_parses_as_valid_uuid_v4() {
+        // The `dev_ephemeral` constructor formats the kid as
+        // `format!("proxy-dev-{}", uuid::Uuid::new_v4())`. The existing
+        // `dev_ephemeral_yields_twenty_distinct_kids_under_burst` pin
+        // checks distinctness + the `proxy-dev-` prefix, but does NOT
+        // verify the suffix is a parseable UUID. A refactor that
+        // swapped `Uuid::new_v4()` for an incrementing process counter
+        // "for deterministic test fixtures" would silently change the
+        // kid shape from a 36-char dashed UUID to a small integer
+        // string — and break every operator tool that parses the
+        // suffix as a UUID for downstream lookups in the Trust Plane's
+        // executor-key registry. Pin both that the suffix parses AND
+        // that the parsed UUID is version 4 (not v1/v3/v5/nil). Pin
+        // total kid length (10-byte prefix + 36-byte UUID = 46 bytes).
+        let exec = PicExecutor::dev_ephemeral("http://127.0.0.1:1/".into()).unwrap();
+        let kid = exec.executor_kid();
+        let suffix = kid
+            .strip_prefix("proxy-dev-")
+            .expect("kid must carry proxy-dev- prefix");
+        let parsed =
+            uuid::Uuid::parse_str(suffix).expect("dev-ephemeral kid suffix must parse as a UUID");
+        // UUIDv4 — random; version nibble is 4 per RFC 4122 §4.4.
+        assert_eq!(
+            parsed.get_version_num(),
+            4,
+            "dev-ephemeral must mint v4 UUIDs, got version {} for kid {kid}",
+            parsed.get_version_num(),
+        );
+        // And the canonical kid length is 10 (prefix) + 36 (dashed UUID)
+        // = 46 bytes — pin a single-byte drift would surface here.
+        assert_eq!(kid.len(), 46, "kid length drift: {kid:?}");
+    }
 }

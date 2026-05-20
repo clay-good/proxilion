@@ -691,4 +691,152 @@ mod tests {
         let s_v_again = serde_json::to_string(&v).unwrap();
         assert_eq!(s_v, s_v_again, "two-pass serialize drift on same instance");
     }
+
+    // ─── round 188 (2026-05-20): PolicyView + parse_listing + ListResponse surfaces ───
+
+    #[test]
+    fn policy_view_all_five_fields_are_owned_string_type_for_arc_swap_outlives_yaml_source() {
+        // `PolicyView { id, vendor, action, mode, pic_mode }` — every
+        // field is an OWNED `String`, not a borrowed `&str`. The
+        // PolicyHandle's underlying `Arc<str>` source bytes get
+        // dropped on the next hot-reload; the `Vec<PolicyView>`
+        // returned to the HTTP handler must outlive that drop. A
+        // refactor to `&'a str` for "zero-alloc on the listing
+        // path" would introduce a lifetime parameter that would
+        // cascade through the entire response-building chain. Pin
+        // the owned-String type via require_string on all 5 fields.
+        // Symmetric to round-176 PolicyBundle + round-185
+        // owned-String pins extended to PolicyView's full struct.
+        fn require_string(_: &String) {}
+        let v = PolicyView {
+            id: "p-shared".into(),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            mode: "enforce".into(),
+            pic_mode: "audit".into(),
+        };
+        require_string(&v.id);
+        require_string(&v.vendor);
+        require_string(&v.action);
+        require_string(&v.mode);
+        require_string(&v.pic_mode);
+    }
+
+    #[test]
+    fn list_response_policy_count_field_is_usize_type_for_vec_len_compat() {
+        // `ListResponse.policy_count: usize` — type is `usize`, NOT
+        // `u32` / `i64`. The source value comes from
+        // `Engine::policy_count() -> usize` and is the canonical
+        // slice-len type across the codebase. A refactor that
+        // narrowed to u32 "for explicit byte-size clarity on the
+        // wire" would silently truncate on the (operationally
+        // implausible but type-correct) u32::MAX-row boundary AND
+        // force a cast at the Engine call site. Pin via the
+        // canonical require_usize helper. Symmetric to round-186
+        // CANONICAL_REQUEST_MAX_LEN usize type pin extended to
+        // this response-shape field.
+        fn require_usize(_: usize) {}
+        let r = ListResponse {
+            source: None,
+            policy_count: 0,
+            policies: vec![],
+        };
+        require_usize(r.policy_count);
+    }
+
+    #[test]
+    fn parse_listing_skips_entries_without_required_id_field() {
+        // The id field is what every operator-facing tool (dashboard
+        // table, /api/v1/policy/{id}/mode endpoint, audit-row join)
+        // keys on. The parser uses `m.get(...)?.as_str()?` which
+        // short-circuits to None when either the key is missing or
+        // the value is non-string — and the outer `filter_map`
+        // drops the None. Pin that an entry WITHOUT `id` is dropped
+        // entirely (not synthesized with an empty string or a
+        // generated UUID), so an operator who fat-fingered `id:` to
+        // `name:` sees their entry missing rather than silently
+        // re-labeled. The existing `parse_listing_skips_entries_where_id_is_not_a_string`
+        // pin covers the non-string-value branch; pin the
+        // entirely-missing-key branch here.
+        let yaml = "\
+- vendor: drive
+  action: files.get
+  mode: enforce
+- id: p-valid
+  vendor: gmail
+  action: messages.send
+  mode: enforce
+";
+        let listing = parse_listing(yaml);
+        assert_eq!(
+            listing.len(),
+            1,
+            "missing-id entry must drop, got: {listing:?}"
+        );
+        assert_eq!(listing[0].id, "p-valid");
+    }
+
+    #[test]
+    fn parse_listing_empty_yaml_array_returns_empty_vec_without_error() {
+        // `parse_listing` accepts `"[]"` (legitimate "no policies
+        // loaded yet" state at boot or after a clear-all) and MUST
+        // return an empty Vec. A refactor that pre-required at
+        // least one entry "for non-empty-config safety" would
+        // surface here as panic or empty-list-rejected. The setup-
+        // status page reads this listing and counts zero — pin the
+        // empty contract end-to-end. Also walk an empty-string
+        // input (a hot-reload race where the file was being
+        // written when read).
+        assert!(parse_listing("[]").is_empty());
+        assert!(parse_listing("").is_empty());
+        // Whitespace-only input also yields empty (yaml-parsed as
+        // null, then the `as_mapping` filter drops every entry).
+        assert!(parse_listing("   \n   ").is_empty());
+    }
+
+    #[test]
+    fn parse_listing_applies_documented_defaults_for_omitted_mode_and_pic_mode() {
+        // The parser's `.unwrap_or("enforce")` on mode AND
+        // `.unwrap_or("audit")` on pic_mode are the documented
+        // safe-production defaults (spec.md §9). An operator who
+        // writes a minimal policy (only `id`, `vendor`, `action`,
+        // `decision`) MUST see those defaults surface in the
+        // listing — otherwise their dashboard shows an empty cell
+        // for mode/pic_mode and the policy executes against an
+        // implicit default that the operator can't audit. Pin the
+        // default-substitution shape so a refactor that propagated
+        // `None` to the wire (e.g. via `Option<String>`) would
+        // surface here. Symmetric to round-178 default_pic_mode
+        // helper pin extended to the listing-time fallback path.
+        let yaml = "\
+- id: p-minimal
+  vendor: drive
+  action: files.get
+";
+        let listing = parse_listing(yaml);
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].mode, "enforce", "default mode must be enforce");
+        assert_eq!(
+            listing[0].pic_mode, "audit",
+            "default pic_mode must be audit",
+        );
+    }
+
+    #[test]
+    fn set_mode_body_mode_field_is_owned_string_for_axum_extract_outlives_request_body() {
+        // `SetModeBody.mode: String` — owned, not borrowed. The
+        // axum `Json(body): Json<SetModeBody>` extractor consumes
+        // the request body bytes and the deserializer takes
+        // ownership of every String field. A refactor to
+        // `mode: &'a str` "for zero-alloc on the dispatch
+        // arm" would introduce a lifetime parameter that the
+        // Json extractor's owned-content contract can't satisfy.
+        // Pin the owned-String type via require_string. Symmetric
+        // to round-185 + round-187 owned-String pins extended to
+        // this API request body field.
+        fn require_string(_: &String) {}
+        let body: SetModeBody = serde_json::from_str(r#"{"mode":"observe"}"#).unwrap();
+        require_string(&body.mode);
+        assert_eq!(body.mode, "observe");
+    }
 }

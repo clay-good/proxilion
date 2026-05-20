@@ -844,4 +844,145 @@ mod tests {
         assert!(html.contains("alice@acme.com"));
         assert!(html.contains("gmail.messages.send"));
     }
+
+    // ─── round 187 (2026-05-20): html_escape + HTML_TEMPLATE + fill_template surfaces ───
+
+    #[test]
+    fn html_escape_return_type_is_owned_string_for_cross_await_template_filling() {
+        // `html_escape(s: &str) -> String` — return is OWNED `String`,
+        // NOT borrowed. The `fill_template` call site chains 12
+        // sequential `.replace(...)` operations against the owned
+        // String; an `&'a str` return would force a temporary at
+        // every replace site. Pin the owned-String type via the
+        // canonical require_string helper. Symmetric to round-185
+        // + round-186 owned-String pins extended to this HTML-
+        // sanitization helper.
+        fn require_string(_: &String) {}
+        let s = html_escape("alice & bob <x>");
+        require_string(&s);
+        assert_eq!(s, "alice &amp; bob &lt;x&gt;");
+    }
+
+    #[test]
+    fn html_escape_is_referentially_transparent_across_fifty_repeated_calls() {
+        // `html_escape` is a pure per-char map — no clock, no env,
+        // no global state. Pin referential transparency across 50
+        // back-to-back calls on a multi-special-char fixture. A
+        // refactor that introduced any per-call mutation (e.g. a
+        // bump-allocator backed by thread-local state that lazily
+        // capped string sizes) would silently make two calls
+        // diverge AND break operator-log dedup pipelines that hash
+        // the rendered approver landing page. Symmetric to round-185
+        // + round-186 50-call ref-transparency pins extended to
+        // this sanitization helper.
+        let input = "<script>alert(1)</script> & \"quote\" + 'apostrophe' & café";
+        let first = html_escape(input);
+        for i in 1..50 {
+            assert_eq!(
+                html_escape(input),
+                first,
+                "html_escape diverged on call #{i}",
+            );
+        }
+    }
+
+    #[test]
+    fn html_escape_empty_input_returns_empty_string_without_allocation_panic() {
+        // Boundary: empty input must return empty output without
+        // panicking on the `String::with_capacity(0)` allocation
+        // boundary. The existing
+        // `html_escape_passes_unicode_and_empty_through_unchanged`
+        // pins the unicode case but covers empty as a side-condition
+        // — pin it directly here so a refactor that pre-asserted
+        // `!s.is_empty()` "for input hygiene" surfaces as a panic
+        // on the empty-string call path (the operator-approver
+        // landing renders empty strings for the missing
+        // `approver_hint` / `issued_by` fields).
+        let s = html_escape("");
+        assert!(s.is_empty(), "empty input must round-trip to empty output");
+        // Symmetric: explicit byte-length check.
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn html_template_constant_is_static_str_lifetime_for_zero_alloc_template_filling() {
+        // `HTML_TEMPLATE` is `include_str!("..")` which produces a
+        // `&'static str` baked into the binary at compile time.
+        // The `fill_template` call site calls `.replace(...)` 12
+        // times against this constant — the static lifetime is
+        // load-bearing because `.replace` returns owned String
+        // (each replace step copies from the static buffer once)
+        // and the original constant survives every call without
+        // an allocation. A refactor that switched to lazy-loading
+        // the template from disk "for hot-reload" would silently
+        // promote the constant to owned String AND add I/O to
+        // every approver landing render. Pin the static lifetime
+        // via require_static_str. Symmetric to round-184 +
+        // round-186 static-str lifetime pins extended to this
+        // template constant.
+        fn require_static_str(_: &'static str) {}
+        require_static_str(HTML_TEMPLATE);
+        // Sanity: the template is non-empty.
+        assert!(!HTML_TEMPLATE.is_empty());
+    }
+
+    #[test]
+    fn html_template_contains_every_placeholder_token_fill_template_substitutes() {
+        // `fill_template` chains 12 `.replace("{{NAME}}", ...)`
+        // calls. Pin that EVERY placeholder fill_template attempts
+        // to substitute is actually present in the HTML template.
+        // A refactor that added a 13th `.replace(...)` call without
+        // adding the corresponding `{{XYZ}}` token to the template
+        // would silently produce a no-op — the operator would see
+        // a broken substitution variable in the rendered HTML. The
+        // existing `template_substitutions_fill_all_placeholders`
+        // pin checks the REVERSE direction (no `{{` left after
+        // fill); pin the FORWARD direction here so adding a stray
+        // placeholder to the .replace chain surfaces as a missing
+        // template token.
+        for token in [
+            "{{ACTION_TITLE}}",
+            "{{ACTION}}",
+            "{{EXPIRES_AT}}",
+            "{{P_0}}",
+            "{{VENDOR}}",
+            "{{VERB}}",
+            "{{PATH}}",
+            "{{POLICY_ID}}",
+            "{{DETAIL}}",
+            "{{CREATED_AT}}",
+            "{{REQUESTED_OPS}}",
+            "{{FORM_OR_RESULT}}",
+        ] {
+            assert!(
+                HTML_TEMPLATE.contains(token),
+                "HTML_TEMPLATE missing placeholder {token}",
+            );
+        }
+    }
+
+    #[test]
+    fn fill_template_return_type_is_owned_string_for_axum_response_body() {
+        // `fill_template` returns owned `String` — the axum response
+        // wraps it via `Html(...)` which owns the body. A refactor
+        // to `Cow<'static, str>` "for the no-substitution fast path"
+        // would force the response to either Clone or borrow with a
+        // lifetime parameter that doesn't compose with the handler
+        // signature. Pin owned-String return via require_string.
+        // Symmetric to round-186 canonical_request_json owned-String
+        // return pin extended to this template renderer.
+        fn require_string(_: &String) {}
+        let row = sample_row("approve");
+        let blocked = sample_blocked();
+        let html = fill_template(&row, Some(&blocked), "<p>body</p>");
+        require_string(&html);
+        // Sanity: the rendered HTML is non-trivially sized (template
+        // is at least a few hundred bytes; substituted values add
+        // more).
+        assert!(
+            html.len() > 100,
+            "rendered html too small: {} bytes",
+            html.len()
+        );
+    }
 }

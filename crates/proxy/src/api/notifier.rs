@@ -917,4 +917,213 @@ mod tests {
         let b: SetConfigBody = serde_json::from_str(raw).unwrap();
         assert_eq!(b.enabled, Some(false));
     }
+
+    #[test]
+    fn notifier_api_state_is_send_sync_static_for_axum_state_boundary() {
+        // `NotifierApiState` is wired into the axum Router via
+        // `with_state(state)` — axum's `State<NotifierApiState>` extractor
+        // requires `Send + Sync + 'static`. A refactor that gave any
+        // field an `Rc<...>` (e.g. wrapping `proxy_base_url` in
+        // `Rc<String>` "for cheap clone of the boot-immutable URL")
+        // would break Sync and surface at the router assembly site with
+        // a far-removed `tower::Service` trait-bound error. Pin the
+        // three-trait combo here so the failure surfaces at the right
+        // module. Symmetric to the
+        // `api_error_and_killswitch_state_are_send_sync_static_for_axum_state_boundary`
+        // and `actions_api_state_and_actions_api_error_send_sync_static_for_axum_state_boundary`
+        // pins on sibling api/* modules.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<NotifierApiState>();
+    }
+
+    #[test]
+    fn test_request_and_set_config_body_debug_carries_struct_names_for_grep_bucketing() {
+        // Both `TestRequest` and `SetConfigBody` carry `#[derive(Debug)]`
+        // which feeds `?req` / `?body` in handler-level tracing fields.
+        // Operators grep the log line by struct name to bucket the
+        // notifier-config edit path vs. the notifier-test fire path.
+        // A hand-rolled `impl Debug` that hid the struct name "to
+        // compact the line" would break every operator bucket.
+        // Symmetric to the
+        // `key_error_and_build_error_debug_carries_struct_name_for_grep`
+        // and `actions_api_error_debug_carries_variant_names_for_grep_bucketing`
+        // pins on sibling modules.
+        let req = TestRequest {
+            driver: Some("webhook".into()),
+        };
+        let req_dbg = format!("{req:?}");
+        assert!(
+            req_dbg.contains("TestRequest"),
+            "missing TestRequest in Debug: {req_dbg}",
+        );
+        assert!(
+            req_dbg.contains("driver"),
+            "missing driver field in Debug: {req_dbg}",
+        );
+        let body = SetConfigBody {
+            driver: "webhook".into(),
+            enabled: Some(true),
+            config: serde_json::json!({}),
+        };
+        let body_dbg = format!("{body:?}");
+        assert!(
+            body_dbg.contains("SetConfigBody"),
+            "missing SetConfigBody in Debug: {body_dbg}",
+        );
+        for field in ["driver", "enabled", "config"] {
+            assert!(
+                body_dbg.contains(field),
+                "missing {field} in SetConfigBody Debug: {body_dbg}",
+            );
+        }
+    }
+
+    #[test]
+    fn redact_url_path_truncation_marker_is_byte_exact_three_char_dot_dot_dot_suffix() {
+        // The `/...` path-truncation marker is the operator-facing
+        // signal "this URL had a path that we hid". Receiver-side
+        // dashboards split on the exact `/...` suffix to render the
+        // "redacted" badge. A refactor to `/<hidden>` or `/***` or
+        // `/(path-redacted)` would silently break every dashboard
+        // filter. The existing tests pin the round-trip shape; pin
+        // the byte-exact suffix here so a one-byte drift surfaces.
+        let s = redact_url("https://hooks.example/services/T/B/C");
+        assert!(
+            s.ends_with("/..."),
+            "must end with byte-exact `/...` suffix, got: {s}",
+        );
+        // The suffix is exactly 4 bytes — slash + three dots. A
+        // refactor to a 2-dot ellipsis (`/..`) or a Unicode horizontal
+        // ellipsis (`/…` = `/\u{2026}` = 4 bytes but different chars)
+        // would surface here.
+        let suffix = &s.as_bytes()[s.len() - 4..];
+        assert_eq!(suffix, b"/...", "suffix bytes must equal `/...`");
+        // Symmetric: trailing-slash-only input lands on `/...` too —
+        // pin via byte-exact suffix.
+        let s2 = redact_url("https://example.com/");
+        assert_eq!(&s2.as_bytes()[s2.len() - 4..], b"/...");
+    }
+
+    #[test]
+    fn redact_url_is_idempotent_applying_twice_equals_applying_once() {
+        // The output of `redact_url` is itself a valid URL shape (the
+        // `/...` suffix is not a valid path component on the wire but
+        // the helper treats it as the first path segment on a re-run).
+        // Pin idempotency: `redact_url(redact_url(x)) == redact_url(x)`
+        // across all the input shapes the helper handles. A refactor
+        // that started stripping the `/...` suffix "for clean re-
+        // redaction" or that appended an additional `/...` on each
+        // call "for layered redaction" would surface here as a
+        // divergence between one-pass and two-pass output. The
+        // dashboard's redact-on-read path may invoke this helper
+        // multiple times on the same URL (e.g. once at fetch, once
+        // at render); pin determinism. Symmetric to the
+        // `sanitize_token_is_idempotent_applying_twice_equals_applying_once`
+        // and `redact_pii_text_is_idempotent_across_two_passes_on_pii_heavy_input`
+        // pins on sibling helpers.
+        for input in [
+            "https://hooks.slack.com/services/T/B/abcXYZ?token=secret",
+            "https://example.com",
+            "https://example.com/",
+            "https://siem.local:8080/ingest",
+            "ftp://files.example/x/y",
+            "just-a-token",
+            "",
+        ] {
+            let once = redact_url(input);
+            let twice = redact_url(&once);
+            assert_eq!(
+                once, twice,
+                "idempotency broke on input {input:?}: once={once:?}, twice={twice:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn set_config_body_config_field_preserves_deeply_nested_json_value_verbatim() {
+        // The `config: Value` field is `serde_json::Value` (not `String`,
+        // not `Map<String, String>`) so the per-driver handlers can
+        // index into deeply-nested config shapes without re-parsing.
+        // Pin that a deeply-nested config object (3 levels deep with
+        // mixed types — string, bool, int, array, null) round-trips
+        // through deserialization byte-equivalently to the input JSON.
+        // A refactor that switched the field to a flat `Value::Object`
+        // "for schema validation" would silently flatten nested
+        // structures and break the per-driver handlers that walk the
+        // nested shapes (e.g. the slack handler reads
+        // `config["user_map"][slack_id]`).
+        let raw = r#"{
+            "driver": "webhook",
+            "enabled": true,
+            "config": {
+                "url": "https://hook.example",
+                "options": {
+                    "retries": 5,
+                    "backoff_ms": 100,
+                    "headers": ["x-foo", "x-bar"],
+                    "tls": {
+                        "verify": true,
+                        "ca_path": null
+                    }
+                }
+            }
+        }"#;
+        let b: SetConfigBody = serde_json::from_str(raw).unwrap();
+        assert_eq!(b.config["url"], "https://hook.example");
+        assert_eq!(b.config["options"]["retries"], 5);
+        assert_eq!(b.config["options"]["backoff_ms"], 100);
+        assert_eq!(b.config["options"]["headers"][0], "x-foo");
+        assert_eq!(b.config["options"]["headers"][1], "x-bar");
+        assert_eq!(b.config["options"]["tls"]["verify"], true);
+        assert!(b.config["options"]["tls"]["ca_path"].is_null());
+        // The nested object IS an object (not coerced to a string).
+        assert!(b.config["options"].is_object());
+        assert!(b.config["options"]["headers"].is_array());
+    }
+
+    #[tokio::test]
+    async fn notifier_api_state_clone_shares_notifiers_hot_swap_state_across_clones() {
+        use std::sync::Arc;
+        // `NotifierApiState` derives `Clone` — axum's State extractor
+        // clones the state into every request scope. The inner
+        // `Notifiers` bundle MUST share its hot-swap state across all
+        // clones (the §10.3 contract): a replace through one clone's
+        // bundle must be visible on a sibling clone's bundle. The
+        // existing `notifier_api_state_is_send_sync_static_for_axum_state_boundary`
+        // pin only checks the type bounds — pin the observable Clone-
+        // share semantic here. Symmetric to the
+        // `killswitch_api_state_clone_shares_inner_kill_cache_handle`
+        // pin on sibling api/killswitch.rs round 158-era backfill.
+        use sqlx::postgres::PgPoolOptions;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/x")
+            .expect("lazy pool builds");
+        let state = NotifierApiState {
+            notifiers: Notifiers::empty(),
+            db: pool,
+            proxy_base_url: "https://proxy.local".into(),
+        };
+        let clone_a = state.clone();
+        let clone_b = state.clone();
+        // Replace webhook via clone_a; observe via clone_b.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let webhook = Arc::new(
+            WebhookNotifier::new(
+                "https://shared-webhook.example".into(),
+                secret,
+                "https://proxy.local".into(),
+            )
+            .unwrap(),
+        );
+        clone_a.notifiers.webhook.replace(Some(webhook));
+        assert!(
+            clone_b.notifiers.webhook.current().is_some(),
+            "Notifiers bundle not shared across NotifierApiState Clone — refactor broke axum State propagation",
+        );
+        // proxy_base_url is also cheap-cloned (String); pin both clones
+        // observe the same value.
+        assert_eq!(clone_a.proxy_base_url, "https://proxy.local");
+        assert_eq!(clone_b.proxy_base_url, "https://proxy.local");
+    }
 }

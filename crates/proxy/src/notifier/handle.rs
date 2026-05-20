@@ -460,6 +460,239 @@ mod tests {
     }
 
     #[test]
+    fn notifiers_empty_produces_three_handles_with_independent_arc_swap_state() {
+        // `Notifiers::empty()` builds three INDEPENDENT `Handle::new(None)`
+        // values — a swap on webhook MUST NOT surface on slack OR email.
+        // The existing `two_independent_empty_bundles_have_independent_handle_state`
+        // pin walks bundle-to-bundle isolation; this pin walks the
+        // sibling-handle isolation WITHIN a single bundle. A refactor
+        // that introduced a shared inner ArcSwap "for memory savings on
+        // boot-empty bundles" would silently fan a webhook replace into
+        // slack's current() reads. Pin all three pairwise.
+        let n = Notifiers::empty();
+        n.webhook
+            .replace(Some(mk_webhook("https://only-webhook.example")));
+        assert!(n.webhook.current().is_some());
+        assert!(n.slack.current().is_none(), "slack must remain None");
+        assert!(n.email.current().is_none(), "email must remain None");
+        // Symmetric: clear webhook + set slack — webhook + email stay None.
+        n.webhook.replace(None);
+        use crate::notifier::{SlackNotifier, SlackSigningSecret};
+        let slack = Arc::new(
+            SlackNotifier::new(
+                "https://hooks.slack.com/services/T/B/C".into(),
+                SlackSigningSecret::new("00112233445566778899aabbccddeeff"),
+                "https://proxy.local".into(),
+            )
+            .unwrap(),
+        );
+        n.slack.replace(Some(slack));
+        assert!(n.webhook.current().is_none());
+        assert!(n.slack.current().is_some());
+        assert!(n.email.current().is_none());
+    }
+
+    #[tokio::test]
+    async fn notifiers_clone_shares_all_three_handles_not_just_webhook() {
+        // The existing `bundle_clone_shares_handles_with_original` test pins
+        // the webhook arm only. The OR-chain in `any_configured` covers
+        // three arms — a refactor that gave `slack` or `email` a deep-
+        // copying Clone impl (e.g. via a manual derive that wrapped them
+        // in `Arc::new(...)` "for explicit ownership") would silently break
+        // hot-swap on those two drivers without surfacing in the webhook
+        // pin. Pin slack + email Clone-share explicitly.
+        use crate::notifier::{SlackNotifier, SlackSigningSecret};
+        let n = Notifiers::empty();
+        let m = n.clone();
+        let slack = Arc::new(
+            SlackNotifier::new(
+                "https://hooks.slack.com/services/T/B/C".into(),
+                SlackSigningSecret::new("00112233445566778899aabbccddeeff"),
+                "https://proxy.local".into(),
+            )
+            .unwrap(),
+        );
+        n.slack.replace(Some(slack));
+        assert!(
+            m.slack.current().is_some(),
+            "slack replace through n must surface through m",
+        );
+        // Email arm — build a lazy-pool EmailNotifier (no DB connection
+        // required until persist time).
+        use crate::notifier::EmailNotifier;
+        use sqlx::postgres::PgPoolOptions;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/__handle_clone_email_share_test")
+            .expect("lazy connect builds");
+        let email = Arc::new(
+            EmailNotifier::new(
+                "smtp://localhost:25",
+                "sec@x.com",
+                &["a@x.com".into()],
+                "https://proxy.local".into(),
+                pool,
+            )
+            .expect("EmailNotifier::new builds"),
+        );
+        n.email.replace(Some(email));
+        assert!(
+            m.email.current().is_some(),
+            "email replace through n must surface through m",
+        );
+    }
+
+    #[test]
+    fn handle_new_with_some_arc_strong_count_observably_increments_by_one() {
+        // `Handle::new(Some(arc))` stores the Arc inside an
+        // `Arc<ArcSwap<Option<Arc<T>>>>` — the input Arc's strong_count
+        // MUST increment by exactly one (the Handle's inner reference).
+        // A refactor that double-wrapped (`Arc::new((*arc).clone())`,
+        // requiring T: Clone or shallow-copying the inner T) would
+        // surface here as strong_count == 1 post-construction. Pin the
+        // delta explicitly so a Clone-bound regression on the inner T
+        // surfaces at this site rather than at the (already-pinned)
+        // ptr_eq test.
+        let w = mk_webhook("https://strong-count.example");
+        assert_eq!(Arc::strong_count(&w), 1, "pre-construct: only the local");
+        let h: NotifierHandle = Handle::new(Some(w.clone()));
+        // After construction the Handle's inner ArcSwap holds an extra
+        // reference — strong_count is now 2 (local + Handle inner).
+        assert_eq!(Arc::strong_count(&w), 2, "post-construct: local + Handle");
+        // Drop the Handle — strong_count returns to 1.
+        drop(h);
+        assert_eq!(Arc::strong_count(&w), 1, "post-drop: only the local");
+    }
+
+    #[test]
+    fn handle_replace_with_new_arc_drops_prior_arc_strong_count_on_swap() {
+        // `Handle::replace(Some(new))` MUST drop the prior `Arc<T>` the
+        // ArcSwap held — strong_count on the previous Arc should decrement
+        // by one (the ArcSwap stops holding it). A refactor that
+        // accidentally retained the prior Arc in a Vec "for replace
+        // history" would surface here as a strong_count that doesn't
+        // drop, leaking notifier instances across every config swap.
+        let prev = mk_webhook("https://prev.example");
+        let h: NotifierHandle = Handle::new(Some(prev.clone()));
+        assert_eq!(
+            Arc::strong_count(&prev),
+            2,
+            "pre-replace: local + Handle inner",
+        );
+        let new = mk_webhook("https://new.example");
+        h.replace(Some(new.clone()));
+        // Swap dropped prev from the ArcSwap — strong_count back to 1.
+        assert_eq!(
+            Arc::strong_count(&prev),
+            1,
+            "post-replace: prev only held by local",
+        );
+        // And the new Arc's strong_count is 2 (local + Handle inner).
+        assert_eq!(
+            Arc::strong_count(&new),
+            2,
+            "post-replace: new held by local + Handle",
+        );
+    }
+
+    #[test]
+    fn handle_is_send_sync_static_over_arbitrary_inner_type_via_generic_bound() {
+        // The existing `handle_is_send_sync_static_for_each_concrete_notifier_type`
+        // pin walks the three concrete type aliases. Pin the generic
+        // `Handle<T: Send + Sync + 'static>` bound directly via a
+        // non-notifier `T` (`String`, `u64`, custom plain struct) so a
+        // refactor that constrained the impl to a hand-rolled trait
+        // marker (e.g. `T: NotifierDriver`) would surface here on the
+        // generic-instantiation site rather than only at the concrete
+        // alias sites. The harness is the same `require_send_sync_static`
+        // function the sibling pin uses; the difference is the type
+        // parameter being arbitrary plain Rust types.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<Handle<String>>();
+        require_send_sync_static::<Handle<u64>>();
+        struct Plain {
+            #[allow(dead_code)]
+            x: i32,
+        }
+        require_send_sync_static::<Handle<Plain>>();
+    }
+
+    #[tokio::test]
+    async fn notifiers_any_configured_returns_to_false_after_full_set_then_clear_cycle() {
+        // The OR-chain `webhook || slack || email` must surface false
+        // after EVERY driver has been set + cleared (a complete cycle).
+        // A refactor that introduced a "sticky" counter ("once configured,
+        // always count as configured" — the natural shape of a metrics-
+        // friendly internal flag) would silently keep `any_configured()`
+        // true even after the operator cleared every driver. Pin the
+        // full set + clear cycle across all three arms.
+        use crate::notifier::{EmailNotifier, SlackNotifier, SlackSigningSecret};
+        use sqlx::postgres::PgPoolOptions;
+        let n = Notifiers::empty();
+        assert!(!n.any_configured(), "starts false");
+        n.webhook
+            .replace(Some(mk_webhook("https://cycle-webhook.example")));
+        assert!(n.any_configured());
+        let slack = Arc::new(
+            SlackNotifier::new(
+                "https://hooks.slack.com/services/T/B/C".into(),
+                SlackSigningSecret::new("00112233445566778899aabbccddeeff"),
+                "https://proxy.local".into(),
+            )
+            .unwrap(),
+        );
+        n.slack.replace(Some(slack));
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/__handle_cycle_test")
+            .expect("lazy connect builds");
+        let email = Arc::new(
+            EmailNotifier::new(
+                "smtp://localhost:25",
+                "sec@x.com",
+                &["a@x.com".into()],
+                "https://proxy.local".into(),
+                pool,
+            )
+            .expect("EmailNotifier::new builds"),
+        );
+        n.email.replace(Some(email));
+        assert!(n.any_configured(), "all three set");
+        // Clear each in turn.
+        n.webhook.replace(None);
+        assert!(n.any_configured(), "still slack + email");
+        n.slack.replace(None);
+        assert!(n.any_configured(), "still email");
+        n.email.replace(None);
+        assert!(!n.any_configured(), "fully cleared returns to false");
+    }
+
+    #[test]
+    fn handle_current_returns_arc_with_strong_count_greater_than_one_so_caller_owns_a_ref() {
+        // `Handle::current()` returns an `Option<Arc<T>>` clone — the
+        // caller takes ownership of an Arc whose strong_count is at
+        // least 2 (Handle inner + caller). A refactor that returned a
+        // `&Arc<T>` "for zero-alloc reads" would surface as a borrow-
+        // checker error at the hot-path call sites that fire `.await`
+        // on the inner notifier; a refactor that `Arc::try_unwrap()`-ed
+        // the inner (e.g. to "take ownership for atomic mutation") would
+        // surface here as strong_count == 1. Pin the multi-ref contract.
+        let w = mk_webhook("https://multiref.example");
+        let h: NotifierHandle = Handle::new(Some(w.clone()));
+        let got = h.current().expect("must be Some");
+        // strong_count >= 2: at minimum the local `w`, the Handle inner,
+        // and the just-returned `got`. With clone in mk_webhook we have
+        // exactly: local `w` + Handle inner + got = 3.
+        assert!(
+            Arc::strong_count(&got) >= 2,
+            "caller-owned Arc must have strong_count >= 2, got {}",
+            Arc::strong_count(&got),
+        );
+        // And the returned Arc points to the SAME T as the original.
+        assert!(Arc::ptr_eq(&w, &got));
+    }
+
+    #[test]
     fn empty_bundle_starts_with_none_for_email_handle_too() {
         // The `webhook_burst` and `slack_burst` Option<BurstSuppressor>
         // fields had their default-None pin (`empty_bundle_has_none_for_burst_suppressors`),

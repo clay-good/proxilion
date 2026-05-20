@@ -661,4 +661,161 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         Tmp { path, file }
     }
+
+    #[test]
+    fn policy_bundle_and_file_loader_and_static_loader_and_load_error_are_send_sync_static() {
+        // PolicyBundle is held inside the proxy's `ArcSwap<Engine>` hot-
+        // swap path; both loader implementations are stored as
+        // `Arc<dyn PolicyLoader>` and shared across tokio task
+        // boundaries (the watcher + every per-request load() call).
+        // PolicyLoadError flows through `anyhow::Error` chains at the
+        // proxy's reload-error path. All four MUST be Send + Sync +
+        // 'static. The existing module pins individual VALUES but
+        // never the trait bounds — a refactor adding an Rc<...> field
+        // "for cheap shared metadata" on any of the four would break
+        // Sync and surface at a remote `tower::Service` trait-bound
+        // rather than at this module. Pin all four — symmetric to
+        // round-168 + round-169 + round-173 + round-175 Send+Sync+'static
+        // pins extended to the policy loader trait hierarchy.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<PolicyBundle>();
+        require_send_sync_static::<FilePolicyLoader>();
+        require_send_sync_static::<StaticPolicyLoader>();
+        require_send_sync_static::<PolicyLoadError>();
+    }
+
+    #[test]
+    fn policy_bundle_yaml_and_version_fields_are_owned_string_type_for_hot_swap_arc_clone() {
+        // PolicyBundle is moved into `ArcSwap<Engine>` on every reload;
+        // the proxy clones the Arc but the inner bundle's String fields
+        // must be owned (not borrowed) so the new Engine outlives the
+        // loader's source buffer. A refactor to `yaml: &'a str` "to
+        // avoid the per-reload allocation" would surface a lifetime
+        // constraint that the ArcSwap call site couldn't satisfy.
+        // Pin via require_string symmetric to round-168 require_vec_string
+        // + round-172 PcaView.pic_profile + round-175 lookup_list
+        // Vec<String> ownership-type pins extended to PolicyBundle
+        // String fields.
+        fn require_string(_: &String) {}
+        let b = PolicyBundle {
+            yaml: "- id: x".into(),
+            version: "mtime:0".into(),
+        };
+        require_string(&b.yaml);
+        require_string(&b.version);
+    }
+
+    #[test]
+    fn policy_load_error_display_byte_exact_prefix_shape_no_kebab_no_uppercase_across_three_variants()
+     {
+        // Operator alert filters bucket reload failures on the three
+        // canonical Display prefixes: `io error:`, `source not found:`,
+        // `backend error:`. The existing pin walks the substring
+        // contains but never the EXACT byte-equal prefix shape. A
+        // refactor renaming `Io` to `Filesystem` "for clarity" or
+        // adding kebab-case to a future #[error("...")] attribute would
+        // silently rebucket every existing Grafana alert. Pin
+        // byte-exact lowercase + no-kebab across all three variants
+        // — symmetric to round-173 ErrorCode as_str lowercase sweep
+        // extended to thiserror Display prefixes.
+        let io = PolicyLoadError::Io("boom".into());
+        let s = format!("{io}");
+        assert!(
+            s.starts_with("io error:"),
+            "expected `io error:` prefix: {s}"
+        );
+        assert!(
+            s.chars()
+                .take("io error".len())
+                .all(|c| !c.is_ascii_uppercase())
+        );
+        assert!(!s[.."io error:".len()].contains('-'));
+
+        let nf = PolicyLoadError::NotFound("/x".into());
+        let s = format!("{nf}");
+        assert!(
+            s.starts_with("source not found:"),
+            "expected `source not found:` prefix: {s}",
+        );
+        assert!(!s["source not found".len()..].is_empty());
+
+        let be = PolicyLoadError::Backend("db".into());
+        let s = format!("{be}");
+        assert!(
+            s.starts_with("backend error:"),
+            "expected `backend error:` prefix: {s}",
+        );
+    }
+
+    #[test]
+    fn policy_load_error_debug_carries_all_three_variant_names_for_grep_bucketing() {
+        // Operator log filters bucket reload failures by Debug variant
+        // name (`?err` rendering in the `policy_handle::reload` error
+        // path). The existing pins walk Display but never Debug
+        // variant names — a manual Debug impl that collapsed all
+        // three variants to `PolicyLoadError(_)` "for compact logs"
+        // would silently break grep-based alerting that splits
+        // filesystem-error from not-found from db-backend errors.
+        // Pin all three variant names render in Debug — symmetric to
+        // round-163 ConfigError Debug variant-name sweep + round-168
+        // PicViolationRecord pic_mode + round-173 ErrorCode sweeps
+        // extended to PolicyLoadError.
+        let io = PolicyLoadError::Io("boom".into());
+        assert!(format!("{io:?}").contains("Io"), "got: {io:?}");
+        let nf = PolicyLoadError::NotFound("/x".into());
+        assert!(format!("{nf:?}").contains("NotFound"), "got: {nf:?}");
+        let be = PolicyLoadError::Backend("db".into());
+        assert!(format!("{be:?}").contains("Backend"), "got: {be:?}");
+    }
+
+    #[test]
+    fn static_loader_set_yaml_atomic_revision_increment_is_monotonic_across_50_mutations() {
+        // The `set_yaml` mutator bumps an AtomicU64 revision via
+        // SeqCst ordering — the revision is the version token
+        // (`format!("rev:{rev}")`) returned by `load()`. A refactor
+        // that swapped to `Relaxed` ordering "for hot-path perf" would
+        // be technically incorrect for the changed_since-then-load
+        // happens-before contract the watcher relies on, but the bug
+        // would surface only under high concurrency. Pin the
+        // monotonic-increment contract on the single-threaded path
+        // across 50 mutations — symmetric to round-159 Handle::new
+        // Arc-strong-count increment pins extended to StaticPolicyLoader
+        // revision counter.
+        let loader = StaticPolicyLoader::new("yaml-0");
+        let mut prev_rev = 0u64;
+        for i in 1..=50 {
+            loader.set_yaml(format!("yaml-{i}"));
+            let rev = loader.revision.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                rev,
+                prev_rev + 1,
+                "revision must increment by exactly 1 on iter {i}"
+            );
+            prev_rev = rev;
+        }
+        assert_eq!(prev_rev, 50);
+    }
+
+    #[tokio::test]
+    async fn static_loader_load_yields_owned_policy_bundle_via_clone_not_borrowed_slice() {
+        // `StaticPolicyLoader::load()` returns `Result<PolicyBundle,
+        // _>` (owned) — the bundle's `yaml` field is a clone of the
+        // inner Mutex<String> so consumers can drop the loader and
+        // still consume the bundle. A refactor returning `Result<&
+        // PolicyBundle, _>` "to avoid the clone" would force a lifetime
+        // constraint that the ArcSwap call site couldn't satisfy. Pin
+        // owned-bundle semantic by dropping the loader BEFORE
+        // inspecting the bundle.
+        let bundle = {
+            let loader = StaticPolicyLoader::new("- id: x\n");
+            loader.load().await.expect("static load must succeed")
+            // loader dropped here
+        };
+        assert!(bundle.yaml.contains("id: x"));
+        assert_eq!(bundle.version, "rev:0");
+        // Owned-type pin.
+        fn require_string(_: &String) {}
+        require_string(&bundle.yaml);
+        require_string(&bundle.version);
+    }
 }

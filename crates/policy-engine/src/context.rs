@@ -372,4 +372,149 @@ mod tests {
         assert_eq!(d.body.get("external_recipient"), Some(&json!(true)));
         assert_eq!(d.body.get("score"), Some(&json!(5)));
     }
+
+    #[test]
+    fn request_context_and_user_ctx_are_send_sync_static_for_axum_evaluate_with_trace_boundary() {
+        // RequestContext is constructed per-adapter-request and passed
+        // by reference to `Engine::evaluate_with_trace(&ctx)`; the
+        // policy-engine's tokio task spawns rego evaluation across
+        // .await points, requiring Send + Sync + 'static. The existing
+        // module never pins these trait bounds — a refactor adding a
+        // non-Send field (e.g. `Rc<HashMap<...>>` for cheap-clone path
+        // dedup) would break Send and surface at a remote
+        // `tower::Service` trait-bound rather than at this module.
+        // Pin both struct types — symmetric to round-168 + round-169
+        // + round-173 Send+Sync+'static pins extended to the policy
+        // engine's input context.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<RequestContext>();
+        require_send_sync_static::<UserCtx>();
+    }
+
+    #[test]
+    fn request_context_body_field_is_hashmap_string_to_serde_json_value_for_template_lookup() {
+        // The `body` field carries per-adapter exposed-to-policy fields
+        // (default-deny per spec.md §5.4); the `lookup` + `lookup_list`
+        // helpers walk it via `HashMap::get(tail)`. The existing pins
+        // walk VALUES via `body.get("k") == Some(&json!(...))` but never
+        // the TYPE-level contract. A refactor to `HashMap<String,
+        // String>` "for stricter typing" would silently force callers
+        // to allocate a Value at every body-field site AND would lose
+        // the as_array branch in `lookup_list` (you can't get an array
+        // from a String). Pin the exact field type via a generic fn —
+        // symmetric to round-168 require_vec_string + round-172
+        // require_string ownership-type pins extended to body field.
+        fn require_hashmap_string_value(_: &HashMap<String, serde_json::Value>) {}
+        let ctx = sample_ctx();
+        require_hashmap_string_value(&ctx.body);
+        // Symmetric: path + headers are HashMap<String, String> (NOT Value).
+        fn require_hashmap_string_string(_: &HashMap<String, String>) {}
+        require_hashmap_string_string(&ctx.path);
+        require_hashmap_string_string(&ctx.headers);
+    }
+
+    #[test]
+    fn lookup_list_is_referentially_transparent_across_fifty_repeated_calls_on_body_array_fixture()
+    {
+        // Symmetric to round-161 + round-162 + round-166 + round-168 +
+        // round-169 + round-170 + round-171 + round-172 + round-173
+        // referential-transparency pins extended to lookup_list. The
+        // helper is invoked by `OpsExpression::resolve` per policy
+        // evaluation; a refactor caching results in a once-cell keyed
+        // on `&self as *const _` "for hot-path perf" would silently
+        // return stale arrays on a re-evaluated context where body was
+        // hot-swapped under a long-lived RequestContext (a future
+        // body-rewrite middleware path the spec contemplates). Pin 50
+        // calls byte-equal.
+        let mut ctx = RequestContext::default();
+        ctx.body
+            .insert("to_domains".to_string(), json!(["a.com", "b.com", "c.com"]));
+        let baseline = ctx
+            .lookup_list("body.to_domains")
+            .expect("fixture has 3 elems");
+        assert_eq!(baseline.len(), 3);
+        for i in 0..50 {
+            let again = ctx.lookup_list("body.to_domains").expect("re-lookup");
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: lookup_list must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_list_returns_owned_vec_string_type_via_require_vec_string_for_template_expansion() {
+        // `OpsExpression::resolve` consumes the returned Vec by moving
+        // each String into a fresh atom — the type MUST be `Vec<String>`
+        // (owned per-element AND owned outer Vec). A refactor to
+        // `Vec<&'a str>` "to avoid per-element allocation" would
+        // surface a lifetime constraint that the resolve site
+        // (which builds a transient context, calls lookup_list,
+        // then drops the context before consuming the atoms in a
+        // spawned eval task) couldn't satisfy. The existing pins
+        // walk VALUES but never the TYPE-level contract — pin via
+        // require_vec_string symmetric to round-168 parse_missing_atoms
+        // + round-172 PcaView.ops owned-type pins extended to
+        // lookup_list return.
+        fn require_vec_string(_: &Vec<String>) {}
+        let mut ctx = RequestContext::default();
+        ctx.body.insert("xs".to_string(), json!(["a", "b"]));
+        let v = ctx.lookup_list("body.xs").expect("fixture");
+        require_vec_string(&v);
+        // Per-element String (not &str).
+        fn require_string(_: &String) {}
+        require_string(&v[0]);
+    }
+
+    #[test]
+    fn lookup_with_no_dot_separator_returns_none_except_for_bare_customer_domain_special_case() {
+        // The dispatch on `dotted.split_once('.')?` early-returns None
+        // for any single-token input EXCEPT the `customer_domain`
+        // special case which is checked first (line 58 of the helper).
+        // The existing module walks the bare-`customer_domain` path
+        // but never the NEGATIVE polarity on sibling bare identifiers
+        // ("vendor", "action", "path", "headers", "user"). A refactor
+        // that lifted "vendor" or "action" to the bare-identifier
+        // tier "for ergonomic policy templates" would silently expand
+        // the special-case set and break every YAML that authors
+        // `${vendor}` literally as a template key. Pin negative
+        // polarity across 5 bare identifiers.
+        let ctx = sample_ctx();
+        // Positive control: customer_domain bare identifier IS resolved.
+        assert_eq!(ctx.lookup("customer_domain").as_deref(), Some("acme.com"));
+        // Negative sweep: every other bare identifier returns None.
+        for bare in &["vendor", "action", "path", "headers", "user", "body"] {
+            assert!(
+                ctx.lookup(bare).is_none(),
+                "bare identifier `{bare}` must NOT resolve (only customer_domain is bare)",
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_user_groups_returns_none_because_user_ctx_only_exposes_email_via_lookup_dispatch() {
+        // UserCtx carries `groups: Vec<String>` but the `lookup`
+        // dispatch on `user.*` only matches `email` (line 64-66 of
+        // the helper). A refactor that added a `user.groups` arm "for
+        // ergonomic group-based policy templates" would silently
+        // change `${user.groups}` from None (current contract — the
+        // template fails to resolve and the atom is dropped, per
+        // spec.md §9 unresolved-template semantics) to Some(repr).
+        // Pin None across `user.groups` AND any other user.* tail.
+        // Operators currently work around this by using `lookup_list`
+        // on `body.groups` (the adapter copies the relevant groups
+        // into the body context); a silent change here would let two
+        // policy paths produce different results.
+        let mut ctx = sample_ctx();
+        ctx.user.groups = vec!["eng".into(), "admin".into()];
+        assert!(
+            ctx.lookup("user.groups").is_none(),
+            "user.groups must NOT resolve via scalar lookup",
+        );
+        // Other user.* tails also return None.
+        assert!(ctx.lookup("user.id").is_none());
+        assert!(ctx.lookup("user.name").is_none());
+        // Symmetric: user.email IS resolved (positive control).
+        assert_eq!(ctx.lookup("user.email").as_deref(), Some("alice@acme.com"));
+    }
 }

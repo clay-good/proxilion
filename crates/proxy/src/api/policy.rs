@@ -486,4 +486,209 @@ mod tests {
         assert_eq!(v[1].id, "alpha", "source order preserved at index 1");
         assert_eq!(v[2].id, "mu", "source order preserved at index 2");
     }
+
+    #[test]
+    fn set_mode_body_is_send_sync_static_for_axum_json_extractor_boundary() {
+        // `SetModeBody` is the body type the axum `Json<SetModeBody>`
+        // extractor deserializes into; it crosses the handler's
+        // `.await` boundary on the `state.policy.set_mode(...)` call.
+        // axum's `FromRequest` blanket impl requires the extracted
+        // type to be `Send + 'static`; `Sync` is structurally upheld
+        // by the plain-String field. Symmetric to the
+        // `policy_api_state_is_send_sync_static_for_axum_state_boundary`
+        // pin on `PolicyApiState` and to the
+        // `set_config_body` Send+Sync+'static implications baked into
+        // the sibling notifier State pin (round 160). A refactor that
+        // introduced an `Rc<String>` field "for cheap clone of the
+        // inner mode string" would break Send + Sync but the breakage
+        // would surface at the extractor site with an opaque
+        // tower::Service trait-bound error rather than here. Pin the
+        // three-trait combo so a refactor lands clean diagnostics at
+        // this file boundary.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<SetModeBody>();
+    }
+
+    #[test]
+    fn policy_view_serializes_with_exactly_five_known_keys_for_admin_ui_table_columns() {
+        // `PolicyView` is the per-row JSON shape the admin UI renders
+        // as a table — five columns: id, vendor, action, mode,
+        // pic_mode. A refactor that added a sixth field (e.g.
+        // `last_reload_at: DateTime<Utc>` "for ergonomic display")
+        // would silently widen every row in the admin table and
+        // could shift downstream operator tooling that keys on the
+        // exact column count. Pin the exhaustive 5-key set so a
+        // wire-shape change is a deliberate decision rather than a
+        // drive-by. Symmetric to the `list_response_serializes_with_exactly_three_known_keys`
+        // pin below.
+        let v = PolicyView {
+            id: "p1".into(),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            mode: "enforce".into(),
+            pic_mode: "audit".into(),
+        };
+        let val = serde_json::to_value(&v).unwrap();
+        let obj = val.as_object().expect("top-level must be object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::HashSet<&str> =
+            ["id", "vendor", "action", "mode", "pic_mode"]
+                .into_iter()
+                .collect();
+        assert_eq!(keys, expected, "got: {keys:?}");
+    }
+
+    #[test]
+    fn list_response_serializes_with_exactly_three_known_keys_for_admin_ui_table_shape() {
+        // `ListResponse` is the top-level JSON envelope `GET /api/v1/policy`
+        // returns: three keys — source, policy_count, policies. The
+        // admin UI renders the listing under those exact names and
+        // dashboards key on `policy_count` for the cluster-wide
+        // policy-count metric. A refactor that added a fourth key
+        // (e.g. `last_reload_ms: u64` "for the dashboard reload
+        // toast") would silently widen the wire shape and break
+        // downstream operator tooling. Pin the exhaustive 3-key set
+        // so a wire-shape change surfaces here. Symmetric to the
+        // `policy_view_serializes_with_exactly_five_known_keys` pin
+        // above.
+        let r = ListResponse {
+            source: Some("/etc/proxilion/policies.yaml".into()),
+            policy_count: 2,
+            policies: vec![],
+        };
+        let val = serde_json::to_value(&r).unwrap();
+        let obj = val.as_object().expect("top-level must be object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::HashSet<&str> =
+            ["source", "policy_count", "policies"].into_iter().collect();
+        assert_eq!(keys, expected, "got: {keys:?}");
+        // Symmetric pin on the None-source polarity — the key set must
+        // not shift on the absent-source branch (it stays present as
+        // JSON null per the round-N `null_source` pin).
+        let r2 = ListResponse {
+            source: None,
+            policy_count: 0,
+            policies: vec![],
+        };
+        let val2 = serde_json::to_value(&r2).unwrap();
+        let obj2 = val2.as_object().expect("top-level must be object");
+        let keys2: std::collections::HashSet<&str> = obj2.keys().map(String::as_str).collect();
+        assert_eq!(keys2, expected, "None-source polarity got: {keys2:?}");
+    }
+
+    #[test]
+    fn policy_view_and_list_response_json_keys_are_lowercase_snake_case_no_kebab_no_uppercase() {
+        // The wire convention across the admin API is lowercase
+        // snake_case (matches the `policy_count` / `pic_mode` shapes
+        // already in flight). A refactor that surfaced one as
+        // PascalCase OR kebab-case (e.g. via a `#[serde(rename_all =
+        // "kebab-case")]` "for hyphen-friendly URLs" on a future
+        // shared types crate) would silently break every operator
+        // dashboard regex bucket. Pin absence of uppercase ASCII AND
+        // absence of `-` across BOTH structs' serialized keys.
+        // Symmetric to the `oauth_error_body_code_is_lowercase_snake_case`
+        // and `actions_api_error_body_code_lowercase_snake_case` pins.
+        let v = PolicyView {
+            id: "p1".into(),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            mode: "enforce".into(),
+            pic_mode: "audit".into(),
+        };
+        let val = serde_json::to_value(&v).unwrap();
+        for key in val.as_object().unwrap().keys() {
+            assert!(
+                !key.chars().any(|c| c.is_ascii_uppercase()),
+                "PolicyView key `{key}` carries uppercase",
+            );
+            assert!(
+                !key.contains('-'),
+                "PolicyView key `{key}` carries kebab `-`",
+            );
+        }
+        let r = ListResponse {
+            source: None,
+            policy_count: 0,
+            policies: vec![],
+        };
+        let val = serde_json::to_value(&r).unwrap();
+        for key in val.as_object().unwrap().keys() {
+            assert!(
+                !key.chars().any(|c| c.is_ascii_uppercase()),
+                "ListResponse key `{key}` carries uppercase",
+            );
+            assert!(
+                !key.contains('-'),
+                "ListResponse key `{key}` carries kebab `-`",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_listing_is_referentially_transparent_across_fifty_repeated_calls() {
+        // `parse_listing` is pure (no clock, no env, no global state —
+        // serde_yaml has no interior mutability, and the closure
+        // chain is `as_mapping → as_str → to_string` all pure).
+        // Pin referential transparency by calling 50 times with the
+        // same YAML and asserting every call yields a byte-equal
+        // (via PartialEq on PolicyView) result. A refactor that
+        // introduced any form of state (a once-cell-backed cache, a
+        // counter, a `tracing::warn!` that mutated a global counter
+        // and surfaced via a future "warn-once" gate) would surface
+        // here. Symmetric to the `verify_pkce_s256_is_referentially_transparent`
+        // pin on [crates/proxy/src/crypto/pkce.rs] and the
+        // `redact_url_is_idempotent_applying_twice_equals_applying_once`
+        // (round 160) idempotency pin — both are pure-function
+        // invariants on operator-facing surfaces. Spread the input
+        // across three policies + multi-byte unicode so the pin
+        // covers a realistic admin-list shape.
+        let yaml = "- id: café-rule\n  vendor: google\n  action: drive.files.get\n  mode: enforce\n  pic_mode: audit\n- id: bare\n- id: zeta\n  vendor: google\n  action: gmail.messages.send\n  mode: observe\n  pic_mode: enforce\n";
+        let first = parse_listing(yaml);
+        assert_eq!(first.len(), 3, "fixture sanity: 3 policies");
+        for i in 0..50 {
+            let again = parse_listing(yaml);
+            assert_eq!(again.len(), first.len(), "call {i} length drift");
+            for (a, b) in first.iter().zip(again.iter()) {
+                assert_eq!(a.id, b.id, "call {i} id drift");
+                assert_eq!(a.vendor, b.vendor, "call {i} vendor drift");
+                assert_eq!(a.action, b.action, "call {i} action drift");
+                assert_eq!(a.mode, b.mode, "call {i} mode drift");
+                assert_eq!(a.pic_mode, b.pic_mode, "call {i} pic_mode drift");
+            }
+        }
+    }
+
+    #[test]
+    fn policy_view_clone_serializes_byte_equal_to_original_across_independent_passes() {
+        // `PolicyView` derives `Clone` AND `Serialize` — operator
+        // tooling expects the cloned view to serialize to a byte-
+        // identical JSON document as the original (no per-clone
+        // identity smuggling, no insertion-order-sensitivity that
+        // would surface as a key reorder on the second serialize).
+        // The existing `policy_view_clone_preserves_every_field_byte_equal`
+        // pin checks field-level equality; pin the SERIALIZED form
+        // byte-equality so a refactor to a manual `Serialize` impl
+        // that interleaved any clock or counter "for trace tagging"
+        // would surface here as a multi-pass diff between original
+        // and clone. Symmetric to the round-N
+        // `expiry_and_escalation_report_debug_is_deterministic_across_independent_constructions`
+        // pin on the sibling reports — both axes pin byte-stability
+        // across independent constructions of equal-field values.
+        let v = PolicyView {
+            id: "p1".into(),
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            mode: "enforce".into(),
+            pic_mode: "audit".into(),
+        };
+        let c = v.clone();
+        let s_v = serde_json::to_string(&v).unwrap();
+        let s_c = serde_json::to_string(&c).unwrap();
+        assert_eq!(s_v, s_c, "clone serializes to non-byte-equal JSON");
+        // And the serialization is deterministic across two passes on
+        // the SAME instance (no insertion-order or once-cell-backed
+        // drift between consecutive calls).
+        let s_v_again = serde_json::to_string(&v).unwrap();
+        assert_eq!(s_v, s_v_again, "two-pass serialize drift on same instance");
+    }
 }

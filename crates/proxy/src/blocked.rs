@@ -859,4 +859,283 @@ mod canonical_request_json_tests {
         assert_eq!(c.escalation_after_minutes, Some(15));
         assert_eq!(c.request_canonical_json.as_deref(), Some("{}"));
     }
+
+    #[test]
+    fn canonical_request_max_len_is_power_of_two_for_memory_budget_alignment() {
+        // The existing `canonical_request_max_len_constant_pinned_at_4_kib`
+        // pin asserts the literal value (4096). Pin the structural
+        // invariant that earns the literal: 4096 = 2^12 is a power
+        // of two, which matters because the SIEM ingestors and
+        // postgres TOAST page boundaries align cleanly to power-of-
+        // two byte budgets (a refactor that bumped to 5000 "for round
+        // number" would silently misalign every audit row across the
+        // TOAST 8KB page boundary and could change the storage cost
+        // of every row by triggering a TOAST chunk-split). Symmetric
+        // pin to `default_tick_interval_is_strictly_positive_and_bounded_for_loop_safety`
+        // on [crates/proxy/src/blocked_expiry.rs] — both pin a
+        // structural invariant on top of the literal constant.
+        const {
+            assert!(
+                CANONICAL_REQUEST_MAX_LEN.is_power_of_two(),
+                "CANONICAL_REQUEST_MAX_LEN must be a power of two",
+            );
+            // And it must be > 0 (a zero cap would silently truncate
+            // every audit row to the envelope) AND ≤ 1 MiB (a
+            // refactor that bumped to 16 MB "for verbose debug"
+            // would silently inflate every audit row beyond the SIEM
+            // ingestor's per-event payload bound and the per-row
+            // postgres TOAST budget).
+            assert!(
+                CANONICAL_REQUEST_MAX_LEN > 0,
+                "must be positive to avoid truncating every row",
+            );
+            assert!(
+                CANONICAL_REQUEST_MAX_LEN <= 1024 * 1024,
+                "must be ≤ 1 MiB to keep SIEM + postgres budgets aligned",
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_request_json_is_referentially_transparent_across_fifty_repeated_calls() {
+        // The function is pure (no clock, no env, no global state —
+        // the `metrics::counter!` on the truncation path mutates a
+        // global counter but does NOT vary the returned bytes). Pin
+        // referential transparency by calling 50 times with the
+        // same args and asserting every call yields byte-equal
+        // output, across BOTH the non-truncated AND the truncation
+        // envelope branches. The existing `is_deterministic_across_calls`
+        // pin checks two calls on the non-truncated branch only; widen
+        // to 50 iterations × 2 branches so a refactor that introduced
+        // a once-cell-backed cache "for hot-path performance" OR a
+        // counter-tagged trace id would surface here. Symmetric to
+        // `verify_pkce_s256_is_referentially_transparent_across_repeated_calls`
+        // on [crates/proxy/src/crypto/pkce.rs] and the round-161
+        // `parse_listing_is_referentially_transparent_across_fifty_repeated_calls`
+        // pin on [crates/proxy/src/api/policy.rs].
+        let path_params = std::collections::HashMap::new();
+        let body = std::collections::HashMap::new();
+        let first_small = canonical_request_json(
+            "POST",
+            "/x",
+            "google",
+            "drive.files.get",
+            &path_params,
+            &body,
+        );
+        let mut big_body = std::collections::HashMap::new();
+        big_body.insert("blob".into(), serde_json::Value::String("z".repeat(8192)));
+        let first_big = canonical_request_json(
+            "POST",
+            "/drive/v3/files",
+            "google",
+            "drive.files.create",
+            &path_params,
+            &big_body,
+        );
+        for i in 0..50 {
+            let again_small = canonical_request_json(
+                "POST",
+                "/x",
+                "google",
+                "drive.files.get",
+                &path_params,
+                &body,
+            );
+            assert_eq!(again_small, first_small, "call {i} small-branch drift");
+            let again_big = canonical_request_json(
+                "POST",
+                "/drive/v3/files",
+                "google",
+                "drive.files.create",
+                &path_params,
+                &big_body,
+            );
+            assert_eq!(again_big, first_big, "call {i} truncation-branch drift");
+        }
+    }
+
+    #[test]
+    fn canonical_request_json_top_level_result_is_json_object_across_both_truncated_and_normal_branches()
+     {
+        // The existing tests pin individual top-level keys via
+        // `v["method"]`, `v["truncated"]`, etc., implicitly relying
+        // on the top-level shape being a JSON object — but never
+        // pin the object-shape contract directly. A refactor that
+        // wrapped the envelope in an array `[{...}]` "for batch
+        // ingest compat" OR returned a top-level JSON string
+        // (a `serde_json::to_string(&payload).unwrap()` accidentally
+        // double-serialized once) would still parse via
+        // `serde_json::from_str` but break every downstream consumer
+        // that walks via `v["method"]`. Pin `is_object()` on BOTH
+        // branches so the structural contract is explicit.
+        let path_params = std::collections::HashMap::new();
+        let body = std::collections::HashMap::new();
+        let small = canonical_request_json(
+            "GET",
+            "/x",
+            "google",
+            "drive.files.get",
+            &path_params,
+            &body,
+        );
+        let v_small: serde_json::Value = serde_json::from_str(&small).unwrap();
+        assert!(
+            v_small.is_object(),
+            "non-truncated branch must be JSON object, got: {v_small:?}",
+        );
+        assert!(!v_small.is_array());
+        assert!(!v_small.is_string());
+        // Truncation branch.
+        let mut big_body = std::collections::HashMap::new();
+        big_body.insert("blob".into(), serde_json::Value::String("y".repeat(8192)));
+        let big = canonical_request_json(
+            "POST",
+            "/drive/v3/files",
+            "google",
+            "drive.files.create",
+            &path_params,
+            &big_body,
+        );
+        let v_big: serde_json::Value = serde_json::from_str(&big).unwrap();
+        assert!(
+            v_big.is_object(),
+            "truncation envelope must be JSON object, got: {v_big:?}",
+        );
+        assert!(!v_big.is_array());
+        assert!(!v_big.is_string());
+    }
+
+    #[test]
+    fn canonical_request_json_multibyte_unicode_in_vendor_and_action_passes_through_truncation_envelope_verbatim()
+     {
+        // The existing `canonical_request_json_preserves_multibyte_unicode_in_body_string_value`
+        // pin walks multibyte content in the BODY field on the non-
+        // truncated branch only. Pin the symmetric contract on the
+        // TRUNCATION envelope's identification fields (vendor +
+        // action), which the operator-facing approver UI renders
+        // verbatim even when the body was elided. A refactor that
+        // `.to_ascii_lowercase()`-ed the vendor/action labels "for
+        // SIEM ingest hygiene" or `.replace(non_ascii, "?")`-ed them
+        // would silently mangle the truncation envelope's id triple
+        // and break per-tenant audit-row triage for non-ASCII
+        // vendor/action labels (a future multi-tenant deployment
+        // with localized vendor slugs). Force the truncation branch
+        // with a bloat body, then assert the multibyte vendor + action
+        // labels survive byte-for-byte.
+        let path_params = std::collections::HashMap::new();
+        let mut body = std::collections::HashMap::new();
+        body.insert("blob".into(), serde_json::Value::String("x".repeat(8192)));
+        let vendor = "googlé→🔥";
+        let action = "drive.files.café";
+        let s = canonical_request_json("POST", "/x", vendor, action, &path_params, &body);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["vendor"], vendor);
+        assert_eq!(v["action"], action);
+    }
+
+    #[test]
+    fn owned_blocked_notification_as_borrowed_sets_schema_to_constant_blocked_notification_schema_verbatim()
+     {
+        // The `as_borrowed()` builder unconditionally stamps the
+        // `schema` field to `BlockedNotification::SCHEMA` (the
+        // wire-versioned schema string downstream consumers route
+        // on). A refactor that started persisting the schema in
+        // `OwnedBlockedNotification` itself (to round-trip a
+        // historical wire version "for replay across schema bumps")
+        // would silently let stale schema strings leak back onto
+        // the notifier wire — every webhook receiver verifying the
+        // schema header would 4xx events from any pre-bump persist.
+        // Pin that `as_borrowed()` ALWAYS emits the current
+        // `BlockedNotification::SCHEMA` constant verbatim,
+        // regardless of what was in the original BlockedNotification
+        // (today's `OwnedBlockedNotification::from` doesn't even
+        // store the schema, but pin the invariant so a future
+        // refactor surfaces here rather than at the notifier wire).
+        let ops: Vec<String> = vec![];
+        let n = BlockedNotification {
+            schema: "obsolete-schema-string-from-past",
+            blocked_id: Uuid::nil(),
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "/p",
+            layer: "policy",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            approve_url: "u/approve".into(),
+            reject_url: "u/reject".into(),
+        };
+        let owned = OwnedBlockedNotification::from(&n);
+        let borrowed = owned.as_borrowed();
+        // schema must be the current SCHEMA constant, NOT the
+        // obsolete string from the input.
+        assert_eq!(borrowed.schema, BlockedNotification::SCHEMA);
+        assert_ne!(borrowed.schema, "obsolete-schema-string-from-past");
+    }
+
+    #[test]
+    fn owned_blocked_notification_as_borrowed_is_repeatable_yields_byte_equal_fields_across_two_calls()
+     {
+        // `as_borrowed()` is called once per spawned notifier task
+        // (webhook + slack + email fan-out — up to three calls
+        // against the same OwnedBlockedNotification instance). Pin
+        // that two consecutive calls on the same instance produce
+        // byte-equal borrowed views — a refactor that mutated any
+        // internal state on the first call (e.g. lazily computed a
+        // signature and cached it back into the owned struct "for
+        // performance") OR a refactor that introduced any once-
+        // cell-backed tagging would surface here as a divergence
+        // between the webhook and slack fan-out arms. Symmetric to
+        // the `verify_pkce_s256_is_referentially_transparent` and
+        // round-161 `parse_listing_is_referentially_transparent`
+        // pins — pure-helper repeatability invariants.
+        let ops = vec!["gmail:send:bob@external.com".to_string()];
+        let id = Uuid::new_v4();
+        let req = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let n = BlockedNotification {
+            schema: BlockedNotification::SCHEMA,
+            blocked_id: id,
+            request_id: req,
+            session_id: session,
+            p_0: Some("alice@acme.com"),
+            vendor: "google",
+            action: "gmail.messages.send",
+            method: "POST",
+            path: "/gmail/v1/users/me/messages/send",
+            layer: "policy",
+            policy_id: Some("p1"),
+            detail: Some("external recipient"),
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            approve_url: "u/approve".into(),
+            reject_url: "u/reject".into(),
+        };
+        let owned = OwnedBlockedNotification::from(&n);
+        let a = owned.as_borrowed();
+        let b = owned.as_borrowed();
+        assert_eq!(a.schema, b.schema);
+        assert_eq!(a.blocked_id, b.blocked_id);
+        assert_eq!(a.request_id, b.request_id);
+        assert_eq!(a.session_id, b.session_id);
+        assert_eq!(a.p_0, b.p_0);
+        assert_eq!(a.vendor, b.vendor);
+        assert_eq!(a.action, b.action);
+        assert_eq!(a.method, b.method);
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.layer, b.layer);
+        assert_eq!(a.policy_id, b.policy_id);
+        assert_eq!(a.detail, b.detail);
+        assert_eq!(a.predecessor_pca_id, b.predecessor_pca_id);
+        assert_eq!(a.requested_ops, b.requested_ops);
+        assert_eq!(a.approve_url, b.approve_url);
+        assert_eq!(a.reject_url, b.reject_url);
+    }
 }

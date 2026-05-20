@@ -1265,4 +1265,157 @@ mod tests {
         let s: Vec<&str> = domains.iter().filter_map(|d| d.as_str()).collect();
         assert_eq!(s, vec!["acme.com"]);
     }
+
+    #[test]
+    fn max_body_constant_is_ten_mebibytes_byte_exact_parity_with_drive_adapter() {
+        // spec.md §5.5 — every Google adapter (drive + calendar + gmail)
+        // shares the same 10 MiB upstream-body budget. Drive's round-166
+        // pin walks the byte-exact value on its module-local MAX_BODY;
+        // calendar is a deliberate parallel and a drift between the two
+        // (e.g. a calendar-only refactor to 5 MiB "for shorter timeouts")
+        // would silently shift the budget below the per-vendor median
+        // for one adapter only. Pin byte-exact value AND const-block > 0
+        // AND usize type-tag — symmetric to drive's pin.
+        assert_eq!(MAX_BODY, 10 * 1024 * 1024);
+        assert_eq!(MAX_BODY, 10_485_760);
+        const _MAX_BODY_POSITIVE: () = assert!(MAX_BODY > 0);
+        const _MAX_IS_USIZE: usize = MAX_BODY;
+        assert_eq!(_MAX_IS_USIZE, 10_485_760);
+    }
+
+    #[test]
+    fn max_event_json_constant_is_one_mebibyte_byte_exact_for_google_calendar_upstream_cap() {
+        // Google Calendar's published upstream cap on event JSON is ~1 MiB
+        // (see module docstring); the proxy surfaces the limit BEFORE the
+        // upstream call so operators see a structured 413 rather than an
+        // opaque Google 4xx. The constant is calendar-specific (drive
+        // doesn't have it; the read endpoints don't accept agent bodies)
+        // — pin byte-exact value AND `MAX_EVENT_JSON < MAX_BODY`
+        // (otherwise the per-event cap would never trip; the body cap
+        // would always win first).
+        assert_eq!(MAX_EVENT_JSON, 1024 * 1024);
+        assert_eq!(MAX_EVENT_JSON, 1_048_576);
+        const _MAX_EVENT_JSON_POSITIVE: () = assert!(MAX_EVENT_JSON > 0);
+        // Relationship invariant: per-event cap strictly tighter than
+        // overall body cap so the structured 413 surfaces with the
+        // event-specific message.
+        const _EVENT_TIGHTER_THAN_BODY: () = assert!(MAX_EVENT_JSON < MAX_BODY);
+        assert_eq!(MAX_BODY / MAX_EVENT_JSON, 10);
+    }
+
+    #[test]
+    fn domain_of_preserves_multibyte_unicode_in_domain_part_verbatim() {
+        // `domain_of` calls `.to_ascii_lowercase().trim()` — ASCII letters
+        // get lowercased but multibyte unicode (`café`, `日本`) passes
+        // through unchanged. The existing module pins ASCII-only domain
+        // lowercasing (`Bob@Example.COM` → `example.com`) but never the
+        // multibyte case. A refactor to `.to_lowercase()` (locale-aware
+        // unicode lowercase) "for stricter normalization" would silently
+        // mangle non-ASCII domains — e.g. `İSTANBUL.tr` lowercases under
+        // Turkish locale to `istanbul.tr` AND under en-US to `i̇stanbul.tr`
+        // (with a combining dot above U+0307). Pin byte-equal verbatim
+        // passthrough for a multibyte domain.
+        assert_eq!(
+            domain_of("user@café.com").as_deref(),
+            Some("café.com"),
+            "multibyte é must pass through unchanged",
+        );
+        // ASCII case still lowered on the same input.
+        assert_eq!(
+            domain_of("user@CAFÉ.com").as_deref(),
+            Some("cafÉ.com"),
+            "ASCII C/A/F lowered but É (non-ASCII) preserved verbatim per to_ascii_lowercase contract",
+        );
+        // Cross-script: Japanese.
+        assert_eq!(
+            domain_of("alice@日本.jp").as_deref(),
+            Some("日本.jp"),
+            "Japanese characters must pass through unchanged",
+        );
+    }
+
+    #[test]
+    fn urlencoding_preserves_at_sign_and_dot_verbatim_for_email_shaped_calendar_ids() {
+        // Google Calendar IDs are typically email-shaped (`primary`,
+        // `alice@org.com`, hex strings). The PATH AsciiSet encodes
+        // `' '`, `/`, `?`, `#`, `&`, `%` — but explicitly NOT `@` or
+        // `.`. A refactor that switched to `percent_encoding::NON_ALPHANUMERIC`
+        // (a stricter set) would silently encode `@` as `%40` and
+        // break every email-shaped calendar ID at the Google upstream
+        // (which expects `alice@org.com` byte-equal in the path).
+        // Pin `@` + `.` + alphanum verbatim passthrough.
+        assert_eq!(urlencoding("alice@org.com"), "alice@org.com");
+        assert_eq!(urlencoding("primary"), "primary");
+        assert_eq!(urlencoding("abc123"), "abc123");
+        // Hex strings (the other common calendar-id shape) survive byte-equal.
+        assert_eq!(
+            urlencoding("0123456789abcdef0123456789abcdef"),
+            "0123456789abcdef0123456789abcdef",
+        );
+        // And the reserved chars ARE still encoded.
+        assert_eq!(urlencoding("a/b"), "a%2Fb");
+        assert_eq!(urlencoding("a?b"), "a%3Fb");
+    }
+
+    #[test]
+    fn urlencoding_encodes_percent_sign_to_prevent_double_decode_on_google_upstream() {
+        // The PATH AsciiSet explicitly includes `%` — without this, a
+        // calendar id that legitimately contained `%` (e.g. from a prior
+        // double-encode upstream) would be ambiguous at Google's path
+        // parser (it would attempt to decode `%XX` as a hex escape). Pin
+        // that `%` is ALWAYS encoded as `%25` AND that a literal `%2F`
+        // surface in an input is itself further encoded to `%252F` (the
+        // helper is NOT idempotent — this is the safety contract; a
+        // refactor dropping `%` from the encode set "to avoid double-
+        // encoding" would silently let `%2F` flow through and be decoded
+        // to `/` by Google's path parser, opening a path-traversal vector).
+        assert_eq!(urlencoding("%"), "%25");
+        assert_eq!(urlencoding("a%b"), "a%25b");
+        // Non-idempotency: applying twice produces double-encoded output.
+        let once = urlencoding("a/b");
+        assert_eq!(once, "a%2Fb");
+        let twice = urlencoding(&once);
+        assert_eq!(twice, "a%252Fb", "double-encode must produce %25 prefix");
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_block_preserves_reason_string_multibyte_unicode_verbatim() {
+        // Symmetric to round-166 google_drive.rs PolicyBlocked.reason
+        // multibyte pin extended to calendar adapter. The existing
+        // calendar pin (round-66) walks ASCII-only reasons; a refactor
+        // applying `.to_ascii_lowercase()` "for SIEM hygiene" on the
+        // calendar arm alone would silently mangle non-English reasons
+        // and split the dashboard's "blocked-by-policy" bucket between
+        // calendar and drive on the same multibyte input.
+        let reason: String = "外部参加者ブロック café→🔥".into();
+        let err = enforce_pre_request_decision(&Outcome {
+            matched_policy_id: Some("cal-external-attendee-gate".into()),
+            decision: Decision::Block {
+                reason: reason.clone(),
+                override_allowed: true,
+            },
+            required_ops: policy_engine::OpsExpression::default(),
+            read_filter: None,
+            pic_mode: policy_engine::PicMode::Audit,
+            mode: policy_engine::Mode::Enforce,
+            observe_would_have: None,
+            audit_body: None,
+        })
+        .unwrap_err();
+        match err {
+            AppError::PolicyBlocked {
+                reason: out_reason,
+                policy_id,
+                override_allowed,
+            } => {
+                assert_eq!(
+                    out_reason, reason,
+                    "multibyte reason must pass through byte-equal"
+                );
+                assert_eq!(policy_id.as_deref(), Some("cal-external-attendee-gate"));
+                assert!(override_allowed);
+            }
+            other => panic!("expected PolicyBlocked, got {other:?}"),
+        }
+    }
 }

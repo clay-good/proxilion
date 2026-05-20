@@ -423,4 +423,156 @@ mod tests {
         assert_eq!(c.pic_mode, "runtime_gate");
         assert_eq!(c.p_0, Some("alice@demo.local"));
     }
+
+    #[test]
+    fn pic_violation_record_pic_mode_field_is_static_str_lifetime_for_zero_alloc_log_filter() {
+        // The module docstring + persist binding both treat `pic_mode` as
+        // a two-value enum-on-strings (`"audit"` or `"runtime_gate"`).
+        // The existing module pins the value across both Debug + Clone
+        // surfaces, but never the `&'static str` lifetime. A refactor to
+        // `String` "for richer mode labels like `runtime_gate.confirmed`"
+        // would silently allocate one String per PIC violation row at the
+        // adapter-layer build site (every Drive/Gmail/Calendar request
+        // that trips monotonicity ends up here) — pin lifetime via a
+        // `require_static_str` fn whose signature only compiles when
+        // the field has `'static` lifetime, symmetric to round-163
+        // ConfigError::InvalidValue.field pin + round-165 oauth
+        // token_type pin extended to PicViolationRecord.pic_mode.
+        fn require_static_str(_: &'static str) {}
+        let req = Uuid::new_v4();
+        let sess = Uuid::new_v4();
+        let ops: Vec<String> = vec![];
+        let atoms: Vec<String> = vec![];
+        let r = PicViolationRecord {
+            request_id: req,
+            session_id: sess,
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "GET",
+            path: "/",
+            policy_id: None,
+            predecessor_pca_id: None,
+            attempted_ops: &ops,
+            missing_atoms: &atoms,
+            pic_mode: "runtime_gate",
+            detail: None,
+        };
+        require_static_str(r.pic_mode);
+        // Cross-value sweep: both canonical labels are 'static-bound.
+        let r2 = PicViolationRecord {
+            pic_mode: "audit",
+            ..r.clone()
+        };
+        require_static_str(r2.pic_mode);
+    }
+
+    #[test]
+    fn pic_violation_record_static_borrow_is_send_sync_for_tokio_spawn_boundary() {
+        // `persist()` is an async fn that takes the Record by value and
+        // performs an `.await` on the DB INSERT — the Record must be
+        // `Send` across that .await point for any caller that pushes
+        // the persist call into a `tokio::spawn` block (the
+        // tee-to-audit-sink path does this so the request return path
+        // doesn't wait on the secondary writer). The 'a borrow makes
+        // `Sync` impossible at arbitrary lifetimes; pin the 'static
+        // instantiation specifically — which is sufficient for the
+        // tokio::spawn caller since the borrowed slices it constructs
+        // live as long as the spawned future. Symmetric to round-164
+        // PicExecutor Send+Sync+'static pin extended to violations
+        // record.
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<PicViolationRecord<'static>>();
+    }
+
+    #[test]
+    fn parse_missing_atoms_is_referentially_transparent_across_fifty_repeated_calls() {
+        // Symmetric to round-161 parse_listing + round-162 canonical_request_json
+        // + round-166 enforce_pre_request_decision referential-transparency
+        // pins extended to PIC violation parsing. The Trust Plane
+        // refusal-body parser is called once per PIC-mode violation; a
+        // refactor caching results in a `once_cell` keyed on a hash of
+        // the detail string "for hot-path perf" would surface a stale
+        // result on the next violation with a different detail but a
+        // colliding hash. Pin 50 calls on a multi-atom fixture and assert
+        // every call returns byte-equal Vec<String>.
+        let detail = "ops not subset of predecessor: missing [drive:read:bob/secret.docx, gmail:send:to/eve@evil.example, calendar:write:event/q4-planning]";
+        let baseline = parse_missing_atoms(detail);
+        assert_eq!(baseline.len(), 3, "fixture must produce exactly 3 atoms");
+        for i in 0..50 {
+            let again = parse_missing_atoms(detail);
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: parse_missing_atoms must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_missing_atoms_preserves_multibyte_unicode_in_atoms_verbatim() {
+        // The atom labels can contain multibyte unicode when the policy
+        // YAML carries non-ASCII resource paths (e.g. a Drive file id
+        // that's a unicode title, a calendar event id with kanji). The
+        // existing module never walks a multibyte atom; a refactor
+        // applying `.to_ascii_lowercase()` "for SIEM hygiene" or
+        // `.replace(|c: char| !c.is_ascii(), "?")` "for grep safety"
+        // would silently mangle non-ASCII atom labels and split the
+        // operator's dashboard bucket between ASCII and multibyte
+        // policies on what should be the same `missing_atoms[i]` value.
+        // Pin byte-equal preservation across café + Japanese + emoji.
+        let detail = "missing [drive:read:café/secret.docx, calendar:write:event/日本-q4, gmail:send:to/eve🔥@evil.example]";
+        let atoms = parse_missing_atoms(detail);
+        assert_eq!(atoms.len(), 3);
+        assert_eq!(atoms[0], "drive:read:café/secret.docx");
+        assert_eq!(atoms[1], "calendar:write:event/日本-q4");
+        assert_eq!(atoms[2], "gmail:send:to/eve🔥@evil.example");
+    }
+
+    #[test]
+    fn parse_missing_atoms_returns_empty_vec_on_four_distinct_no_bracket_input_shapes() {
+        // The early-return contract — `let Some(open) = detail.find('[')
+        // else { return Vec::new(); }` — must produce an EMPTY Vec on
+        // every no-bracket input shape, not panic, not return a
+        // single-element fallback, not echo the input as one atom.
+        // The existing pin walks one no-bracket input — pin 4 distinct
+        // shapes so a refactor to "fall back to splitting on whitespace
+        // when no brackets" silently surfaces an N-atom result on what
+        // operators expect to be the empty-list contract.
+        // (1) Empty string.
+        assert!(parse_missing_atoms("").is_empty());
+        // (2) Long no-bracket prose.
+        let long = "x".repeat(1000);
+        assert!(parse_missing_atoms(&long).is_empty());
+        // (3) Single non-bracket char.
+        assert!(parse_missing_atoms("a").is_empty());
+        // (4) Comma-separated text with no brackets at all (would-be
+        //     hot-path for a "smart" fallback to splitting on commas).
+        assert!(parse_missing_atoms("a, b, c").is_empty());
+        // (5) Closing bracket only — open bracket is what triggers the
+        //     parse; without it, no atoms.
+        assert!(parse_missing_atoms("foo]").is_empty());
+    }
+
+    #[test]
+    fn parse_missing_atoms_returns_owned_vec_string_type_not_borrowed_slice() {
+        // The persist() bind site requires `Vec<String>` (owned) because
+        // sqlx binds the slice to `text[]` and the Postgres driver
+        // serializes one String at a time. A refactor to `Vec<&'a str>`
+        // "to avoid per-atom allocation" would surface at the persist
+        // binding as a lifetime constraint — break the call site that
+        // constructs a transient detail String, parses it, then drops it
+        // before the bind (`detail` is dropped at end of statement, but
+        // the parsed atoms must outlive). The existing pin
+        // (`parse_atoms_returns_owned_strings_independent_of_input_lifetime`)
+        // walks the value-level outlives semantic; pin the TYPE-level
+        // contract via a generic fn whose signature only compiles when
+        // the return is `Vec<String>` — a refactor to `Vec<&str>` would
+        // fail compilation here rather than at the bind site.
+        fn require_vec_string(_: &Vec<String>) {}
+        let atoms = parse_missing_atoms("missing [a:1, b:2]");
+        require_vec_string(&atoms);
+        // Defensive: each atom is also owned `String`, not `&str`.
+        fn require_string(_: &String) {}
+        require_string(&atoms[0]);
+    }
 }

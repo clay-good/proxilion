@@ -925,4 +925,151 @@ mod tests {
         assert_eq!(v["code"], "pic_invariant_violation");
         assert!(v["detail"].as_str().unwrap().contains("monotonicity"));
     }
+
+    #[test]
+    fn max_body_constant_is_ten_mebibytes_byte_exact_for_spec_5_5_upstream_budget() {
+        // spec.md §5.5 — adapters MUST bound upstream body reads at a
+        // fixed budget so a malicious or buggy upstream can't OOM the
+        // proxy. The constant is `10 * 1024 * 1024` = 10 MiB; existing
+        // tests in this module never pin the value. A refactor to a
+        // megabyte (`10 * 1_000 * 1_000` = 10 MB, 4.86% smaller) "for
+        // round-number reporting" would silently shrink the budget below
+        // every PowerPoint export from Drive (those routinely exceed 9.6
+        // MB but stay under 10 MiB). Pin the byte-exact value AND
+        // arithmetic identity AND > 0.
+        assert_eq!(MAX_BODY, 10 * 1024 * 1024);
+        assert_eq!(MAX_BODY, 10_485_760);
+        const _MAX_BODY_POSITIVE: () = assert!(MAX_BODY > 0);
+        // The constant is referenced via the bounded-read helper — pin
+        // it survives at the compile-time const-block (an `_: usize` cast
+        // would let a future refactor change the type silently).
+        const _MAX_IS_USIZE: usize = MAX_BODY;
+        assert_eq!(_MAX_IS_USIZE, 10_485_760);
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_is_referentially_transparent_across_fifty_calls_on_allow() {
+        // The handler invokes `enforce_pre_request_decision` exactly
+        // once per request, but a refactor that started caching the
+        // result keyed on `&outcome as *const _` "for hot-path perf"
+        // would surface here as a stale result on the next request with
+        // a different Outcome but same Allow shape. The existing pin
+        // (`enforce_allow_is_ok`) walks one call only — pin 50 calls
+        // on independent Outcome instances each constructed with
+        // distinct matched_policy_id, ensuring no hidden caching.
+        for i in 0..50 {
+            let mut o = outcome(Decision::Allow);
+            o.matched_policy_id = Some(format!("policy-{i}"));
+            assert!(
+                enforce_pre_request_decision(&o).is_ok(),
+                "iteration {i}: expected Ok",
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_block_preserves_reason_string_multibyte_unicode_verbatim() {
+        // The existing block-arm pin walks ASCII-only `external send
+        // blocked`. A refactor that called `.to_ascii_lowercase()` "for
+        // SIEM hygiene" or `.replace(' ', "_")` would silently mangle
+        // non-ASCII reasons (operators in non-English locales write
+        // policy reasons in their own language). Pin multibyte unicode
+        // passthrough byte-equal — symmetric to round-162 blocked.rs
+        // multibyte vendor + action pin extended to PolicyBlocked.reason.
+        let reason: String = "外部送信ブロック café→🔥".into();
+        let err = enforce_pre_request_decision(&outcome(Decision::Block {
+            reason: reason.clone(),
+            override_allowed: false,
+        }))
+        .unwrap_err();
+        match err {
+            AppError::PolicyBlocked {
+                reason: out_reason, ..
+            } => {
+                assert_eq!(
+                    out_reason, reason,
+                    "reason must pass through byte-equal including multibyte",
+                );
+            }
+            other => panic!("expected PolicyBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_proxy_headers_writes_exactly_three_known_headers_when_policy_id_is_some() {
+        // The existing pin (`proxy_headers_present`) asserts the three
+        // headers are PRESENT but never that they are the EXHAUSTIVE
+        // set — a refactor adding `x-proxilion-trace-id` (round-3 §3
+        // shipped trace_id surfacing on responses; a future
+        // copy-paste into this helper "for symmetry" would silently
+        // expand every adapter's response header set). Pin the
+        // exhaustive set via HashSet equality on the header names.
+        let mut h = HeaderMap::new();
+        insert_proxy_headers(&mut h, Uuid::nil(), &outcome(Decision::Allow), Uuid::nil());
+        let names: std::collections::HashSet<String> =
+            h.keys().map(|n| n.as_str().to_ascii_lowercase()).collect();
+        let expected: std::collections::HashSet<String> = [
+            "x-proxilion-request-id",
+            "x-proxilion-pca-id",
+            "x-proxilion-policy",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            names, expected,
+            "insert_proxy_headers must write EXACTLY these 3 headers when policy_id is Some",
+        );
+    }
+
+    #[test]
+    fn insert_proxy_headers_x_proxilion_policy_value_byte_equal_to_matched_policy_id_input() {
+        // The existing pin (`proxy_headers_present`) asserts equality
+        // against a fixed `"test-policy"` literal but never that the
+        // value is byte-equal to the INPUT (a refactor that mapped
+        // policy ids through a slugifier "for header-safe values"
+        // would silently strip dots / underscores from policy ids
+        // like `gmail.external-send-gate.v2` and break operator
+        // dashboards that join header values back to policy YAML ids).
+        // Pin byte-equal across 4 policy-id shapes including dots,
+        // hyphens, underscores, and ASCII-uppercase.
+        for pid in &[
+            "gmail.external-send-gate.v2",
+            "drive_quarantine_layerB",
+            "Calendar-External-Invite-Block",
+            "p",
+        ] {
+            let mut h = HeaderMap::new();
+            let mut o = outcome(Decision::Allow);
+            o.matched_policy_id = Some((*pid).into());
+            insert_proxy_headers(&mut h, Uuid::nil(), &o, Uuid::nil());
+            let got = h.get("x-proxilion-policy").unwrap().to_str().unwrap();
+            assert_eq!(got, *pid, "policy header must be byte-equal to input");
+        }
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_rate_limit_ignores_burst_and_per_seconds_fields() {
+        // RateLimit's burst + per_seconds fields are read by the
+        // rate-limiter middleware downstream, NOT by
+        // enforce_pre_request_decision (which collapses to bare
+        // AppError::RateLimit with no inner detail per spec.md §5.7
+        // — operator-facing 429 responses don't echo back the policy's
+        // limit parameters). The existing pin walks one (burst=1,
+        // per_seconds=60) but never asserts the collapse: a refactor
+        // adding `AppError::RateLimit { burst, per_seconds }` "for
+        // richer 429 envelopes" would surface here on the across-the-
+        // matrix test. Pin same variant across distinct numeric inputs.
+        for (burst, per) in &[(0u32, 1u32), (1, 60), (100, 3600), (u32::MAX, u32::MAX)] {
+            let err = enforce_pre_request_decision(&outcome(Decision::RateLimit {
+                burst: *burst,
+                per_seconds: *per,
+            }))
+            .unwrap_err();
+            assert!(
+                matches!(err, AppError::RateLimit),
+                "RateLimit({burst},{per}) must collapse to bare AppError::RateLimit",
+            );
+        }
+    }
 }

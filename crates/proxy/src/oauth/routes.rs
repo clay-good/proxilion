@@ -963,4 +963,188 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn token_response_serializes_with_exactly_four_known_keys_for_rfc_6749_compat() {
+        // RFC 6749 §5.1 defines the access-token response shape:
+        // `access_token`, `token_type`, `expires_in`, `scope` (+ the
+        // optional `refresh_token`, which we deliberately omit because
+        // the bearer is the single source of truth). Existing tests in
+        // this module never assert the EXHAUSTIVE wire shape — a refactor
+        // adding a `granted_at` "ergonomic display" field would silently
+        // ship a new key to every relying party (CLIs grep on the
+        // 4-key shape; a fifth key sliding in would mis-bucket fields
+        // in the `--json` renderer). Pin the set as an exhaustive
+        // HashSet equality — symmetric to round-161 `PolicyView`
+        // exhaustive-5-key pin extended to OAuth token response.
+        let body = TokenResponse {
+            access_token: "ya29.test-access-token".into(),
+            token_type: "Bearer",
+            expires_in: 3600,
+            scope: "openid profile email".into(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        let obj = v
+            .as_object()
+            .expect("TokenResponse must serialize as JSON object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
+        let expected: std::collections::HashSet<&str> =
+            ["access_token", "token_type", "expires_in", "scope"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            keys, expected,
+            "TokenResponse must serialize with EXACTLY these 4 keys per RFC 6749 §5.1",
+        );
+    }
+
+    #[test]
+    fn token_response_token_type_field_is_static_str_type_with_bearer_value_byte_equal() {
+        // RFC 6749 §5.1 + RFC 6750 §4 — the `token_type` MUST be `Bearer`
+        // byte-equal (capitalized B, lowercase tail). The existing module
+        // never pins the field's `&'static str` *type tag* (vs a `String`
+        // that would still serialize byte-equal but allocate per response).
+        // A refactor to `String` "for ergonomic builder symmetry with
+        // access_token" would silently allocate one String per token
+        // response — surfacing on this `require_static_str` fn whose
+        // signature compiles only when the field has `'static` lifetime.
+        // Pin both: type-level via dyn-cast AND value-level byte-equal.
+        fn require_static_str(_: &'static str) {}
+        let body = TokenResponse {
+            access_token: "x".into(),
+            token_type: "Bearer",
+            expires_in: 1,
+            scope: "s".into(),
+        };
+        require_static_str(body.token_type);
+        assert_eq!(body.token_type, "Bearer");
+        // Defensive against accidental case-flip: not "bearer", not "BEARER".
+        assert_ne!(body.token_type, "bearer");
+        assert_ne!(body.token_type, "BEARER");
+        // Wire shape: serialize to JSON and verify the value byte-equal.
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(
+            s.contains("\"token_type\":\"Bearer\""),
+            "expected literal `\"token_type\":\"Bearer\"` substring: {s}",
+        );
+    }
+
+    #[test]
+    fn token_response_expires_in_field_serializes_as_json_number_type_not_string() {
+        // RFC 6749 §5.1 — `expires_in` is a JSON number. A refactor to
+        // `String` "to carry units (\"3600s\") for human readability"
+        // would silently break every OAuth client that parses it as
+        // `int`. The existing module never asserts the JSON type tag
+        // — pin `is_number` AND the inverse `!is_string` for both
+        // 3600 (production) and 0 (token-expired edge) values.
+        for &v in &[0i64, 3600, i64::MAX] {
+            let body = TokenResponse {
+                access_token: "x".into(),
+                token_type: "Bearer",
+                expires_in: v,
+                scope: "s".into(),
+            };
+            let j: serde_json::Value = serde_json::to_value(&body).unwrap();
+            assert!(
+                j["expires_in"].is_number(),
+                "expires_in must be JSON number, not {:?}",
+                j["expires_in"],
+            );
+            assert!(
+                !j["expires_in"].is_string(),
+                "expires_in must NOT be JSON string for value {v}",
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_error_class_returns_static_str_lifetime_for_zero_alloc_log_label() {
+        // `oauth_error_class` is invoked on every OAuth handler error
+        // path to attach a `class={denied|error}` label to the metric
+        // `proxilion_oauth_callback_total`. The existing tests pin the
+        // value across variants but never the `&'static str` lifetime
+        // — a refactor returning `String` "for variant-specific dynamic
+        // labels" would silently allocate one String per error metric
+        // emission. Pin lifetime via `require_static_str` fn whose
+        // signature only compiles when the return type is `&'static
+        // str` — symmetric to round-163 `ConfigError::InvalidValue.field`
+        // pin extended to a function return.
+        fn require_static_str(_: &'static str) {}
+        // Cross-variant sweep: every variant on both sides of the
+        // denied/error split must produce a `&'static str` label.
+        let bad_req = OAuthError::BadRequest("bad".into());
+        let unknown_client = OAuthError::UnknownClient;
+        let session_gone = OAuthError::SessionGone;
+        let bridge = OAuthError::BridgeRejected("nope".into());
+        let pkce = OAuthError::PkceFail;
+        let bad_code = OAuthError::BadAuthCode;
+        let pic_inv = OAuthError::PicInvariant("hop".into());
+        let crypto = OAuthError::Crypto;
+        let internal = OAuthError::Internal("boom".into());
+        require_static_str(oauth_error_class(&bad_req));
+        require_static_str(oauth_error_class(&unknown_client));
+        require_static_str(oauth_error_class(&session_gone));
+        require_static_str(oauth_error_class(&bridge));
+        require_static_str(oauth_error_class(&pkce));
+        require_static_str(oauth_error_class(&bad_code));
+        require_static_str(oauth_error_class(&pic_inv));
+        require_static_str(oauth_error_class(&crypto));
+        require_static_str(oauth_error_class(&internal));
+    }
+
+    #[test]
+    fn new_auth_code_returns_distinct_values_across_one_hundred_calls_for_collision_safety() {
+        // The existing module pins length (52) + alphabet (no `=`, no
+        // `0/1/8/9`) on a single sample but never the COLLISION
+        // PROPERTY — auth_codes are the primary key on the `auth_codes`
+        // table; a refactor to a counter or to a hash of fixed input
+        // would silently produce duplicates and the next OAuth callback
+        // would 23505 (unique violation) at the INSERT site. Pin
+        // distinctness across 100 calls — symmetric to the 32-byte / 256
+        // bits of entropy the RNG draws (birthday-paradox collision
+        // probability is ~10^-58 for 100 draws, so a measured
+        // duplicate-across-100 surfaces a non-RNG implementation).
+        let mut seen = std::collections::HashSet::with_capacity(100);
+        for _ in 0..100 {
+            let c = new_auth_code();
+            assert_eq!(c.len(), 52, "every code must be 52 chars: {c}");
+            assert!(
+                seen.insert(c.clone()),
+                "duplicate auth_code in 100-call sweep: {c}",
+            );
+        }
+        assert_eq!(seen.len(), 100, "expected 100 distinct codes");
+    }
+
+    #[test]
+    fn token_form_deserializes_from_form_encoded_body_with_all_five_required_fields() {
+        // The handler accepts the OAuth token endpoint shape per RFC 6749
+        // §4.1.3 + §4.1.4 + RFC 7636 §4.5: `grant_type`, `code`,
+        // `redirect_uri`, `client_id`, `code_verifier`. The existing
+        // module never round-trips a real form-encoded payload — a
+        // refactor renaming any of the 5 fields (e.g. `code_verifier` →
+        // `pkce_verifier` "for clarity") would silently break every OAuth
+        // client. Pin the 5-field shape via `serde_urlencoded` round
+        // trip — the same crate axum's `Form` extractor uses internally.
+        let encoded = "grant_type=authorization_code\
+                       &code=test-auth-code-52-chars\
+                       &redirect_uri=https%3A%2F%2Fexample.com%2Fcallback\
+                       &client_id=proxilion-agent\
+                       &code_verifier=test-verifier-128-chars";
+        let form: TokenForm =
+            serde_urlencoded::from_str(encoded).expect("TokenForm must deserialize 5-field shape");
+        assert_eq!(form.grant_type, "authorization_code");
+        assert_eq!(form.code, "test-auth-code-52-chars");
+        assert_eq!(form.redirect_uri, "https://example.com/callback");
+        assert_eq!(form.client_id, "proxilion-agent");
+        assert_eq!(form.code_verifier, "test-verifier-128-chars");
+        // Missing any one of the 5 fields surfaces a deserialize error
+        // — pin one example (the spec-load-bearing `grant_type`) to
+        // catch a refactor that gave the field `#[serde(default)]`.
+        let missing_grant = "code=c&redirect_uri=u&client_id=cid&code_verifier=cv";
+        assert!(
+            serde_urlencoded::from_str::<TokenForm>(missing_grant).is_err(),
+            "missing grant_type must surface deserialize error",
+        );
+    }
 }

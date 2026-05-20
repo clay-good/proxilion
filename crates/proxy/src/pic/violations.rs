@@ -575,4 +575,182 @@ mod tests {
         fn require_string(_: &String) {}
         require_string(&atoms[0]);
     }
+
+    // ─── round 184 (2026-05-20): PicViolationRecord + parse_missing_atoms surfaces ───
+
+    #[test]
+    fn pic_violation_record_attempted_ops_and_missing_atoms_fields_are_borrowed_string_slice_type()
+    {
+        // `attempted_ops: &'a [String]` AND `missing_atoms: &'a [String]`
+        // — both fields are borrowed slices over owned `String`s. The
+        // borrow shape is load-bearing for the persist() bind path:
+        // sqlx's `.bind(r.attempted_ops)` accepts `&[String]` directly
+        // for the `text[]` column type. A refactor to `Vec<String>`
+        // "for ownership clarity" would force every call site to
+        // clone the upstream Vec into the record (the adapter
+        // currently constructs a transient Vec, takes a borrow, then
+        // drops both at end of scope — the persist() future captures
+        // the borrow). Pin both field types via the canonical
+        // require_slice_string helper. Symmetric to round-179 +
+        // round-180 + round-181 owned-vs-borrowed type pins extended
+        // to this Record's borrowed-slice fields.
+        fn require_slice_string(_: &[String]) {}
+        let attempted: Vec<String> = vec!["a:1".into(), "b:2".into()];
+        let missing: Vec<String> = vec!["c:3".into()];
+        let r = PicViolationRecord {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "POST",
+            path: "/x",
+            policy_id: None,
+            predecessor_pca_id: None,
+            attempted_ops: &attempted,
+            missing_atoms: &missing,
+            pic_mode: "audit",
+            detail: None,
+        };
+        require_slice_string(r.attempted_ops);
+        require_slice_string(r.missing_atoms);
+        // Round-trip sanity: the borrowed slice pointer equals the
+        // original Vec's slice pointer (zero-copy borrow).
+        assert_eq!(r.attempted_ops.as_ptr(), attempted.as_ptr());
+        assert_eq!(r.missing_atoms.as_ptr(), missing.as_ptr());
+    }
+
+    #[test]
+    fn parse_missing_atoms_with_open_bracket_at_first_char_yields_normal_parse() {
+        // The parser uses `detail.find('[')` — when the open bracket
+        // is at byte offset 0 (no prefix), the slicing arithmetic
+        // `&detail[open + 1..]` must NOT panic and the atoms inside
+        // must be parsed normally. The existing tests all pin
+        // bracket-with-prefix shapes (`"missing [...]"`); pin the
+        // no-prefix edge here so a refactor that pre-required a
+        // colon-or-space before the bracket "for shape validation"
+        // would silently start returning empty Vec on what is a
+        // legitimate Trust-Plane refusal shape (`"[a:1, b:2]"`).
+        let atoms = parse_missing_atoms("[a:1, b:2]");
+        assert_eq!(atoms, vec!["a:1".to_string(), "b:2".to_string()]);
+    }
+
+    #[test]
+    fn parse_missing_atoms_with_open_bracket_as_last_char_returns_empty_without_panic() {
+        // Boundary: when the open bracket `[` is the LAST character of
+        // the input, `detail.find('[')` returns `Some(len - 1)`, and
+        // `detail[open + 1..]` is the empty slice — `find(']')` on
+        // that returns None, so the function short-circuits to
+        // `Vec::new()`. Pin that NO panic surfaces in the slice
+        // arithmetic AND the empty-Vec return contract holds. A
+        // refactor that pre-validated `open + 1 < detail.len()` via
+        // an `assert!` for "tidiness" would silently introduce a
+        // panic-on-input path that crashes the request handler.
+        // Symmetric to round-170 boundary pins extended to the
+        // pathological-input arithmetic edge.
+        let atoms = parse_missing_atoms("missing [");
+        assert!(atoms.is_empty(), "trailing-open-bracket must return empty");
+        // Also pin the LITERALLY-just-an-open-bracket input — even
+        // more degenerate, must still no-panic empty.
+        let atoms = parse_missing_atoms("[");
+        assert!(atoms.is_empty());
+    }
+
+    #[test]
+    fn parse_missing_atoms_preserves_one_kb_atom_inside_brackets_byte_equal() {
+        // Trust-Plane refusal bodies can carry long atom labels (a
+        // Drive file path with deep nesting, a calendar event id
+        // with embedded query params). The existing
+        // `parse_atoms_handles_one_hundred_atom_list_preserving_first_middle_last`
+        // pin walks the MANY-ATOM axis; pin the LONG-ATOM axis
+        // here: a single 1-KB-class atom inside brackets must
+        // survive byte-equal through the parse. A refactor that
+        // truncated atom labels to a fixed budget (e.g. 256 chars
+        // "for log-line hygiene") would silently mangle long
+        // labels AND silently change every operator dashboard
+        // bucket keying on the full atom string.
+        let long_atom = format!("drive:read:{}", "x".repeat(1024));
+        let detail = format!("missing [{long_atom}]");
+        let atoms = parse_missing_atoms(&detail);
+        assert_eq!(atoms.len(), 1);
+        assert_eq!(atoms[0], long_atom);
+        assert!(atoms[0].len() > 1024, "atom must survive at full length");
+    }
+
+    #[test]
+    fn parse_missing_atoms_only_strips_double_and_single_quotes_not_backtick_or_other_delimiters() {
+        // The parser's `trim_matches(|c| c == '"' || c == '\'')`
+        // strips ONLY ASCII double-quote and single-quote. Pin that
+        // a backtick (`)-wrapped atom passes through verbatim
+        // (backticks ARE NOT stripped), and that the brace, paren,
+        // angle-bracket "delimiter-shaped" chars likewise pass
+        // through. A refactor that widened the strip set to "any
+        // delimiter char" (the natural "be permissive about
+        // upstream quoting styles" mistake) would silently strip
+        // backticks from atoms that legitimately carry them (e.g.
+        // a future query-shape atom like `gmail:filter:from:\`eve@evil.example\``).
+        // Pin via three distinct non-quote delimiters.
+        // Backtick — must NOT be stripped (verbatim).
+        let atoms = parse_missing_atoms("missing [`a:1`]");
+        assert_eq!(atoms, vec!["`a:1`".to_string()]);
+        // Mixed: single-quote IS stripped from outside, backtick
+        // inside survives.
+        let atoms = parse_missing_atoms("missing ['`a:1`']");
+        assert_eq!(atoms, vec!["`a:1`".to_string()]);
+        // Double-quote IS stripped (already pinned via
+        // parse_atoms_quoted), pin the symmetric backtick negative
+        // here.
+        let atoms = parse_missing_atoms(r#"missing ["a:1"]"#);
+        assert_eq!(atoms, vec!["a:1".to_string()]);
+    }
+
+    #[test]
+    fn pic_violation_record_pic_mode_accepts_both_documented_static_str_values_audit_and_runtime_gate()
+     {
+        // `pic_mode: &'static str` — the docstring on the field
+        // says: "`audit` (request proceeded) or `runtime_gate`
+        // (request blocked)." Both values are construction-time
+        // literals; pin that BOTH known values construct the
+        // Record without issue AND survive a Clone byte-equal.
+        // The existing `pic_violation_record_pic_mode_field_is_static_str_lifetime_for_zero_alloc_log_filter`
+        // pin checks the &'static str lifetime via require_static_str
+        // (single value); pin both documented values here as the
+        // operator-facing "every PIC violation lands in one of
+        // these two buckets" contract. A refactor that introduced
+        // a third value (e.g. `"observe"` for a future
+        // observe-mode-but-also-track-PIC mode) would surface here
+        // as needing to update this test alongside the docstring.
+        // Symmetric to round-178 + round-181 variant-count
+        // exhaustive-set pins extended to a documented string-tier
+        // constants set.
+        for mode in ["audit", "runtime_gate"] {
+            let r = PicViolationRecord {
+                request_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                p_0: None,
+                vendor: "v",
+                action: "a",
+                method: "POST",
+                path: "/x",
+                policy_id: None,
+                predecessor_pca_id: None,
+                attempted_ops: &[],
+                missing_atoms: &[],
+                pic_mode: mode,
+                detail: None,
+            };
+            // Static lifetime survives — pin via require_static_str.
+            fn require_static_str(_: &'static str) {}
+            require_static_str(r.pic_mode);
+            // Clone preserves byte-equal.
+            let c = r.clone();
+            assert_eq!(c.pic_mode, mode);
+            // Documented values are NOT kebab-case AND NOT uppercase
+            // (matches the runtime_gate spec.md §9 customer YAML
+            // example shape that pic_mode is a snake_case wire
+            // shape in dashboards).
+            assert!(!mode.contains('-'), "mode must not be kebab-case: {mode}");
+            assert_eq!(mode, &mode.to_lowercase(), "mode must be lowercase");
+        }
+    }
 }

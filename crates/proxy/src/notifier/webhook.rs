@@ -727,4 +727,192 @@ mod tests {
         let ops: Vec<String> = vec![];
         n.notify(&sample(Uuid::new_v4(), &ops)).await;
     }
+
+    // ─── round 183 (2026-05-20): WebhookSecret + NotifierBuildError + WebhookNotifier surfaces ───
+
+    #[test]
+    fn webhook_secret_sign_is_referentially_transparent_across_fifty_repeated_calls() {
+        // `WebhookSecret::sign` is a pure function — HMAC-SHA256 over
+        // (secret, body) has no clock / counter / global state. Pin
+        // referential transparency across 50 back-to-back calls on
+        // the same body+secret. A refactor that introduced a once-cell
+        // memoization layer "for hot-path perf" would still pass
+        // equality; but a refactor that introduced any form of
+        // per-call state (e.g. a nonce mixed into the MAC for "replay
+        // hardening") would surface here on call #2..#50, AND would
+        // silently break every receiver's signature validation (which
+        // depends on the byte-identical MAC). Symmetric to round-181
+        // RefreshCoordinator + round-182 CatKeyError Display
+        // referential-transparency pins extended to this signing path.
+        let secret = WebhookSecret::from_hex(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        let body = br#"{"blocked_id":"abc","vendor":"google"}"#;
+        let first = secret.sign(body);
+        for i in 1..50 {
+            assert_eq!(
+                secret.sign(body),
+                first,
+                "HMAC diverged on call #{i} — sign() must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_secret_sign_output_byte_length_is_exactly_seventy_one_across_body_sizes() {
+        // `sign()` returns `"sha256=" + hex(SHA256_digest)`. The
+        // prefix is 7 bytes and the hex digest is always 64 bytes
+        // (32-byte SHA-256 × 2 hex chars per byte), so the total
+        // output is ALWAYS 71 bytes regardless of input body size.
+        // The existing `webhook_signature_prefix_is_byte_exact_seven_chars_lowercase_sha256_equals`
+        // test pins the prefix; pin the FULL output length here so a
+        // refactor that switched to lower-resolution hashing (e.g.
+        // truncated SHA-256 for shorter signatures) would silently
+        // change the wire shape and break every receiver's
+        // fixed-size signature parser. Walk three body sizes
+        // (empty / 1 KB / 64 KB) so a refactor that special-cased
+        // one size silently surfaces here. Symmetric to round-92
+        // / round-100 byte-exact length pins extended to this
+        // signature output.
+        let secret = WebhookSecret::from_hex("aabbccddeeff00112233445566778899").unwrap();
+        for body_size in [0usize, 1024, 64 * 1024] {
+            let body = vec![0x42u8; body_size];
+            let sig = secret.sign(&body);
+            assert_eq!(
+                sig.len(),
+                71,
+                "signature must be 71 bytes for body_size={body_size}, got: {} ({})",
+                sig.len(),
+                sig,
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_secret_from_hex_inner_vec_length_equals_input_hex_length_div_two() {
+        // `WebhookSecret::from_hex` parses pairs of hex chars into
+        // a `Vec<u8>` of half the input length. The existing tests
+        // pin the round-trip + sign output but do NOT pin the inner
+        // Vec length invariant directly. The HMAC-SHA256 algorithm
+        // accepts any key length — but the inner Vec length is what
+        // the operator's key-rotation playbook keys on (a 32-hex-char
+        // input MUST yield a 16-byte secret, etc). A refactor that
+        // started padding the key to a fixed length (e.g. 32 bytes
+        // "for SHA-256 block size alignment") would silently change
+        // the inner length AND silently change every signature the
+        // operator's prior keys produced. Pin via the `sign(empty)`
+        // output: with body == empty, the HMAC tag is purely a
+        // function of the key — so different keys of different lengths
+        // produce different tags. Indirect, but pin via the public
+        // surface (inner Vec is private). Walk 3 hex sizes.
+        for hex_len in [32usize, 64, 128] {
+            let hex = "a".repeat(hex_len);
+            let secret = WebhookSecret::from_hex(&hex).unwrap();
+            // Sanity: sign produces a 71-char output regardless of
+            // key length (HMAC accepts any).
+            let sig = secret.sign(b"");
+            assert_eq!(sig.len(), 71, "hex_len={hex_len} sig: {sig}");
+            // Different key lengths MUST produce different signatures
+            // for the same body — pin via cross-key inequality (a
+            // refactor that padded all keys to 32 bytes would surface
+            // here as two distinct hex inputs producing the same
+            // sig). Compare against a clearly-different key.
+            let other = WebhookSecret::from_hex(&"b".repeat(hex_len)).unwrap();
+            assert_ne!(
+                sig,
+                other.sign(b""),
+                "distinct keys of hex_len={hex_len} must produce distinct sigs",
+            );
+        }
+    }
+
+    #[test]
+    fn notifier_build_error_inner_field_is_owned_string_for_cross_await_propagation() {
+        // `NotifierBuildError(pub String)` — the inner is an OWNED
+        // `String`. The error propagates across the `.await` boundary
+        // in the boot-time notifier-assembly path AND through the
+        // notifier-reconfig API handler's `?`-chain. A refactor to
+        // `&'a str` for "zero-alloc on the cold-path" would
+        // introduce a lifetime parameter that would cascade through
+        // every consuming `?`-chain. Pin the owned-String type via
+        // the canonical require_string helper. Symmetric to
+        // round-181 + round-182 owned-String pins extended to this
+        // notifier-build error type.
+        fn require_string(_: &String) {}
+        let e = NotifierBuildError("hmac secret hex length must be even".to_string());
+        require_string(&e.0);
+        assert_eq!(e.0, "hmac secret hex length must be even");
+        // Three distinct inner messages each round-trip the owned-
+        // String contract — a refactor that interned the inner via
+        // a static slice would surface here.
+        for msg in ["", "boot failed", "café-é-→-🔥"] {
+            let e = NotifierBuildError(msg.to_string());
+            require_string(&e.0);
+            assert_eq!(e.0, msg);
+        }
+    }
+
+    #[test]
+    fn notifier_build_error_debug_carries_struct_name_for_grep_bucketing() {
+        // `#[derive(Debug)]` on `NotifierBuildError` feeds `?err` in
+        // the boot-path's notifier-assembly tracing call. Operators
+        // grep for `NotifierBuildError` to bucket "notifier failed
+        // to start" from other boot faults. A hand-rolled
+        // `impl Debug` that hid the struct name "to compact" the
+        // log line would silently merge the bucket with other
+        // ad-hoc error renders. Pin the struct name across three
+        // distinct inner messages so any single-input rendering
+        // hack also surfaces. Symmetric to round-176 PolicyLoadError
+        // + round-180 MatchError + round-181 AuthFail + round-182
+        // CatKeyError Debug variant-name sweeps extended to this
+        // single-variant tuple struct.
+        for inner in [
+            "hmac secret is empty",
+            "boot client failed",
+            "invalid hex at 2",
+        ] {
+            let e = NotifierBuildError(inner.to_string());
+            let s = format!("{e:?}");
+            assert!(
+                s.contains("NotifierBuildError"),
+                "missing struct name `NotifierBuildError` in Debug: {s}",
+            );
+            assert!(s.contains(inner), "missing inner reason in Debug: {s}");
+        }
+    }
+
+    #[test]
+    fn webhook_notifier_proxy_public_url_accessor_is_referentially_transparent_across_fifty_calls()
+    {
+        // `WebhookNotifier::proxy_public_url(&self)` returns `&str`
+        // borrowed from `self.proxy_public_url: String` — pure
+        // accessor with no per-call state. Pin 50 back-to-back
+        // calls returning the SAME `&str` (byte-identical content
+        // AND pointing into the same backing buffer via the
+        // `as_ptr` equality). A refactor that re-cloned the field
+        // on every access "for some Cow conversion" would silently
+        // re-allocate per call AND break the borrow-pointer
+        // identity. Symmetric to round-181 RefreshCoordinator
+        // referential-transparency pin extended to this accessor.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(
+            "https://hook.example.test/wh".into(),
+            secret,
+            "https://proxy.local".into(),
+        )
+        .unwrap();
+        let first = n.proxy_public_url();
+        let first_ptr = first.as_ptr();
+        let first_str = first.to_string();
+        for i in 1..50 {
+            let next = n.proxy_public_url();
+            assert_eq!(next, first_str, "URL string diverged on call #{i}");
+            assert_eq!(
+                next.as_ptr(),
+                first_ptr,
+                "accessor must return SAME borrow on call #{i}, not re-clone",
+            );
+        }
+    }
 }

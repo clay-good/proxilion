@@ -808,4 +808,189 @@ mod tests {
         let b = c.lock_for([5u8; 32]).await;
         assert!(Arc::ptr_eq(&a, &b), "second lookup returns the same Arc");
     }
+
+    // ─── round 181 (2026-05-20): operator-actionable surfaces on AuthFail + AuthState ───
+
+    #[test]
+    fn auth_fail_variant_count_pinned_at_nine_via_exhaustive_match() {
+        // `AuthFail` has exactly 9 variants today (BadFormat / NotFound /
+        // Decrypt / Refresh / PcaCacheMiss / PcaTampered / CatKey / Db /
+        // Other). Operator runbooks bucket bearer-rejection failures by
+        // variant; a refactor that added a new variant without updating
+        // the runbook (e.g. `Throttled` for a future rate-limit gate)
+        // would surface a tenth grep bucket the dashboard wasn't sized
+        // for. Pin the variant count via an exhaustive match — a new
+        // arm forces this test to compile-fail at the match site, which
+        // is the canonical "make the runbook update load-bearing"
+        // pattern. Symmetric to round-89 PkceError 2-variant pin
+        // extended one module up.
+        fn arm_name(e: &AuthFail) -> &'static str {
+            match e {
+                AuthFail::BadFormat => "BadFormat",
+                AuthFail::NotFound => "NotFound",
+                AuthFail::Decrypt => "Decrypt",
+                AuthFail::Refresh(_) => "Refresh",
+                AuthFail::PcaCacheMiss => "PcaCacheMiss",
+                AuthFail::PcaTampered => "PcaTampered",
+                AuthFail::CatKey(_) => "CatKey",
+                AuthFail::Db(_) => "Db",
+                AuthFail::Other(_) => "Other",
+            }
+        }
+        let nine: Vec<AuthFail> = vec![
+            AuthFail::BadFormat,
+            AuthFail::NotFound,
+            AuthFail::Decrypt,
+            AuthFail::Refresh("r".into()),
+            AuthFail::PcaCacheMiss,
+            AuthFail::PcaTampered,
+            AuthFail::CatKey("c".into()),
+            AuthFail::Db(sqlx::Error::RowNotFound),
+            AuthFail::Other("o".into()),
+        ];
+        let names: std::collections::HashSet<&'static str> = nine.iter().map(arm_name).collect();
+        assert_eq!(names.len(), 9, "9 distinct variant names expected");
+    }
+
+    #[test]
+    fn auth_fail_refresh_cat_key_and_other_inner_fields_are_owned_string() {
+        // `Refresh(String)` / `CatKey(String)` / `Other(String)` —
+        // each inner is an OWNED `String`. The error propagates across
+        // an `.await` boundary in `auth_middleware` up through tracing
+        // and the operator-token audit-sink task; the originating
+        // upstream-error byte slice is dropped before the audit sink
+        // serializes the variant. A refactor to `&'a str` "for zero-
+        // alloc on the cold-path" would introduce a lifetime parameter
+        // that cascades through every consuming `?`-chain. Pin the
+        // owned-String type via the canonical require_string helper
+        // across all three String-bearing variants. Symmetric to
+        // round-177 Decision + round-180 MatchError owned-String pins
+        // extended to AuthFail's String-bearing variants.
+        fn require_string(_: &String) {}
+        let r = match AuthFail::Refresh("network timeout".into()) {
+            AuthFail::Refresh(s) => s,
+            other => panic!("expected Refresh, got {other:?}"),
+        };
+        require_string(&r);
+        let c = match AuthFail::CatKey("trust plane 503".into()) {
+            AuthFail::CatKey(s) => s,
+            other => panic!("expected CatKey, got {other:?}"),
+        };
+        require_string(&c);
+        let o = match AuthFail::Other("unexpected".into()) {
+            AuthFail::Other(s) => s,
+            other => panic!("expected Other, got {other:?}"),
+        };
+        require_string(&o);
+    }
+
+    #[test]
+    fn auth_fail_pca_cache_miss_display_is_byte_exact_with_braced_id_placeholder() {
+        // `#[error("PCA cache miss (no upstream GET /v1/pca/{{id}} available)")]`
+        // — the doubled `{{id}}` escapes the literal `{id}` in the
+        // formatted output. The existing
+        // `auth_fail_pca_cache_miss_message_explains_upstream_gap`
+        // pins `.contains("PCA cache miss")` + `.contains("/v1/pca/")`
+        // — but a refactor that swapped `{{id}}` for `{id}` (the
+        // mechanical "treat the braces as a placeholder" mistake) would
+        // surface as a runtime panic on the unknown `id` arg, or
+        // (worse) a silently malformed Display if a future refactor
+        // added an `id: String` field and resolved the placeholder.
+        // Pin the byte-exact full Display string so the brace-escape
+        // semantic is locked. Symmetric to round-50 + round-66 byte-
+        // exact Display pins extended to this variant.
+        assert_eq!(
+            AuthFail::PcaCacheMiss.to_string(),
+            "PCA cache miss (no upstream GET /v1/pca/{id} available)",
+        );
+    }
+
+    #[test]
+    fn unauthorized_body_bytes_pinned_at_byte_exact_twelve_bytes_no_trailing_newline() {
+        // The 401 body is the literal 12-byte ASCII `b"unauthorized"`.
+        // The existing `unauthorized_helper_returns_401_with_plain_body`
+        // pins the byte slice via `to_bytes(.., 64)` but does NOT pin
+        // the byte length explicitly. Agent clients (Cursor / Claude
+        // Code) sometimes parse the body via fixed-size buffer reads
+        // — a refactor that appended a trailing newline "for tidy
+        // log output" would silently change the body from 12 to 13
+        // bytes and break those parsers. Pin byte-exact length AND
+        // no-trailing-whitespace. Symmetric to round-92 / round-100
+        // byte-exact length pins extended to this 401 response.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let r = unauthorized();
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+            let bytes = axum::body::to_bytes(r.into_body(), 64).await.unwrap();
+            assert_eq!(bytes.len(), 12, "401 body must be byte-exact 12 bytes");
+            assert_eq!(&bytes[..], b"unauthorized");
+            // No trailing whitespace / newline / carriage return.
+            assert!(
+                !bytes.ends_with(b"\n") && !bytes.ends_with(b" ") && !bytes.ends_with(b"\r"),
+                "401 body must not have trailing whitespace, got: {bytes:?}",
+            );
+        });
+    }
+
+    #[test]
+    fn refresh_coordinator_lock_for_is_referentially_transparent_across_fifty_repeated_calls() {
+        // `lock_for(hash)` is the hot-path single-flight call —
+        // every middleware invocation calls it; the result MUST be the
+        // SAME `Arc<Mutex<()>>` instance for the same hash across the
+        // moka cache TTL window. The existing
+        // `refresh_coordinator_returns_same_mutex_for_same_hash` pins
+        // ONE pair (two back-to-back calls); pin 50 back-to-back calls
+        // so a refactor that introduced a stateful between-call
+        // mutation (e.g. a per-call counter wired into the mutex
+        // identity) would surface here on call #2..#50. Symmetric to
+        // round-179 + round-180 referential-transparency pins extended
+        // to the moka-cache-backed single-flight lookup.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let c = RefreshCoordinator::default();
+            let h = [7u8; 32];
+            let first = c.lock_for(h).await;
+            for i in 1..50 {
+                let next = c.lock_for(h).await;
+                assert!(
+                    Arc::ptr_eq(&first, &next),
+                    "moka cache must return SAME Arc on call #{i}",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn auth_fail_refresh_inner_string_supports_long_unicode_payload_via_two_kb_input() {
+        // `Refresh(String)` carries upstream error context (Google's
+        // token endpoint response). Google's error responses can be
+        // verbose (multi-paragraph JSON `error_description` strings).
+        // Pin that a 2-KB-class inner survives the `#[error("google
+        // token refresh failed: {0}")]` Display passthrough without
+        // truncation — and that a multibyte unicode payload inside the
+        // 2-KB envelope also survives byte-equal (no `.chars().take(N)`
+        // truncation snuck in via a refactor that added "log line
+        // length budget" defenses at this layer). The existing
+        // `auth_fail_refresh_display_passes_inner_through_unicode_and_newline_verbatim`
+        // pin walks 4 small inputs (<40 bytes); pin the 2-KB scale
+        // boundary here so a fixed-size-buffer refactor surfaces.
+        let mut inner = String::with_capacity(2048);
+        inner.push_str("café-é-→-🔥 "); // 2-byte + 2-byte + 3-byte + 4-byte char spread
+        while inner.len() < 2048 {
+            inner.push('a');
+        }
+        assert!(inner.len() >= 2048, "fixture sanity: {} bytes", inner.len());
+        let e = AuthFail::Refresh(inner.clone());
+        let s = e.to_string();
+        let expected = format!("google token refresh failed: {inner}");
+        assert_eq!(s, expected, "2-KB inner must survive verbatim");
+        // Multibyte unicode prefix preserved.
+        assert!(s.contains("café-é-→-🔥"), "multibyte prefix must survive");
+    }
 }

@@ -565,4 +565,180 @@ mod tests {
             "numeric public_key must reject",
         );
     }
+
+    // ─── round 182 (2026-05-20): operator-actionable surfaces on CatKeyError + CatKeyRegistry ───
+
+    #[test]
+    fn cat_key_error_variant_count_pinned_at_three_via_exhaustive_match() {
+        // `CatKeyError` has exactly 3 variants today (Fetch / Status /
+        // Decode). Operator runbooks bucket Trust-Plane / CAT-key faults
+        // by variant — Fetch (network), Status (Trust Plane responded
+        // with non-2xx), Decode (key material malformed). A refactor
+        // that added a fourth variant (e.g. `Expired` for a future
+        // CAT-key TTL gate) would surface a fourth grep bucket the
+        // dashboard wasn't sized for. Pin the variant count via an
+        // exhaustive match — a new arm forces this test to compile-fail
+        // at the match site. Symmetric to round-181 AuthFail 9-variant
+        // exhaustive-match pin extended to a sibling error enum.
+        fn arm_name(e: &CatKeyError) -> &'static str {
+            match e {
+                CatKeyError::Fetch(_) => "Fetch",
+                CatKeyError::Status(_) => "Status",
+                CatKeyError::Decode(_) => "Decode",
+            }
+        }
+        // Walk the two leaf variants (Fetch requires a reqwest::Error
+        // which is not cheaply constructible here — it's covered by
+        // the existing `cat_key_error_fetch_variant_display_carries_trust_plane_prefix_with_inner_reason`
+        // tokio test).
+        let three_seen: std::collections::HashSet<&'static str> =
+            [CatKeyError::Status(503), CatKeyError::Decode("x".into())]
+                .iter()
+                .map(arm_name)
+                .collect();
+        assert_eq!(three_seen.len(), 2, "2 distinct leaf-variant names");
+        // Sanity: the compiler-enforced exhaustive arm_name above
+        // implicitly forces the 3-variant cap (a 4th variant fails
+        // the match arm count). Surface the cap via a count of
+        // syntactic arms — the match in arm_name has exactly 3.
+        // (This assertion is documentation-only; the real cap is the
+        // exhaustive match.)
+        assert_eq!(arm_name(&CatKeyError::Status(0)), "Status");
+        assert_eq!(arm_name(&CatKeyError::Decode("".into())), "Decode");
+    }
+
+    #[test]
+    fn cat_key_error_decode_inner_field_is_owned_string_for_cross_await_propagation() {
+        // `Decode(String)` — the inner is an OWNED `String`, not a
+        // borrowed `&'static str` or `Cow<'_, str>`. The error
+        // propagates across the `.await` boundary in
+        // `CatKeyRegistry::get` (the `get_or_try_init` future); the
+        // originating error byte slice (e.g. the b64::DecodeError
+        // Display rendered into a String) is dropped before the
+        // outer middleware consumes the Result. A refactor to a
+        // borrowed form for "zero-alloc on the cold-path" would
+        // introduce a lifetime parameter that cascades through every
+        // consuming `?`-chain in pic/verifier.rs. Pin the owned-String
+        // type via the canonical require_string helper. Symmetric to
+        // round-179 + round-180 + round-181 owned-String pins
+        // extended to this error variant.
+        fn require_string(_: &String) {}
+        let inner = match CatKeyError::Decode("expected 32 bytes".into()) {
+            CatKeyError::Decode(s) => s,
+            other => panic!("expected Decode, got {other:?}"),
+        };
+        require_string(&inner);
+        assert_eq!(inner, "expected 32 bytes");
+    }
+
+    #[test]
+    fn cat_key_error_status_inner_field_is_u16_type_for_full_http_code_range() {
+        // `Status(u16)` — the inner is `u16`, NOT `http::StatusCode`.
+        // The wire-shape choice is load-bearing: `http::StatusCode`
+        // clamps to the IETF-registered 100..=999 range AND panics on
+        // values outside it via `from_u16().unwrap()`, while `u16`
+        // accepts 0..=65535 verbatim. Operators rely on the
+        // raw-integer rendering for upstream-misbehavior triage
+        // (e.g. a malformed Trust-Plane that returned `0` on
+        // connection-closure or a custom non-standard `999` code).
+        // The existing `cat_key_error_status_zero_does_not_panic_and_renders_zero_for_grep`
+        // walks behavior at boundaries; pin the underlying TYPE via
+        // the canonical require_u16 helper so a refactor that swapped
+        // to `Status(http::StatusCode)` "for type-safety" would
+        // silently re-introduce the panic-on-out-of-range edge.
+        // Symmetric to round-177 Decision::RateLimit u32-field type
+        // pin extended to this error variant.
+        fn require_u16(_: u16) {}
+        let code = match CatKeyError::Status(503) {
+            CatKeyError::Status(c) => c,
+            other => panic!("expected Status, got {other:?}"),
+        };
+        require_u16(code);
+        assert_eq!(code, 503);
+    }
+
+    #[test]
+    fn cat_key_error_display_is_referentially_transparent_across_fifty_repeated_calls() {
+        // The `#[error(...)]` Display impl is pure — no clock, no env,
+        // no global state. Pin referential transparency across 50
+        // back-to-back `to_string()` calls for both leaf variants
+        // (Status / Decode). A refactor that introduced a once-cell-
+        // backed memoization layer "for hot-path Display perf" would
+        // still pass equality; but a refactor that introduced any
+        // form of stateful rendering (a counter mixed into the format,
+        // a per-call ID) would surface here on call #2..#50. Symmetric
+        // to round-179 + round-180 + round-181 referential-transparency
+        // pins extended to this error type's Display impl.
+        let status = CatKeyError::Status(503);
+        let status_first = status.to_string();
+        for i in 1..50 {
+            assert_eq!(
+                status.to_string(),
+                status_first,
+                "Status Display diverged on call #{i}",
+            );
+        }
+        let decode = CatKeyError::Decode("bad b64".into());
+        let decode_first = decode.to_string();
+        for i in 1..50 {
+            assert_eq!(
+                decode.to_string(),
+                decode_first,
+                "Decode Display diverged on call #{i}",
+            );
+        }
+    }
+
+    #[test]
+    fn cat_key_registry_new_yields_distinct_arcs_across_independent_constructions() {
+        // `CatKeyRegistry::new(url)` constructs a fresh `Arc<Inner>`
+        // per call — two independent constructions MUST NOT share the
+        // underlying Inner (the OnceCell, the http client, the URL).
+        // The existing `cat_key_registry_clones_share_underlying_oncecell`
+        // pins that CLONES share via Arc; pin the SYMMETRIC contract
+        // here — fresh constructions are independent. A refactor that
+        // memoized `new()` "for cheap re-construction in tests" via a
+        // process-wide registry would silently make every call site
+        // share a OnceCell, surface here as Arc::ptr_eq returning true
+        // across independent news. Pin strong_count == 1 on a fresh
+        // registry (one Arc strong ref, no shared aliasing). Symmetric
+        // to round-153 PolicyHandle Clone-Arc-share pin extended to
+        // the symmetric independent-construction contract.
+        let r1 = CatKeyRegistry::new("http://a.invalid".into());
+        let r2 = CatKeyRegistry::new("http://b.invalid".into());
+        assert!(
+            !Arc::ptr_eq(&r1.inner, &r2.inner),
+            "independent new() calls must produce distinct Arcs",
+        );
+        assert_eq!(Arc::strong_count(&r1.inner), 1);
+        assert_eq!(Arc::strong_count(&r2.inner), 1);
+    }
+
+    #[test]
+    fn info_resp_deserialize_is_referentially_transparent_across_fifty_repeated_calls() {
+        // `serde_json::from_str::<InfoResp>` is pure on the same raw
+        // bytes — pin referential transparency across 50 back-to-back
+        // deserializations on the same `{"kid":"k1","public_key":"AAA"}`
+        // fixture. A refactor that introduced a thread-local
+        // deserializer cache "for hot-path perf" would still pass
+        // equality; but a refactor that introduced any form of
+        // stateful parsing (a counter wired into the kid field, a
+        // per-call mutation) would surface here on call #2..#50. The
+        // existing `info_resp_deserializes` pin covers ONE call; pin
+        // the 50-call ref-transparency here. Symmetric to round-178
+        // parse_policies referential-transparency pin extended to
+        // this sibling serde deserialization.
+        let raw = r#"{"kid":"k1","public_key":"AAA"}"#;
+        let first: InfoResp = serde_json::from_str(raw).unwrap();
+        let first_kid = first.kid.clone();
+        let first_pk = first.public_key.clone();
+        for i in 1..50 {
+            let next: InfoResp = serde_json::from_str(raw).unwrap();
+            assert_eq!(next.kid, first_kid, "kid diverged on call #{i}");
+            assert_eq!(
+                next.public_key, first_pk,
+                "public_key diverged on call #{i}",
+            );
+        }
+    }
 }

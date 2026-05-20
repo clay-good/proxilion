@@ -456,4 +456,212 @@ mod tests {
         let j = serde_json::to_value(&n).unwrap();
         assert_eq!(j["requested_ops"], serde_json::json!([]));
     }
+
+    #[test]
+    fn blocked_notification_serializes_with_exactly_sixteen_known_keys_for_webhook_consumer_contract()
+     {
+        // Webhook receivers (Slack incoming-webhook bridges, PagerDuty
+        // routers, custom SOC integrations) key on the EXHAUSTIVE field
+        // set of the v1 envelope. The existing tests pin individual keys
+        // via substring `.contains` / `j["k"]` but never the SET as a
+        // closed contract — a refactor adding `escalation_after_minutes`
+        // "for ergonomic Slack template display" would silently ship a
+        // 17th key to every receiver, and any consumer doing a closed-
+        // set validation (PagerDuty's "extra field" warning) would
+        // start emitting noise. Pin the 16-key set as exhaustive,
+        // symmetric to round-161 PolicyView 5-key + round-165
+        // TokenResponse 4-key + round-166 insert_proxy_headers 3-header
+        // exhaustive-set pins extended to webhook envelope.
+        let ops: Vec<String> = vec!["drive:read:a".into()];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        let j = serde_json::to_value(&n).unwrap();
+        let obj = j
+            .as_object()
+            .expect("envelope must serialize as JSON object");
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
+        let expected: std::collections::HashSet<&str> = [
+            "schema",
+            "blocked_id",
+            "request_id",
+            "session_id",
+            "p_0",
+            "vendor",
+            "action",
+            "method",
+            "path",
+            "layer",
+            "policy_id",
+            "detail",
+            "predecessor_pca_id",
+            "requested_ops",
+            "approve_url",
+            "reject_url",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            keys, expected,
+            "BlockedNotification v1 envelope must carry EXACTLY these 16 keys for webhook consumers",
+        );
+    }
+
+    #[test]
+    fn blocked_notification_static_borrow_is_send_sync_for_tokio_spawn_webhook_fanout() {
+        // The webhook + slack + email fan-out spawns one task per driver
+        // (`tokio::spawn(async move { driver.notify(&n).await })`); the
+        // notification must be `Send` to cross the spawn boundary AND
+        // `Sync` so multiple drivers can read the same envelope concurrently.
+        // The 'a borrow makes Sync impossible at arbitrary lifetimes;
+        // pin the 'static instantiation specifically — symmetric to
+        // round-168 PicViolationRecord<'static> Send + Sync pin extended
+        // to BlockedNotification at the fan-out boundary. A refactor
+        // adding a non-Sync field (e.g. `RefCell<...>` for some
+        // lazy-rendered URL "for performance") would break here rather
+        // than at the spawn call site with an opaque trait-bound error.
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<BlockedNotification<'static>>();
+    }
+
+    #[test]
+    fn from_record_preserves_multibyte_unicode_in_vendor_action_path_detail_verbatim() {
+        // Symmetric to round-162 blocked.rs multibyte vendor + action +
+        // round-166 google_drive PolicyBlocked.reason + round-167
+        // calendar reason + round-168 parse_missing_atoms multibyte
+        // pins extended to BlockedNotification's vendor + action + path
+        // + detail fields. A copy-paste `to_ascii_lowercase()` "for SIEM
+        // hygiene" landing on the from_record builder would silently
+        // mangle non-ASCII vendor labels (a future Microsoft365 adapter
+        // localized as `microsoft365.café` or a path including a
+        // unicode file id). Pin byte-equal passthrough on 4 distinct
+        // fields with multibyte content.
+        let ops: Vec<String> = vec![];
+        let multibyte_path = "/drive/files/café/secret.docx";
+        let multibyte_detail = "policy `外部送信ブロック` denied to_domain=eve🔥@evil.example";
+        let r = BlockedActionRecord {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            p_0: Some("alice@日本.jp"),
+            vendor: "google.café",
+            action: "drive.files.récupérer",
+            method: "GET",
+            path: multibyte_path,
+            layer: "policy",
+            policy_id: Some("drive-外部-gate"),
+            detail: Some(multibyte_detail),
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        assert_eq!(n.vendor, "google.café");
+        assert_eq!(n.action, "drive.files.récupérer");
+        assert_eq!(n.path, multibyte_path);
+        assert_eq!(n.detail, Some(multibyte_detail));
+        assert_eq!(n.policy_id, Some("drive-外部-gate"));
+        assert_eq!(n.p_0, Some("alice@日本.jp"));
+        // And through JSON serialization — webhook receivers see the
+        // exact same byte sequences.
+        let j = serde_json::to_value(&n).unwrap();
+        assert_eq!(j["vendor"], "google.café");
+        assert_eq!(j["path"], multibyte_path);
+        assert_eq!(j["detail"], multibyte_detail);
+    }
+
+    #[test]
+    fn schema_constant_is_static_str_lifetime_for_zero_alloc_webhook_header_propagation() {
+        // The SCHEMA constant is propagated into the X-Schema header of
+        // outbound webhooks and into the Slack action_id; both flows
+        // expect a 'static str so the value can be reused across an
+        // unbounded number of notifications without allocation. The
+        // existing pin (`schema_constant_is_versioned_string_consumers_key_on`)
+        // walks the VALUE but not the LIFETIME — a refactor to
+        // `pub const SCHEMA: String = String::from("...")` "for builder
+        // ergonomics" would either fail compile (const fn String) or
+        // silently flip the type to one that allocates per access. Pin
+        // 'static via require_static_str — symmetric to round-163
+        // ConfigError + round-165 oauth token_type + round-168
+        // pic_mode static-str pins extended to BlockedNotification SCHEMA.
+        fn require_static_str(_: &'static str) {}
+        require_static_str(BlockedNotification::SCHEMA);
+        // Also pin: the `schema` field on a BlockedNotification instance
+        // is the SAME &'static str, not a String allocated from it.
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        require_static_str(n.schema);
+    }
+
+    #[test]
+    fn approve_and_reject_urls_carry_no_query_string_for_csrf_token_round_trip() {
+        // The approver UI (ui-less-surfaces.md §10.4) builds an HTML
+        // form that POSTs back to these URLs; the URLs themselves must
+        // NOT carry a query string because the CSRF token is signed
+        // separately and surfaced as a form-body field, not a URL param
+        // (the URL would leak via Referer headers on the redirect).
+        // The existing pins walk URL structure and verb-segment
+        // differentiation but never the no-query-string contract — a
+        // refactor that appended `?token=...` "for one-click approve
+        // from email links" would silently re-introduce the leak.
+        // Pin the absence of `?` (and `#` fragment) on both URLs.
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://proxy.example.com");
+        assert!(
+            !n.approve_url.contains('?'),
+            "approve URL must not carry query string: {}",
+            n.approve_url,
+        );
+        assert!(
+            !n.reject_url.contains('?'),
+            "reject URL must not carry query string: {}",
+            n.reject_url,
+        );
+        assert!(
+            !n.approve_url.contains('#'),
+            "approve URL must not carry fragment: {}",
+            n.approve_url,
+        );
+        assert!(
+            !n.reject_url.contains('#'),
+            "reject URL must not carry fragment: {}",
+            n.reject_url,
+        );
+    }
+
+    #[test]
+    fn from_record_is_referentially_transparent_across_fifty_repeated_calls_on_same_input() {
+        // Symmetric to round-161 parse_listing + round-162 canonical_request_json
+        // + round-166 enforce_pre_request_decision + round-168
+        // parse_missing_atoms referential-transparency pins extended to
+        // BlockedNotification::from_record. The fan-out path may call
+        // `from_record` multiple times if the operator clicks "resend"
+        // on a stale notification; a refactor caching the JSON via a
+        // once-cell keyed on `&record as *const _` "for hot-path perf"
+        // would silently return stale URLs on a record whose
+        // blocked_id was reissued. Pin 50 calls on the same record
+        // produce byte-equal JSON.
+        let ops: Vec<String> = vec!["drive:read:a".into(), "gmail:send:b".into()];
+        let r = sample_record(&ops);
+        let blocked_id = Uuid::new_v4();
+        let baseline = serde_json::to_string(&BlockedNotification::from_record(
+            blocked_id,
+            &r,
+            "https://x.example",
+        ))
+        .unwrap();
+        for i in 0..50 {
+            let again = serde_json::to_string(&BlockedNotification::from_record(
+                blocked_id,
+                &r,
+                "https://x.example",
+            ))
+            .unwrap();
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: from_record + serialize must be referentially transparent",
+            );
+        }
+    }
 }

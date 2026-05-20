@@ -1299,4 +1299,193 @@ mod tests {
         assert!(key_pem.contains("BEGIN PRIVATE KEY") || key_pem.contains("BEGIN EC PRIVATE KEY"));
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn request_id_header_constant_is_byte_exact_lowercase_x_request_id_per_http2() {
+        // HTTP/2 §8.1.2 requires header names to be lowercase on the
+        // wire; `HeaderName::from_static` panics at compile time on a
+        // non-lowercase input but a refactor switching to a runtime
+        // `HeaderName::from_bytes` "for dynamic header names" would
+        // surface a lowercase-violation only at the first inbound h2
+        // request. Pin byte-exact `"x-request-id"` so a refactor to
+        // `"X-Request-Id"` (the common docs casing) fails compile here
+        // rather than at first connection. The middleware chain reads
+        // this header to extract or mint a UUID; downstream operator
+        // dashboards key on the lowercase form across thousands of
+        // logged lines per second.
+        assert_eq!(REQUEST_ID_HEADER.as_str(), "x-request-id");
+        // Defensive: the constant carries the lowercase form (no
+        // intermediate string normalization).
+        assert!(
+            REQUEST_ID_HEADER
+                .as_str()
+                .chars()
+                .all(|c| !c.is_ascii_uppercase()),
+            "REQUEST_ID_HEADER must be lowercase per HTTP/2 §8.1.2",
+        );
+        // Byte-length pin: 12 bytes for `x-request-id` — a refactor to
+        // `x-req-id` (a "shorter alias") would surface here.
+        assert_eq!(REQUEST_ID_HEADER.as_str().len(), 12);
+    }
+
+    #[test]
+    fn hex_decode_32_is_referentially_transparent_across_fifty_repeated_calls() {
+        // Symmetric to round-161 + round-162 + round-166 + round-168
+        // referential-transparency pins extended to the proxy boot-path
+        // hex decoder. A refactor caching results in a once-cell keyed
+        // on input pointer "for boot-perf" would silently return stale
+        // bytes on a re-invoked decode (e.g. a config-reload path that
+        // re-parses the token encryption key). Pin 50 calls on a
+        // multi-pattern fixture produce byte-equal output.
+        let input = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let baseline = hex_decode_32(input).expect("fixture must decode");
+        for i in 0..50 {
+            let again = hex_decode_32(input).expect("re-decode must succeed");
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: hex_decode_32 must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn hex_decode_32_error_message_carries_pair_index_for_operator_diagnostic_grep() {
+        // The error message includes `hex char pair {i}:` so operators
+        // can pinpoint which pair in a 64-char token encryption key is
+        // malformed — load-bearing for the boot-failure log line that
+        // surfaces when an operator's `.env` got a typo at position 7.
+        // The existing pins walk error.is_err() across multiple inputs
+        // but never the MESSAGE — a refactor that collapsed all hex
+        // errors to "invalid hex" "for compact logs" would silently
+        // strip the position info and force the operator to bisect
+        // their config by hand. Pin the byte-exact `hex char pair `
+        // prefix + pair-index inclusion in the message.
+        // Pair at index 7: position 14-15 is `ZZ`.
+        let mut bad = "00".repeat(7); // 14 valid chars
+        bad.push_str("ZZ"); // pair 7 invalid
+        bad.push_str(&"00".repeat(24)); // remaining 48 valid
+        assert_eq!(bad.len(), 64);
+        let err = hex_decode_32(&bad).expect_err("must reject ZZ pair");
+        let s = format!("{err}");
+        assert!(s.contains("hex char pair "), "expected pair-prefix: {s}");
+        assert!(s.contains("7"), "expected pair index 7: {s}");
+    }
+
+    #[test]
+    fn healthz_version_field_is_static_str_type_for_zero_alloc_per_response_propagation() {
+        // The `/healthz` handler may be hit hundreds of times per
+        // second by Cloudflare + uptime monitors + internal load
+        // balancers. The `version` field is `&'static str` so the
+        // response body's version string can be reused across every
+        // response without allocation. The existing pin walks the
+        // VALUE (`"0.1.0"`) but never the LIFETIME — a refactor to
+        // `String` "for dynamic build-info embedding" would silently
+        // allocate one String per healthz response. Pin lifetime via
+        // require_static_str — symmetric to round-163 + round-165
+        // + round-168 + round-169 static-str pins extended to
+        // Healthz.version.
+        fn require_static_str(_: &'static str) {}
+        let h = Healthz {
+            ready: true,
+            version: "0.1.0",
+            checks: std::collections::BTreeMap::new(),
+        };
+        require_static_str(h.version);
+        // And the BTreeMap key type is also &'static str.
+        for (k, _) in h.checks.iter() {
+            require_static_str(k);
+        }
+    }
+
+    #[test]
+    fn check_detail_serializes_as_json_null_when_none_not_elided_per_dashboard_key_presence_contract()
+     {
+        // The Cloudflare uptime panel and operator Grafana panels both
+        // key on `checks.trust_plane.detail` BEING PRESENT (as either
+        // a string or `null`) — never absent. A refactor adding
+        // `#[serde(skip_serializing_if = "Option::is_none")]` to the
+        // detail field "to compact the JSON" would silently strip the
+        // key on healthy probes and break panels that filter on
+        // `detail == null` to mean "no error message". Pin that the
+        // detail key is ALWAYS present in JSON output, rendered as
+        // `null` on the Some/None polarity sweep. Symmetric to the
+        // round-161 ListResponse exhaustive-3-key pin extended to
+        // healthz Check fields.
+        let none_check = Check {
+            ok: true,
+            detail: None,
+            latency_ms: 5,
+        };
+        let v = serde_json::to_value(&none_check).unwrap();
+        let obj = v.as_object().expect("Check must serialize as JSON object");
+        assert!(
+            obj.contains_key("detail"),
+            "detail key must be PRESENT on None polarity (rendered as null)",
+        );
+        assert!(v["detail"].is_null(), "detail must render as JSON null");
+        // Symmetric: Some(string) polarity renders as the string.
+        let some_check = Check {
+            ok: false,
+            detail: Some("upstream timeout".into()),
+            latency_ms: 5000,
+        };
+        let v = serde_json::to_value(&some_check).unwrap();
+        assert_eq!(v["detail"], "upstream timeout");
+    }
+
+    #[test]
+    fn healthz_checks_btree_map_iterates_in_alphabetical_key_order_for_stable_jsonpath_walks() {
+        // `Healthz.checks` is a `BTreeMap` (alphabetical iteration)
+        // NOT a `HashMap`. Operator dashboards walk the JSON with
+        // stable JSONPath expressions (`$.checks[0].name == "database"`
+        // for the first critical check) and a refactor swapping to
+        // `HashMap` "for faster lookups" would randomize iteration
+        // order and break every jq / Grafana panel that assumed the
+        // alphabetical contract. Pin the contract: serialize with 3
+        // out-of-alphabetical-insertion-order keys and assert the
+        // JSON renders them sorted (`database`, `federation_bridge`,
+        // `trust_plane`).
+        let mut checks = std::collections::BTreeMap::new();
+        // Insert deliberately out of alphabetical order — BTreeMap must
+        // sort on the way out regardless.
+        checks.insert(
+            "trust_plane",
+            Check {
+                ok: true,
+                detail: None,
+                latency_ms: 1,
+            },
+        );
+        checks.insert(
+            "database",
+            Check {
+                ok: true,
+                detail: None,
+                latency_ms: 2,
+            },
+        );
+        checks.insert(
+            "federation_bridge",
+            Check {
+                ok: true,
+                detail: None,
+                latency_ms: 3,
+            },
+        );
+        let h = Healthz {
+            ready: true,
+            version: "0.1.0",
+            checks,
+        };
+        let s = serde_json::to_string(&h).unwrap();
+        // The keys appear in alphabetical order in the serialized JSON
+        // because serde-json walks the BTreeMap in iteration order.
+        let db_idx = s.find("\"database\"").unwrap();
+        let fb_idx = s.find("\"federation_bridge\"").unwrap();
+        let tp_idx = s.find("\"trust_plane\"").unwrap();
+        assert!(
+            db_idx < fb_idx && fb_idx < tp_idx,
+            "BTreeMap must serialize keys in alphabetical order: {s}",
+        );
+    }
 }

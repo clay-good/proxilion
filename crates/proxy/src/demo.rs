@@ -555,6 +555,147 @@ mod tests {
     }
 
     #[test]
+    fn users_const_all_carry_user_colon_prefix_and_are_static_str() {
+        // `USERS` is a `&[&'static str]` of demo principal names. The
+        // shape is `user:<email>` so synthetic events render correctly
+        // in the dashboard's "p_0" column AND so an operator can grep
+        // demo rows out of production audit queries via the `user:`
+        // prefix. A refactor that dropped the prefix "for cleaner
+        // emails" would silently produce demo rows that look like
+        // real principal names — pin the prefix presence on every
+        // entry AND the `&'static str` lifetime bound via a helper.
+        fn require_static_str(_: &'static str) {}
+        for u in USERS {
+            require_static_str(u);
+            assert!(
+                u.starts_with("user:"),
+                "USERS entry `{u}` must start with `user:`",
+            );
+            // Demo emails are all lowercase ASCII so a regex grep on
+            // `^user:[a-z]+@demo.local$` picks them up.
+            assert!(
+                u.is_ascii(),
+                "USERS entry `{u}` must be ASCII for grep stability",
+            );
+        }
+        // The list has at least three entries (alice/bob/carol shape)
+        // so synthetic events have a varied principal distribution.
+        assert!(USERS.len() >= 3, "USERS too small: {}", USERS.len());
+    }
+
+    #[test]
+    fn scenarios_const_has_at_least_three_entries_for_decision_variety() {
+        // The existing `scenario_set_includes_block_allow_and_require_confirmation_decisions`
+        // pin checks decision diversity by HashSet membership but
+        // never the underlying size invariant — a refactor that
+        // collapsed the SCENARIOS list to a single entry "for
+        // simplicity" would still pass that test if the one entry
+        // had decision="allow" (the HashSet check covers only the
+        // three required decisions). Pin the minimum size (>=3) so
+        // a future-shrink to fewer than 3 surfaces here. The current
+        // production list has 3+ scenarios — pin the floor.
+        assert!(
+            SCENARIOS.len() >= 3,
+            "SCENARIOS too small: {}",
+            SCENARIOS.len(),
+        );
+    }
+
+    #[test]
+    fn synth_event_sets_policy_id_to_scenario_policy_via_some_wrapper() {
+        // The `policy_id` field on the ActionEvent flows through to
+        // the audit row's `policy_id` column AND the dashboard's
+        // "policy" filter. Every synthetic event MUST carry a
+        // `Some(scenario.policy)` value — NOT None (which would put
+        // demo rows in the "no policy matched" bucket alongside real
+        // Layer-A invariant breaks and read-filter blocks). Pin
+        // across all SCENARIOS that the synth_event policy_id
+        // surfaces as Some with the scenario's policy string verbatim.
+        let now = Utc::now();
+        for s in SCENARIOS {
+            let ev = synth_event(s, now);
+            assert_eq!(
+                ev.policy_id.as_deref(),
+                Some(s.policy),
+                "synth_event must carry scenario.policy verbatim, got: {:?}",
+                ev.policy_id,
+            );
+        }
+    }
+
+    #[test]
+    fn synth_event_extra_field_is_demo_true_jsonb_marker_across_all_scenarios() {
+        // Every synthetic event carries `extra: {"demo": true}` —
+        // operator audit queries filter on this marker (`WHERE
+        // extra->>'demo' = 'true'`) to exclude demo rows from real
+        // metrics. A refactor that dropped the marker "for cleaner
+        // payloads" would silently pollute every operator dashboard
+        // with demo data. Pin BOTH that the field is a JSON object
+        // (not a null / not a string) AND that the `demo` key is
+        // boolean `true` across all SCENARIOS.
+        let now = Utc::now();
+        for s in SCENARIOS {
+            let ev = synth_event(s, now);
+            assert!(
+                ev.extra.is_object(),
+                "extra must be JSON object, got: {}",
+                ev.extra,
+            );
+            assert_eq!(
+                ev.extra["demo"], true,
+                "extra.demo must be `true`, got: {}",
+                ev.extra["demo"],
+            );
+        }
+    }
+
+    #[test]
+    fn synth_event_p_0_field_always_drawn_from_users_const_set() {
+        // `synth_event` selects a `user:` value via
+        // `USERS.choose(&mut rng)`. Pin that ACROSS many iterations
+        // every synthesized p_0 is a member of the USERS set — no
+        // off-by-one slicing, no hardcoded fallback. The `unwrap_or
+        // (USERS[0])` fallback fires only if `choose` returns None
+        // (which happens on empty slice — never the case for the
+        // canonical SCENARIOS-paired USERS const). Pin via 100
+        // iterations + set membership.
+        let now = Utc::now();
+        let allowed: std::collections::HashSet<String> =
+            USERS.iter().map(|s| s.to_string()).collect();
+        for _ in 0..100 {
+            let ev = synth_event(&SCENARIOS[0], now);
+            assert!(
+                allowed.contains(&ev.p_0),
+                "p_0 `{}` not in USERS set",
+                ev.p_0,
+            );
+        }
+    }
+
+    #[test]
+    fn synth_event_status_byte_equal_to_scenario_status_for_dashboard_bucketing() {
+        // The HTTP status code on the ActionEvent is what the
+        // dashboard's "status" column renders AND what operator
+        // metrics bucket on (`status >= 400 → error rate`). Pin that
+        // every synthesized event surfaces the scenario's status
+        // byte-equal — a refactor that, e.g., synthesized 200 on
+        // every event "for hygiene" or that clamped to 5xx for
+        // "block" decisions would silently change the demo signal
+        // shape. Pin the assignment is verbatim across all
+        // SCENARIOS so the demo bucket distribution matches the
+        // SCENARIOS const declaration.
+        let now = Utc::now();
+        for s in SCENARIOS {
+            let ev = synth_event(s, now);
+            assert_eq!(
+                ev.status, s.status,
+                "synth_event status drifted from scenario: ev={} sc={}",
+                ev.status, s.status,
+            );
+        }
+    }
+
+    #[test]
     fn scenario_set_includes_block_allow_and_require_confirmation_decisions() {
         // SCENARIOS is the canonical demo set. Pin the decision variety so a
         // refactor that drops an interesting class is caught.

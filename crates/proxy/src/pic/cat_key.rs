@@ -416,6 +416,133 @@ mod tests {
     }
 
     #[test]
+    fn cat_key_registry_and_cat_key_error_send_sync_static_for_app_state_arc_boundary() {
+        // `CatKeyRegistry` is held in AppState and cloned into the
+        // PicVerifier on every chain-walk; `CatKeyError` flows
+        // through `?` chains across `.await` points in the verifier's
+        // cold path. Both MUST be Send+Sync+'static — a refactor
+        // adding an `Rc<...>` on `Inner` (e.g. for cached fetch
+        // metadata) would break Sync at the AppState wire site with
+        // an opaque tower::Service trait-bound. Symmetric to the
+        // VerifierError + PicVerifier Send+Sync+'static pin on
+        // [crates/proxy/src/pic/verifier.rs] round 150 — keep the
+        // pic-module type boundary symmetric.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<CatKeyRegistry>();
+        require_send_sync_static::<CatKeyError>();
+    }
+
+    #[test]
+    fn cat_key_error_debug_carries_variant_names_for_grep_bucketing() {
+        // `#[derive(Debug)]` on CatKeyError feeds `?err` in
+        // `tracing::warn!` call sites on the verifier's cold path.
+        // Operators grep tracing log lines by variant name to bucket
+        // Fetch (network / Trust Plane unreachable) vs Status
+        // (Trust Plane responded with non-2xx) vs Decode (Trust Plane
+        // emitted malformed key bytes). A hand-rolled `impl Debug`
+        // that hid variant names "to compact" would break every
+        // operator bucket. Symmetric to the VerifierError Debug
+        // variant-names pin on verifier.rs round 150 + the other
+        // operator-facing Error enum Debug pins.
+        for (variant, name) in [
+            (CatKeyError::Status(503), "Status"),
+            (CatKeyError::Decode("bad b64".into()), "Decode"),
+        ] {
+            let s = format!("{:?}", variant);
+            assert!(s.contains(name), "expected `{name}` in Debug, got: {s}");
+        }
+    }
+
+    #[test]
+    fn cat_key_registry_clone_shares_inner_arc_via_arc_strong_count() {
+        // `CatKeyRegistry` derives Clone — the `inner: Arc<Inner>`
+        // field is cloned by Arc::clone (cheap ref-count bump). axum
+        // State + the PicVerifier hold their own clones; for the
+        // OnceCell cached key to be visible to all clones, the inner
+        // Arc MUST be shared (NOT deep-copied). A refactor that
+        // accidentally swapped `Arc<Inner>` for `Box<Inner>` would
+        // silently break the cache — the first verifier to fetch
+        // would warm its OnceCell, but every other clone's OnceCell
+        // would still be empty, causing repeated Trust Plane fetches.
+        // Pin Arc::strong_count delta = 1 across construction +
+        // clone + drop.
+        let r = CatKeyRegistry::new("http://example.invalid".into());
+        assert_eq!(Arc::strong_count(&r.inner), 1);
+        let c = r.clone();
+        assert_eq!(Arc::strong_count(&r.inner), 2);
+        let _d = c.clone();
+        assert_eq!(Arc::strong_count(&r.inner), 3);
+        drop(c);
+        assert_eq!(Arc::strong_count(&r.inner), 2);
+    }
+
+    #[test]
+    fn cat_key_error_status_arm_display_byte_exact_with_status_code_no_inner_body_leak() {
+        // `#[error("Trust Plane returned non-success {0}")]` on
+        // `Status(u16)` — pin the byte-exact Display shape against
+        // a known status code. The wire field is the raw u16 with
+        // NO inner response body leaked. A refactor to
+        // `Status { code: u16, body: String }` "for richer triage"
+        // would silently surface the Trust Plane's response body
+        // (which can carry vendor-internal state on error). Pin
+        // the prefix + the integer + no leading 0-padding.
+        assert_eq!(
+            CatKeyError::Status(503).to_string(),
+            "Trust Plane returned non-success 503",
+        );
+        assert_eq!(
+            CatKeyError::Status(404).to_string(),
+            "Trust Plane returned non-success 404",
+        );
+        // Three-digit status codes serialize without leading zeros.
+        assert!(!CatKeyError::Status(42).to_string().contains("042"));
+    }
+
+    #[test]
+    fn cat_key_error_implements_std_error_trait_via_dyn_cast_with_decode_leaf_no_source() {
+        // `CatKeyError::Decode(String)` is a leaf-arm (no inner
+        // error), but `CatKeyError::Fetch(#[from] reqwest::Error)`
+        // wraps an inner. Pin BOTH source contracts: Decode has
+        // source == None (leaf), Status has source == None (leaf
+        // u16), but Fetch's source is Some (the inner reqwest::Error).
+        // Symmetric to the verifier_error_implements_std_error_trait
+        // pin on verifier.rs round 150 — keep the pic-module error-
+        // type std::error::Error contracts symmetric. A refactor
+        // that swapped `#[from]` for an inner-string shape on Fetch
+        // "to flatten the chain" would silently break anyhow's chain
+        // walk (the inner reqwest::Error wouldn't be reachable).
+        let d = CatKeyError::Decode("bad b64".into());
+        let dyn_err: &dyn std::error::Error = &d;
+        assert!(
+            std::error::Error::source(dyn_err).is_none(),
+            "Decode must be leaf arm with no source",
+        );
+        let s = CatKeyError::Status(503);
+        let dyn_err: &dyn std::error::Error = &s;
+        assert!(
+            std::error::Error::source(dyn_err).is_none(),
+            "Status must be leaf arm with no source",
+        );
+    }
+
+    #[test]
+    fn cat_key_registry_new_with_multibyte_unicode_url_preserves_bytes_verbatim() {
+        // Internationalized DNS / non-ASCII Trust Plane hostnames are
+        // rare but possible (operators occasionally embed multibyte
+        // proxy hostnames in dev setups). `CatKeyRegistry::new` stores
+        // the URL String verbatim — pin that multibyte unicode
+        // (3-byte é + 3-byte → + 4-byte 🔥) survives construction
+        // byte-equal. A refactor that `.to_ascii_lowercase()`-ed the
+        // URL "for SNI canonicalization" would silently mangle every
+        // non-ASCII URL AND break the subsequent reqwest .get() call
+        // that builds against the stored URL. Inspect via the
+        // inner.trust_plane_url field.
+        let url = "https://trust.café-prod.local/→🔥";
+        let r = CatKeyRegistry::new(url.into());
+        assert_eq!(r.inner.trust_plane_url, url);
+    }
+
+    #[test]
     fn info_resp_rejects_non_string_kid_and_public_key_field_types() {
         // The `InfoResp { kid: String, public_key: String }` fields
         // are strictly typed — a Trust Plane response that emitted

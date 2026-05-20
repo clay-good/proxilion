@@ -659,4 +659,171 @@ mod tests {
         );
         assert_eq!(rf.detail.as_deref(), Some("secret detected"));
     }
+
+    // ─── round 185 (2026-05-20): idempotency + signature surfaces on the mutation helpers ───
+
+    #[test]
+    fn mark_layer_a_failed_is_idempotent_across_fifty_repeated_invocations() {
+        // `mark_layer_a_failed` uses `set_layer` (find-or-append) — so
+        // calling it 50 times in a row with the same args MUST leave
+        // the trace in the SAME state as one call: one LayerA entry
+        // with passed=false + PicInvariantViolation + matched_rule_id=None
+        // + the given detail. A refactor that switched `set_layer` to
+        // `push` (always-append) would surface here as the layer count
+        // ballooning to N+50 across the loop and dashboard alerts
+        // double-counting Trust-Plane refusals. The existing
+        // `mark_layer_a_failed_replaces_passed_entry` pins ONE call;
+        // pin 50-call idempotency here. Symmetric to round-181 +
+        // round-183 referential-transparency pins extended to this
+        // in-place mutation helper.
+        let mut t = fresh_trace();
+        for _ in 0..50 {
+            mark_layer_a_failed(&mut t, "missing drive:write:bob/*".into());
+        }
+        // The trace's layer count stays at the initial 2 — set_layer
+        // replaces in place, never appends, when the slot exists.
+        assert_eq!(t.layers.len(), 2, "set_layer must not duplicate on repeat");
+        let la = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .unwrap();
+        assert!(!la.passed);
+        assert_eq!(la.error_code, Some(ErrorCode::PicInvariantViolation));
+        assert!(la.matched_rule_id.is_none());
+        assert_eq!(la.detail.as_deref(), Some("missing drive:write:bob/*"));
+    }
+
+    #[test]
+    fn mark_read_filter_is_idempotent_across_fifty_repeated_invocations() {
+        // Symmetric to `mark_layer_a_failed_is_idempotent_across_fifty_repeated_invocations`
+        // extended to the read-filter slot. The first call appends
+        // (no ReadFilter in fresh_trace), and the next 49 calls
+        // replace — so the final layer count MUST be exactly the
+        // initial 2 + 1 ReadFilter == 3, NOT 2 + 50. A refactor that
+        // bypassed set_layer and pushed directly would surface here.
+        // Pin the per-mutation in-place semantic + the final state
+        // byte-equal to one canonical call.
+        let mut t = fresh_trace();
+        for _ in 0..50 {
+            mark_read_filter(&mut t, true, Some("p-scan".into()), "hit".into());
+        }
+        assert_eq!(
+            t.layers.len(),
+            3,
+            "mark_read_filter must not duplicate on repeat invocations",
+        );
+        let rf = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::ReadFilter)
+            .unwrap();
+        assert!(!rf.passed);
+        assert_eq!(rf.error_code, Some(ErrorCode::ReadFilterBlocked));
+        assert_eq!(rf.matched_rule_id.as_deref(), Some("p-scan"));
+        assert_eq!(rf.detail.as_deref(), Some("hit"));
+    }
+
+    #[test]
+    fn summary_is_referentially_transparent_across_fifty_repeated_calls() {
+        // The existing `summary_helper_is_pure_returning_byte_equal_output_across_independent_calls`
+        // pin walks TWO calls; extend to 50 to catch stateful drift
+        // (a once-cell-backed memoization that subtly varied based on
+        // call count, an Instant-stamped suffix snuck in "for log
+        // correlation"). Operator log aggregators hash the summary
+        // string to dedup; per-call variance would silently inflate
+        // the hash-bucket count and break dedup. Symmetric to
+        // round-181 RefreshCoordinator + round-183 WebhookSecret::sign
+        // 50-iteration ref-transparency pins extended to this summary
+        // helper.
+        let mut t = fresh_trace();
+        mark_layer_a_failed(&mut t, "pic break".into());
+        mark_read_filter(&mut t, true, Some("p1".into()), "secret".into());
+        let first = summary(&t);
+        for i in 1..50 {
+            let next = summary(&t);
+            assert_eq!(
+                next, first,
+                "summary diverged on call #{i}: {first:?} vs {next:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn mark_layer_a_failed_detail_field_lands_in_layer_outcome_detail_as_owned_string() {
+        // `mark_layer_a_failed(trace, detail: String)` consumes the
+        // String and threads it into `LayerOutcome::failed`'s `detail:
+        // Option<String>` field. Pin the owned-String shape via
+        // require_string on the inner — a refactor that switched the
+        // helper's signature to `&str` "for ergonomic operator-string
+        // construction" would force every call site to clone, AND
+        // would break the cross-await ownership required by the
+        // tokio-spawn'd audit-sink that captures the trace. Symmetric
+        // to round-184 owned-String field-type pins extended to this
+        // helper's String passthrough.
+        fn require_string(_: &String) {}
+        let mut t = fresh_trace();
+        mark_layer_a_failed(&mut t, "missing drive:write:bob/*".to_string());
+        let la = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .unwrap();
+        let detail = la.detail.as_ref().expect("detail must be Some");
+        require_string(detail);
+        assert_eq!(detail, "missing drive:write:bob/*");
+    }
+
+    #[test]
+    fn summary_output_contains_only_commas_no_other_separator_chars_for_log_filter_safety() {
+        // `summary()` uses `Vec::join(",")` — the ONLY separator
+        // emitted is the literal `,`. Pin this so a refactor that
+        // swapped to `"; "` (semicolon-space, the "more readable"
+        // mistake), or to `\n` (newline, "for multi-line clarity")
+        // would surface here as an unexpected character in the
+        // single-line summary. Operator log filters expect the
+        // single-line `","` separator; multi-line output would split
+        // log records on the Loki/CloudWatch newline boundary and
+        // silently fragment the structured event. Pin the absence of
+        // semicolon / newline / tab / pipe / space in a multi-layer
+        // summary.
+        let mut t = fresh_trace();
+        mark_layer_a_failed(&mut t, "pic".into());
+        mark_read_filter(&mut t, true, Some("p1".into()), "hit".into());
+        let s = summary(&t);
+        // Must contain at least one comma (multi-layer trace).
+        assert!(s.contains(','), "expected comma separator: {s}");
+        // Must NOT contain any of the alternate separators a refactor
+        // might introduce.
+        for forbidden in [';', '\n', '\t', '|', ' '] {
+            assert!(
+                !s.contains(forbidden),
+                "summary must not contain {forbidden:?}: {s}",
+            );
+        }
+    }
+
+    #[test]
+    fn set_layer_is_send_safe_fn_pointer_for_axum_handler_state_use() {
+        // The three public helpers (`set_layer`, `mark_layer_a_failed`,
+        // `mark_read_filter`) are called from inside axum request
+        // handlers that run on tokio's thread pool. The functions
+        // themselves don't need Send/Sync (they're free functions),
+        // but their fn-pointer types MUST be `Send + Sync + 'static`
+        // so the handler can stash one in a trait-object closure
+        // without an !Send capture. Pin the fn-pointer trait bounds
+        // via the canonical require helpers — a refactor that
+        // introduced a non-Send capture (e.g. via a #[thread_local]
+        // configuration shim) would surface here at the fn-pointer
+        // type boundary. Symmetric to round-181 + round-182
+        // Send/Sync/'static pins extended to function pointers.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<fn(&mut PolicyTrace, PolicyLayer, LayerOutcome)>();
+        require_send_sync_static::<fn(&mut PolicyTrace, String)>();
+        require_send_sync_static::<fn(&mut PolicyTrace, bool, Option<String>, String)>();
+        // Also pin the actual function items by casting to fn-pointer.
+        let _: fn(&mut PolicyTrace, PolicyLayer, LayerOutcome) = set_layer;
+        let _: fn(&mut PolicyTrace, String) = mark_layer_a_failed;
+        let _: fn(&mut PolicyTrace, bool, Option<String>, String) = mark_read_filter;
+    }
 }

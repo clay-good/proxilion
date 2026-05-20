@@ -1138,4 +1138,211 @@ mod canonical_request_json_tests {
         assert_eq!(a.approve_url, b.approve_url);
         assert_eq!(a.reject_url, b.reject_url);
     }
+
+    // ─── round 186 (2026-05-20): canonical_request_json + BlockedActionRecord type-level surfaces ───
+
+    #[test]
+    fn canonical_request_max_len_constant_field_is_usize_type_for_slice_len_compat() {
+        // `CANONICAL_REQUEST_MAX_LEN: usize` — the constant's type is
+        // `usize`, NOT `u32` / `i64`. Pin the underlying TYPE via the
+        // canonical require_usize helper so a refactor that switched
+        // to `i32` (or any signed/non-platform-pointer type) "for
+        // explicit byte-size clarity" would force every call site
+        // (the `s.len() <= CANONICAL_REQUEST_MAX_LEN` comparison) to
+        // add casts — and would silently introduce an i32/i64 overflow
+        // hazard on long bodies if the comparison swap weren't done
+        // in lockstep. The existing `canonical_request_max_len_constant_pinned_at_4_kib`
+        // pins the VALUE; this pins the TYPE. Symmetric to round-177
+        // u32 + round-182 u16 type pins extended to this usize
+        // constant.
+        fn require_usize(_: usize) {}
+        require_usize(CANONICAL_REQUEST_MAX_LEN);
+        // Sanity: still equals the documented 4096 (4 KiB) value.
+        assert_eq!(CANONICAL_REQUEST_MAX_LEN, 4096);
+    }
+
+    #[test]
+    fn canonical_request_json_return_type_is_owned_string_for_cross_await_ownership() {
+        // `canonical_request_json(...) -> String` — the return is an
+        // OWNED `String`, NOT a borrowed `&str` or `Cow<'_, str>`.
+        // The persist() bind path captures the value across an
+        // `.await` boundary in the sqlx INSERT call AND across the
+        // tokio::spawn'd notifier fan-out. A refactor to `&'a str`
+        // "for zero-alloc on the trim path" would introduce a
+        // lifetime parameter that cascades through every consuming
+        // `?`-chain. Pin the owned-String type via the canonical
+        // require_string helper. Symmetric to round-181 + round-183
+        // owned-String type pins extended to this canonical-JSON
+        // builder's return type.
+        let (path_params, body) = empty_maps();
+        let s = canonical_request_json(
+            "POST",
+            "/gmail/v1/users/me/messages/send",
+            "google",
+            "gmail.messages.send",
+            &path_params,
+            &body,
+        );
+        fn require_string(_: &String) {}
+        require_string(&s);
+        // Sanity: also a non-empty owned String value.
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn blocked_action_record_static_borrow_is_send_sync_static_for_router_state_path() {
+        // `BlockedActionRecord<'static>` flows through the adapter's
+        // record-building call site that constructs the record from
+        // 'static lifetime sources (test fixtures, const labels). The
+        // existing `owned_blocked_notification_is_send_sync_static_for_tokio_spawn_boundary`
+        // pins the Owned variant; pin the BORROWED 'static variant
+        // here so a refactor that introduced a !Sync field on
+        // BlockedActionRecord (e.g. `Cell<u32>` "for a per-row
+        // counter") would surface at this file rather than at
+        // hundreds of call sites. Symmetric to round-184 +
+        // PicViolationRecord<'static> Send+Sync pin extended to
+        // this sibling borrowed-Record type.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<BlockedActionRecord<'static>>();
+    }
+
+    #[test]
+    fn blocked_action_record_requested_ops_field_is_borrowed_string_slice_type() {
+        // `BlockedActionRecord.requested_ops: &'a [String]` —
+        // borrowed slice, not owned Vec. The persist() bind path
+        // calls `.bind(r.requested_ops)` which accepts `&[String]`
+        // directly for the `text[]` Postgres column. A refactor to
+        // `Vec<String>` "for ownership clarity" would force every
+        // call site to clone the upstream Vec into the record.
+        // Symmetric to round-184 PicViolationRecord borrowed-slice
+        // pin extended to this sibling Record's requested_ops slice.
+        fn require_slice_string(_: &[String]) {}
+        let ops: Vec<String> = vec![
+            "gmail:send:bob@external.com".into(),
+            "gmail:send:eve@evil.example".into(),
+        ];
+        let r = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "POST",
+            path: "/x",
+            layer: "policy",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        require_slice_string(r.requested_ops);
+        // Zero-copy borrow — slice ptr equals the original Vec's
+        // slice ptr.
+        assert_eq!(r.requested_ops.as_ptr(), ops.as_ptr());
+        assert_eq!(r.requested_ops.len(), 2);
+    }
+
+    #[test]
+    fn owned_blocked_notification_as_borrowed_schema_field_is_static_str_lifetime() {
+        // `OwnedBlockedNotification::as_borrowed()` sets
+        // `schema: BlockedNotification::SCHEMA` — a `&'static str`
+        // constant from notifier/mod.rs. Pin the static lifetime via
+        // require_static_str so a refactor that swapped the schema
+        // assignment to `self.schema.clone()` "for symmetry with the
+        // other String fields" would silently promote the field to
+        // an owned String AND drop the 'static lifetime contract
+        // every webhook header propagation depends on. Symmetric to
+        // round-172 + round-173 + round-174 static-str lifetime
+        // pins extended to this as_borrowed schema field.
+        fn require_static_str(_: &'static str) {}
+        let ops = vec!["gmail:send:bob@external.com".to_string()];
+        let n = BlockedNotification {
+            schema: BlockedNotification::SCHEMA,
+            blocked_id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            p_0: Some("alice@acme.com"),
+            vendor: "google",
+            action: "gmail.messages.send",
+            method: "POST",
+            path: "/gmail/v1/users/me/messages/send",
+            layer: "policy",
+            policy_id: Some("p1"),
+            detail: Some("external recipient"),
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            approve_url: "u/approve".into(),
+            reject_url: "u/reject".into(),
+        };
+        let owned = OwnedBlockedNotification::from(&n);
+        let borrowed = owned.as_borrowed();
+        require_static_str(borrowed.schema);
+        // Sanity: the schema string matches the canonical constant.
+        assert_eq!(borrowed.schema, BlockedNotification::SCHEMA);
+        assert_eq!(borrowed.schema, "proxilion.blocked_action.v1");
+    }
+
+    #[test]
+    fn owned_blocked_notification_from_is_referentially_transparent_across_fifty_repeated_calls() {
+        // `OwnedBlockedNotification::from(&n)` is a pure
+        // borrowed-to-owned converter — no clock, no env, no global
+        // state. Pin referential transparency across 50 back-to-back
+        // calls on the same `BlockedNotification` source. A refactor
+        // that introduced a per-call tag (e.g. an Instant-stamped
+        // suffix added to the URL "for log correlation") would
+        // silently make two calls diverge AND break webhook /
+        // slack / email fan-out idempotency (each fan-out arm calls
+        // from() independently). Symmetric to round-181 +
+        // round-183 + round-185 referential-transparency pins
+        // extended to this borrowed-to-owned converter.
+        let ops = vec!["gmail:send:bob@external.com".to_string()];
+        let id = Uuid::new_v4();
+        let req = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let n = BlockedNotification {
+            schema: BlockedNotification::SCHEMA,
+            blocked_id: id,
+            request_id: req,
+            session_id: session,
+            p_0: Some("alice@acme.com"),
+            vendor: "google",
+            action: "gmail.messages.send",
+            method: "POST",
+            path: "/gmail/v1/users/me/messages/send",
+            layer: "policy",
+            policy_id: Some("p1"),
+            detail: Some("external recipient"),
+            predecessor_pca_id: None,
+            requested_ops: &ops,
+            approve_url: "u/approve".into(),
+            reject_url: "u/reject".into(),
+        };
+        let first = OwnedBlockedNotification::from(&n);
+        for i in 1..50 {
+            let next = OwnedBlockedNotification::from(&n);
+            assert_eq!(
+                next.blocked_id, first.blocked_id,
+                "blocked_id diverged on call #{i}",
+            );
+            assert_eq!(next.vendor, first.vendor, "vendor diverged on call #{i}");
+            assert_eq!(next.action, first.action, "action diverged on call #{i}");
+            assert_eq!(next.method, first.method, "method diverged on call #{i}");
+            assert_eq!(next.path, first.path, "path diverged on call #{i}");
+            assert_eq!(next.layer, first.layer, "layer diverged on call #{i}");
+            assert_eq!(
+                next.approve_url, first.approve_url,
+                "approve_url diverged on call #{i}",
+            );
+            assert_eq!(
+                next.reject_url, first.reject_url,
+                "reject_url diverged on call #{i}",
+            );
+            assert_eq!(
+                next.requested_ops, first.requested_ops,
+                "requested_ops diverged on call #{i}",
+            );
+        }
+    }
 }

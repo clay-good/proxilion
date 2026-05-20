@@ -806,9 +806,9 @@ code, .mono { font-family: var(--mono); }
       </div>
 
       <div class="diagram-wrap">
-        <svg viewBox="0 0 1200 620" role="img" aria-labelledby="diagramTitle diagramDesc" xmlns="http://www.w3.org/2000/svg">
+        <svg viewBox="0 0 1200 660" role="img" aria-labelledby="diagramTitle diagramDesc" xmlns="http://www.w3.org/2000/svg">
           <title id="diagramTitle">Proxilion system architecture diagram</title>
-          <desc id="diagramDesc">A managed AI agent calls a SaaS API through Proxilion. Proxilion authenticates the human user at the IdP, mints PCA_0 from the Trust Plane, binds the agent token to PCA_1, then issues a per-action PCA_2 narrowed to a single operation, before forwarding the request upstream. Every PCA is logged to an append-only audit store.</desc>
+          <desc id="diagramDesc">A managed AI agent calls a SaaS API through Proxilion. Proxilion authenticates the human user at the IdP, runs the in-process policy engine (Layer A ops shape, Layer B content policy, Layer C response read-filter) to decide whether to proceed, then requests a signed successor PCA from the Trust Plane. The Trust Plane is a narrow cryptographic notary that enforces only the PIC protocol invariants (Provenance, Identity, Continuity) — no customer policy ever crosses that boundary. Proxilion forwards the approved request upstream and logs every PCA to an append-only audit store.</desc>
 
           <defs>
             <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -822,9 +822,11 @@ code, .mono { font-family: var(--mono); }
           <style>
             .node { fill: var(--diagram-node-bg); stroke: var(--diagram-node-stroke); stroke-width: 1.5; rx: 10; }
             .node-prox { fill: var(--diagram-node-bg); stroke: var(--accent); stroke-width: 1.8; }
+            .node-engine { fill: var(--diagram-node-bg); stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 3 3; }
             .node-trust { fill: var(--diagram-node-bg); stroke: var(--accent); stroke-width: 1.6; stroke-dasharray: 4 3; }
             .lbl { font: 700 14px ui-sans-serif, system-ui, sans-serif; fill: var(--diagram-node-text); }
             .lbl-accent { font: 700 16px ui-sans-serif, system-ui, sans-serif; fill: var(--accent); letter-spacing: 0.04em; }
+            .lbl-engine { font: 700 13px ui-sans-serif, system-ui, sans-serif; fill: var(--accent); letter-spacing: 0.02em; }
             .sub { font: 500 11px ui-sans-serif, system-ui, sans-serif; fill: var(--diagram-node-sub); }
             .pca { font: 700 11px ui-monospace, monospace; fill: var(--accent); }
             .flow { stroke: var(--accent); stroke-width: 2; fill: none; }
@@ -843,19 +845,30 @@ code, .mono { font-family: var(--mono); }
           <text x="1040" y="100" text-anchor="middle" class="sub">Anthropic hosted Claude</text>
           <text x="1040" y="118" text-anchor="middle" class="sub">OpenAI assistants</text>
 
-          <!-- Middle: Proxilion -->
-          <rect class="node-prox" x="300" y="240" width="600" height="130"/>
-          <text x="600" y="278" text-anchor="middle" class="lbl-accent">PROXILION  .  Reverse Proxy + Policy Engine</text>
-          <text x="600" y="306" text-anchor="middle" class="sub">OAuth interception  .  per-action PCA issuance  .  Layer-B content policy</text>
-          <text x="600" y="332" text-anchor="middle" class="pca">PCA_0 &#8839; PCA_1 &#8839; PCA_2   (ops monotonically shrink)</text>
-          <text x="600" y="354" text-anchor="middle" class="sub">prompt-injection containment  .  external-recipient policy  .  justification-required deletes</text>
+          <!-- Middle: Proxilion outer box -->
+          <rect class="node-prox" x="300" y="200" width="600" height="220"/>
+          <text x="600" y="232" text-anchor="middle" class="lbl-accent">PROXILION  .  Reverse Proxy</text>
+          <text x="600" y="254" text-anchor="middle" class="sub">OAuth interception  .  agent-token binding  .  upstream forwarding  .  killswitch</text>
 
-          <!-- Trust Plane -->
-          <rect class="node-trust" x="60" y="252" width="200" height="106"/>
-          <text x="160" y="292" text-anchor="middle" class="lbl">Trust Plane</text>
-          <text x="160" y="314" text-anchor="middle" class="sub">CAT signing key</text>
-          <text x="160" y="332" text-anchor="middle" class="sub">customer-held</text>
-          <text x="160" y="352" text-anchor="middle" class="pca">mints PCA</text>
+          <!-- Policy Engine sub-box (visually INSIDE Proxilion) -->
+          <rect class="node-engine" x="324" y="272" width="552" height="84"/>
+          <text x="600" y="294" text-anchor="middle" class="lbl-engine">Policy Engine  .  in-process</text>
+          <text x="600" y="313" text-anchor="middle" class="sub">Layer A: ops shape  .  Layer B: content + recipient policy  .  Layer C: response read-filter</text>
+          <text x="600" y="331" text-anchor="middle" class="sub">YAML rules  .  hot-reloadable  .  per-tenant  .  customer policy never leaves this box</text>
+          <text x="600" y="349" text-anchor="middle" class="pca">decision &rarr; allow / block / require_confirmation</text>
+
+          <!-- Proxilion footer: PCA chain -->
+          <text x="600" y="386" text-anchor="middle" class="pca">PCA_0 &#8839; PCA_1 &#8839; PCA_2   (ops monotonically shrink)</text>
+          <text x="600" y="406" text-anchor="middle" class="sub">prompt-injection containment  .  external-recipient gate  .  justification-required deletes</text>
+
+          <!-- Trust Plane (narrow crypto notary) -->
+          <rect class="node-trust" x="60" y="232" width="200" height="156"/>
+          <text x="160" y="260" text-anchor="middle" class="lbl">Trust Plane</text>
+          <text x="160" y="280" text-anchor="middle" class="sub">CAT signer  .  crypto notary</text>
+          <text x="160" y="300" text-anchor="middle" class="sub">PIC invariants only</text>
+          <text x="160" y="318" text-anchor="middle" class="sub">Provenance . Identity . Continuity</text>
+          <text x="160" y="342" text-anchor="middle" class="sub">no customer policy state</text>
+          <text x="160" y="368" text-anchor="middle" class="pca">signs + verifies PCA</text>
 
           <!-- Audit store -->
           <rect class="node" x="940" y="252" width="200" height="106"/>
@@ -865,43 +878,47 @@ code, .mono { font-family: var(--mono); }
           <text x="1040" y="352" text-anchor="middle" class="pca">offline-verifiable</text>
 
           <!-- Bottom: Upstream SaaS -->
-          <rect class="node" x="320" y="480" width="180" height="92"/>
-          <text x="410" y="518" text-anchor="middle" class="lbl">Google Drive</text>
-          <text x="410" y="540" text-anchor="middle" class="sub">files.get / files.list</text>
+          <rect class="node" x="320" y="520" width="180" height="92"/>
+          <text x="410" y="558" text-anchor="middle" class="lbl">Google Drive</text>
+          <text x="410" y="580" text-anchor="middle" class="sub">files.get / files.list</text>
 
-          <rect class="node" x="510" y="480" width="180" height="92"/>
-          <text x="600" y="518" text-anchor="middle" class="lbl">Gmail</text>
-          <text x="600" y="540" text-anchor="middle" class="sub">messages.send</text>
+          <rect class="node" x="510" y="520" width="180" height="92"/>
+          <text x="600" y="558" text-anchor="middle" class="lbl">Gmail</text>
+          <text x="600" y="580" text-anchor="middle" class="sub">messages.send</text>
 
-          <rect class="node" x="700" y="480" width="180" height="92"/>
-          <text x="790" y="518" text-anchor="middle" class="lbl">Google Calendar</text>
-          <text x="790" y="540" text-anchor="middle" class="sub">events.insert</text>
+          <rect class="node" x="700" y="520" width="180" height="92"/>
+          <text x="790" y="558" text-anchor="middle" class="lbl">Google Calendar</text>
+          <text x="790" y="580" text-anchor="middle" class="sub">events.insert</text>
 
           <!-- Flows -->
           <!-- User -> Proxilion (IdP auth) -->
-          <path class="flow" d="M 160 132 C 160 180, 340 200, 420 240" marker-end="url(#arrow)"/>
-          <text x="232" y="184" class="flow-lbl">1. IdP federation</text>
+          <path class="flow" d="M 160 132 C 160 160, 340 175, 420 200" marker-end="url(#arrow)"/>
+          <text x="232" y="160" class="flow-lbl">1. IdP federation</text>
 
           <!-- Agent -> Proxilion (OAuth + actions) -->
-          <path class="flow" d="M 1040 132 C 1040 180, 860 200, 780 240" marker-end="url(#arrow)"/>
-          <text x="900" y="184" class="flow-lbl">2. agent request</text>
+          <path class="flow" d="M 1040 132 C 1040 160, 860 175, 780 200" marker-end="url(#arrow)"/>
+          <text x="900" y="160" class="flow-lbl">2. agent request</text>
 
-          <!-- Proxilion <-> Trust Plane -->
-          <path class="flow" d="M 300 305 L 260 305" marker-end="url(#arrow)"/>
-          <text x="278" y="296" class="flow-lbl" text-anchor="middle">mint</text>
+          <!-- Proxilion -> Trust Plane (request signed PCA) -->
+          <path class="flow" d="M 300 286 L 260 286" marker-end="url(#arrow)"/>
+          <text x="280" y="277" class="flow-lbl" text-anchor="middle">request PCA</text>
+
+          <!-- Trust Plane -> Proxilion (verify + sign, return path) -->
+          <path class="flow-back" d="M 260 336 L 300 336" marker-end="url(#arrow-muted)"/>
+          <text x="280" y="354" class="flow-lbl" text-anchor="middle">verify + sign</text>
 
           <!-- Proxilion -> Audit -->
-          <path class="flow" d="M 900 305 L 940 305" marker-end="url(#arrow)"/>
-          <text x="920" y="296" class="flow-lbl" text-anchor="middle">log</text>
+          <path class="flow" d="M 900 310 L 940 310" marker-end="url(#arrow)"/>
+          <text x="920" y="301" class="flow-lbl" text-anchor="middle">log</text>
 
           <!-- Proxilion -> SaaS -->
-          <path class="flow" d="M 480 370 C 480 430, 410 430, 410 480" marker-end="url(#arrow)"/>
-          <path class="flow" d="M 600 370 L 600 480" marker-end="url(#arrow)"/>
-          <path class="flow" d="M 720 370 C 720 430, 790 430, 790 480" marker-end="url(#arrow)"/>
-          <text x="600" y="420" text-anchor="middle" class="flow-lbl">3. forward, PCA_2 bound</text>
+          <path class="flow" d="M 480 420 C 480 470, 410 470, 410 520" marker-end="url(#arrow)"/>
+          <path class="flow" d="M 600 420 L 600 520" marker-end="url(#arrow)"/>
+          <path class="flow" d="M 720 420 C 720 470, 790 470, 790 520" marker-end="url(#arrow)"/>
+          <text x="600" y="462" text-anchor="middle" class="flow-lbl">3. forward, PCA_2 bound</text>
 
           <!-- Return path (dashed) -->
-          <path class="flow-back" d="M 410 480 C 410 430, 480 430, 480 370" marker-end="url(#arrow-muted)"/>
+          <path class="flow-back" d="M 410 520 C 410 470, 480 470, 480 420" marker-end="url(#arrow-muted)"/>
         </svg>
 
         <div class="diagram-legend">

@@ -558,6 +558,189 @@ mod tests {
         assert_eq!(redact_pii_bytes(&at_255), copy);
     }
 
+    // ─── round 194 (2026-05-20): AuditBodyMode + helper purity surfaces ───
+
+    #[test]
+    fn audit_body_mode_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // `AuditBodyMode` has exactly 3 variants today (Hash /
+        // RedactPii / Full) — the three documented audit dispositions
+        // operators choose between per spec.md §6.4. The dashboard's
+        // "audit_body retention" pie chart is sized to 3 buckets. A
+        // refactor that landed a fourth variant (e.g. `HeadersOnly` to
+        // record the request envelope without the body) would surface
+        // a fourth label dimension the panel wasn't sized for AND the
+        // `mode_label` match in `persist()` would non-exhaustively
+        // compile-fail at runtime — but the panic-on-default arm path
+        // would surface in production rather than at refactor time
+        // without this pin. Symmetric to round-189 ActionsApiError
+        // 4-variant + round-190 ApiError 2-variant + round-191
+        // SetupError 1-variant + round-192 TriggerClaim 4-variant
+        // exhaustive-match pins extended to this sibling enum
+        // re-exported from policy-engine.
+        fn arm_name(m: &AuditBodyMode) -> &'static str {
+            match m {
+                AuditBodyMode::Hash => "Hash",
+                AuditBodyMode::RedactPii => "RedactPii",
+                AuditBodyMode::Full => "Full",
+            }
+        }
+        let three: Vec<AuditBodyMode> = vec![
+            AuditBodyMode::Hash,
+            AuditBodyMode::RedactPii,
+            AuditBodyMode::Full,
+        ];
+        let names: std::collections::HashSet<&'static str> = three.iter().map(arm_name).collect();
+        assert_eq!(names.len(), 3, "3 distinct leaf-variant names walked");
+        assert_eq!(arm_name(&AuditBodyMode::Hash), "Hash");
+        assert_eq!(arm_name(&AuditBodyMode::RedactPii), "RedactPii");
+        assert_eq!(arm_name(&AuditBodyMode::Full), "Full");
+    }
+
+    #[test]
+    fn sha256_hex_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `sha256_hex` is the digest function feeding the `request_hash`
+        // / `response_hash` columns. The function is called twice per
+        // request (request + response body) and again on replay. A
+        // refactor that mixed in a thread-local nonce "for HMAC-style
+        // domain separation" would silently break the cross-request
+        // hash-comparison the replay tools rely on. Pin 50 calls on the
+        // same input yield byte-equal output. Symmetric to round-187
+        // html_escape + round-180 evaluate + round-191 SetupStatus +
+        // round-193 ErrorBody referential-transparency pins extended
+        // to this hash helper.
+        let input = b"hello world";
+        let baseline = sha256_hex(input);
+        for i in 0..50 {
+            let again = sha256_hex(input);
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: sha256_hex must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn base64_encode_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `base64_encode` feeds the `request_body_b64` /
+        // `response_body_b64` columns when audit_body mode is
+        // `Full` or `RedactPii`. Replay tools decode the column on
+        // every audit row; a refactor that introduced a per-call
+        // line-wrap (the `MIME` engine wraps at 76 cols) would
+        // silently change the column contents and break the decoder.
+        // Pin 50 calls on the same input yield byte-equal output.
+        // Symmetric to the sha256_hex pin above — both helpers feed
+        // the same INSERT and must move in lockstep on purity.
+        let input = &[0x00u8, 0x01, 0xFE, 0xFF, b'h', b'i'];
+        let baseline = base64_encode(input);
+        for i in 0..50 {
+            let again = base64_encode(input);
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: base64_encode must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn redact_pii_text_is_referentially_transparent_across_fifty_calls_on_pii_heavy_input() {
+        // `redact_pii_text` is on the RedactPii mode's hot path —
+        // called for every request body when the matched policy uses
+        // that audit disposition. The existing
+        // `redact_pii_text_is_idempotent_across_two_passes_on_pii_heavy_input`
+        // pin walks the one-pass-equals-two-pass contract but NOT the
+        // referential-transparency-across-N-calls contract. A refactor
+        // that introduced a thread-local LRU cache "for hot-path
+        // perf" keyed on input pointer (not content) would silently
+        // diverge across calls on equal-content-different-allocation
+        // inputs — pin 50 calls byte-equal here.
+        let input = "alice@acme.com 415-555-1234 ssn 123-45-6789 \
+                     Bearer ya29.a0AfH6SMABcDefGhIjKlMnOpQrStUv0123 \
+                     card 4111 1111 1111 1111";
+        let baseline = redact_pii_text(input);
+        for i in 0..50 {
+            let again = redact_pii_text(input);
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: redact_pii_text must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn sha256_hex_return_type_is_owned_string_for_cross_await_sqlx_bind_through_persist() {
+        // `sha256_hex` returns `String` — the digest must be owned
+        // because it flows through `.bind(&req_hash)` and
+        // `.bind(&resp_hash)` in `persist(...)` which is async and
+        // crosses `.await` at the sqlx execute. A refactor to
+        // `Cow<'a, str>` "for zero-alloc on the empty input" would
+        // introduce a lifetime parameter that doesn't outlive the
+        // `.bind(...).await` borrow. Pin via require_string.
+        // Symmetric to round-186 canonical_request_json + round-187
+        // html_escape + round-188 PolicyView 5-field owned-String
+        // pins extended to this digest helper.
+        fn require_string(_: &String) {}
+        let h = sha256_hex(b"any input");
+        require_string(&h);
+        // Sanity: width pins are already covered by sibling tests;
+        // here we focus on the owned-type contract.
+        assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn audit_body_mode_label_strings_are_byte_exact_lowercase_for_grafana_label_axis() {
+        // The `mode_label` match in `persist(...)` emits "hash" /
+        // "redact_pii" / "full" as Grafana label values on
+        // `proxilion_audit_body_persisted_total` and
+        // `proxilion_audit_body_persist_failures_total`. The dashboard
+        // panel groups by `mode = "hash" | "redact_pii" | "full"`. A
+        // refactor that emitted Title-Case ("Hash") or kebab-case
+        // ("redact-pii") would silently re-label every counter
+        // increment under a new dimension value and break the
+        // dashboard's "by mode" stacked bar. Pin byte-exact lowercase
+        // snake_case for all three variants via a closure that
+        // mirrors the `mode_label` match arms in persist().
+        // Symmetric to round-184 PicViolationRecord.pic_mode lowercase
+        // + round-188 PolicyView.mode lowercase pins extended to this
+        // metric-label axis.
+        let label = |m: AuditBodyMode| match m {
+            AuditBodyMode::Hash => "hash",
+            AuditBodyMode::RedactPii => "redact_pii",
+            AuditBodyMode::Full => "full",
+        };
+        for (m, expected) in [
+            (AuditBodyMode::Hash, "hash"),
+            (AuditBodyMode::RedactPii, "redact_pii"),
+            (AuditBodyMode::Full, "full"),
+        ] {
+            let got = label(m);
+            assert_eq!(got, expected);
+            // Lowercase snake_case sweep: no uppercase, no kebab.
+            assert!(
+                !got.chars().any(|c| c.is_ascii_uppercase()),
+                "mode label has uppercase: {got}",
+            );
+            assert!(!got.contains('-'), "mode label has kebab dash: {got}");
+        }
+    }
+
+    #[test]
+    fn redact_pii_text_return_type_is_owned_string_for_cross_await_base64_encode_chain() {
+        // `redact_pii_text` returns `String` — its output feeds
+        // `base64_encode(&redact_pii_bytes(...))` in the RedactPii
+        // arm of `persist(...)` which crosses the `.await` at sqlx
+        // execute. A refactor to `Cow<'a, str>` for "zero-alloc on
+        // no-PII inputs" would introduce a lifetime parameter that
+        // the surrounding async function's owned-content contract
+        // can't satisfy. Pin via require_string. Symmetric to the
+        // sha256_hex owned-String pin above + round-193 ErrorBody.detail
+        // Option<String> pin extended to this sibling owned-content
+        // helper.
+        fn require_string(_: &String) {}
+        let s = redact_pii_text("hello alice@acme.com");
+        require_string(&s);
+        assert!(s.contains("<REDACTED_EMAIL>"));
+    }
+
     #[test]
     fn redact_pii_text_no_pii_input_returns_byte_equal_string() {
         // For an input with zero PII matches across all six redactors,

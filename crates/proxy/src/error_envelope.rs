@@ -524,4 +524,138 @@ mod tests {
             "second key must be `code`, got: {next_chunk}",
         );
     }
+
+    // ─── round 193 (2026-05-20): ErrorBody field-type + purity surfaces ───
+
+    #[test]
+    fn error_body_is_send_sync_static_for_axum_into_response_boxed_future_boundary() {
+        // The existing `error_body_is_send_sync_for_axum_into_response_boundary`
+        // pin walks Send + Sync only. Axum's `IntoResponse` future is
+        // boxed AND held across `.await` points in adapter error paths,
+        // so the `'static` bound is also load-bearing — a refactor that
+        // introduced a non-'static borrow (e.g. `error: &'a str` instead
+        // of `&'static str`) would silently force a lifetime parameter
+        // through every adapter that constructs an ErrorBody. Pin
+        // Send + Sync + 'static together — symmetric to round-189
+        // ListResponse + round-190 KillBody + round-191 CheckItem +
+        // SetupStatus + round-192 TriggerClaim Send+Sync+'static
+        // pins extended to this central envelope type.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ErrorBody>();
+    }
+
+    #[test]
+    fn error_body_fix_and_docs_fields_are_option_of_static_str_for_zero_alloc_some_variant() {
+        // `ErrorBody.fix: Option<&'static str>` and `ErrorBody.docs:
+        // Option<&'static str>` — both fields are literal docstrings
+        // authored at adapter call sites, never `format!()`-built. A
+        // refactor that promoted EITHER field to `Option<String>` "for
+        // ergonomic interpolation of request-time values" (e.g.
+        // `format!("Set X={env}")` mixing in an env var) would silently
+        // allocate one String per error envelope AND would widen the
+        // surface area for interpolation injection from operator-
+        // supplied error chains. Pin lifetime via require_static_str on
+        // the Some-polarity for both fields. Symmetric to round-191
+        // CheckItem.fix Option<&'static str> pin extended to this
+        // sibling envelope's two operator-instruction fields.
+        fn require_static_str(_: &'static str) {}
+        let body = ErrorBody::new("t", "c")
+            .with_fix("Run `proxilion-ctl rotate-keys`")
+            .with_docs("https://proxilion.com/docs/troubleshooting");
+        require_static_str(body.fix.expect("Some fixture"));
+        require_static_str(body.docs.expect("Some fixture"));
+    }
+
+    #[test]
+    fn error_body_detail_field_is_option_string_type_for_runtime_formatted_content() {
+        // `ErrorBody.detail: Option<String>` — the ONLY heap-allocated
+        // Option field on ErrorBody. Adapter call sites build the
+        // detail via `format!(...)` at error time (e.g.
+        // `format!("missing key {kid}")` from the CAT-key registry),
+        // so it MUST be owned String, NOT `Option<&'static str>` (which
+        // would foreclose runtime interpolation). The existing
+        // `with_detail_accepts_string_and_str_via_into` pin covers the
+        // Into<String> behavior but never the field-type contract
+        // directly. Pin via require_opt_string. Symmetric to round-190
+        // KillBody Option<String> + round-192 TriggerClaim::Error owned-
+        // String pins extended to this field's Option<String> shape.
+        fn require_opt_string(_: &Option<String>) {}
+        let body = ErrorBody::new("t", "c").with_detail("dynamic detail");
+        require_opt_string(&body.detail);
+        assert_eq!(body.detail.as_deref(), Some("dynamic detail"));
+    }
+
+    #[test]
+    fn error_body_serialization_is_referentially_transparent_across_fifty_calls_on_same_envelope() {
+        // The /api/v1/* handlers emit ErrorBody across every 4xx/5xx
+        // response — a refactor that injected a per-call timestamp or
+        // request-id INTO the envelope serialization "for debug
+        // correlation" would silently break the byte-equal contract
+        // operator log aggregators rely on for dedup hashing. Pin 50
+        // serialization calls on the same struct yield byte-equal
+        // JSON. Symmetric to round-187 html_escape + round-180
+        // evaluate + round-191 SetupStatus + round-192 slack_ok_message
+        // referential-transparency pins extended to this central error
+        // envelope.
+        let body = ErrorBody::new("nope", "not_found")
+            .with_detail("row 42 missing")
+            .with_fix("re-run the migration")
+            .with_docs("https://proxilion.com/docs/x")
+            .with_extras(serde_json::json!({"policy_id": "p1"}));
+        let baseline = serde_json::to_string(&body).unwrap();
+        for i in 0..50 {
+            let again = serde_json::to_string(&body).unwrap();
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: ErrorBody serialization must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn error_body_debug_carries_struct_name_for_grep_bucketing() {
+        // The `#[derive(Debug)]` on `ErrorBody` feeds `?err` in
+        // operator-facing tracing call sites. The existing
+        // `error_body_debug_includes_code_for_grep` pin checks that
+        // `code` is rendered, but never the struct-name itself. A
+        // hand-rolled `impl Debug` that emitted just the fields without
+        // the struct prefix (a "compact" custom Debug) would break
+        // operator grep buckets keyed on "ErrorBody {". Pin via
+        // substring match on the canonical Debug-derive output shape.
+        // Symmetric to round-181 AuthFail + round-186 BlockedActionRecord
+        // + round-189 ActionsApiError Debug variant/struct-name pins
+        // extended to this central envelope's Debug shape.
+        let body = ErrorBody::new("title", "internal_error").with_detail("d");
+        let dbg = format!("{body:?}");
+        assert!(dbg.contains("ErrorBody"), "missing struct name: {dbg}");
+        assert!(dbg.contains("internal_error"), "missing code: {dbg}");
+    }
+
+    #[test]
+    fn error_body_builders_return_self_by_value_not_mut_ref_for_chaining_in_method_position() {
+        // The four builders (`with_detail` / `with_fix` / `with_docs` /
+        // `with_extras`) take `mut self` and return `Self` — pin this
+        // contract via assigning the call site's return to a binding
+        // directly. The existing tests chain builders but never
+        // observe the return-by-value contract independently. A
+        // refactor that switched to `&mut Self` return "for ergonomic
+        // setter syntax" would break every adapter call site (which
+        // uses `let body = ErrorBody::new(...).with_X(...);`) — pin
+        // the by-value contract here so the refactor surfaces at this
+        // module rather than at the first adapter. Symmetric to
+        // round-183 WebhookSecret::sign + round-184 PicViolationRecord
+        // method-signature pins extended to this builder API.
+        // The pin is enforced by requiring a `let _: ErrorBody = ...`
+        // binding that wouldn't type-check if the return were &mut.
+        let _: ErrorBody = ErrorBody::new("t", "c").with_detail("d");
+        let _: ErrorBody = ErrorBody::new("t", "c").with_fix("f");
+        let _: ErrorBody = ErrorBody::new("t", "c").with_docs("https://x");
+        let _: ErrorBody = ErrorBody::new("t", "c").with_extras(serde_json::json!({}));
+        // And the chained form composes — pin that the chain also
+        // yields ErrorBody (not a borrowed reference).
+        let _: ErrorBody = ErrorBody::new("t", "c")
+            .with_detail("d")
+            .with_fix("f")
+            .with_docs("https://x");
+    }
 }

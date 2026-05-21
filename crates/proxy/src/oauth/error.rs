@@ -734,4 +734,210 @@ mod tests {
                 .contains("subset")
         );
     }
+
+    // ─── round 198 (2026-05-20): OAuthError variant + body purity surfaces ───
+
+    #[test]
+    fn oauth_error_variant_count_pinned_at_exactly_eleven_via_exhaustive_match() {
+        // `OAuthError` has exactly 11 variants today (BadRequest /
+        // UnknownClient / SessionGone / BridgeRejected / PkceFail /
+        // BadAuthCode / PicInvariant / Upstream / Db / Crypto /
+        // Internal). The status() + body() match arms enumerate
+        // ALL 11; a refactor that landed a twelfth variant (e.g.
+        // `RateLimited` for a future /token rate-gate) would
+        // surface a 12th grep bucket the operator runbook wasn't
+        // sized for AND would non-exhaustively compile-fail at
+        // both match sites. Pin variant count via an exhaustive
+        // match — a new arm forces this test to compile-fail at
+        // the arm site. Symmetric to round-181 AuthFail 9-variant
+        // + round-182 CatKeyError 3-variant + round-189
+        // ActionsApiError 4-variant + round-190 ApiError 2-variant
+        // + round-192 TriggerClaim 4-variant + round-194
+        // AuditBodyMode 3-variant + round-197 (this round) all
+        // exhaustive-match pins extended to this OAuthError enum.
+        fn arm_name(e: &OAuthError) -> &'static str {
+            match e {
+                OAuthError::BadRequest(_) => "BadRequest",
+                OAuthError::UnknownClient => "UnknownClient",
+                OAuthError::SessionGone => "SessionGone",
+                OAuthError::BridgeRejected(_) => "BridgeRejected",
+                OAuthError::PkceFail => "PkceFail",
+                OAuthError::BadAuthCode => "BadAuthCode",
+                OAuthError::PicInvariant(_) => "PicInvariant",
+                OAuthError::Upstream(_) => "Upstream",
+                OAuthError::Db(_) => "Db",
+                OAuthError::Crypto => "Crypto",
+                OAuthError::Internal(_) => "Internal",
+            }
+        }
+        // Walk all 10 constructible variants (Upstream needs a real
+        // reqwest::Error — exercised in sibling tests; the match
+        // exhaustiveness at compile time is what guards the
+        // variant count, not the Vec contents).
+        let ten: Vec<OAuthError> = vec![
+            OAuthError::BadRequest("x".into()),
+            OAuthError::UnknownClient,
+            OAuthError::SessionGone,
+            OAuthError::BridgeRejected("x".into()),
+            OAuthError::PkceFail,
+            OAuthError::BadAuthCode,
+            OAuthError::PicInvariant("x".into()),
+            OAuthError::Db(sqlx::Error::RowNotFound),
+            OAuthError::Crypto,
+            OAuthError::Internal("x".into()),
+        ];
+        let names: std::collections::HashSet<&'static str> = ten.iter().map(arm_name).collect();
+        assert_eq!(names.len(), 10, "10 constructible-variant names walked");
+        // And the 11th (Upstream) is reachable via the match — the
+        // exhaustive arm forces compile-time enumeration of all 11.
+    }
+
+    #[test]
+    fn oauth_error_four_string_bearing_variants_carry_owned_string_for_cross_await_propagation() {
+        // The four String-bearing variants — `BadRequest(String)`,
+        // `BridgeRejected(String)`, `PicInvariant(String)`,
+        // `Internal(String)` — all carry OWNED String, NOT borrowed
+        // `&'a str`. The errors flow through `?`-chains across
+        // `.await` boundaries in the OAuth /authorize, /callback,
+        // /token handlers AND propagate through `IntoResponse`. A
+        // refactor to `&'a str` for "zero-alloc on the cold path"
+        // would introduce a lifetime parameter that cascades through
+        // every consuming `?`-chain in the OAuth handler module.
+        // Pin owned-String via require_string on all 4 String-bearing
+        // arms. Symmetric to round-181 AuthFail 3-String-arm +
+        // round-190 ApiError::BadRequest + round-192 TriggerClaim::Error
+        // + round-193 ErrorBody.detail owned-String pins extended to
+        // this OAuth-error enum's String-bearing arms.
+        fn require_string(_: &String) {}
+        for (e, name) in [
+            (OAuthError::BadRequest("x".into()), "BadRequest"),
+            (OAuthError::BridgeRejected("x".into()), "BridgeRejected"),
+            (OAuthError::PicInvariant("x".into()), "PicInvariant"),
+            (OAuthError::Internal("x".into()), "Internal"),
+        ] {
+            match e {
+                OAuthError::BadRequest(s)
+                | OAuthError::BridgeRejected(s)
+                | OAuthError::PicInvariant(s)
+                | OAuthError::Internal(s) => {
+                    require_string(&s);
+                    assert_eq!(s, "x", "arm {name}");
+                }
+                _ => panic!("expected String-bearing arm for {name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn oauth_error_body_is_referentially_transparent_across_fifty_calls_on_same_variant() {
+        // `body()` is called once per error response inside
+        // `into_response`. The construction is purely from the
+        // variant + inner String — no clock, no random source. A
+        // refactor that mixed in a per-call timestamp or a
+        // tracing-span id "for body-level correlation" would break
+        // the byte-equal contract operator log aggregators rely on
+        // for response-body dedup hashing. Pin 50 calls on three
+        // distinct variants yield byte-equal serialized bodies.
+        // Symmetric to round-187 html_escape + round-193 ErrorBody
+        // + round-194 sha256_hex + round-195 SessionExtractError +
+        // round-197 synth_event referential-transparency pins
+        // extended to this OAuthError::body() construction path.
+        for variant_builder in [
+            || OAuthError::PkceFail,
+            || OAuthError::SessionGone,
+            || OAuthError::BadRequest("scope required".into()),
+        ] {
+            let baseline = serde_json::to_string(&variant_builder().body()).unwrap();
+            for i in 0..50 {
+                let again = serde_json::to_string(&variant_builder().body()).unwrap();
+                assert_eq!(
+                    again, baseline,
+                    "iter {i}: OAuthError::body() must be referentially transparent",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oauth_error_status_method_return_type_is_status_code_not_u16() {
+        // `OAuthError::status(&self) -> StatusCode` — the method
+        // returns the strong-typed `axum::http::StatusCode`, NOT
+        // `u16`. A refactor that flipped to `u16` "for ergonomic
+        // metrics labeling" would lose the type-level guarantee
+        // that the value is a valid HTTP status code (StatusCode's
+        // constructor rejects out-of-range u16s) AND would force
+        // every `IntoResponse` call site to wrap the u16 back into
+        // a StatusCode. Pin via require_status_code. Symmetric to
+        // round-196 DEFAULT_TICK_INTERVAL Duration type pin
+        // extended to this method-return-type contract.
+        fn require_status_code(_: StatusCode) {}
+        require_status_code(OAuthError::PkceFail.status());
+        require_status_code(OAuthError::SessionGone.status());
+        require_status_code(OAuthError::Db(sqlx::Error::RowNotFound).status());
+    }
+
+    #[test]
+    fn oauth_error_body_code_field_is_static_str_lifetime_for_zero_alloc_per_response() {
+        // `ErrorBody.code: &'static str` — the OAuth body() match
+        // arms construct ErrorBody::new(...) with literal string
+        // codes (`"bad_request"`, `"pkce_fail"`, `"internal_error"`,
+        // etc.). All 9 distinct code strings are &'static str
+        // literals. A refactor at the ErrorBody side to widen the
+        // field type to `String` "for ergonomic dynamic codes"
+        // would silently heap-allocate one String per OAuth
+        // response. Pin lifetime via require_static_str on the
+        // code field of body() across 4 distinct variants.
+        // Symmetric to round-193 ErrorBody.fix/docs static-str
+        // pins extended to this code-field lifetime contract.
+        fn require_static_str(_: &'static str) {}
+        for v in [
+            OAuthError::BadRequest("x".into()),
+            OAuthError::PkceFail,
+            OAuthError::SessionGone,
+            OAuthError::Internal("x".into()),
+        ] {
+            require_static_str(v.body().code);
+        }
+    }
+
+    #[test]
+    fn oauth_error_body_distinct_codes_across_unique_variants_no_collisions() {
+        // The 11 OAuthError variants map to 8 DISTINCT `code`
+        // strings: `bad_request` / `unknown_client` / `session_gone`
+        // / `bridge_rejected` / `pkce_fail` / `bad_auth_code` /
+        // `pic_invariant_violation` / `upstream_unavailable` /
+        // `internal_error` — but the Db + Crypto + Internal trio
+        // share `internal_error`. Pin that the documented-distinct
+        // 8 codes are pairwise non-equal (collisions would silently
+        // collapse two operator-runbook buckets), AND that the
+        // shared-by-design `internal_error` arm covers Db + Crypto
+        // + Internal as a single bucket. Symmetric to round-188
+        // PolicyView 5-key + round-191 CheckItem 6-key exact-set
+        // pins extended to this OAuth-error code-axis no-collision
+        // contract.
+        let unique_codes = [
+            OAuthError::BadRequest("x".into()).body().code,
+            OAuthError::UnknownClient.body().code,
+            OAuthError::SessionGone.body().code,
+            OAuthError::BridgeRejected("x".into()).body().code,
+            OAuthError::PkceFail.body().code,
+            OAuthError::BadAuthCode.body().code,
+            OAuthError::PicInvariant("x".into()).body().code,
+        ];
+        let unique_set: std::collections::HashSet<&str> = unique_codes.iter().copied().collect();
+        assert_eq!(
+            unique_set.len(),
+            unique_codes.len(),
+            "code collision across documented-distinct variants: {unique_codes:?}",
+        );
+        // And the shared-arm trio (Db + Crypto + Internal) all
+        // surface "internal_error" by design.
+        for v in [
+            OAuthError::Db(sqlx::Error::RowNotFound),
+            OAuthError::Crypto,
+            OAuthError::Internal("x".into()),
+        ] {
+            assert_eq!(v.body().code, "internal_error");
+        }
+    }
 }

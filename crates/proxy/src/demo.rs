@@ -695,6 +695,174 @@ mod tests {
         }
     }
 
+    // ─── round 197 (2026-05-20): Scenario field-type + synth_event purity surfaces ───
+
+    #[test]
+    fn scenario_seven_static_str_fields_are_all_static_lifetime_for_zero_alloc_const_table() {
+        // `Scenario` has 7 `&'static str` fields (vendor / action /
+        // method / path_template / decision / policy / and the inner
+        // `&'static str` inside `block_reason: Option<&'static str>`).
+        // The SCENARIOS slice is a compile-time `&[Scenario]` const —
+        // every str literal lives in .rodata. A refactor that swapped
+        // any to `String` "for ergonomic dynamic scenarios" would force
+        // heap allocation per `*const Scenario` deref AND would foreclose
+        // the const-table embedding. Pin lifetime via require_static_str
+        // on all 6 always-Some fields. Symmetric to round-170 Healthz.version
+        // + round-191 CheckItem.title/docs static-str pins extended to
+        // this sibling const-table shape.
+        fn require_static_str(_: &'static str) {}
+        let s = block_scenario();
+        require_static_str(s.vendor);
+        require_static_str(s.action);
+        require_static_str(s.method);
+        require_static_str(s.path_template);
+        require_static_str(s.decision);
+        require_static_str(s.policy);
+        // block_reason is Option<&'static str> — when Some, the inner
+        // must also be &'static str.
+        require_static_str(
+            s.block_reason
+                .expect("block_reason is Some on block_scenario"),
+        );
+    }
+
+    #[test]
+    fn scenario_status_field_is_u16_type_for_http_status_code_compat() {
+        // `Scenario.status: u16` — the HTTP status code domain. The
+        // `synth_event` constructor passes this verbatim to
+        // `ActionEvent.status: u16` (also pinned at u16 elsewhere).
+        // A refactor to `i32` "for vendor-error sentinel space" would
+        // silently allow negative values past the type system AND
+        // diverge from `ActionEvent.status` at the assignment site,
+        // forcing a cast that could truncate. Pin via require_u16.
+        // Symmetric to round-182 CatKeyError::Status u16 + round-189
+        // ListRow.status i32 (sibling, different choice — actions log
+        // is signed for negative-sentinel passthrough; demo Scenario
+        // is unsigned matching HTTP standard) pins extended to this
+        // demo-scenario const-table field.
+        fn require_u16(_: u16) {}
+        for s in SCENARIOS {
+            require_u16(s.status);
+        }
+    }
+
+    #[test]
+    fn scenario_quarantined_count_field_is_usize_type_for_vec_len_compat() {
+        // `Scenario.quarantined_count: usize` — matches the
+        // `ActionEvent.quarantined_count: usize` shape (Vec<_>::len()
+        // return-type). The dashboard's "quarantined attachments shown
+        // in red" UI rule keys on this value. A refactor to `u32` "for
+        // SQL bigint alignment" would force a cast at the synth_event
+        // assignment site AND diverge from the `read_filter::apply`
+        // return shape that calls `.len()` on the trigger Vec. Pin
+        // via require_usize. Symmetric to round-188 ListResponse.policy_count
+        // + round-186 CANONICAL_REQUEST_MAX_LEN usize + round-196
+        // u64 sweep extended to this sibling const-table count.
+        fn require_usize(_: usize) {}
+        for s in SCENARIOS {
+            require_usize(s.quarantined_count);
+        }
+    }
+
+    #[test]
+    fn scenario_read_filter_triggered_field_is_bool_type_for_branch_dispatch_in_dashboard() {
+        // `Scenario.read_filter_triggered: bool` — pin the type tag
+        // explicitly. A refactor to a tristate enum (e.g. `Triggered`
+        // / `Skipped` / `Errored`) "for richer demo signal" would
+        // foreclose the bool-direct passthrough into
+        // `ActionEvent.read_filter_triggered: bool`. The dashboard's
+        // "read-filter triggered" columnar marker branches on the
+        // JSON `true`/`false` literal — pin the bool type so the
+        // wire shape can't drift. Symmetric to round-191 SetupApiState.google_configured
+        // bool + round-196 ExpirySweepReport.expired_rows u64 numeric/
+        // type pins extended to this demo-scenario const-table field.
+        fn require_bool(_: bool) {}
+        for s in SCENARIOS {
+            require_bool(s.read_filter_triggered);
+        }
+    }
+
+    #[test]
+    fn scenario_block_reason_field_is_option_static_str_for_zero_alloc_some_polarity() {
+        // `Scenario.block_reason: Option<&'static str>` — matches
+        // the existing pin on `CheckItem.fix` from round-191. Demo
+        // block scenarios surface a fixed operator-authored reason
+        // string ("to_domain not in customer_domain", "requires user
+        // confirmation"); a refactor to `Option<String>` "for
+        // synthesized format!()-built reasons" would silently
+        // allocate one String per scenario per `synth_event` call
+        // AND would foreclose the const-table embedding. Pin
+        // Option<&'static str> on Some-polarity via
+        // require_static_str. Symmetric to round-191 CheckItem.fix
+        // + round-193 ErrorBody.fix Option<&'static str> pins
+        // extended to this sibling const-table shape.
+        fn require_static_str(_: &'static str) {}
+        let mut some_count = 0;
+        let mut none_count = 0;
+        for s in SCENARIOS {
+            match s.block_reason {
+                Some(inner) => {
+                    require_static_str(inner);
+                    some_count += 1;
+                }
+                None => none_count += 1,
+            }
+        }
+        // Pin both polarities exist in the canonical SCENARIOS slice.
+        assert!(some_count > 0, "no Some-polarity in SCENARIOS");
+        assert!(none_count > 0, "no None-polarity in SCENARIOS");
+    }
+
+    #[test]
+    fn synth_event_passthrough_fields_are_referentially_transparent_across_fifty_calls() {
+        // `synth_event` has BOTH deterministic surfaces (`vendor` /
+        // `action` / `method` / `status` / `decision` / `policy_id`
+        // / `block_reason` / `read_filter_triggered` /
+        // `quarantined_count` / `at` / `extra`) and random surfaces
+        // (`request_id` / `agent_session_id` / `leaf_pca_id` / `p_0`
+        // / path suffix). Pin that the DETERMINISTIC fields are
+        // byte-equal across 50 calls on the same scenario + same `at`
+        // — a refactor that mixed scenario-derived bytes into a
+        // random source "for variety" would silently break the
+        // deterministic surfaces. Symmetric to round-187 html_escape
+        // + round-194 sha256_hex + round-195 SessionExtractError
+        // response referential-transparency pins extended to this
+        // synth_event helper's deterministic-fields contract.
+        let now = Utc::now();
+        let s = block_scenario();
+        let baseline = synth_event(&s, now);
+        for i in 0..50 {
+            let again = synth_event(&s, now);
+            // Deterministic fields must be byte-equal.
+            assert_eq!(again.vendor, baseline.vendor, "iter {i}: vendor drifted",);
+            assert_eq!(again.action, baseline.action, "iter {i}: action drifted");
+            assert_eq!(again.method, baseline.method, "iter {i}: method drifted");
+            assert_eq!(again.status, baseline.status, "iter {i}: status drifted");
+            assert_eq!(
+                again.decision, baseline.decision,
+                "iter {i}: decision drifted",
+            );
+            assert_eq!(
+                again.policy_id, baseline.policy_id,
+                "iter {i}: policy_id drifted",
+            );
+            assert_eq!(
+                again.block_reason, baseline.block_reason,
+                "iter {i}: block_reason drifted",
+            );
+            assert_eq!(
+                again.read_filter_triggered, baseline.read_filter_triggered,
+                "iter {i}: read_filter_triggered drifted",
+            );
+            assert_eq!(
+                again.quarantined_count, baseline.quarantined_count,
+                "iter {i}: quarantined_count drifted",
+            );
+            assert_eq!(again.at, baseline.at, "iter {i}: at drifted");
+            assert_eq!(again.extra, baseline.extra, "iter {i}: extra drifted");
+        }
+    }
+
     #[test]
     fn scenario_set_includes_block_allow_and_require_confirmation_decisions() {
         // SCENARIOS is the canonical demo set. Pin the decision variety so a

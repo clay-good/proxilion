@@ -788,6 +788,183 @@ mod tests {
     }
 
     #[test]
+    fn infer_idp_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `infer_idp` is a pure substring classifier — no I/O, no
+        // global state, no time-of-day input. Pin referential
+        // transparency across 50 calls per input so a refactor that,
+        // e.g., memoized the result in a thread-local LRU keyed on
+        // the input POINTER (not content) would surface here as a
+        // non-deterministic label on the second call. Symmetric to
+        // the burst/siem/audit_body referentially-transparent pins
+        // in rounds 193+199+200. The metric `idp` label feeds Grafana
+        // panels that join on stable label cardinality — a 1-in-50
+        // drift would silently fork one IdP into two label values.
+        for raw in [
+            Some("https://acme.okta.com"),
+            Some("https://login.microsoftonline.com/abc/v2.0"),
+            Some("https://accounts.google.com"),
+            Some("https://keycloak.internal/auth"),
+            Some(""),
+            None,
+        ] {
+            let first = infer_idp(raw);
+            for i in 0..50 {
+                let next = infer_idp(raw);
+                assert_eq!(
+                    next, first,
+                    "iter {i}: infer_idp drift on input {raw:?}: got {next} vs first {first}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_federation_token_is_referentially_transparent_across_fifty_calls_on_same_jwt() {
+        // Same purity pin for the JWT decode path. `validate_federation_token`
+        // reads `chrono::Utc::now()` for the exp/iat clock-skew checks
+        // but is otherwise a pure decode — a refactor that mixed a
+        // per-call nonce into the parse "for replay hardening" or
+        // that LRU-cached the parsed claims by JWT-string pointer
+        // would surface here as a non-deterministic `state` field on
+        // the second call. The OAuth callback handler depends on the
+        // decode being pure modulo the wall-clock — pin across 50
+        // calls on the same fresh JWT.
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": ["drive:read:engineering/*"],
+            "state": "trace-fixed",
+            "iat": now,
+            "exp": now + 3600,
+        }));
+        let first = validate_federation_token(&jwt).expect("first decode");
+        for i in 0..50 {
+            let c = validate_federation_token(&jwt).expect("decode");
+            assert_eq!(c.pca_0_id, first.pca_0_id, "iter {i}: pca_0_id drift");
+            assert_eq!(c.p_0, first.p_0, "iter {i}: p_0 drift");
+            assert_eq!(c.ops, first.ops, "iter {i}: ops drift");
+            assert_eq!(c.state, first.state, "iter {i}: state drift");
+            assert_eq!(c.iat, first.iat, "iter {i}: iat drift");
+            assert_eq!(c.exp, first.exp, "iter {i}: exp drift");
+        }
+    }
+
+    #[test]
+    fn federation_claims_field_types_pinned_for_oauth_callback_session_persist_contract() {
+        // `FederationClaims` is decoded from the bridge JWT and its
+        // fields cross several .await boundaries before the OAuth
+        // callback handler INSERTs the session row: `pca_0_id` keys
+        // the postgres `sessions.pca_0_id UUID` column; `p_0` keys
+        // `sessions.p_0 TEXT`; `ops` keys `sessions.granted_ops
+        // TEXT[]`; `iat`/`exp` are timestamp-seconds typed `i64` for
+        // direct `chrono::Utc::now().timestamp()` arithmetic. Pin
+        // all 5 field types at the struct boundary so a refactor
+        // that, e.g., switched `pca_0_id` to String "for ergonomic
+        // bridge-stub fixtures" would surface here, not as a cascading
+        // sqlx bind-type-mismatch at the INSERT call site.
+        fn require_uuid(_: Uuid) {}
+        fn require_string(_: String) {}
+        fn require_vec_string(_: Vec<String>) {}
+        fn require_i64(_: i64) {}
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": ["drive:read:engineering/*"],
+            "state": "s",
+            "iat": now,
+            "exp": now + 60,
+        }));
+        let c = validate_federation_token(&jwt).expect("decode");
+        require_uuid(c.pca_0_id);
+        require_string(c.p_0.clone());
+        require_vec_string(c.ops.clone());
+        require_i64(c.iat);
+        require_i64(c.exp);
+        require_string(c.state.clone());
+    }
+
+    #[test]
+    fn federation_claims_iss_and_pca_0_cbor_b64_field_types_pinned_for_optional_bridge_contract() {
+        // The two `#[serde(default)]` optional fields — `iss` and
+        // `pca_0_cbor_b64` — MUST stay typed `Option<String>` to
+        // preserve the bridge-stub-vs-production contract (stubs omit
+        // them; production fills them). A refactor to bare String
+        // with empty-string default "for ergonomic always-some access"
+        // would silently collapse the present-vs-absent distinction
+        // and break the `idp="unknown"` fallback on the callback
+        // metric (which keys on `iss.as_deref()` being None). Pin
+        // both at the field boundary via require_opt_string.
+        fn require_opt_string(_: Option<String>) {}
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "s",
+            "iat": now,
+            "exp": now + 60,
+            "iss": "https://acme.okta.com",
+            "pca_0_cbor_b64": "AAECAwQF",
+        }));
+        let c = validate_federation_token(&jwt).expect("decode");
+        require_opt_string(c.iss.clone());
+        require_opt_string(c.pca_0_cbor_b64.clone());
+    }
+
+    #[test]
+    fn validate_federation_token_return_type_is_result_owned_by_value_for_cross_await_propagation()
+    {
+        // The OAuth `/callback` handler awaits the decode and then
+        // moves the `FederationClaims` value across multiple .await
+        // boundaries (session INSERT, PCA cache insert, audit row
+        // emit). Pin that the return type is `Result<FederationClaims,
+        // OAuthError>` owned-by-value (not `Result<&'a FederationClaims,
+        // _>` borrowed or `Result<Box<FederationClaims>, _>` heap-
+        // boxed). A refactor to borrowed return "for zero-alloc decode"
+        // would tie every claims value to the input JWT string's
+        // lifetime, which is freed when the request body is dropped —
+        // any spawned audit task holding a `claims_ref` would dangle.
+        // require_owned_claims forces the by-value contract.
+        fn require_owned_claims(_: Result<FederationClaims, OAuthError>) {}
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": [],
+            "state": "s",
+            "iat": now,
+            "exp": now + 60,
+        }));
+        require_owned_claims(validate_federation_token(&jwt));
+    }
+
+    #[test]
+    fn infer_idp_returns_unknown_for_empty_string_distinctly_from_oidc_fallback() {
+        // The `infer_idp` cascade has a subtle ordering: empty string
+        // input MUST return "unknown" (the final else branch's
+        // `!s.is_empty()` check fails) and NOT "oidc" (the catch-all
+        // for non-well-known issuers). Distinguishing "unknown"
+        // (bridge stub gave us nothing) from "oidc" (generic OIDC
+        // IdP) is load-bearing for operator dashboards — a refactor
+        // that simplified the cascade to drop the `is_empty()` guard
+        // "since lowercase empty string contains no well-known
+        // substrings" would silently collapse "unknown" into "oidc"
+        // and break the panel that watches the unknown-vs-generic-
+        // OIDC ratio. Pin the empty-string-→-unknown distinction
+        // independently from the existing None→unknown pin.
+        assert_eq!(infer_idp(Some("")), "unknown");
+        assert_eq!(infer_idp(None), "unknown");
+        // And the close-to-empty boundary — a single whitespace
+        // also routes to oidc (non-empty string after lowercase
+        // contains no well-known substring). Pin so the
+        // `is_empty()` guard's behavior at byte-length-1 is
+        // operator-visible.
+        assert_eq!(infer_idp(Some(" ")), "oidc");
+    }
+
+    #[test]
     fn accepts_fresh_token() {
         let now = chrono::Utc::now().timestamp();
         let jwt = make_jwt(&serde_json::json!({

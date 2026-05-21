@@ -800,4 +800,154 @@ mod tests {
         fn require_clone<T: Clone>() {}
         require_clone::<OperatorAuthState>();
     }
+
+    #[test]
+    fn last_used_debounce_constant_type_is_duration_for_instant_duration_since_signature_compat() {
+        // The `LAST_USED_DEBOUNCE` constant is fed to two distinct
+        // signatures: `Instant::duration_since(prev)` returns Duration
+        // and is compared against this constant via the `<` operator;
+        // `Cache::builder().time_to_idle(LAST_USED_DEBOUNCE * 2)` passes
+        // the doubled value to moka. Both call sites require the
+        // constant be typed `Duration` — a refactor to `u64` "for
+        // ergonomic config-file embedding" would silently strip the
+        // unit-info at the type level, force every call site through
+        // ad-hoc `Duration::from_secs(LAST_USED_DEBOUNCE)` wrappers,
+        // AND open a paper cut where a future change to `_MILLIS` vs
+        // `_SECS` would silently widen the debounce window 1000x. Pin
+        // the type at the constant boundary via a let-binding type
+        // annotation; the existing tests exercise the constant
+        // behaviorally but never pin its TYPE.
+        fn require_duration(_: Duration) {}
+        let v: Duration = LAST_USED_DEBOUNCE;
+        require_duration(v);
+        // Also pin the numeric value contract — the docstring commits
+        // to "at most one UPDATE per token per minute", which is
+        // 60-second debounce. A refactor that tightened to e.g. 30s
+        // "for fresher observability" would silently double write
+        // amplification under sustained load.
+        assert_eq!(LAST_USED_DEBOUNCE, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn touch_cache_capacity_constant_type_is_u64_for_moka_max_capacity_signature_compat() {
+        // The `TOUCH_CACHE_CAPACITY` constant is fed directly to
+        // `Cache::builder().max_capacity(TOUCH_CACHE_CAPACITY)`, which
+        // takes `u64`. Symmetric to `kill_cache::MAX_CAPACITY`'s u64
+        // pin (rounds 201) — a refactor to `usize` "for parity with
+        // Vec::len()" would diverge between 32-bit and 64-bit hosts
+        // AND would silently force an `as u64` cast at the moka call
+        // site that could truncate on hypothetical 16-bit embedded
+        // hosts. Pin the type at the constant boundary via require_u64.
+        fn require_u64(_: u64) {}
+        let v: u64 = TOUCH_CACHE_CAPACITY;
+        require_u64(v);
+        assert_eq!(TOUCH_CACHE_CAPACITY, 100_000);
+    }
+
+    #[test]
+    fn operator_principal_field_types_pinned_for_axum_extension_storage_contract() {
+        // `OperatorPrincipal` is stored in axum request extensions and
+        // cloned into spawned `last_used_at` UPDATE tasks AND scope-
+        // check middleware. Pin all 4 field types at the struct
+        // boundary so a refactor that, e.g., switched `scopes` to
+        // `Arc<[String]>` "for borrowed-slice ergonomics" (which
+        // breaks the `.iter().any(|s| s == ...)` call site's `&&str`
+        // -vs-`&String` comparison) OR switched `last_used_at` to
+        // bare `DateTime<Utc>` (which would lose nullable-column
+        // shape from the postgres `last_used_at TIMESTAMPTZ` column
+        // and force every fixture through a sentinel "never used"
+        // value) would surface here at the struct boundary, not as a
+        // cascading row-fetch error at the sqlx call site.
+        fn require_uuid(_: Uuid) {}
+        fn require_string(_: String) {}
+        fn require_arc_vec_string(_: Arc<Vec<String>>) {}
+        fn require_opt_datetime(_: Option<DateTime<Utc>>) {}
+        let p = OperatorPrincipal {
+            token_id: Uuid::new_v4(),
+            name: "n".into(),
+            scopes: Arc::new(vec!["policy:read".into()]),
+            last_used_at: Some(Utc::now()),
+        };
+        require_uuid(p.token_id);
+        require_string(p.name.clone());
+        require_arc_vec_string(p.scopes.clone());
+        require_opt_datetime(p.last_used_at);
+    }
+
+    #[test]
+    fn parse_token_return_type_is_borrowed_str_slice_for_zero_alloc_validate_then_use_contract() {
+        // `parse_token` returns `Option<&str>` borrowed from its input
+        // — the docstring's wording "`pxl_operator_*` parsing — same
+        // shape as `Bearer`" commits to the zero-allocation
+        // validate-then-use idiom: the middleware validates the token
+        // shape with `parse_token(token).is_none()` and on success
+        // continues to use the ORIGINAL `token: &str` (not the
+        // parsed return value) for `hash(token)`. A refactor to
+        // `Option<String>` "for ergonomic owned-output" would silently
+        // start heap-allocating one String per operator-API request
+        // AND break the `is_none()` check's `if-let-else-return`
+        // shape. Pin the lifetime by binding the input to a local +
+        // checking the return value's pointer equals the input's.
+        let t = "pxl_operator_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let out: Option<&str> = parse_token(t);
+        let out = out.expect("valid token");
+        // Pointer equality — `out` is a borrow into `t`, not a
+        // freshly-allocated String.
+        assert_eq!(out.as_ptr(), t.as_ptr());
+        assert_eq!(out.len(), t.len());
+    }
+
+    #[test]
+    fn hash_return_type_is_fixed_size_32_byte_array_for_postgres_bytea_bind_shape() {
+        // `hash` returns `[u8; 32]` (fixed-size stack array) — the
+        // middleware binds `&hash[..]` (a slice view of the array)
+        // into sqlx's `BIND $1` for the `token_hash = $1` lookup
+        // against the `operator_tokens.token_hash BYTEA` column. A
+        // refactor that switched to `Vec<u8>` "for symmetry with
+        // bearer::hash" would heap-allocate one Vec per request AND
+        // would tolerate variable-length values at the type system
+        // boundary (a future-bug where a caller passed `truncate(16)`
+        // would silently produce a 16-byte hash that the DB lookup
+        // would never match — but with `[u8; 32]` the compiler
+        // forbids that at the type level). Pin the array length AND
+        // type at the return boundary.
+        fn require_array_u8_32(_: [u8; 32]) {}
+        let h = hash("pxl_operator_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+        require_array_u8_32(h);
+        // The const `TOKEN_LEN` is 65; the hash output is ALWAYS 32
+        // bytes regardless of input length — sanity-pin with a
+        // distinct-length input.
+        let h2 = hash("");
+        require_array_u8_32(h2);
+        assert_eq!(h2.len(), 32);
+    }
+
+    #[test]
+    fn scope_error_inner_field_types_pinned_for_thiserror_display_substitution_contract() {
+        // `ScopeError` has two fields: `required: String` (interpolated
+        // into the `#[error("insufficient scope: need `{required}`")]`
+        // Display impl) and `have: Vec<String>` (rendered into the
+        // JSON 403 response body's `have` array). Pin both: a
+        // refactor that switched `required` to `&'static str` "for
+        // zero-alloc constant scope names" would break the runtime-
+        // dynamic scope-string call sites (handlers pass owned
+        // strings from request paths); a refactor that switched
+        // `have` to `Arc<Vec<String>>` "for cheap clone" would force
+        // the JSON serializer through one extra `Arc::deref` per 403
+        // response AND would break the operator-facing dashboard
+        // parser's array-shape expectation. Both shapes are
+        // load-bearing — pin at the field boundary.
+        fn require_string(_: String) {}
+        fn require_vec_string(_: Vec<String>) {}
+        let e = ScopeError {
+            required: "policy:write".to_string(),
+            have: vec!["policy:read".to_string()],
+        };
+        require_string(e.required.clone());
+        require_vec_string(e.have.clone());
+        // Also pin the Display shape — the `#[error(...)]` derive
+        // wires `to_string()` to the format string with `{required}`
+        // substituted byte-exact.
+        assert_eq!(e.to_string(), "insufficient scope: need `policy:write`");
+    }
 }

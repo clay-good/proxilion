@@ -601,4 +601,149 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&ctx, &out));
     }
+
+    // ─── round 195 (2026-05-20): SessionContext + SessionCtx field-type surfaces ───
+
+    #[test]
+    fn session_context_string_fields_are_owned_string_type_for_cross_await_arc_extension_outlives()
+    {
+        // `SessionContext.p_0` / `google_access_token` / `google_token_scope`
+        // — all three string fields are OWNED `String`. The auth
+        // middleware constructs the SessionContext from decrypted
+        // OAuth state + DB query results, wraps it in Arc<...>, and
+        // hands the Arc to downstream adapters across `.await`
+        // boundaries (the adapter's upstream call, the audit-body
+        // persist, the trace emit). A refactor to `&'a str` for "zero-
+        // alloc on the cold path" would introduce a lifetime parameter
+        // that the Arc<SessionContext>: 'static contract the axum
+        // extensions store demands. Pin owned-String via require_string
+        // on all 3 fields. Symmetric to round-189 ListRow 6-field +
+        // round-193 ErrorBody.detail owned-String pins extended to
+        // this central per-request shape's String-bearing fields.
+        fn require_string(_: &String) {}
+        let ctx = sample_ctx();
+        require_string(&ctx.p_0);
+        require_string(&ctx.google_access_token);
+        require_string(&ctx.google_token_scope);
+    }
+
+    #[test]
+    fn session_context_granted_ops_field_is_owned_vec_string_for_response_outlives_handler_frame() {
+        // `SessionContext.granted_ops: Vec<String>` — owned, not a
+        // borrowed slice. The bearer middleware copies the cached
+        // PCA's ops into granted_ops by-value; the Vec must own its
+        // contents to survive the per-request Arc<SessionContext>
+        // lifetime crossing .await boundaries through every adapter
+        // call. A refactor to `&'a [String]` for "zero-copy on the
+        // hot path" would introduce a lifetime parameter that
+        // cascades through every adapter's SessionContext use, AND
+        // would tie the granted_ops vec to the PCA cache's storage
+        // lifetime (which evicts under LRU pressure). Pin via
+        // require_vec_string. Symmetric to round-184 PicViolationRecord
+        // attempted_ops + round-186 BlockedActionRecord.requested_ops
+        // borrowed-slice pins (the INVERSE case — those are
+        // intentionally borrowed; this one is intentionally owned).
+        fn require_vec_string(_: &Vec<String>) {}
+        let ctx = sample_ctx();
+        require_vec_string(&ctx.granted_ops);
+        assert_eq!(ctx.granted_ops.len(), 1);
+    }
+
+    #[test]
+    fn session_context_bearer_hash_field_is_fixed_size_byte_array_thirty_two_not_vec_u8() {
+        // `SessionContext.bearer_hash: [u8; 32]` — the field is a
+        // fixed-size array, NOT a `Vec<u8>` or `Bytes`. The killswitch
+        // (§3.2) keys on the SHA-256 digest as a 32-byte fixed-width
+        // value; the postgres `agent_bearers.bearer_sha256` column is
+        // `bytea CHECK (octet_length(bearer_sha256) = 32)`. A refactor
+        // to `Vec<u8>` "for ergonomic byte-vec construction" would
+        // silently allow variable-length values past the type system
+        // AND would heap-allocate one Vec per session (vs the inline
+        // 32-byte array). Pin via require_array_u8_32. The const-
+        // generic length parameter forces the 32 at the type level.
+        // Symmetric to round-189 ListRow.status i32 + round-190
+        // KillResponse.bearers_revoked i64 numeric-type pins extended
+        // to this fixed-size-array field.
+        fn require_array_u8_32(_: &[u8; 32]) {}
+        let ctx = sample_ctx();
+        require_array_u8_32(&ctx.bearer_hash);
+        assert_eq!(ctx.bearer_hash.len(), 32);
+    }
+
+    #[test]
+    fn session_context_leaf_pca_cbor_field_is_owned_vec_u8_for_async_executor_predecessor_passthrough()
+     {
+        // `SessionContext.leaf_pca_cbor: Vec<u8>` — owned, not borrowed.
+        // The pic/executor.rs hands this raw CBOR to the Trust Plane
+        // as the predecessor PCA when minting per-action successors —
+        // a request that crosses several `.await` points (upstream
+        // adapter call, Trust Plane mint, response). The Vec must own
+        // its contents to survive the Arc<SessionContext>: 'static
+        // contract. A refactor to `Bytes` (the `bytes` crate's
+        // reference-counted alternative) would change the shape from
+        // owned Vec to refcounted Bytes — semantically similar but
+        // breaks the `&[u8]`-from-Vec implicit deref the executor's
+        // signature takes. Pin via require_vec_u8. Symmetric to
+        // round-189 ListRow 6-field owned + round-194 redact_pii_text
+        // owned-String pins extended to this binary-data field.
+        fn require_vec_u8(_: &Vec<u8>) {}
+        let ctx = sample_ctx();
+        require_vec_u8(&ctx.leaf_pca_cbor);
+        assert_eq!(ctx.leaf_pca_cbor, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn session_ctx_inner_field_is_arc_session_context_for_cheap_clone_fan_out_contract() {
+        // `SessionCtx(pub Arc<SessionContext>)` — the inner is
+        // ARC-wrapped, not a bare `SessionContext`. The cheap-fan-out
+        // contract every spawned task depends on rides on `Arc::clone`
+        // being O(1) refcount bump rather than a deep struct clone.
+        // The existing `session_ctx_clone_shares_arc_with_original` +
+        // `session_ctx_clone_increments_arc_strong_count_by_exactly_one`
+        // pins walk the Arc-sharing CONTRACT, but neither pins the
+        // INNER FIELD TYPE explicitly. A refactor to
+        // `pub struct SessionCtx(pub SessionContext)` would pass both
+        // of those tests by construction (the deep clone semantics
+        // would silently take over) — pin via require_arc_session_context
+        // so the type-level contract surfaces here. Symmetric to
+        // round-182 CatKeyRegistry Arc::strong_count + round-191
+        // SetupApiState Clone+Send+Sync+'static pins extended to this
+        // sibling Arc-wrapping shape.
+        fn require_arc_session_context(_: &Arc<SessionContext>) {}
+        let ctx = Arc::new(sample_ctx());
+        let session_ctx = SessionCtx(ctx.clone());
+        require_arc_session_context(&session_ctx.0);
+        assert!(Arc::ptr_eq(&session_ctx.0, &ctx));
+    }
+
+    #[tokio::test]
+    async fn session_extract_error_response_is_referentially_transparent_across_fifty_calls() {
+        // The 401 fixed-body response is emitted on EVERY extractor
+        // miss (operator-token lifecycle, agent-bearer revocation,
+        // mid-request kill). The existing
+        // `session_extract_error_into_response_is_byte_equal_across_independent_calls`
+        // pin walks the 2-call axis; widen to N=50 here so a refactor
+        // that introduced per-call state (e.g. an incrementing
+        // request-id stamp "for correlation across the auth boundary")
+        // would surface across the sweep rather than only on a 2-call
+        // edge. Operator log aggregators rely on the 12-byte
+        // `"unauthorized"` body being byte-equal across thousands of
+        // 401s per second under sustained load — a refactor that
+        // mixed per-call state would shred the dedup pipeline.
+        // Symmetric to round-187 html_escape + round-193 ErrorBody
+        // + round-194 sha256_hex referential-transparency pins
+        // extended to this fixed-body 401 path.
+        let baseline = {
+            let r = SessionExtractError.into_response();
+            axum::body::to_bytes(r.into_body(), 1024).await.unwrap()
+        };
+        for i in 0..50 {
+            let r = SessionExtractError.into_response();
+            let bytes = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+            assert_eq!(
+                bytes, baseline,
+                "iteration {i}: SessionExtractError response must be referentially transparent",
+            );
+        }
+    }
 }

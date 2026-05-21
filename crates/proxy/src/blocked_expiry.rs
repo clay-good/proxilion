@@ -548,6 +548,194 @@ mod tests {
         assert_eq!(s1.escalated_rows, s2.escalated_rows);
     }
 
+    // ─── round 196 (2026-05-20): EscalationRow + report field-type surfaces ───
+
+    #[test]
+    fn escalation_row_is_send_sync_static_for_sqlx_fetch_all_await_boundary() {
+        // `EscalationRow` is the deserialized return type of the
+        // claim-and-stamp UPDATE in `sweep_escalations`. The Vec<EscalationRow>
+        // is held across the `.await` at sqlx fetch_all AND iterated
+        // across N more `.await` boundaries (one per row, calling
+        // `email_driver.notify_escalation(&notif).await`). Send + Sync
+        // + 'static are all required for the tokio runtime's multi-
+        // thread spawn semantics. A refactor that introduced a !Send
+        // field (e.g. `Rc<String>` "for cheap clone of policy_id during
+        // notif construction") would surface here rather than at the
+        // spawn site far from this file. Pin the three-trait combo —
+        // symmetric to round-189 ListRow + round-191 CheckItem +
+        // round-192 TriggerClaim Send+Sync+'static pins extended to
+        // this sibling sqlx::FromRow row shape.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<EscalationRow>();
+    }
+
+    #[test]
+    fn escalation_row_optional_string_fields_are_option_string_for_nullable_postgres_columns() {
+        // `EscalationRow.p_0` / `policy_id` / `detail` — all three are
+        // `Option<String>` matching the postgres nullable column shape
+        // (`p_0 text NULL`, `policy_id text NULL`, `detail text NULL`).
+        // A refactor to bare `String` "for ergonomic .as_deref() on the
+        // notification builder side" would break the sqlx FromRow
+        // derive at compile time (nullable column → non-nullable Rust
+        // type), but a refactor that defaulted to empty-string via
+        // `COALESCE(p_0, '')` in the SQL would silently collapse "no
+        // p_0 known" with "p_0 is explicitly empty" — both important
+        // operator-triage distinctions. Pin Option<String> via
+        // require_opt_string on all three nullable fields. Symmetric
+        // to round-190 KillBody 3-Option<String> + round-193
+        // ErrorBody.detail Option<String> pins extended to this
+        // sibling Option<String>-bearing row shape.
+        fn require_opt_string(_: &Option<String>) {}
+        let row = EscalationRow {
+            id: uuid::Uuid::nil(),
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            p_0: Some("alice@demo.local".into()),
+            vendor: "google".into(),
+            action: "drive.read".into(),
+            method: "GET".into(),
+            path: "/v3/files".into(),
+            layer: "layer_b".into(),
+            policy_id: Some("pol1".into()),
+            detail: Some("scope mismatch".into()),
+            predecessor_pca_id: None,
+            requested_ops: vec!["drive:read:*".into()],
+        };
+        require_opt_string(&row.p_0);
+        require_opt_string(&row.policy_id);
+        require_opt_string(&row.detail);
+    }
+
+    #[test]
+    fn escalation_row_required_string_fields_are_owned_string_for_cross_await_notification_outlives()
+     {
+        // `EscalationRow.vendor` / `action` / `method` / `path` /
+        // `layer` — all five are owned `String`, NOT borrowed `&'a str`.
+        // The sqlx::FromRow derive generates owned-content shapes by
+        // default (the underlying sqlx row buffer is dropped at the
+        // end of fetch_all); the Vec<EscalationRow> then survives
+        // across multiple `.await` boundaries for the notifier
+        // fan-out. A refactor that swapped to borrowed `&'a str`
+        // fields "for zero-alloc on the SQL-binding hot path" would
+        // need the row buffer to outlive each notification, breaking
+        // the natural sqlx scope. Pin owned-String via require_string
+        // on all 5 non-nullable string fields. Symmetric to round-189
+        // ListRow 6-field + round-195 SessionContext 3-field owned-
+        // String sweeps extended to this sibling FromRow shape.
+        fn require_string(_: &String) {}
+        let row = EscalationRow {
+            id: uuid::Uuid::nil(),
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            p_0: None,
+            vendor: "google".into(),
+            action: "drive.read".into(),
+            method: "GET".into(),
+            path: "/v3/files".into(),
+            layer: "layer_b".into(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec![],
+        };
+        require_string(&row.vendor);
+        require_string(&row.action);
+        require_string(&row.method);
+        require_string(&row.path);
+        require_string(&row.layer);
+    }
+
+    #[test]
+    fn escalation_row_requested_ops_field_is_owned_vec_string_for_borrowed_slice_into_notification()
+    {
+        // `EscalationRow.requested_ops: Vec<String>` — owned, not a
+        // borrowed slice. The notification construction in
+        // `sweep_escalations` borrows the field as
+        // `requested_ops: &row.requested_ops` (a `&[String]`); the
+        // borrow must be valid across the
+        // `email_driver.notify_escalation(&notif).await` call. The
+        // owning Vec lives in the EscalationRow which lives in the
+        // surrounding Vec<EscalationRow> that outlives every per-row
+        // notification. A refactor to `&'a [String]` "for zero-copy
+        // from the sqlx row buffer" would force a lifetime parameter
+        // through EscalationRow that breaks the cross-await contract.
+        // Pin via require_vec_string. Symmetric to round-195
+        // SessionContext.granted_ops Vec<String> + round-186
+        // BlockedActionRecord.requested_ops borrowed-slice (inverse)
+        // pins extended to this sibling shape.
+        fn require_vec_string(_: &Vec<String>) {}
+        let row = EscalationRow {
+            id: uuid::Uuid::nil(),
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            p_0: None,
+            vendor: "v".into(),
+            action: "a".into(),
+            method: "m".into(),
+            path: "p".into(),
+            layer: "l".into(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec!["op1".into(), "op2".into()],
+        };
+        require_vec_string(&row.requested_ops);
+        assert_eq!(row.requested_ops.len(), 2);
+    }
+
+    #[test]
+    fn expiry_and_escalation_report_count_fields_are_u64_type_for_no_truncation_at_cast_site() {
+        // `ExpirySweepReport.expired_rows: u64` and
+        // `EscalationSweepReport.escalated_rows: u64` — both are u64,
+        // NOT u32/usize/i64. The sweep `rows.len() as u64` cast at
+        // each report-construction site is the load-bearing
+        // conversion. A refactor to u32 "since we never see > 4B rows
+        // in a sweep" would silently introduce a truncation hazard
+        // on the cast — `rows.len()` is `usize` which is u64 on most
+        // production targets, so a u32 destination would wrap on the
+        // (admittedly unlikely) 4B+ overdue-rows case. A refactor to
+        // i64 "for postgres bigint compat at the metric ingestion
+        // layer" would silently allow negative values past the type
+        // system. Pin via require_u64. The existing
+        // `sweep_report_clone_at_u64_max_preserves_value_without_overflow`
+        // test pins MAX-value round-trip; pin the TYPE here.
+        // Symmetric to round-190 KillResponse.bearers_revoked i64 +
+        // round-188 ListResponse.policy_count usize numeric-type pins
+        // extended to these sibling sweep-report fields.
+        fn require_u64(_: u64) {}
+        let e = ExpirySweepReport { expired_rows: 42 };
+        let s = EscalationSweepReport { escalated_rows: 17 };
+        require_u64(e.expired_rows);
+        require_u64(s.escalated_rows);
+    }
+
+    #[test]
+    fn default_tick_interval_field_type_is_duration_for_tokio_sleep_signature_compat() {
+        // `DEFAULT_TICK_INTERVAL: Duration` — the constant is
+        // `std::time::Duration`, NOT `u64` or `usize` or a custom
+        // wrapper. The `tokio::time::sleep(tick_interval).await` call
+        // in `spawn` requires `Duration`; a refactor to `u64` "for
+        // simpler config parsing" would force every spawn-site to
+        // re-construct a Duration on every tick AND would lose the
+        // unit information at the type level (60 secs vs 60 millis
+        // vs 60 nanos). Pin via require_duration. The existing
+        // `default_tick_interval_pinned_at_60_seconds` +
+        // `default_tick_interval_equals_sixty_via_multiple_duration_constructors`
+        // pins walk the VALUE; pin the TYPE here so a refactor
+        // surfaces on the type axis even if value-equality somehow
+        // held (e.g. via a custom wrapper with a value-preserving
+        // PartialEq impl). Symmetric to round-186
+        // CANONICAL_REQUEST_MAX_LEN usize + round-187 HTML_TEMPLATE
+        // &'static str type-level constant pins extended to this
+        // sibling tick-interval constant.
+        fn require_duration(_: Duration) {}
+        require_duration(DEFAULT_TICK_INTERVAL);
+        // And as_secs() returns u64 — pin the round-trip through that
+        // accessor type as well.
+        let secs: u64 = DEFAULT_TICK_INTERVAL.as_secs();
+        assert_eq!(secs, 60);
+    }
+
     #[test]
     fn default_tick_interval_carries_no_subsecond_component() {
         // The `Duration::from_secs(60)` constructor pins zero subsecond

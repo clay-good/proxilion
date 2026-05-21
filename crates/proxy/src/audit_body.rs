@@ -741,6 +741,132 @@ mod tests {
         assert!(s.contains("<REDACTED_EMAIL>"));
     }
 
+    // ─── round 209 (2026-05-21): redactor purity + ownership surfaces ───
+
+    #[test]
+    fn redact_pii_bytes_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // Symmetric to the existing `redact_pii_text` referential-transparency
+        // pin: `redact_pii_bytes` is the byte-level entry point called from
+        // `persist(...)` on the RedactPii arm, immediately before
+        // `base64_encode`. A refactor that introduced a thread-local pad-byte
+        // mixin "for SIEM column de-duplication" OR an LRU keyed on the
+        // input slice's `as_ptr()` would silently fork audit rows across
+        // calls on equal-content-different-allocation inputs. Pin 50 calls
+        // byte-equal here for the bytes-level helper symmetric to the
+        // text-level pin already in place.
+        let input = b"alice@acme.com Bearer ya29.a0AfH6SMABcDefGhIjKlMnOpQrStUv0123";
+        let baseline = redact_pii_bytes(input);
+        for i in 0..50 {
+            let again = redact_pii_bytes(input);
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: redact_pii_bytes must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn redact_pii_bytes_return_type_is_owned_vec_u8_for_cross_await_sqlx_bind_through_persist() {
+        // `redact_pii_bytes` returns `Vec<u8>` — the bytes must be owned
+        // because the persist path feeds them through
+        // `base64_encode(&redact_pii_bytes(...))` whose String output then
+        // flows across the `.bind(&body_b64).execute(db).await` suspension
+        // point in `persist(...)`. A refactor to `Cow<'a, [u8]>` "for
+        // zero-alloc on the binary-passthrough arm" would introduce a
+        // lifetime parameter tied to the caller's upstream HTTP body
+        // borrow, breaking the cross-await contract. Pin via
+        // require_vec_u8. Symmetric to round 208 + the sibling
+        // `sha256_hex_return_type_is_owned_string_for_cross_await_...` pin.
+        fn require_vec_u8(_: &Vec<u8>) {}
+        let out = redact_pii_bytes(b"alice@acme.com");
+        require_vec_u8(&out);
+        // Sanity that we exercised the text-redact arm (not the binary
+        // passthrough): the email must have been redacted in the output.
+        assert!(
+            std::str::from_utf8(&out)
+                .unwrap()
+                .contains("<REDACTED_EMAIL>")
+        );
+    }
+
+    #[test]
+    fn base64_encode_return_type_is_owned_string_for_cross_await_sqlx_bind() {
+        // `base64_encode` returns `String` — the encoded body must be owned
+        // because it flows through `.bind(&body_b64).execute(db).await` in
+        // `persist(...)`. A refactor to `Cow<'a, str>` "for zero-alloc on
+        // empty input" would tie the lifetime to the input slice the caller
+        // owns and break the cross-await contract symmetric to
+        // `sha256_hex_return_type_is_owned_string_...`. Pin via require_string.
+        fn require_string(_: &String) {}
+        let s = base64_encode(b"hello");
+        require_string(&s);
+    }
+
+    #[test]
+    fn base64_encode_output_length_is_padded_multiple_of_four_for_standard_engine_db_column_alignment()
+     {
+        // The STANDARD base64 engine emits PADDED output: every encoded
+        // length is a multiple of 4. A refactor that switched to
+        // `STANDARD_NO_PAD` "for shorter audit rows" would silently break
+        // every replay tool that decodes the column via the padded engine
+        // (decoding NO_PAD bytes with a PAD engine errors with `InvalidPadding`).
+        // Pin the multiple-of-4 invariant across five input lengths (0, 1,
+        // 2, 3, 17) covering every (len mod 3) residue class. Symmetric to
+        // the empty-input pin already in place.
+        for n in [0usize, 1, 2, 3, 17] {
+            let input = vec![0x41u8; n];
+            let out = base64_encode(&input);
+            assert_eq!(
+                out.len() % 4,
+                0,
+                "base64 output for input len={n} must be padded to multiple of 4, got len={}",
+                out.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn audit_body_mode_is_copy_for_persist_match_arm_dispatch_without_clone_chain() {
+        // `AuditBodyMode` is taken by value at the `persist(...)` entry
+        // point AND referenced inside two `match` arms (`mode_label`
+        // generation, then the body-encoding switch). The function never
+        // calls `.clone()` on `mode` — it relies on `Copy` for the second
+        // move. A refactor that landed a `String` field on a future variant
+        // (e.g. `HashWith { salt: String }`) would silently break `Copy`
+        // and force a `.clone()` insertion at the call site, OR worse,
+        // surface as a "use of moved value" compile error far from the
+        // mode definition. Pin the `Copy` bound here so the diagnostic
+        // lands at the audit_body site. Symmetric to round 194's
+        // exhaustive-match variant-count pin extended with the trait-bound
+        // half of the contract.
+        fn require_copy<T: Copy>() {}
+        require_copy::<AuditBodyMode>();
+        // Witness the bound by moving the same value twice without an
+        // explicit clone.
+        let m = AuditBodyMode::Hash;
+        let _a = m;
+        let _b = m;
+    }
+
+    #[test]
+    fn redactors_returns_same_static_pointer_across_two_calls_for_oncelock_singleton_contract() {
+        // `redactors()` is the OnceLock-initialized singleton accessor —
+        // every `redact_pii_text` call goes through it. A refactor that
+        // dropped the OnceLock cache "for simpler code" and called
+        // `Regex::new(...)` per call would silently regress the documented
+        // <50µs/pattern compile cost to a per-request cost AND surface
+        // here as two distinct `&'static Redactors` pointer values.
+        // Pin the pointer-identity invariant (two calls return the
+        // SAME pointer) — proves the cache fires from the second call
+        // onward.
+        let a: *const Redactors = redactors();
+        let b: *const Redactors = redactors();
+        assert_eq!(
+            a, b,
+            "redactors() must return the same OnceLock-cached pointer across calls",
+        );
+    }
+
     #[test]
     fn redact_pii_text_no_pii_input_returns_byte_equal_string() {
         // For an input with zero PII matches across all six redactors,

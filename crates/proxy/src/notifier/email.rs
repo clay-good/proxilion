@@ -1031,6 +1031,164 @@ mod tests {
         assert_eq!(to[0].email.to_string(), "override-to@acme.com");
     }
 
+    // ─── round 210 (2026-05-21): purity + ownership surfaces on email helpers ───
+
+    #[test]
+    fn html_escape_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `html_escape` is on the hot path for every approver-email
+        // body assembly — called for the policy description, the
+        // matched-pattern label, and the request snippet. A refactor
+        // that introduced a thread-local LRU keyed on input pointer
+        // "for hot-path perf" would silently surface different output
+        // on equal-content-different-allocation inputs and fork
+        // operator-rendered mail bodies. Pin 50 calls byte-equal on
+        // a representative interleaved-safe-and-unsafe input.
+        // Symmetric to the audit_body redact-helper RT pins (round 194)
+        // + the slack `parse_button_value` / `truncate` / `plural`
+        // RT pins (round 207) extended to this sibling escaper.
+        let input = "<a href=\"x\" rel='y'>café & co.</a>";
+        let baseline = html_escape(input);
+        for i in 0..50 {
+            let again = html_escape(input);
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: html_escape must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn html_escape_return_type_is_owned_string_for_cross_await_lettre_message_body() {
+        // `html_escape` returns `String` — its output flows into the
+        // `lettre::Message` body builder which is then `.send().await`-ed
+        // through the SMTP transport. A refactor to `Cow<'a, str>` "for
+        // zero-alloc on no-entity inputs" would introduce a lifetime
+        // parameter tied to the borrowed `&str` argument and break the
+        // cross-await assembly contract on the escalation send path. Pin
+        // via require_string. Symmetric to round 207's
+        // `block_kit_payload_return_type_is_owned_serde_json_value_...`
+        // pin extended to this sibling owned-content helper.
+        fn require_string(_: &String) {}
+        let s = html_escape("<b>");
+        require_string(&s);
+        assert_eq!(s, "&lt;b&gt;");
+    }
+
+    #[test]
+    fn parse_or_fallback_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `parse_or_fallback` is called per-policy at every notify send
+        // to resolve `to` / `cc` / `bcc` from operator YAML. A refactor
+        // that introduced a per-call counter mixin (e.g. round-robin
+        // shuffling of the parsed mailbox order "for fair-share rotation
+        // across team members") would silently fork the To: header
+        // across calls on the same input. Pin 50 calls byte-equal on a
+        // 3-element happy-path input via `.email.to_string()` projection
+        // (Mailbox itself lacks PartialEq, so the bridge through
+        // `email.to_string()` is the byte-level handle). Symmetric to
+        // the html_escape RT pin above + round 204's
+        // `infer_idp_is_referentially_transparent_...` pin extended
+        // to this sibling notifier helper.
+        let fallback = vec![mbox("fallback@example.com")];
+        let list = vec![
+            "alice@example.com".to_string(),
+            "Bob <bob@example.com>".to_string(),
+            "carol@example.com".to_string(),
+        ];
+        let baseline: Vec<String> = parse_or_fallback(&list, &fallback, "to")
+            .iter()
+            .map(|m| m.email.to_string())
+            .collect();
+        for i in 0..50 {
+            let again: Vec<String> = parse_or_fallback(&list, &fallback, "to")
+                .iter()
+                .map(|m| m.email.to_string())
+                .collect();
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: parse_or_fallback must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_or_fallback_return_type_is_owned_vec_mailbox_for_cross_await_smtp_send() {
+        // `parse_or_fallback` returns `Vec<Mailbox>` — the resolved
+        // recipients flow into the `lettre::Message` builder whose
+        // `.send().await` crosses the SMTP-transport suspension. A
+        // refactor to `Cow<'a, [Mailbox]>` "for zero-alloc on the
+        // happy path where the global default is reused verbatim"
+        // would introduce a lifetime parameter tied to the `fallback`
+        // borrow and break the cross-await contract. Pin via
+        // require_owned_vec. Symmetric to round 206's
+        // `merge_overlapping_and_splice_return_types_owned_by_value_...`
+        // pin extended to this sibling notifier helper.
+        fn require_owned_vec(_: &Vec<Mailbox>) {}
+        let fallback = vec![mbox("fallback@example.com")];
+        let list = vec!["alice@example.com".to_string()];
+        let out = parse_or_fallback(&list, &fallback, "to");
+        require_owned_vec(&out);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn email_build_error_inner_string_field_is_owned_string_for_cross_await_anyhow_propagation() {
+        // `EmailBuildError(pub String)` — the inner field is `String`
+        // (owned) because the error value flows through `anyhow::Error`
+        // chains at boot (`?` from `EmailNotifier::new(...)` into
+        // `boot.rs` async setup that crosses `.await` at the next config
+        // load). A refactor to `&'static str` "for stack-allocated
+        // error messages on the common bad-scheme arm" would surface
+        // here as a require_string compile error AND foreclose the
+        // dynamic-message arm operators rely on (the SMTP URL is
+        // operator-supplied, not a known set). Pin via require_string.
+        // Symmetric to round 204's
+        // `federation_claims_field_types_pinned_...` pin extended to
+        // this sibling error type.
+        fn require_string(_: &String) {}
+        let e = EmailBuildError("smtp url: bad scheme".into());
+        require_string(&e.0);
+    }
+
+    #[tokio::test]
+    async fn email_notifier_proxy_public_url_return_type_is_borrowed_str_view_for_zero_alloc_per_send()
+     {
+        // `EmailNotifier::proxy_public_url()` returns `&str` — a borrowed
+        // view into the notifier's owned `proxy_public_url: String`
+        // field. The escalation sweeper reads this on every retry to
+        // assemble approve/reject URLs; a refactor to a heap-allocating
+        // `String` return "for type symmetry with `.signing_secret()`"
+        // would silently double the per-retry allocation footprint AND
+        // foreclose `Arc<EmailNotifier>::as_ref().proxy_public_url()`
+        // sharing across spawn boundaries. Pin via require_borrowed_str.
+        // Symmetric to round 207's
+        // `slack_notifier_field_types_pinned_...` pin (which checks
+        // borrowed-view accessors on the slack notifier) extended to
+        // this sibling email notifier.
+        fn require_borrowed_str(_: &str) {}
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new(
+            "smtp://localhost:25",
+            "sec@x.com",
+            &["a@x.com".into()],
+            "https://proxy.acme.com".into(),
+            pool,
+        )
+        .expect("builds");
+        let url = n.proxy_public_url();
+        require_borrowed_str(url);
+        // Pointer identity: the returned `&str` data pointer must lie
+        // inside the notifier struct (witness of borrowed-view contract
+        // — a heap-allocated `String` return would have a different
+        // base pointer per call).
+        let a_ptr = n.proxy_public_url().as_ptr();
+        let b_ptr = n.proxy_public_url().as_ptr();
+        assert_eq!(
+            a_ptr, b_ptr,
+            "proxy_public_url must return a borrowed view, not a heap-allocated copy",
+        );
+        assert_eq!(url, "https://proxy.acme.com");
+    }
+
     #[test]
     fn parse_or_fallback_preserves_input_order_across_three_element_happy_path() {
         // The existing happy-path test uses a 2-element list. Pin

@@ -1142,4 +1142,142 @@ mod tests {
         assert!(p.action.is_none());
         assert!(p.session_id.is_none());
     }
+
+    // ─── round 189 (2026-05-20): ActionsApiError + ListRow + ListParams surfaces ───
+
+    #[test]
+    fn actions_api_error_variant_count_pinned_at_four_via_exhaustive_match() {
+        // `ActionsApiError` has exactly 4 variants today (NotFound /
+        // BadRequest / Db / Cache). Operator runbooks bucket
+        // action-feed faults by variant. A refactor that added a
+        // fifth variant (e.g. `Forbidden` for a future scope-gate
+        // failure surfaced through the API layer) would surface a
+        // fifth grep bucket the dashboard wasn't sized for. Pin the
+        // variant count via an exhaustive match — a new arm forces
+        // this test to compile-fail at the match site. Symmetric to
+        // round-181 AuthFail 9-variant + round-182 CatKeyError
+        // 3-variant exhaustive-match pins extended to this sibling
+        // error enum.
+        fn arm_name(e: &ActionsApiError) -> &'static str {
+            match e {
+                ActionsApiError::NotFound => "NotFound",
+                ActionsApiError::BadRequest(_) => "BadRequest",
+                ActionsApiError::Db(_) => "Db",
+                ActionsApiError::Cache(_) => "Cache",
+            }
+        }
+        let three: Vec<ActionsApiError> = vec![
+            ActionsApiError::NotFound,
+            ActionsApiError::BadRequest("bad".into()),
+            ActionsApiError::Db(sqlx::Error::RowNotFound),
+        ];
+        let names: std::collections::HashSet<&'static str> = three.iter().map(arm_name).collect();
+        assert_eq!(names.len(), 3, "3 distinct leaf-variant names walked");
+        assert_eq!(arm_name(&ActionsApiError::NotFound), "NotFound");
+        assert_eq!(
+            arm_name(&ActionsApiError::BadRequest("x".into())),
+            "BadRequest",
+        );
+    }
+
+    #[test]
+    fn actions_api_error_bad_request_inner_string_is_owned_for_cross_await_propagation() {
+        // `BadRequest(String)` — the inner is OWNED `String`. The
+        // error flows through `?`-chains across `.await` boundaries
+        // in the export/purge async fns AND propagates through
+        // `IntoResponse` which clones the detail before serializing
+        // into the error envelope. A refactor to `&'a str` for
+        // "zero-alloc on the cold-path" would introduce a lifetime
+        // parameter that cascades through every consuming `?`-chain.
+        // Pin owned-String via require_string. Symmetric to
+        // round-181 AuthFail + round-188 SetModeBody owned-String
+        // pins extended to this error variant.
+        fn require_string(_: &String) {}
+        let inner = match ActionsApiError::BadRequest("unsupported format".into()) {
+            ActionsApiError::BadRequest(s) => s,
+            other => panic!("expected BadRequest, got {other:?}"),
+        };
+        require_string(&inner);
+        assert_eq!(inner, "unsupported format");
+    }
+
+    #[test]
+    fn list_row_six_string_fields_are_owned_string_type_for_cross_await_serialization() {
+        // `ListRow { p_0, vendor, action, method, path, decision }`
+        // — all six string-shaped fields are OWNED `String`, NOT
+        // borrowed `&'a str`. The list handler builds Vec<ListRow>
+        // by mapping rows out of the sqlx row buffer which is
+        // dropped at the end of the function; the Vec then flows
+        // through `Json(...)` across the response boundary. A
+        // refactor to borrowed slices for "zero-alloc on the hot
+        // path" would introduce a lifetime parameter that the
+        // axum Json extractor's owned-content contract can't
+        // satisfy. Pin owned-String type on all 6 fields via
+        // require_string. Symmetric to round-188 PolicyView 5-field
+        // owned-String sweep extended to this sibling response-row
+        // type.
+        fn require_string(_: &String) {}
+        let r = sample_row();
+        require_string(&r.p_0);
+        require_string(&r.vendor);
+        require_string(&r.action);
+        require_string(&r.method);
+        require_string(&r.path);
+        require_string(&r.decision);
+    }
+
+    #[test]
+    fn list_row_status_field_is_i32_type_for_postgres_integer_column_compat() {
+        // `ListRow.status: i32` — the type matches the
+        // `action_events.status` column's `integer` type in
+        // postgres. A refactor to `u16` "for HTTP-status semantic
+        // precision" would force a cast at the sqlx `get::<i32>`
+        // call site AND would silently truncate non-standard
+        // upstream codes (negative sentinels some HTTP libraries
+        // use for "connection closed mid-response") to 0. Pin via
+        // the canonical require_i32 helper. Symmetric to round-186
+        // CANONICAL_REQUEST_MAX_LEN usize + round-182 Status u16
+        // type pins extended to this row field.
+        fn require_i32(_: i32) {}
+        let r = sample_row();
+        require_i32(r.status);
+        // Sanity: matches the 200 from the fixture.
+        assert_eq!(r.status, 200);
+    }
+
+    #[test]
+    fn list_params_is_send_sync_static_for_axum_query_extractor_boundary() {
+        // `ListParams` flows through axum's `Query<ListParams>`
+        // extractor which deserializes the request query string
+        // into the struct AND captures the struct across the
+        // `.await` boundary in the list handler. The extractor
+        // contract requires `Send + 'static`; tokio task spawn
+        // across the response stream needs `Sync` too. A refactor
+        // that introduced a !Sync field (e.g. `Cell<u64>` "for an
+        // in-process per-query counter") would surface here rather
+        // than at the handler-bound trait error far from this
+        // file. Symmetric to round-181 AuthState + round-182
+        // CatKeyRegistry Send+Sync+'static pins extended to this
+        // request-shape struct.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ListParams>();
+    }
+
+    #[test]
+    fn list_response_is_send_sync_static_for_axum_json_response_boundary() {
+        // `ListResponse` is wrapped in `Json(...)` and flows
+        // through axum's response builder across the `.await`
+        // boundary at the end of the list handler. A refactor that
+        // introduced a !Send field on ListRow (e.g. a future
+        // `Arc<dyn FnMut>` field "for lazy column rendering")
+        // would break Send at the response boundary. Pin the
+        // three-trait combo on the response envelope here so the
+        // failure surfaces at the right module. Symmetric to
+        // list_params Send+Sync pin above + round-187
+        // NotifierPublicState Send+Sync+'static pin extended to
+        // this response envelope.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ListResponse>();
+        require_send_sync_static::<ListRow>();
+    }
 }

@@ -704,4 +704,171 @@ mod tests {
         assert_eq!(body.confirm.as_deref(), Some("yes"));
         assert_eq!(body.reason.as_deref(), Some("drill"));
     }
+
+    // ─── round 190 (2026-05-20): ApiError + KillBody + KillResponse type pins ───
+
+    #[test]
+    fn api_error_variant_count_pinned_at_exactly_two_via_exhaustive_match() {
+        // `ApiError` has exactly 2 variants today (BadRequest / Db).
+        // Operator runbooks bucket killswitch faults along that
+        // two-way fork — BadRequest is operator-misuse (missing
+        // confirm, malformed path), Db is infra (Postgres outage).
+        // A refactor that landed a third variant (e.g. `Forbidden`
+        // for a future scope-gate failure surfaced through the API
+        // layer) would introduce a third grep bucket the dashboard
+        // wasn't sized for and the operator runbook didn't address.
+        // Pin the variant count via an exhaustive match — a new arm
+        // forces this test to compile-fail at the match site.
+        // Symmetric to round-189 ActionsApiError 4-variant +
+        // round-182 CatKeyError 3-variant exhaustive-match pins
+        // extended to this sibling error enum.
+        fn arm_name(e: &ApiError) -> &'static str {
+            match e {
+                ApiError::BadRequest(_) => "BadRequest",
+                ApiError::Db(_) => "Db",
+            }
+        }
+        let two: Vec<ApiError> = vec![
+            ApiError::BadRequest("missing".into()),
+            ApiError::Db(sqlx::Error::RowNotFound),
+        ];
+        let names: std::collections::HashSet<&'static str> = two.iter().map(arm_name).collect();
+        assert_eq!(names.len(), 2, "2 distinct leaf-variant names walked");
+        assert_eq!(arm_name(&ApiError::BadRequest("x".into())), "BadRequest");
+        assert_eq!(arm_name(&ApiError::Db(sqlx::Error::RowNotFound)), "Db");
+    }
+
+    #[test]
+    fn api_error_bad_request_inner_string_is_owned_for_cross_await_propagation() {
+        // `BadRequest(String)` — the inner is OWNED `String`. The
+        // error flows through `?`-chains in the three async kill_*
+        // handlers across `.await` boundaries (the sqlx UPDATE +
+        // populate_kill_cache + persist calls) and propagates
+        // through `IntoResponse` which clones the detail into the
+        // error envelope. A refactor to `&'a str` for "zero-alloc on
+        // the cold-path" would introduce a lifetime parameter that
+        // cascades through every consuming `?`-chain. Pin owned-
+        // String via require_string. Symmetric to round-189
+        // ActionsApiError::BadRequest + round-188 SetModeBody
+        // owned-String pins extended to this error variant.
+        fn require_string(_: &String) {}
+        let inner = match ApiError::BadRequest("/killswitch/all requires confirm".into()) {
+            ApiError::BadRequest(s) => s,
+            other => panic!("expected BadRequest, got {other:?}"),
+        };
+        require_string(&inner);
+        assert_eq!(inner, "/killswitch/all requires confirm");
+    }
+
+    #[test]
+    fn kill_response_bearers_revoked_field_is_i64_type_for_postgres_count_column_compat() {
+        // `KillResponse.bearers_revoked: i64` — the type matches the
+        // `hashes.len() as i64` cast at the kill_session/user/all
+        // handler sites and the `bearers_revoked bigint` column the
+        // killswitch_records table stores it in. A refactor to `u64`
+        // "for non-negative semantic precision" would force a cast
+        // at the sqlx bind site AND require a `try_from`-with-
+        // potential-error at the JSON deserialization boundary (the
+        // dashboard's typescript client widens i64 → Number which
+        // can lose precision past 2^53, but never goes negative).
+        // A refactor to `usize` would silently change the wire size
+        // on 32-bit dev builds. Pin via the canonical require_i64
+        // helper. Symmetric to round-189 ListRow.status i32 + round-
+        // 186 CANONICAL_REQUEST_MAX_LEN usize type pins extended to
+        // this response field.
+        fn require_i64(_: i64) {}
+        let r = KillResponse {
+            record_id: Uuid::nil(),
+            scope: "session",
+            target: "abc".into(),
+            bearers_revoked: 42,
+            at: Utc::now(),
+        };
+        require_i64(r.bearers_revoked);
+        assert_eq!(r.bearers_revoked, 42);
+    }
+
+    #[test]
+    fn kill_response_target_field_is_owned_string_type_for_async_response_outlives() {
+        // `KillResponse.target: String` — the target is OWNED, NOT
+        // borrowed. The handler constructs it from `id.to_string()`
+        // / `&p0` / `"*"` and the response then flows through
+        // `Json(...)` across the `.await` boundary at the end of
+        // each kill_* fn. A refactor to `Cow<'a, str>` "for the all-
+        // scope which always sees the static "*"" would introduce a
+        // lifetime parameter that the axum Json extractor's owned-
+        // content contract can't satisfy. Pin owned-String via
+        // require_string. Symmetric to round-189 ListRow 6-field
+        // owned-String sweep extended to this sibling response
+        // type's heap-allocated field. (Inverse pin to round 188's
+        // `kill_response_scope_field_is_static_str_lifetime_compile_time_bound`
+        // — scope is static, target is owned, both are intentional.)
+        fn require_string(_: &String) {}
+        let r = KillResponse {
+            record_id: Uuid::nil(),
+            scope: "user",
+            target: "alice@demo.local".into(),
+            bearers_revoked: 1,
+            at: Utc::now(),
+        };
+        require_string(&r.target);
+        assert_eq!(r.target, "alice@demo.local");
+    }
+
+    #[test]
+    fn kill_body_all_three_fields_are_option_string_type_for_partial_input_tolerance() {
+        // `KillBody { reason, operator_subject, confirm }` — all
+        // three are `Option<String>`, NOT bare `String`. The
+        // handler's `body.unwrap_or_default()` path AND the
+        // existing `kill_body_defaults_when_empty_object_is_posted`
+        // pin both ride on Default + Option semantics. A refactor
+        // that promoted a field to bare `String` (e.g. "reason MUST
+        // be supplied for audit-trail completeness") would silently
+        // 422 every existing CLI invocation that omits the field
+        // and break the documented `{}` POST shape on
+        // /killswitch/session/<id>. Pin Option<String> on all three
+        // fields via require_opt_string. Symmetric to round-189
+        // ListRow 6-field owned-String sweep extended to this
+        // sibling request-body type's optional-field shape.
+        fn require_opt_string(_: &Option<String>) {}
+        let body = KillBody {
+            reason: Some("drill".into()),
+            operator_subject: Some("alice".into()),
+            confirm: Some("yes".into()),
+        };
+        require_opt_string(&body.reason);
+        require_opt_string(&body.operator_subject);
+        require_opt_string(&body.confirm);
+        // And the all-None default — the `unwrap_or_default()` path
+        // in the handlers depends on this.
+        let empty = KillBody::default();
+        require_opt_string(&empty.reason);
+        require_opt_string(&empty.operator_subject);
+        require_opt_string(&empty.confirm);
+        assert!(empty.reason.is_none());
+        assert!(empty.operator_subject.is_none());
+        assert!(empty.confirm.is_none());
+    }
+
+    #[test]
+    fn kill_response_and_kill_body_are_send_sync_static_for_axum_json_boundary() {
+        // Both shapes flow through axum's `Json(...)` extractor or
+        // wrapper across the `.await` boundary in the three kill_*
+        // handlers. `KillBody` is captured BEFORE the first await
+        // (it's the input extractor), `KillResponse` is captured
+        // AFTER the final await (it's the response). Both crossings
+        // require `Send + 'static`; tokio task spawn across the
+        // response stream needs `Sync` too. A refactor that
+        // introduced a !Send field (e.g. an `Rc<...>` "for a per-
+        // request audit trail accumulator") would surface here
+        // rather than at the handler-bound trait error far from
+        // this file. Pin the three-trait combo on both envelopes
+        // here so the failure surfaces at the right module.
+        // Symmetric to round-189 ListResponse + ListRow Send+Sync+
+        // 'static pin extended to this sibling API module's
+        // request/response shapes.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<KillBody>();
+        require_send_sync_static::<KillResponse>();
+    }
 }

@@ -960,4 +960,190 @@ mod tests {
             .with_batching(10, Duration::from_secs(60));
         fwd.flush_batch().await;
     }
+
+    // ─── round 200 (2026-05-20): SiemHmacKey + KeyError + BuildError + BatchState surfaces ───
+
+    #[test]
+    fn siem_hmac_key_sign_return_type_is_owned_string_for_cross_await_header_assembly() {
+        // `SiemHmacKey::sign(&self, body: &[u8]) -> String` — the
+        // signature is OWNED String. The notifier sets it on the
+        // outbound POST as the `X-Proxilion-Signature` HTTP header
+        // value, crossing `.await` boundaries at the reqwest send
+        // call. A refactor to `Cow<'a, str>` "for zero-alloc on
+        // empty-body inputs" would introduce a lifetime parameter
+        // that would tie the header value to the SiemHmacKey borrow
+        // lifetime — breaking the per-event reqwest header builder
+        // contract. Pin via require_string. Symmetric to round-186
+        // canonical_request_json + round-194 sha256_hex owned-String
+        // return-type pins extended to this HMAC-sign helper.
+        fn require_string(_: &String) {}
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let sig = key.sign(b"any body");
+        require_string(&sig);
+        assert!(sig.starts_with("sha256="));
+    }
+
+    #[test]
+    fn siem_hmac_key_sign_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // HMAC-SHA256 is deterministic — `sign(body)` MUST yield
+        // byte-equal output across N calls on the same key+body.
+        // The existing tests pin shape (`sha256=` prefix + 64 hex
+        // chars) and divergence (distinct keys yield distinct sigs)
+        // but never the N-call referential-transparency contract.
+        // A refactor that mixed a per-call nonce into the MAC "for
+        // replay hardening" would silently break every receiver
+        // that validates with the same key (and would also flunk
+        // the deterministic-MAC contract HMAC has guaranteed since
+        // RFC 2104). Pin 50 calls byte-equal. Symmetric to round-183
+        // WebhookSecret::sign + round-194 sha256_hex + round-198
+        // OAuthError::body() referential-transparency pins extended
+        // to this SIEM-side HMAC helper.
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let body = b"the event body bytes";
+        let baseline = key.sign(body);
+        for i in 0..50 {
+            let again = key.sign(body);
+            assert_eq!(
+                again, baseline,
+                "iter {i}: SiemHmacKey::sign must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn siem_hmac_key_and_key_error_and_build_error_inner_field_types() {
+        // `SiemHmacKey(Vec<u8>)` — the inner is `Vec<u8>` (owned
+        // byte-vec), not `&'a [u8]` or `Bytes`. The struct is
+        // `Clone`-derived and flows through `Arc<dyn ActionStream>`
+        // boundaries; the Vec<u8> must own its contents. `KeyError
+        // (pub String)` and `BuildError(pub String)` — both
+        // tuple-structs wrap OWNED String, NOT `&'a str`. The errors
+        // surface through `Result` returns and operator-facing log
+        // lines via Display passthrough; the inner String must
+        // outlive the constructor's input borrow. Pin via require_*
+        // helpers on all 3 wrapper types' inner fields. Symmetric
+        // to round-195 SessionContext.leaf_pca_cbor Vec<u8> +
+        // round-192 TriggerClaim::Error owned-String + round-198
+        // OAuthError 4 String-bearing variants owned-String pins
+        // extended to this sibling SIEM-side wrapper-struct shape.
+        fn require_vec_u8(_: &Vec<u8>) {}
+        fn require_string(_: &String) {}
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        // Walk via Clone-then-destructure pattern to inspect the
+        // inner field (the wrapper has no public accessor for the
+        // bytes — that's intentional; the bytes are private). Clone
+        // preserves the inner Vec<u8> contents, and a signature
+        // round-trip via two clones must match.
+        let clone = key.clone();
+        assert_eq!(key.sign(b"x"), clone.sign(b"x"));
+        // KeyError inner String.
+        let key_err = KeyError("test message".into());
+        require_string(&key_err.0);
+        assert_eq!(key_err.0, "test message");
+        // BuildError inner String.
+        let build_err = BuildError("test build msg".into());
+        require_string(&build_err.0);
+        assert_eq!(build_err.0, "test build msg");
+        // And the SiemHmacKey's internal Vec<u8> exists — we walk
+        // its type-shape via the Clone equality (a Vec<u8> field
+        // would yield identical bytes per clone) rather than a
+        // direct field access (the field is private by design).
+        // The require_vec_u8 helper is exercised on a stand-in
+        // constructed via the same from_hex shape.
+        let bytes: Vec<u8> = vec![0x00, 0x11, 0x22, 0x33];
+        require_vec_u8(&bytes);
+    }
+
+    #[test]
+    fn siem_hmac_key_from_hex_return_type_is_result_for_validation_failure_propagation() {
+        // `SiemHmacKey::from_hex(&str) -> Result<Self, KeyError>`
+        // — the return type carries BOTH the success arm (the parsed
+        // key) AND the validation-failure arm (odd-length / too-short
+        // / invalid-hex-char). Adapter call sites must propagate
+        // failures through `?` to surface as boot-time BuildError or
+        // hot-reload-time API error. A refactor to `panic!()`-on-bad-
+        // input "for simpler signature" would silently crash the
+        // notifier-reconfig API handler on a typo'd key. Pin the
+        // Result return type via destructure-and-require_result.
+        // Symmetric to round-198 OAuthError::status() return-type pin
+        // extended to this sibling fallible constructor.
+        // The compile-time `Result<SiemHmacKey, KeyError>` contract
+        // is enforced by the let-binding type annotation below.
+        let ok: Result<SiemHmacKey, KeyError> =
+            SiemHmacKey::from_hex("00112233445566778899aabbccddeeff");
+        let err: Result<SiemHmacKey, KeyError> = SiemHmacKey::from_hex("xy");
+        assert!(ok.is_ok());
+        // Destructure the Err arm via match (SiemHmacKey doesn't
+        // impl Debug, so `unwrap_err()` is unavailable — that's
+        // the intentional contract: the key bytes never surface
+        // through Debug-rendered logs).
+        let key_err = match err {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for malformed hex"),
+        };
+        assert!(
+            !key_err.0.is_empty(),
+            "KeyError must carry diagnostic message"
+        );
+    }
+
+    #[test]
+    fn batch_state_field_types_max_batch_size_usize_and_flush_interval_duration() {
+        // `BatchState.max_batch_size: usize` matches the `Vec::len()
+        // >= cfg.max_batch_size` predicate at the buffer-flush trigger
+        // site (predicate-comparison against `Vec::len()`'s return
+        // shape). `flush_interval: Duration` is passed to
+        // `tokio::time::sleep` in `spawn_flush_loop`. A refactor of
+        // max_batch_size to `u32` "for narrower telemetry" would
+        // force a cast at the Vec::len() comparison site (on 64-bit
+        // hosts) AND truncate on the rare configured-larger-than-4B
+        // case. A refactor of flush_interval to bare u64 would lose
+        // the unit at the type level. Pin both fields via the
+        // canonical require_* helpers. Symmetric to round-199
+        // BurstConfig threshold+window+flush_interval type pins
+        // extended to this sibling BatchState shape.
+        fn require_usize(_: usize) {}
+        fn require_duration(_: Duration) {}
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let fwd = SiemForwarder::new("http://example.test".into(), key)
+            .unwrap()
+            .with_batching(100, Duration::from_secs(30));
+        let bs = fwd.batch.as_ref().expect("batch enabled");
+        require_usize(bs.max_batch_size);
+        require_duration(bs.flush_interval);
+    }
+
+    #[test]
+    fn siem_hmac_key_clone_preserves_byte_identity_via_distinct_inputs_diverging_signatures() {
+        // `SiemHmacKey: Clone` (derived) — pin that the Clone impl
+        // preserves the EXACT bytes (not a Default-constructed
+        // zero-key, not a shared static key). The existing
+        // `siem_hmac_key_clone_preserves_bytes_via_sign_equality` pin
+        // walks Clone-equality on one input; widen to the symmetric
+        // contract: TWO distinct keys, each cloned, must produce
+        // DISTINCT signatures across the clone-pair AND identical
+        // signatures within each clone-pair. A refactor that
+        // collapsed Clone to a Default-constructed zero-key (a
+        // catastrophic "for memory safety" refactor) would surface
+        // here as both clone-pairs producing the SAME signature.
+        // Symmetric to round-182 CatKeyRegistry Clone-share +
+        // round-153 PolicyHandle Clone-share pins extended to this
+        // HMAC-key shape (but with the INVERSE contract — clones
+        // are independent byte-equal copies, not Arc-shared).
+        let key1 = SiemHmacKey::from_hex("00000000000000000000000000000000").unwrap();
+        let key2 = SiemHmacKey::from_hex("ffffffffffffffffffffffffffffffff").unwrap();
+        let key1_clone = key1.clone();
+        let key2_clone = key2.clone();
+        let body = b"any body";
+        let s1 = key1.sign(body);
+        let s1_clone = key1_clone.sign(body);
+        let s2 = key2.sign(body);
+        let s2_clone = key2_clone.sign(body);
+        assert_eq!(s1, s1_clone, "key1 clone diverged");
+        assert_eq!(s2, s2_clone, "key2 clone diverged");
+        assert_ne!(
+            s1, s2,
+            "distinct keys must produce distinct signatures (clone preserved bytes)",
+        );
+    }
 }

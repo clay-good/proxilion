@@ -996,4 +996,171 @@ mod tests {
         assert_eq!(ex.layer, "policy");
         assert_eq!(ex.policy_id, "p");
     }
+
+    // ─── round 199 (2026-05-20): BurstConfig + Summary + Event field-type surfaces ───
+
+    #[test]
+    fn burst_config_field_types_threshold_usize_window_duration_flush_interval_duration() {
+        // `BurstConfig` has 3 fields: `threshold: usize` (matches
+        // `Vec::len()`-style count comparison in the suppressor's
+        // `bucket.timestamps.len() < cfg.threshold` predicate),
+        // `window: Duration` (matches `Instant::duration_since(...) <=
+        // window` arithmetic), `flush_interval: Duration` (passed to
+        // `tokio::time::sleep` in the flush-loop spawn). A refactor of
+        // any field to a unit-stripped numeric type "for simpler config
+        // parsing" would force a re-construction at every usage site
+        // AND lose the unit-information at the type level. Pin each
+        // field via the canonical require_* helper. Symmetric to
+        // round-196 DEFAULT_TICK_INTERVAL Duration + round-188
+        // ListResponse.policy_count usize + round-197 Scenario.status
+        // u16 type pins extended to this BurstConfig shape.
+        fn require_usize(_: usize) {}
+        fn require_duration(_: Duration) {}
+        let cfg = BurstConfig::default();
+        require_usize(cfg.threshold);
+        require_duration(cfg.window);
+        require_duration(cfg.flush_interval);
+    }
+
+    #[test]
+    fn suppressed_event_four_owned_string_fields_and_p_0_option_string_for_cross_await_outlives() {
+        // `SuppressedEvent` has 5 fields: 4 owned `String`
+        // (policy_id / vendor / action / layer — all built from
+        // `BlockedNotification` borrowed `&str` via `.to_string()`
+        // inside `admit()`) and 1 `Option<String>` (p_0). The
+        // exemplar is stashed in `Bucket.first_suppressed:
+        // Option<SuppressedEvent>` which outlives the
+        // BlockedNotification borrow that constructed it — every
+        // field MUST be owned (not borrowed) to survive the cross-
+        // await drain. A refactor that left any field as `&str`
+        // "for zero-alloc on the rare-suppress path" would force a
+        // lifetime parameter on SuppressedEvent that breaks the
+        // Bucket-stash contract. Pin owned-String on the 4 always-
+        // present fields + Option<String> on p_0. Symmetric to
+        // round-189 ListRow 6-field + round-196 EscalationRow
+        // owned-String sweeps extended to this exemplar-event shape.
+        fn require_string(_: &String) {}
+        fn require_opt_string(_: &Option<String>) {}
+        let ev = SuppressedEvent {
+            policy_id: "gmail-ext".into(),
+            p_0: Some("alice@acme.com".into()),
+            vendor: "google".into(),
+            action: "gmail.messages.send".into(),
+            layer: "policy".into(),
+        };
+        require_string(&ev.policy_id);
+        require_string(&ev.vendor);
+        require_string(&ev.action);
+        require_string(&ev.layer);
+        require_opt_string(&ev.p_0);
+    }
+
+    #[test]
+    fn burst_summary_count_fields_suppressed_count_and_window_seconds_both_u64_type() {
+        // `BurstSummary.suppressed_count: u64` matches the
+        // `Bucket.suppressed: u64` field's type — pin both flow
+        // through the type system identically. `window_seconds:
+        // u64` matches `Duration::as_secs() -> u64`'s return type
+        // at the assignment site `window_seconds: cfg.window.as_secs()`.
+        // A refactor of either to `u32` "for narrower telemetry
+        // labels" would silently introduce a truncation hazard on
+        // the cast site (the suppressed counter could overflow
+        // u32 in pathological multi-hour bursts; window_seconds
+        // would clip beyond ~136 years which is theoretical but
+        // breaks the type-system contract regardless). Pin via
+        // require_u64. Symmetric to round-196 ExpirySweepReport.
+        // expired_rows + round-190 KillResponse.bearers_revoked u64
+        // type pins extended to this sibling summary shape's two
+        // u64 fields.
+        fn require_u64(_: u64) {}
+        let summary = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 42,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        };
+        require_u64(summary.suppressed_count);
+        require_u64(summary.window_seconds);
+    }
+
+    #[tokio::test]
+    async fn burst_suppressor_admit_return_type_is_bool_not_result_for_infallible_decision_path() {
+        // `admit()` returns `bool` (true=pass-through, false=suppressed)
+        // — NOT `Result<bool, _>`. The notifier hot path is documented
+        // as infallible (the suppressor never panics, never errors —
+        // the worst case is a lock-contention spike under heavy
+        // concurrent bursts which surfaces as latency, not as an
+        // error to handle). A refactor that promoted to `Result<bool,
+        // SuppressorError>` "for future rate-limiter wiring" would
+        // break every notifier call site (which today drops the bool
+        // into an `if admit { send } else { drop }` shape without `?`).
+        // Pin via require_bool. Symmetric to round-192 slack helpers
+        // unit-return pins extended to this hot-path decision return.
+        fn require_bool(_: bool) {}
+        let s = BurstSuppressor::new(BurstConfig {
+            threshold: 1,
+            window: Duration::from_secs(60),
+            flush_interval: Duration::from_secs(30),
+        });
+        let ops: Vec<String> = vec![];
+        let n = notification("p", "alice@acme.com", &ops);
+        let result = s.admit(&n, Instant::now()).await;
+        require_bool(result);
+    }
+
+    #[tokio::test]
+    async fn burst_suppressor_drain_summaries_return_type_is_owned_vec_burst_summary() {
+        // `drain_summaries()` returns `Vec<BurstSummary>` — owned,
+        // not a borrowed slice (`&'a [BurstSummary]`). The summaries
+        // flow to `WebhookNotifier::flush_summaries` across `.await`
+        // boundaries to be POSTed to the operator webhook one at a
+        // time; the Vec must own its contents to survive past the
+        // suppressor's Mutex<HashMap<_, Bucket>> lock release that
+        // happens at the end of `drain_summaries`. A refactor to
+        // `&'a [BurstSummary]` "for zero-copy on small drains" would
+        // force the caller to hold the Mutex guard across the
+        // network I/O — turning the suppressor into a serialization
+        // bottleneck under burst load. Pin via require_vec_burst_summary.
+        // Symmetric to round-196 EscalationRow.requested_ops Vec<String>
+        // owned + round-191 SetupStatus.items Vec<CheckItem> owned
+        // pins extended to this sibling owned-Vec return.
+        fn require_vec_burst_summary(_: &Vec<BurstSummary>) {}
+        let s = BurstSuppressor::new(BurstConfig::default());
+        let summaries = s.drain_summaries().await;
+        require_vec_burst_summary(&summaries);
+    }
+
+    #[test]
+    fn burst_summary_three_owned_string_fields_for_cross_await_drain_outlives_mutex_guard() {
+        // `BurstSummary.policy_id`, `BurstSummary.details_url`, and
+        // `BurstSummary.p_0` (the inner String when Some) — all 3
+        // String-shaped fields are OWNED, NOT borrowed. The summary
+        // flows from `drain_summaries()` (where the Mutex guard is
+        // dropped at function-end) through the notifier fan-out's
+        // `.await` chain. A refactor to `&'a str` for "zero-copy
+        // from the HashMap key" would force the lifetime parameter
+        // through every consuming notifier crossing .await. The
+        // existing `suppressed_event_four_owned_string_fields_...`
+        // pin (above) walks the sibling SuppressedEvent shape; pin
+        // the BurstSummary shape here in symmetric form. Symmetric
+        // to round-191 CheckItem.detail owned-String pin extended
+        // to this sibling notification-payload shape.
+        fn require_string(_: &String) {}
+        fn require_opt_string(_: &Option<String>) {}
+        let summary = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "gmail-ext".into(),
+            p_0: Some("alice@acme.com".into()),
+            suppressed_count: 7,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: "https://proxy.example/api/v1/blocked?policy_id=gmail-ext".into(),
+        };
+        require_string(&summary.policy_id);
+        require_string(&summary.details_url);
+        require_opt_string(&summary.p_0);
+    }
 }

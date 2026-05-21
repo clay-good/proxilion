@@ -904,6 +904,185 @@ mod tests {
         assert_eq!(plural(2, "alert"), "2 alerts");
     }
 
+    #[test]
+    fn parse_button_value_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `parse_button_value` is a pure split-on-`:` + UUID parse —
+        // no I/O, no global state. Pin referential transparency across
+        // 50 calls per input. A refactor that, e.g., memoized the
+        // parse result in a thread-local LRU keyed on input pointer
+        // (not content) would surface non-determinism on the second
+        // call with a fresh-but-content-equal input. The Slack
+        // interaction webhook calls this on every button click — a
+        // 1-in-50 drift would silently corrupt the action routing.
+        // Symmetric to rounds 199/200/204/205/206 referentially-
+        // transparent pins.
+        let id = Uuid::new_v4();
+        for input in [
+            format!("approve:{id}"),
+            format!("reject:{id}"),
+            format!("why:{id}"),
+            "approve".to_string(),
+            "delete:not-uuid".to_string(),
+        ] {
+            let first = parse_button_value(&input);
+            for i in 0..50 {
+                assert_eq!(
+                    parse_button_value(&input),
+                    first,
+                    "iter {i}: parse_button_value drift on input {input:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_and_plural_are_referentially_transparent_across_fifty_calls_on_same_input() {
+        // Same purity pin for the two private helpers — both feed into
+        // Block Kit payload assembly on the hot notification path. A
+        // refactor that, e.g., LRU-cached plural's output keyed on the
+        // (n, word.as_ptr()) pair would silently desync when the same
+        // word arrived from two different sources (e.g. `"block"` from
+        // a const-borrowed literal vs `"block"` from a String allocation).
+        for (s, n) in [("short", 10), ("longer text needing trim", 5), ("αβγδ", 3)] {
+            let first = truncate(s, n);
+            for i in 0..50 {
+                assert_eq!(
+                    truncate(s, n),
+                    first,
+                    "iter {i}: truncate drift on {s:?}, n={n}",
+                );
+            }
+        }
+        for (n, w) in [(0u64, "block"), (1, "block"), (42, "alert")] {
+            let first = plural(n, w);
+            for i in 0..50 {
+                assert_eq!(plural(n, w), first, "iter {i}: plural drift on ({n}, {w})");
+            }
+        }
+    }
+
+    #[test]
+    fn slack_action_enum_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // The `SlackAction` enum has THREE variants (Approve / Reject /
+        // Why). Pin the count via an exhaustive `match` arm so a
+        // refactor that added a fourth variant (e.g. `Snooze` to push
+        // the row's expiry by 5 minutes) would surface here, not as
+        // a silent dispatch-table gap in `api/notifier_slack.rs`.
+        // The exhaustive match has no `_` fallback — a new variant
+        // would force the compiler to surface here.
+        for a in [SlackAction::Approve, SlackAction::Reject, SlackAction::Why] {
+            let _: &'static str = match a {
+                SlackAction::Approve => "approve",
+                SlackAction::Reject => "reject",
+                SlackAction::Why => "why",
+            };
+        }
+        // Sanity: the three variants are pairwise distinct (Eq + Ord
+        // not required, but PartialEq IS — pin pairwise inequality so a
+        // refactor that collapsed Approve+Reject into a tagged enum
+        // "for ergonomic single-variant Resolved(bool)" would surface
+        // here.
+        assert_ne!(SlackAction::Approve, SlackAction::Reject);
+        assert_ne!(SlackAction::Approve, SlackAction::Why);
+        assert_ne!(SlackAction::Reject, SlackAction::Why);
+    }
+
+    #[test]
+    fn slack_signing_secret_skew_window_pinned_at_300_seconds_via_boundary_pair() {
+        // The Slack signing-secret verify path enforces a 5-minute
+        // (300-second) skew window per the Slack docs. The existing
+        // `verify_rejects_old_timestamp` test exercises a 10-minute-
+        // stale ts (clearly out of window); pin the BOUNDARY: a ts
+        // exactly 300 seconds in the past STILL verifies, while a ts
+        // 301 seconds in the past rejects. The `abs_diff > 300` check
+        // is strictly greater, so the 300-second boundary is the
+        // inclusive accept side. A refactor that tightened to `>= 300`
+        // "for paranoid clock-skew hygiene" would shrink the window
+        // by one second AND silently fail interactions near the
+        // boundary on lightly-skewed clocks.
+        let secret = SlackSigningSecret::new("8f742231b10e8888abcd99e1b18bf76c");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (offset, want) in [(300u64, true), (301, false)] {
+            let ts = (now - offset).to_string();
+            let body = b"x=1";
+            let basestring = format!("v0:{ts}:");
+            let mut mac =
+                <Hmac<Sha256> as Mac>::new_from_slice(b"8f742231b10e8888abcd99e1b18bf76c").unwrap();
+            mac.update(basestring.as_bytes());
+            mac.update(body);
+            let tag = mac.finalize().into_bytes();
+            let mut sig = String::from("v0=");
+            for b in tag {
+                use std::fmt::Write;
+                write!(&mut sig, "{:02x}", b).unwrap();
+            }
+            assert_eq!(
+                secret.verify(&sig, &ts, body),
+                want,
+                "offset {offset}s past: expected {want}",
+            );
+        }
+    }
+
+    #[test]
+    fn block_kit_payload_return_type_is_owned_serde_json_value_for_cross_await_http_post() {
+        // `block_kit_payload` returns owned `serde_json::Value` — the
+        // value is then `.to_string()`-ed into the reqwest body across
+        // a `.await` boundary in `notify`. A refactor to a borrowed
+        // shape (e.g. `&'a serde_json::Value` returned from a thread-
+        // local arena "for zero-alloc payload assembly") would tie the
+        // payload's lifetime to the notifier's borrow scope and break
+        // the cross-await contract. Pin the owned-Value return shape
+        // via require_value AND that block_kit_payload + summary_block_kit_payload
+        // both share the contract.
+        fn require_value(_: serde_json::Value) {}
+        require_value(block_kit_payload(&n()));
+        // summary_block_kit_payload symmetric.
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 1,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        };
+        require_value(summary_block_kit_payload(&s));
+    }
+
+    #[test]
+    fn slack_notifier_field_types_pinned_for_cross_await_post_contract() {
+        // `SlackNotifier` carries fields read inside `.await`-suspended
+        // POSTs: `incoming_webhook_url: String` (passed by reference into
+        // reqwest::Client::post which holds it across .await),
+        // `proxy_public_url: String` (returned via accessor, exposed on
+        // dashboards), `signing_secret: SlackSigningSecret` (cloned into
+        // the inbound-interact webhook verifier on every request), and
+        // `user_map: HashMap<String, String>` (consulted on every Slack
+        // user resolution). All four must be owned + 'static across
+        // spawned-task boundaries. Pin via accessor witnesses and
+        // signing_secret(): return type is &SlackSigningSecret which
+        // requires the inner field be owned (not a borrow). Pin
+        // proxy_public_url() return type is &str (borrowed VIEW into
+        // owned field) — a refactor to owned String return would
+        // heap-allocate per-access.
+        fn require_str_borrow(_: &str) {}
+        let n = SlackNotifier::new(
+            "https://hooks.slack.com/services/T/B/X".into(),
+            SlackSigningSecret::new("s"),
+            "https://proxy.local".into(),
+        )
+        .unwrap();
+        require_str_borrow(n.proxy_public_url());
+        // signing_secret accessor return type is &SlackSigningSecret
+        // — pin as a witness function.
+        fn require_secret_borrow(_: &SlackSigningSecret) {}
+        require_secret_borrow(n.signing_secret());
+    }
+
     /// Silence unused-import warnings on the no-test build paths.
     #[allow(dead_code)]
     fn _used(_: chrono::DateTime<Utc>) {}

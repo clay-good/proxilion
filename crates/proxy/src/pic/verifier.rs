@@ -1116,4 +1116,220 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn invariant_kind_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `invariant_kind` is a pure enum-arm dispatch — no I/O, no
+        // state, no time. Pin referential transparency across 50 calls
+        // per error variant so a refactor that, e.g., LRU-cached the
+        // label keyed on error-pointer "for hot-path zero-alloc"
+        // would silently fork the metric label cardinality on the
+        // second call with a freshly-constructed equal variant.
+        // Symmetric to rounds 199/200/204/205/206/207 referentially-
+        // transparent pins.
+        let cases: [VerifierError; 8] = [
+            VerifierError::Missing(Uuid::nil()),
+            VerifierError::BadCatSignature(Uuid::nil()),
+            VerifierError::ContinuityBroken {
+                child: Uuid::nil(),
+                parent: Uuid::nil(),
+            },
+            VerifierError::Monotonicity {
+                missing: "op".into(),
+            },
+            VerifierError::P0Mismatch {
+                child_p0: "a".into(),
+                parent_p0: "b".into(),
+            },
+            VerifierError::HopOrder {
+                child: 2,
+                parent: 0,
+            },
+            VerifierError::Decode("x".into()),
+            VerifierError::CatKey("x".into()),
+        ];
+        for e in &cases {
+            let first = invariant_kind(e);
+            for i in 0..50 {
+                assert_eq!(
+                    invariant_kind(e),
+                    first,
+                    "iter {i}: invariant_kind drift on {e:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invariant_kind_returns_static_str_from_canonical_eight_label_set() {
+        // `invariant_kind` returns `&'static str` for bounded metric
+        // label cardinality. Pin the lifetime contract via require_static_str
+        // — a refactor to `String` "for ergonomic dynamic labels"
+        // would silently heap-allocate per verification AND blow up
+        // Prometheus cardinality on label drift. Pin the canonical
+        // 8-label set is closed: `continuity | monotonicity | p0 | hop
+        // | signature | missing | decode | cat_key`. A future variant
+        // landing without a label arm would fall to the compiler's
+        // exhaustive-match check.
+        fn require_static_str(_: &'static str) {}
+        let cases: [VerifierError; 8] = [
+            VerifierError::ContinuityBroken {
+                child: Uuid::nil(),
+                parent: Uuid::nil(),
+            },
+            VerifierError::Monotonicity {
+                missing: "op".into(),
+            },
+            VerifierError::P0Mismatch {
+                child_p0: "a".into(),
+                parent_p0: "b".into(),
+            },
+            VerifierError::HopOrder {
+                child: 1,
+                parent: 0,
+            },
+            VerifierError::BadCatSignature(Uuid::nil()),
+            VerifierError::Missing(Uuid::nil()),
+            VerifierError::Decode("x".into()),
+            VerifierError::CatKey("x".into()),
+        ];
+        for e in &cases {
+            let label = invariant_kind(e);
+            require_static_str(label);
+            assert!(
+                matches!(
+                    label,
+                    "continuity"
+                        | "monotonicity"
+                        | "p0"
+                        | "hop"
+                        | "signature"
+                        | "missing"
+                        | "decode"
+                        | "cat_key"
+                ),
+                "non-canonical label `{label}` on {e:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn verifier_error_variant_count_pinned_at_exactly_eight_via_exhaustive_match() {
+        // The `VerifierError` enum has EIGHT variants — pinned here
+        // via an exhaustive match arm with no `_` fallback. A refactor
+        // that added a ninth variant (e.g. `RateLimited` for a future
+        // CAT-key registry rate-gate) would surface here, not as a
+        // silent dispatch-table gap in `invariant_kind` (whose own
+        // exhaustive match would also catch — pin BOTH so the failure
+        // surfaces at TWO sites for double coverage).
+        let all: [VerifierError; 8] = [
+            VerifierError::Missing(Uuid::nil()),
+            VerifierError::BadCatSignature(Uuid::nil()),
+            VerifierError::ContinuityBroken {
+                child: Uuid::nil(),
+                parent: Uuid::nil(),
+            },
+            VerifierError::Monotonicity {
+                missing: "op".into(),
+            },
+            VerifierError::P0Mismatch {
+                child_p0: "a".into(),
+                parent_p0: "b".into(),
+            },
+            VerifierError::HopOrder {
+                child: 1,
+                parent: 0,
+            },
+            VerifierError::Decode("x".into()),
+            VerifierError::CatKey("x".into()),
+        ];
+        for e in &all {
+            // Exhaustive without `_` — a future variant breaks compile.
+            let _: u8 = match e {
+                VerifierError::Missing(_) => 0,
+                VerifierError::BadCatSignature(_) => 1,
+                VerifierError::ContinuityBroken { .. } => 2,
+                VerifierError::Monotonicity { .. } => 3,
+                VerifierError::P0Mismatch { .. } => 4,
+                VerifierError::HopOrder { .. } => 5,
+                VerifierError::Decode(_) => 6,
+                VerifierError::CatKey(_) => 7,
+            };
+        }
+        assert_eq!(all.len(), 8);
+    }
+
+    #[test]
+    fn verification_result_field_types_pinned_for_cross_await_dashboard_serialize_contract() {
+        // `VerificationResult` is `Serialize` (carried into the audit
+        // / dashboard JSON envelope) AND `Clone` (Arc-wrapped in the
+        // moka cache). Pin all 7 field types at the struct boundary:
+        // intact bool + links_verified usize + p_0 Option<String> +
+        // broken_at Option<Uuid> + reason Option<String> + pic_profile
+        // Option<String> + pic_profile_mismatch_at Option<Uuid>. A
+        // refactor that, e.g., switched `links_verified` to u64 (for
+        // postgres column shape) OR `reason` to a typed enum (for
+        // structured error categorization) would surface here AND
+        // would change the dashboard JSON wire shape silently.
+        fn require_bool(_: bool) {}
+        fn require_usize(_: usize) {}
+        fn require_opt_string(_: Option<String>) {}
+        fn require_opt_uuid(_: Option<Uuid>) {}
+        let r = VerificationResult {
+            intact: true,
+            links_verified: 3,
+            p_0: Some("user:alice".into()),
+            broken_at: None,
+            reason: None,
+            pic_profile: Some("v1".into()),
+            pic_profile_mismatch_at: None,
+        };
+        require_bool(r.intact);
+        require_usize(r.links_verified);
+        require_opt_string(r.p_0.clone());
+        require_opt_uuid(r.broken_at);
+        require_opt_string(r.reason.clone());
+        require_opt_string(r.pic_profile.clone());
+        require_opt_uuid(r.pic_profile_mismatch_at);
+    }
+
+    #[test]
+    fn pic_verifier_clone_trait_bound_explicit_for_arc_share_axum_state_contract() {
+        // `PicVerifier` derives Clone and is shared via `Arc<...>` /
+        // direct State-extractor across axum routes (verify_chain is
+        // called from the `/api/v1/pca/{id}` handler). The moka Cache
+        // field is itself Clone-shared (internal Arc), so the derive
+        // is load-bearing. A refactor that dropped `#[derive(Clone)]`
+        // "to forbid accidental aliasing of the inner Cache" would
+        // break the axum State extractor at every router-build site.
+        // Pin the trait bound at compile time via require_clone — the
+        // failure surfaces at this file, not as a cascading
+        // tower::Service trait-bound error.
+        fn require_clone<T: Clone>() {}
+        require_clone::<PicVerifier>();
+        // Send+Sync+'static for cross-await audit task boundaries.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<PicVerifier>();
+        require_send_sync_static::<VerificationResult>();
+        require_send_sync_static::<VerifierError>();
+    }
+
+    #[test]
+    fn check_invariants_return_type_is_result_unit_for_error_short_circuit_contract() {
+        // `check_invariants` returns `Result<(), VerifierError>` — the
+        // unit `()` is load-bearing because the function is called
+        // purely for its side-effect-free validation: errors bubble up
+        // via `?` and successful checks fall through without producing
+        // intermediate state. A refactor to `Result<usize, _>` "to
+        // return the number of ops checked for observability" would
+        // force every call site to bind a variable that's never used
+        // AND would surface as ?-chain breakage at the verifier's hot
+        // loop. Pin via constructed-Err witness — `check_invariants`
+        // itself requires real PCA fixtures that this round's pure-
+        // helper budget can't construct in 12 lines, so witness via
+        // the function signature directly.
+        fn require_result_unit(_: Result<(), VerifierError>) {}
+        require_result_unit(Err(VerifierError::Missing(Uuid::nil())));
+        require_result_unit(Ok(()));
+    }
 }

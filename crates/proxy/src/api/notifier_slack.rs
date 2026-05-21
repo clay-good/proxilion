@@ -717,6 +717,178 @@ mod tests {
         );
     }
 
+    // ─── round 192 (2026-05-20): TriggerClaim + helper purity surfaces ───
+
+    #[test]
+    fn trigger_claim_variant_count_pinned_at_exactly_four_via_exhaustive_match() {
+        // `TriggerClaim` has exactly 4 variants today (Fresh /
+        // Retry / Conflict / Error). The /api/v1/notifier/slack/
+        // interact handler dispatches on this enum to decide
+        // between proceed / replay-prior-success / 409 reject /
+        // 500 fallback. Operator metrics
+        // `proxilion_slack_interact_total` is labeled by this
+        // outcome — a future variant (e.g. `Throttled` for a
+        // rate-limit gate) would surface a fifth label dimension
+        // the Grafana panel wasn't sized for. Pin the variant
+        // count via an exhaustive match — a new arm forces this
+        // test to compile-fail at the match site. Symmetric to
+        // round-190 ApiError 2-variant + round-189 ActionsApiError
+        // 4-variant + round-191 SetupError 1-variant exhaustive-
+        // match pins extended to this sibling outcome enum.
+        fn arm_name(c: &TriggerClaim) -> &'static str {
+            match c {
+                TriggerClaim::Fresh => "Fresh",
+                TriggerClaim::Retry => "Retry",
+                TriggerClaim::Conflict => "Conflict",
+                TriggerClaim::Error(_) => "Error",
+            }
+        }
+        let four: Vec<TriggerClaim> = vec![
+            TriggerClaim::Fresh,
+            TriggerClaim::Retry,
+            TriggerClaim::Conflict,
+            TriggerClaim::Error("db down".into()),
+        ];
+        let names: std::collections::HashSet<&'static str> = four.iter().map(arm_name).collect();
+        assert_eq!(names.len(), 4, "4 distinct leaf-variant names walked");
+        assert_eq!(arm_name(&TriggerClaim::Fresh), "Fresh");
+        assert_eq!(arm_name(&TriggerClaim::Retry), "Retry");
+        assert_eq!(arm_name(&TriggerClaim::Conflict), "Conflict");
+        assert_eq!(arm_name(&TriggerClaim::Error("x".into())), "Error");
+    }
+
+    #[test]
+    fn trigger_claim_error_inner_string_is_owned_for_cross_await_propagation() {
+        // `TriggerClaim::Error(String)` — the inner is OWNED
+        // `String`. The error path crosses three `.await` boundaries
+        // in claim_trigger_id (the UPDATE query, the SELECT fallback,
+        // and the interact handler's match-on-claim dispatch). A
+        // refactor to `&'a str` for "zero-alloc on the cold path"
+        // would introduce a lifetime parameter that the async-fn
+        // return-type contract can't satisfy. Pin owned-String via
+        // require_string. Symmetric to round-190 ApiError::BadRequest
+        // + round-189 ActionsApiError::BadRequest + round-188
+        // SetModeBody owned-String pins extended to this outcome
+        // variant's only String-bearing arm.
+        fn require_string(_: &String) {}
+        let inner = match TriggerClaim::Error("postgres: pool closed".into()) {
+            TriggerClaim::Error(s) => s,
+            _ => panic!("expected Error arm"),
+        };
+        require_string(&inner);
+        assert_eq!(inner, "postgres: pool closed");
+    }
+
+    #[test]
+    fn trigger_claim_is_send_sync_static_for_async_fn_return_type_boundary() {
+        // `TriggerClaim` is the return type of `async fn
+        // claim_trigger_id(...)` — futures returning it must be
+        // `Send` for tokio's multi-thread runtime to poll them on
+        // any worker thread. Captured across the `.await` in the
+        // /interact handler. `'static` is required for the boxed
+        // axum handler future. `Sync` is the conservative pin so a
+        // future refactor that stored a TriggerClaim in shared
+        // state (an Arc<Mutex<TriggerClaim>> for an audit-log
+        // dedup cache) still type-checks. A refactor that
+        // introduced a !Send inner (e.g. `Rc<String>` "for cheap
+        // clone of the error string") would surface here rather
+        // than at the handler-bound trait error far from this
+        // file. Symmetric to round-190 KillBody+KillResponse +
+        // round-189 ListParams+ListResponse + round-191 CheckItem
+        // +SetupStatus Send+Sync+'static pins extended to this
+        // sibling outcome enum.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<TriggerClaim>();
+    }
+
+    #[tokio::test]
+    async fn slack_ok_message_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // The /interact handler may be invoked at high rate during
+        // an incident drill (every operator clicking "Approve" on
+        // a burst of blocked actions). `slack_ok_message` is on
+        // that hot path. Pin that 50 calls with the same input
+        // yield byte-equal JSON response bodies — a refactor that
+        // mixed in a per-call timestamp or nonce "for replay
+        // hardening" would silently break the idempotent-retry
+        // contract (Slack's retry-of-the-same-click depends on the
+        // SAME response surface). Symmetric to round-187
+        // html_escape + round-183 WebhookSecret::sign + round-180
+        // evaluate referential-transparency pins extended to this
+        // Slack helper.
+        let baseline_bytes = {
+            let r = slack_ok_message("approved by alice@demo.local");
+            axum::body::to_bytes(r.into_body(), 4096).await.unwrap()
+        };
+        for i in 0..50 {
+            let r = slack_ok_message("approved by alice@demo.local");
+            let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+            assert_eq!(
+                bytes, baseline_bytes,
+                "iteration {i}: slack_ok_message must be referentially transparent",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slack_err_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // Symmetric to slack_ok_message pin above — the error
+        // helper is also on the hot signature-verify path (every
+        // unsigned interact request lands here). 50 calls with
+        // the same (status, message) input yield byte-equal
+        // response bodies. A refactor that mixed in a
+        // per-call request_id "for debug correlation" would
+        // silently break the byte-equal contract operator log
+        // aggregators rely on for dedup. Pin both helpers move
+        // in lockstep on referential transparency. Symmetric to
+        // round-184 parse_missing_atoms + round-187 html_escape
+        // referential-transparency pins extended to this Slack
+        // error helper.
+        let baseline_bytes = {
+            let r = slack_err(StatusCode::BAD_REQUEST, "missing payload");
+            axum::body::to_bytes(r.into_body(), 4096).await.unwrap()
+        };
+        for i in 0..50 {
+            let r = slack_err(StatusCode::BAD_REQUEST, "missing payload");
+            let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+            assert_eq!(
+                bytes, baseline_bytes,
+                "iteration {i}: slack_err must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_claim_error_variant_carries_a_string_not_an_error_type_for_audit_log_passthrough() {
+        // `TriggerClaim::Error(String)` — the inner is `String`,
+        // NOT a typed `sqlx::Error` or an `anyhow::Error`. The
+        // /interact handler logs the string verbatim via
+        // `warn!(error = %s, ...)`; a future refactor that
+        // promoted the inner to `sqlx::Error` "for richer error
+        // chain" would silently change the log-line shape
+        // (`tracing` would render the error's Display + Debug
+        // separately rather than just the .to_string() the audit
+        // log keys on). Pin via destructure-and-require_string —
+        // symmetric to the inner-owned pin above but on the
+        // INNER TYPE axis rather than the lifetime axis.
+        // The two pins are sibling contracts that move
+        // independently — a refactor could promote to a typed
+        // error AND keep ownership; this catches that path.
+        let e = TriggerClaim::Error("db: connection refused".into());
+        // Match shape pins the inner type at compile time.
+        match e {
+            TriggerClaim::Error(s) => {
+                // Use the canonical require_string helper on the bound
+                // inner — verifies BOTH that the variant exists with
+                // the right arm AND that the inner is String, not
+                // String-shaped wrapper.
+                fn require_string(_: &String) {}
+                require_string(&s);
+                assert_eq!(s, "db: connection refused");
+            }
+            _ => panic!("Error arm must hold a bare String"),
+        }
+    }
+
     #[test]
     fn header_str_returns_some_empty_for_empty_header_value() {
         // Boundary: an HTTP header with an empty value is legal

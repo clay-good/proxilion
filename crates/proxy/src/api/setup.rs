@@ -773,4 +773,194 @@ mod tests {
             );
         }
     }
+
+    // ─── round 191 (2026-05-20): SetupError + SetupApiState + CheckItem type pins ───
+
+    #[test]
+    fn setup_error_variant_count_pinned_at_exactly_one_via_exhaustive_match() {
+        // `SetupError` has exactly 1 variant today (Db). The setup
+        // probe currently only fails on the database query — every
+        // other check is a static bool inspection that returns Ok.
+        // A refactor that landed a second variant (e.g. `BadPath` if
+        // a future check resolved the `PROXILION_POLICY_PATH` file
+        // synchronously) would surface a second grep bucket the
+        // dashboard's "Setup probe failures" tile wasn't sized for.
+        // Pin the variant count via an exhaustive match — a new arm
+        // forces this test to compile-fail at the match site.
+        // Symmetric to round-190 ApiError 2-variant + round-189
+        // ActionsApiError 4-variant + round-182 CatKeyError
+        // 3-variant exhaustive-match pins extended to this sibling
+        // error enum.
+        fn arm_name(e: &SetupError) -> &'static str {
+            match e {
+                SetupError::Db(_) => "Db",
+            }
+        }
+        let one = SetupError::Db(sqlx::Error::RowNotFound);
+        let names: std::collections::HashSet<&'static str> =
+            std::iter::once(&one).map(arm_name).collect();
+        assert_eq!(names.len(), 1, "exactly one variant-name walked");
+        assert_eq!(arm_name(&SetupError::Db(sqlx::Error::RowNotFound)), "Db");
+    }
+
+    #[tokio::test]
+    async fn setup_api_state_field_types_match_documented_contract_owned_string_bool_usize() {
+        // `SetupApiState` has 5 fields. The non-DB four MUST match
+        // their documented types: `google_configured: bool` AND
+        // `policy_path_configured: bool` (probe results, copied
+        // from env-var inspection); `federation_bridge_url: String`
+        // (owned because read from config and persisted in state);
+        // `policy_count: usize` (matches Engine::policy_count's
+        // `Vec::len()` return type). A refactor to `&'a str` for
+        // federation_bridge_url would force a lifetime parameter
+        // that breaks `Clone` + the axum State boundary; a refactor
+        // to u32 for policy_count would force a cast at the
+        // `Engine::policy_count()` call site. Pin each via the
+        // canonical require_* helpers. Symmetric to round-188
+        // ListResponse.policy_count usize + round-190 KillResponse.
+        // bearers_revoked i64 + round-189 ListRow.status i32 pins
+        // extended to this state envelope's 4 non-DB fields.
+        fn require_string(_: &String) {}
+        fn require_usize(_: usize) {}
+        fn require_bool(_: bool) {}
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/x")
+            .expect("lazy pool builds");
+        let state = SetupApiState {
+            db: pool,
+            google_configured: true,
+            federation_bridge_url: "https://federation.example/v1".into(),
+            policy_path_configured: false,
+            policy_count: 12,
+        };
+        require_bool(state.google_configured);
+        require_bool(state.policy_path_configured);
+        require_string(&state.federation_bridge_url);
+        require_usize(state.policy_count);
+    }
+
+    #[test]
+    fn check_item_detail_field_is_owned_string_type_for_runtime_formatted_content() {
+        // `CheckItem.detail: String` — the ONLY owned-String field
+        // on CheckItem (the four `&'static str` fields + the bool +
+        // the `Option<&'static str>` are all pinned elsewhere). The
+        // handler builds the detail via `format!("{count} PCA(s) in
+        // cache")` and `format!("configured URL: {url} ...")` — it
+        // MUST be owned to capture the format-result lifetime. A
+        // refactor to `Cow<'static, str>` "for zero-alloc when the
+        // detail is a static literal" would introduce a lifetime
+        // parameter that the axum Json extractor's owned-content
+        // contract can't satisfy. Pin owned-String via require_string.
+        // Symmetric to round-189 ListRow 6-field owned-String sweep
+        // + round-190 KillResponse.target owned-String extended to
+        // this sibling response-shape's only runtime-formatted field.
+        fn require_string(_: &String) {}
+        let item = CheckItem {
+            id: "first_pca",
+            title: "First successful PCA",
+            ok: true,
+            detail: "42 PCA(s) in cache".into(),
+            fix: None,
+            docs: "d",
+        };
+        require_string(&item.detail);
+    }
+
+    #[test]
+    fn check_item_and_setup_status_are_send_sync_static_for_axum_json_response_boundary() {
+        // Both `CheckItem` and `SetupStatus` flow through axum's
+        // `Json(...)` response builder at the end of the `status`
+        // handler, crossing the final `.await` boundary. The
+        // response builder requires `Send + 'static`; tokio task
+        // spawn across the response stream needs `Sync` too. A
+        // refactor that introduced a !Send field on either (e.g. a
+        // `Cell<bool>` "for a per-render check-result cache") would
+        // surface here rather than at the handler-bound trait error
+        // far from this file. Pin the three-trait combo on both
+        // envelopes — symmetric to round-189 ListResponse + ListRow
+        // + round-190 KillBody + KillResponse Send+Sync+'static
+        // pins extended to this API module's response shapes.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<CheckItem>();
+        require_send_sync_static::<SetupStatus>();
+    }
+
+    #[test]
+    fn setup_error_db_arm_chain_walk_terminates_after_at_most_two_hops_for_anyhow_render_safety() {
+        // The existing pin (`setup_error_db_arm_chains_source_to_inner_sqlx_error_via_from_derive`)
+        // asserts `source()` returns `Some(_)` — but never walks the
+        // chain to its terminal. The killswitch sibling's BadRequest
+        // arm has chain depth 0 (leaf); SetupError::Db has chain
+        // depth >= 1 (wraps sqlx::Error). Pin the chain depth at
+        // most 2 (SetupError → sqlx::Error → optional db-driver-
+        // specific root) so a refactor that wrapped Db in
+        // `anyhow::Error` "for richer context" would surface here as
+        // an unbounded chain walk (anyhow can chain arbitrarily
+        // deep). Operator-facing log renderers (tracing's
+        // `?err`-with-source-chain) and the JSON error envelope
+        // walk the chain once — a deep chain would dump excessive
+        // detail into every 500 response body.
+        let e = SetupError::Db(sqlx::Error::RowNotFound);
+        let dyn_err: &dyn std::error::Error = &e;
+        let first = std::error::Error::source(dyn_err);
+        assert!(first.is_some(), "Db arm exposes inner source");
+        let second = first.and_then(std::error::Error::source);
+        if let Some(s) = second {
+            // If a chain past depth 2 exists, surface it.
+            let third = std::error::Error::source(s);
+            assert!(
+                third.is_none(),
+                "SetupError chain must terminate at <= depth 2 to keep error envelopes bounded",
+            );
+        }
+    }
+
+    #[test]
+    fn setup_status_items_field_is_owned_vec_check_item_for_response_body_outlives_handler_frame() {
+        // `SetupStatus.items: Vec<CheckItem>` — the field is owned,
+        // not a borrowed slice (`&'a [CheckItem]`). The status
+        // handler builds the Vec inside its frame and returns it
+        // wrapped in `Json(...)`. A refactor to `&'a [CheckItem]`
+        // "for zero-alloc on the static case" would force a
+        // lifetime parameter that the response boundary can't
+        // satisfy AND would force every checklist item to be
+        // 'static (foreclosing the runtime-built `format!`
+        // shapes). Pin via require_vec_check_item helper.
+        // Symmetric to round-189 ListRow 6-field owned-String
+        // sweep extended one structural level up to the Vec
+        // envelope of CheckItem.
+        fn require_vec_check_item(_: &Vec<CheckItem>) {}
+        let s = SetupStatus {
+            ready_for_traffic: true,
+            items: vec![CheckItem {
+                id: "x",
+                title: "T",
+                ok: true,
+                detail: "ok".into(),
+                fix: None,
+                docs: "d",
+            }],
+        };
+        require_vec_check_item(&s.items);
+        assert_eq!(s.items.len(), 1);
+    }
+
+    #[test]
+    fn setup_api_state_is_clone_send_sync_static_for_axum_state_boundary() {
+        // The existing pin
+        // (`setup_api_state_and_setup_error_are_send_sync_static_for_axum_boundary`)
+        // walks Send+Sync+'static but not Clone — axum's State
+        // extractor clones the state per request, so all four traits
+        // must hold for the router to compile. A refactor that gave
+        // SetupApiState a `Mutex<...>` field (Mutex<T> is !Clone)
+        // "for lazy-init of the federation URL" would break the
+        // Clone bound and surface as a far-removed router-assembly
+        // trace. Pin all four trait bounds together here.
+        // Symmetric to round-190 KillswitchApiState Clone + round-
+        // 192 SlackInteractState require_clone_send_sync_static
+        // pins extended to this sibling state envelope.
+        fn require_clone_send_sync_static<T: Clone + Send + Sync + 'static>() {}
+        require_clone_send_sync_static::<SetupApiState>();
+    }
 }

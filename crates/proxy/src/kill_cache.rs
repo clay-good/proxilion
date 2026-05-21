@@ -480,6 +480,129 @@ mod tests {
         }
     }
 
+    // ─── round 201 (2026-05-20): KillCache + const field-type surfaces ───
+
+    #[test]
+    fn entry_ttl_constant_field_type_is_duration_for_moka_time_to_live_signature_compat() {
+        // `ENTRY_TTL: Duration` matches moka's `time_to_live(...)`
+        // signature which takes `Duration`. The existing
+        // `entry_ttl_constant_pinned_at_one_hour_per_spec` pin walks
+        // the VALUE; pin the TYPE here so a refactor to bare `u64`
+        // / `i64` "for simpler config parsing" would surface here
+        // rather than at the cache-builder call site (where moka's
+        // trait-bound error would mention an unrelated type). The
+        // unit-information (seconds vs millis) lives at the type
+        // level via Duration. Symmetric to round-196
+        // DEFAULT_TICK_INTERVAL Duration + round-199 BurstConfig
+        // window/flush_interval Duration type pins extended to this
+        // sibling cache-TTL constant.
+        fn require_duration(_: Duration) {}
+        require_duration(ENTRY_TTL);
+    }
+
+    #[test]
+    fn max_capacity_constant_field_type_is_u64_for_moka_max_capacity_signature_compat() {
+        // `MAX_CAPACITY: u64` matches moka's `max_capacity(...)`
+        // signature which takes `u64` (not `usize` — moka counts
+        // entries with a 64-bit counter independent of platform
+        // pointer width so multi-million-entry caches behave
+        // identically on 32-bit and 64-bit hosts). The existing
+        // `max_capacity_constant_pinned_at_one_hundred_thousand`
+        // pin walks the VALUE; pin the TYPE here so a refactor to
+        // `usize` "for symmetry with Vec::len()" would surface at
+        // the cache-builder call site with a far-removed type
+        // mismatch. Symmetric to round-199 BurstSummary count
+        // fields u64 + round-196 ExpirySweepReport.expired_rows u64
+        // type pins extended to this sibling capacity-cap constant.
+        fn require_u64(_: u64) {}
+        require_u64(MAX_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn mark_return_type_is_unit_not_result_for_infallible_hot_path() {
+        // `mark(&self, hash: [u8; 32]) -> ()` — the return type is
+        // unit, NOT `Result<(), _>`. The killswitch handler's hot
+        // path is `kc.mark(h).await;` without `?` — it does NOT
+        // surface a "couldn't mark" failure to the operator. moka's
+        // insert is infallible by construction. A refactor that
+        // promoted to `Result<(), CacheError>` "for future shared-
+        // cache backend wiring" would break every kill_cache call
+        // site (which today never matches on the return). Pin via
+        // require_unit. Symmetric to round-192 slack helpers +
+        // round-199 admit() bool-not-Result + round-198 oauth body()
+        // infallibility pins extended to this hot-path write.
+        fn require_unit(_: ()) {}
+        let kc = KillCache::new();
+        let out: () = kc.mark([4u8; 32]).await;
+        require_unit(out);
+    }
+
+    #[tokio::test]
+    async fn mark_many_return_type_is_unit_not_result_for_infallible_bulk_write_path() {
+        // Symmetric to the `mark` return-type pin above. The bulk
+        // path `mark_many(impl IntoIterator<Item = [u8; 32]>) -> ()`
+        // is also infallible — moka's per-entry insert is infallible
+        // AND the loop has no early-return semantics. A refactor
+        // that promoted to `Result<usize, CacheError>` "for caller-
+        // visible partial-failure accounting" would force every
+        // killswitch handler to plumb through the count + check the
+        // result. Pin unit-return via require_unit. The two write
+        // helpers (`mark` + `mark_many`) MUST move in lockstep on
+        // the infallibility contract.
+        fn require_unit(_: ()) {}
+        let kc = KillCache::new();
+        let out: () = kc.mark_many(vec![[5u8; 32]]).await;
+        require_unit(out);
+    }
+
+    #[tokio::test]
+    async fn mark_signature_takes_owned_hash_by_value_not_borrow_for_moka_insert_ownership() {
+        // `mark(&self, hash: [u8; 32])` — the hash parameter is
+        // OWNED `[u8; 32]`, NOT a borrowed `&[u8; 32]`. moka's
+        // `insert(key, value)` takes the key by-value (it stores
+        // an owned copy in the cache table). Passing the hash
+        // by-value here lets the caller hand off ownership without
+        // an intermediate clone. The existing `is_killed_takes_reference`
+        // pin walks the read-path borrow contract; pin the write-
+        // path by-value contract here. A refactor to `&[u8; 32]`
+        // "for symmetry with is_killed" would force `mark` to
+        // clone internally on every call site OR would force the
+        // killswitch handler to keep the `[u8; 32]` alive past
+        // the `mark` call (which it currently does NOT — the
+        // handler iterates the UPDATE's RETURNING and consumes
+        // each row's hash). The compile-time check is the
+        // by-value let-binding pattern.
+        let kc = KillCache::new();
+        let hash: [u8; 32] = [99u8; 32];
+        // Passing by-value MOVES the hash (Copy makes this no-op,
+        // but the type-shape contract holds at the signature).
+        kc.mark(hash).await;
+        // The Copy semantics allow re-use of the local even after
+        // the move-by-value — pin that the hash is unchanged.
+        assert_eq!(hash, [99u8; 32]);
+        // And the cache contains the marked hash.
+        assert!(kc.is_killed(&hash).await);
+    }
+
+    #[test]
+    fn kill_cache_clone_trait_bound_explicit_for_arc_share_axum_state_contract() {
+        // `KillCache: Clone` — derived. The existing
+        // `clone_shares_underlying_moka_cache_marks_visible_across_clones`
+        // pin walks BEHAVIOR (clones share marks). Pin the TRAIT
+        // BOUND directly via require_clone so a refactor that
+        // dropped the derive "to forbid accidental aliasing" would
+        // surface at the type level rather than at the AppState
+        // assembly site with an unrelated `Clone` trait-bound error.
+        // The kill_cache is held in AppState which is `Clone`'d into
+        // every request scope — Clone on KillCache is load-bearing
+        // for the entire axum middleware chain. Symmetric to
+        // round-191 SetupApiState Clone+Send+Sync+'static +
+        // round-192 SlackInteractState Clone pins extended to this
+        // sibling AppState-held shape.
+        fn require_clone<T: Clone>() {}
+        require_clone::<KillCache>();
+    }
+
     #[tokio::test]
     async fn is_killed_returns_bool_not_optional_on_unmarked_hash() {
         // The middleware's hot path uses `if kc.is_killed(&h).await { ... }`

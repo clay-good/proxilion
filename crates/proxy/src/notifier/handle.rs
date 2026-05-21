@@ -715,4 +715,157 @@ mod tests {
         );
         assert!(n.slack.current().is_none(), "slack handle must start None");
     }
+
+    // ─── round 202 (2026-05-20): Handle + Notifiers method-signature surfaces ───
+
+    #[test]
+    fn handle_current_return_type_is_option_arc_t_for_caller_decides_present_or_absent() {
+        // `Handle<T>::current(&self) -> Option<Arc<T>>` — the
+        // return is `Option<Arc<T>>`, NOT `Arc<T>` or `Arc<Option<T>>`.
+        // The Option captures the "no driver configured yet" semantic
+        // distinct from "driver present but disabled" (the latter
+        // would be a future inner-T flag). The Arc captures the
+        // shared-ownership semantic that lets every adapter request
+        // hold a snapshot across `.await` boundaries. A refactor
+        // that flattened to `Arc<Option<T>>` "for cheaper Option-on-
+        // the-outside" would force every caller to .as_ref().is_some()
+        // through the Arc layer AND would foreclose the ArcSwap<Option<Arc<T>>>
+        // hot-swap atomic semantics that depend on the Arc-inside-Option
+        // shape. Pin return type via let-binding type annotation.
+        // Symmetric to round-200 SiemHmacKey::from_hex Result return
+        // pin extended to this hot-swap accessor.
+        let h: NotifierHandle = Handle::new(None);
+        let out: Option<Arc<WebhookNotifier>> = h.current();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn handle_replace_return_type_is_unit_for_infallible_hot_swap_atomic_store() {
+        // `Handle<T>::replace(&self, new: Option<Arc<T>>)` returns
+        // `()` — the hot-swap is infallible by construction (ArcSwap's
+        // store is wait-free + lock-free + can't fail). A refactor
+        // that promoted to `Result<(), SwapError>` "for future
+        // generation-counter conflict detection" would break every
+        // `/api/v1/notifier/config` handler call site which today
+        // calls `.replace(...)` without `?`. Pin via require_unit
+        // + let-binding type annotation. Symmetric to round-201
+        // KillCache::mark unit-return + round-199 admit() bool-not-
+        // Result pins extended to this hot-swap write helper.
+        fn require_unit(_: ()) {}
+        let h: NotifierHandle = Handle::new(None);
+        let out: () = h.replace(None);
+        require_unit(out);
+    }
+
+    #[test]
+    fn notifier_handle_slack_handle_email_handle_are_distinct_type_aliases_over_handle_generic() {
+        // `pub type NotifierHandle = Handle<WebhookNotifier>;`
+        // `pub type SlackHandle = Handle<SlackNotifier>;`
+        // `pub type EmailHandle = Handle<EmailNotifier>;`
+        // — three distinct type aliases over the same `Handle<T>`
+        // generic. The aliases are read-clarity aids at call sites
+        // (`fn build(webhook: NotifierHandle, slack: SlackHandle,
+        // email: EmailHandle)` reads more clearly than `Handle<...>`,
+        // `Handle<...>`, `Handle<...>`). Pin that the three aliases
+        // resolve to DISTINCT concrete types by constructing one
+        // of each and pinning their type via Notifiers field
+        // assignment compatibility — a refactor that consolidated
+        // them to a single `NotifierHandle = Handle<dyn AnyNotifier>`
+        // "for fewer types" would surface here as a type mismatch
+        // at the Notifiers field assignments AND would lose the
+        // monomorphized hot-swap perf (dyn-trait calls would replace
+        // the direct Arc<T> dereferences). The compile-time check
+        // is the let-binding type annotation pattern.
+        let webhook_h: NotifierHandle = Handle::new(None);
+        let slack_h: SlackHandle = Handle::new(None);
+        let email_h: EmailHandle = Handle::new(None);
+        // Each alias resolves to the right generic over its inner
+        // type — verified by Notifiers field assignment.
+        let _bundle = Notifiers {
+            webhook: webhook_h,
+            slack: slack_h,
+            email: email_h,
+            webhook_burst: None,
+            slack_burst: None,
+        };
+    }
+
+    #[test]
+    fn notifiers_burst_suppressor_fields_are_option_burst_suppressor_for_post_boot_attach() {
+        // `Notifiers.webhook_burst` and `Notifiers.slack_burst` —
+        // both `Option<BurstSuppressor>`, NOT bare `BurstSuppressor`.
+        // The Option captures the "no suppressor wired in this
+        // configuration" semantic (e.g. test fixtures, minimal
+        // setups). The hot-swap path re-attaches the boot-time
+        // suppressor to a fresh notifier on `/api/v1/notifier/config`
+        // — without the Option, the boot path would have to construct
+        // a no-op suppressor as a placeholder, AND tests would have
+        // to plumb one through. A refactor to bare BurstSuppressor
+        // "for required-by-default semantics" would force every test
+        // fixture to construct one (the `Notifiers::empty()` helper
+        // depends on these fields being None-defaultable). Pin
+        // Option<BurstSuppressor> via require_opt_burst_suppressor
+        // on both fields. Symmetric to round-191 CheckItem.fix
+        // Option<&'static str> + round-197 Scenario.block_reason
+        // Option<&'static str> pins extended to this bundle shape's
+        // optional-driver-companion contract.
+        fn require_opt_burst_suppressor(_: &Option<BurstSuppressor>) {}
+        let n = Notifiers::empty();
+        require_opt_burst_suppressor(&n.webhook_burst);
+        require_opt_burst_suppressor(&n.slack_burst);
+        // And both are None on the empty bundle (existing pin
+        // `empty_bundle_has_none_for_burst_suppressors` walks the
+        // VALUE; this pin walks the TYPE in lockstep).
+        assert!(n.webhook_burst.is_none());
+        assert!(n.slack_burst.is_none());
+    }
+
+    #[test]
+    fn notifiers_any_configured_return_type_is_bool_for_infallible_or_chain_dispatch() {
+        // `Notifiers::any_configured(&self) -> bool` — the return
+        // is bare `bool`, NOT `Option<bool>` or `Result<bool>`.
+        // The `/admin/setup` summary handler calls
+        // `notifiers.any_configured()` directly in a boolean
+        // context (`if !any_configured { render_setup_hint() }`).
+        // A refactor that promoted to `Result<bool, _>` "for
+        // future race-with-hot-swap detection" would break every
+        // setup-handler call site which today drops the bool into
+        // an `if` without `.unwrap()`. Pin via require_bool + let-
+        // binding type. Symmetric to round-199 BurstSuppressor::admit
+        // bool-not-Result + round-201 KillCache::is_killed bool-not-
+        // Optional pins extended to this sibling bundle accessor.
+        fn require_bool(_: bool) {}
+        let n = Notifiers::empty();
+        let out: bool = n.any_configured();
+        require_bool(out);
+        assert!(!out, "empty bundle's any_configured must be false");
+    }
+
+    #[test]
+    fn handle_new_constructor_return_type_is_self_for_builder_ergonomics() {
+        // `Handle::new(initial: Option<Arc<T>>) -> Self` — the
+        // return is `Self` (the generic Handle<T>), NOT `Result<Self,
+        // _>`. The constructor is infallible (it builds an ArcSwap
+        // from the provided initial, which can't fail). A refactor
+        // that promoted to `Result<Self, BuildError>` "for future
+        // validation of the inner T" would break the
+        // `NotifierHandle::new(None)` boot-path call sites which
+        // today use the return value directly without `?` or
+        // `.unwrap()`. Pin via let-binding type annotation forcing
+        // the Self return shape across all three concrete aliases.
+        // Symmetric to round-200 SiemHmacKey::from_hex Result return
+        // (the INVERSE — that one IS fallible by design; this one
+        // is intentionally infallible). The two constructors document
+        // different contracts via their return types — a refactor
+        // that flipped either would surface here OR at the sibling
+        // round-200 test.
+        let webhook: NotifierHandle = Handle::new(None);
+        let slack: SlackHandle = Handle::new(None);
+        let email: EmailHandle = Handle::new(None);
+        // The three concrete aliases all return Self (their
+        // respective Handle<T> shape). Sanity: each starts None.
+        assert!(webhook.current().is_none());
+        assert!(slack.current().is_none());
+        assert!(email.current().is_none());
+    }
 }

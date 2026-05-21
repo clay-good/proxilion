@@ -571,6 +571,151 @@ mod tests {
         );
     }
 
+    // ─── round 214 (2026-05-21): ActionEvent + ActionStream + Broadcasting surfaces ───
+
+    #[test]
+    fn action_event_field_count_pinned_exactly_sixteen_via_exhaustive_destructure() {
+        // `ActionEvent` has EXACTLY 16 fields. The INSERT into `action_events`
+        // hard-codes 15 columns (extra is JSONB + at is a timestamptz). Pin
+        // the count via exhaustive destructure with no `..` rest pattern —
+        // a 17th field landing without a matching column wiring would
+        // surface here as a compile error rather than as a silent data drop
+        // in the BroadcastingActionStream persist path. Symmetric to
+        // round-213 CachedPca 8-field destructure pin + round-208
+        // VerificationResult 7-field-types-intact pin.
+        let ActionEvent {
+            request_id: _,
+            agent_session_id: _,
+            p_0: _,
+            leaf_pca_id: _,
+            vendor: _,
+            action: _,
+            method: _,
+            path: _,
+            status: _,
+            decision: _,
+            block_reason: _,
+            read_filter_triggered: _,
+            quarantined_count: _,
+            at: _,
+            policy_id: _,
+            extra: _,
+        } = sample();
+    }
+
+    #[test]
+    fn action_event_status_field_type_is_u16_via_require_u16_for_http_response_code_domain() {
+        // `status: u16` matches the HTTP response-code domain (3-digit
+        // codes up to 599 fit; the type signals "HTTP code, not a
+        // generic counter"). The existing `status_u16_round_trips_as_unquoted_integer`
+        // pin walks the wire form; pin the TYPE here so a refactor to
+        // `u32` "for symmetry with the rest of metrics" would surface
+        // here at the field level. The cast at INSERT site is
+        // `event.status as i32` — a u32 refactor would change the cast
+        // domain and silently change the postgres `integer` column
+        // value for status codes above i32::MAX (impossible for HTTP
+        // codes today, but the type contract is the boundary).
+        // Symmetric to round-201 MAX_CAPACITY u64 type pin.
+        fn require_u16(_: u16) {}
+        require_u16(sample().status);
+    }
+
+    #[test]
+    fn broadcasting_action_stream_new_constructor_returns_self_owned_by_value() {
+        // `BroadcastingActionStream::new(pool: PgPool) -> Self` — the
+        // constructor returns OWNED `Self` by value, NOT `Arc<Self>` or
+        // `Result<Self, _>`. server.rs wires
+        // `Arc::new(BroadcastingActionStream::new(pool))` and the
+        // owned-by-value shape lets the caller decide the Arc-wrap
+        // policy. A refactor to `Arc<Self>` "for guaranteed shared
+        // dispatch" would force every call site to handle the deref and
+        // would foreclose the AppState-builder pattern that holds the
+        // bare struct briefly before wrapping. Pin via fn-pointer type
+        // capture at the static-fn item — does NOT require a runtime
+        // PgPool (no call is made).
+        let _ctor: fn(PgPool) -> BroadcastingActionStream = BroadcastingActionStream::new;
+    }
+
+    #[test]
+    fn action_stream_trait_super_bounds_pinned_send_sync_static_for_arc_dyn_dispatch() {
+        // The `ActionStream` trait declares
+        // `pub trait ActionStream: Send + Sync + 'static`. AppState holds
+        // it as `Arc<dyn ActionStream>` so the three super-bounds are
+        // load-bearing for the entire request-scoped dispatch path. A
+        // refactor that dropped one bound "for ergonomic single-thread
+        // testing" would silently break the AppState assembly with a
+        // confusing `tower::Service` trait-bound error far from this
+        // file. Pin all three super-bounds explicitly via require_super
+        // — every concrete impl (LoggingStream, BroadcastingActionStream)
+        // MUST satisfy them. Symmetric to round-211 emit + summary
+        // Send+Sync+'static pins extended to this trait's super-bounds.
+        fn require_super<T: ActionStream + ?Sized>() {}
+        require_super::<dyn ActionStream>();
+        require_super::<LoggingStream>();
+        require_super::<BroadcastingActionStream>();
+    }
+
+    #[test]
+    fn action_event_clone_independent_owned_strings_on_block_reason_some_arm() {
+        // The existing `action_event_clone_produces_independent_value_for_each_sink`
+        // pin walks decision/block_reason/vendor mutation independence
+        // but uses `clone.block_reason = Some("mutated".to_string())` —
+        // it REPLACES the Option rather than mutating the inner String.
+        // Pin the deeper contract: mutating the INNER String of a Some
+        // arm via `.as_mut().unwrap().push_str(...)` must NOT alias back
+        // to the original. A refactor that switched `Option<String>` to
+        // `Option<Arc<String>>` "for memory savings on common policy
+        // names" would pass the replace-the-Option pin but fail this
+        // inner-mutation pin — surfacing the silent cross-sink aliasing
+        // that would let one sink decorator's mutation poison every
+        // other sink.
+        let original = sample();
+        let mut clone = original.clone();
+        clone
+            .block_reason
+            .as_mut()
+            .expect("Some arm")
+            .push_str("-MUTATED");
+        assert_eq!(original.block_reason.as_deref(), Some("policy"));
+        assert_eq!(clone.block_reason.as_deref(), Some("policy-MUTATED"));
+    }
+
+    #[test]
+    fn action_event_referentially_transparent_clone_across_fifty_calls() {
+        // `ActionEvent: Clone` (derived). The clone path is the hot path
+        // — every TeeStream sink clones the event. Pin referential
+        // transparency on the clone helper across 50 calls on the same
+        // input: no thread-local LRU keyed on the source-event pointer
+        // forking the cloned values, no per-call counter mixin tagging
+        // a "clone #N" field. A refactor that introduced
+        // `Arc<dashmap::DashMap<...>>` keyed memoization "for hot-path
+        // dedup" would surface here as a field drift across the 50-call
+        // sweep. Symmetric to round-213 CachedPca::new RT-50 +
+        // round-211 parse_id_value RT-50 referential-transparency pins
+        // extended to this hot-path Clone.
+        let baseline = sample();
+        for n in 0..50 {
+            let next = baseline.clone();
+            assert_eq!(next.request_id, baseline.request_id, "iter {n}");
+            assert_eq!(next.vendor, baseline.vendor, "iter {n}");
+            assert_eq!(next.action, baseline.action, "iter {n}");
+            assert_eq!(next.status, baseline.status, "iter {n}");
+            assert_eq!(next.decision, baseline.decision, "iter {n}");
+            assert_eq!(next.block_reason, baseline.block_reason, "iter {n}");
+            assert_eq!(
+                next.read_filter_triggered, baseline.read_filter_triggered,
+                "iter {n}",
+            );
+            assert_eq!(
+                next.quarantined_count, baseline.quarantined_count,
+                "iter {n}"
+            );
+            assert_eq!(next.at, baseline.at, "iter {n}");
+            assert_eq!(next.policy_id, baseline.policy_id, "iter {n}");
+            assert_eq!(next.extra, baseline.extra, "iter {n}");
+        }
+    }
+
     #[test]
     fn logging_stream_default_produces_usable_instance() {
         // `LoggingStream` derives `Default` — pin the derive so a

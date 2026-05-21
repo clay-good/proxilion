@@ -554,6 +554,146 @@ mod tests {
         assert_eq!(c2.signature.len(), 9);
     }
 
+    // ─── round 213 (2026-05-21): PcaCache + CachedPca + CacheError surfaces ───
+
+    #[test]
+    fn cache_error_variant_count_pinned_exactly_one_via_exhaustive_match() {
+        // `CacheError` has EXACTLY one variant today: `Db`. Pin the count
+        // via exhaustive match with NO `_` wildcard arm so a future
+        // `Decode` (CBOR parse) or `RateLimited` (Trust Plane backoff)
+        // variant landing without operator runbook / dashboard panel
+        // update surfaces here as a compile error. The match-without-`_`
+        // pattern is symmetric to round-207 SlackAction + round-208
+        // VerifierError exhaustive-variant pins extended to this sibling
+        // cache-layer error enum.
+        let e = CacheError::Db(sqlx::Error::RowNotFound);
+        let name = match &e {
+            CacheError::Db(_) => "Db",
+        };
+        assert_eq!(name, "Db");
+    }
+
+    #[test]
+    fn current_pic_profile_constant_type_is_static_str_not_owned_string() {
+        // `CURRENT_PIC_PROFILE: &str` is a `&'static str` literal, NOT
+        // an owned `String` or a `lazy_static!`-wrapped value. The
+        // adapter call sites use `CURRENT_PIC_PROFILE.to_string()` and
+        // rely on the no-allocation-at-construction shape. A refactor
+        // to `lazy_static! { static ref CURRENT_PIC_PROFILE: String = ... }`
+        // "for runtime-configurable profile" would silently introduce
+        // a Deref coercion at every call site, change the type, and
+        // foreclose the `&'static str` lifetime currently relied on
+        // when storing the literal in a struct field that outlives the
+        // request. Pin via require_static_str.
+        fn require_static_str(_: &'static str) {}
+        require_static_str(CURRENT_PIC_PROFILE);
+    }
+
+    #[test]
+    fn cached_pca_new_return_type_is_owned_self_by_value_for_adapter_move_into_state() {
+        // `CachedPca::new(...) -> Self` returns OWNED `Self` by value,
+        // NOT `Arc<Self>` or `Box<Self>`. The adapter call sites use
+        // `let pca = CachedPca::new(...); cache.insert(&pca).await?`
+        // — the owned-by-value shape lets callers hand the value to
+        // `&pca` for insert AND keep it for downstream `pca.cbor`
+        // access without an Arc bump. A refactor to `Arc<Self>` "for
+        // cheap cross-handler share" would force a `*pca` deref or an
+        // `.as_ref()` at every adapter site and would change the
+        // Clone shape (the existing `cached_pca_is_clone_with_disjoint_buffers`
+        // pin would still pass, but the deep-copy semantic would
+        // collapse). Pin via require_owned_pca.
+        fn require_owned_pca(_: CachedPca) {}
+        let pca = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 0, None);
+        require_owned_pca(pca);
+    }
+
+    #[test]
+    fn cached_pca_new_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `CachedPca::new` is a pure builder: same inputs → byte-equal
+        // outputs across N calls, with NO per-call counter mixin and NO
+        // thread-local LRU cache forking outputs across equal-content-
+        // different-allocation inputs. A refactor that "memoized" the
+        // constructor against a `OnceLock<HashMap<(Uuid, ...), CachedPca>>`
+        // for "speed" would surface here as a referential-transparency
+        // failure on the 50-call sweep (the LRU would alias new calls
+        // to a cached prior value with a STALE pca_id field). Symmetric
+        // to round-211 parse_id_value + round-209 redact_pii_bytes
+        // referential-transparency pins extended to this builder.
+        let id = Uuid::new_v4();
+        let pred = Uuid::new_v4();
+        let baseline = CachedPca::new(
+            id,
+            vec![1, 2, 3],
+            "alice@acme.com".into(),
+            vec!["drive:read:file/x".into()],
+            7,
+            Some(pred),
+        );
+        for n in 0..50 {
+            let next = CachedPca::new(
+                id,
+                vec![1, 2, 3],
+                "alice@acme.com".into(),
+                vec!["drive:read:file/x".into()],
+                7,
+                Some(pred),
+            );
+            assert_eq!(next.pca_id, baseline.pca_id, "iter {n}: pca_id drifted");
+            assert_eq!(next.cbor, baseline.cbor, "iter {n}: cbor drifted");
+            assert_eq!(next.p_0, baseline.p_0, "iter {n}: p_0 drifted");
+            assert_eq!(next.ops, baseline.ops, "iter {n}: ops drifted");
+            assert_eq!(next.hop, baseline.hop, "iter {n}: hop drifted");
+            assert_eq!(
+                next.predecessor_id, baseline.predecessor_id,
+                "iter {n}: predecessor_id drifted",
+            );
+            assert_eq!(
+                next.pic_profile, baseline.pic_profile,
+                "iter {n}: pic_profile drifted",
+            );
+            assert!(next.signature.is_empty(), "iter {n}: signature drifted");
+        }
+    }
+
+    #[test]
+    fn cached_pca_field_count_pinned_exactly_eight_via_exhaustive_destructure() {
+        // `CachedPca` has EXACTLY 8 fields. The insert/get sqlx queries
+        // hard-code 8 columns; a future field landing without column
+        // wiring would silently get dropped on insert AND filled with
+        // a default on get. Pin the count via exhaustive destructure
+        // with no `..` rest pattern — a 9th field landing without a
+        // matching INSERT/SELECT update would surface here as a
+        // compile error rather than as a silent data drop. Symmetric
+        // to round-208 VerificationResult 7-field-types-intact pin.
+        let pca = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 0, None);
+        let CachedPca {
+            pca_id: _,
+            cbor: _,
+            p_0: _,
+            ops: _,
+            hop: _,
+            predecessor_id: _,
+            signature: _,
+            pic_profile: _,
+        } = pca;
+    }
+
+    #[test]
+    fn pca_cache_new_constructor_type_signature_takes_pg_pool_by_value() {
+        // `PcaCache::new(pool: PgPool) -> Self` — the constructor takes
+        // an OWNED `PgPool` by value, NOT `&PgPool` or `Arc<PgPool>`.
+        // server.rs assembly calls `PcaCache::new(pool.clone())` —
+        // sqlx's `PgPool::clone` is an Arc bump, so by-value ownership
+        // at the boundary lets the caller hand off without an extra
+        // wrapper. A refactor to `&'a PgPool` "to avoid the clone"
+        // would foreclose the no-lifetime-parameter shape AppState
+        // relies on (AppState holds PcaCache directly without a
+        // lifetime parameter — adding one would cascade through every
+        // axum handler signature). Pin via fn-pointer type capture
+        // at the static-fn item.
+        let _ctor: fn(PgPool) -> PcaCache = PcaCache::new;
+    }
+
     #[test]
     fn cache_error_from_sqlx_via_question_mark() {
         // `?`-conversion is what the public `insert` / `get` methods use;

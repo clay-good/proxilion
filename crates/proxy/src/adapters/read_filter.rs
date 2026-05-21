@@ -634,6 +634,180 @@ mod tests {
     }
 
     #[test]
+    fn apply_return_type_is_tuple_vec_u8_and_filter_outcome_owned_by_value_for_cross_await_propagation()
+     {
+        // `apply` returns `(Vec<u8>, FilterOutcome)` owned-by-value —
+        // the adapter call site moves both halves across the `.await`
+        // boundary into the response-rewrite + audit-row-write pipeline.
+        // A refactor to `(Cow<'a, [u8]>, FilterOutcome)` "for zero-alloc
+        // on clean bodies" would tie the rewritten-body lifetime to the
+        // input `body: &[u8]` borrow, which the upstream HTTP body is
+        // consumed before the audit task spawns — pin the owned-Vec<u8>
+        // shape at the return boundary. Symmetric to rounds 200/204's
+        // owned-String return-type pins.
+        fn require_owned_pair(_: (Vec<u8>, FilterOutcome)) {}
+        let f = build(
+            QuarantineAction::ReplaceWithMarker,
+            vec![Pattern::Literal("xyz".into())],
+        );
+        require_owned_pair(apply(b"abc", &f, Some("text/plain")));
+    }
+
+    #[test]
+    fn truncate_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `truncate` is a pure helper — pin referential transparency
+        // across 50 calls per input. A refactor that, e.g., threaded a
+        // per-process pad-byte through the closure "for length-budget
+        // observability" OR memoized the result keyed on input pointer
+        // (not content) would surface here as drift. The audit row's
+        // `pattern: format!("literal: {}", truncate(s, 80))` AND
+        // `snippet: text[..].chars().take(200)` mirror this helper's
+        // contract; a 1-in-50 drift would silently fork audit rows.
+        for (input, n) in [
+            ("short", 10),
+            ("exactly five", 5),
+            ("αβγδεζ multibyte", 8),
+            ("", 0),
+            ("longer than the cap test", 4),
+        ] {
+            let first = truncate(input, n);
+            for i in 0..50 {
+                assert_eq!(
+                    truncate(input, n),
+                    first,
+                    "iter {i}: truncate drift on input {input:?}, n={n}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_scan_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // Same purity pin for `should_scan`. The content-type classifier
+        // is a pure lowercasing + substring check — pin across 50
+        // calls. A refactor that introduced a per-process LRU cache
+        // keyed on input pointer would silently produce non-determinism
+        // on the second call with a freshly-allocated identical-content
+        // String input. The hot path calls `should_scan` once per
+        // response (NOT per match); drift would create flaky
+        // adapter-level read-filter tests.
+        for ct in [
+            None,
+            Some("application/json"),
+            Some("application/json; charset=utf-8"),
+            Some("text/plain"),
+            Some("image/png"),
+            Some("APPLICATION/JSON"),
+            Some(""),
+        ] {
+            let first = should_scan(ct);
+            for i in 0..50 {
+                assert_eq!(
+                    should_scan(ct),
+                    first,
+                    "iter {i}: should_scan drift on ct {ct:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_overlapping_and_splice_return_types_owned_by_value_for_cross_await_propagation() {
+        // `merge_overlapping` returns owned `Vec<(usize, usize)>` and
+        // `splice` returns owned `String`. Both feed into the
+        // `apply`-then-response-rewrite pipeline that crosses `.await`
+        // boundaries. A refactor to borrowed return types (e.g.
+        // `splice` returning `Cow<'a, str>` "for zero-alloc no-match
+        // case") would tie the rewritten body to the input text's
+        // lifetime — but the input is dropped after `text.into_bytes()`
+        // moves the buffer. Pin both return shapes via owned-witness
+        // helpers.
+        fn require_owned_vec(_: Vec<(usize, usize)>) {}
+        fn require_owned_string(_: String) {}
+        require_owned_vec(merge_overlapping(&[(0, 5), (3, 8)]));
+        require_owned_string(splice("hello world", &[(6, 11)], "X"));
+    }
+
+    #[test]
+    fn marker_constant_byte_length_equals_thirty_five_via_byte_count_pin_for_audit_diff_alignment()
+    {
+        // The `MARKER` byte length is the load-bearing axis the audit
+        // dashboard's "before/after diff" relies on for column-aligned
+        // rendering. The existing `marker_constant_is_static_str_byte_exact`
+        // test pins the string content AND the byte length (35) — but
+        // the comment in that test mentions "38 bytes" (a stale doc
+        // bug). Pin the ACTUAL byte count via two distinct paths
+        // (`.len()` byte count AND `.as_bytes().len()` slice length)
+        // so a future refactor that swapped to a multibyte unicode
+        // marker (e.g. `"[🚫 redacted]"`) would surface the byte-vs-char
+        // divergence here at this file rather than as a column-
+        // alignment regression in the dashboard.
+        assert_eq!(MARKER.len(), 35);
+        // Byte count from the byte slice projection — equivalent to
+        // `.len()` for `&str` but pinned via the slice form so a
+        // future refactor that returned a non-`&str` MARKER would
+        // surface here too.
+        let bytes: &[u8] = MARKER.as_bytes();
+        assert_eq!(bytes.len(), 35);
+        // Char count equals byte count because the marker is
+        // ASCII-only — a multibyte refactor would break this
+        // invariant on the chars().count() side.
+        assert_eq!(MARKER.chars().count(), 35);
+        // ASCII-only: every byte is < 128.
+        for b in MARKER.bytes() {
+            assert!(b < 128, "non-ASCII byte 0x{b:02x} in MARKER");
+        }
+    }
+
+    #[test]
+    fn filter_outcome_field_types_pinned_for_cross_await_audit_row_persist_contract() {
+        // `FilterOutcome` carries the read-filter result across an
+        // `.await` boundary into the audit row INSERT path AND into
+        // the response-rewrite decision. Pin all 4 field types:
+        // `matches: usize` (caller uses `o.matches as i64` for the
+        // audit row); `triggered: bool` (operator panel boolean);
+        // `samples: Vec<QuarantineSample>` (audit row owns the
+        // snippets); `block: bool` (the BlockRequest action's caller
+        // signal). A refactor that switched `samples` to
+        // `Cow<'a, [QuarantineSample]>` "for zero-alloc on no-match"
+        // would tie outcome to the input body's lifetime AND break
+        // the cross-await audit-write contract.
+        fn require_usize(_: usize) {}
+        fn require_bool(_: bool) {}
+        fn require_vec_sample(_: Vec<QuarantineSample>) {}
+        let o = FilterOutcome::default();
+        require_usize(o.matches);
+        require_bool(o.triggered);
+        require_vec_sample(o.samples.clone());
+        require_bool(o.block);
+    }
+
+    #[test]
+    fn quarantine_sample_field_types_pinned_owned_strings_for_audit_row_persist() {
+        // `QuarantineSample` has two String fields — `pattern` (the
+        // audit row's pattern source like `"literal: ignore previous"`
+        // or `"regex: <\\|.*?\\|>"`) and `snippet` (the matched text
+        // truncated to 200 chars). Both cross the `.await` boundary
+        // into the `quarantined_payloads` table INSERT. A refactor to
+        // `&'static str` (impossible — `pattern` is dynamic via
+        // `format!()`) OR to `Cow<'a, str>` "for zero-alloc on regex
+        // patterns that don't need the `literal:` prefix" would tie
+        // both fields to the source body's lifetime. Pin owned-String
+        // at the struct boundary so a future refactor surfaces here.
+        fn require_string(_: String) {}
+        let s = QuarantineSample {
+            pattern: "literal: test".into(),
+            snippet: "matched text".into(),
+        };
+        require_string(s.pattern.clone());
+        require_string(s.snippet.clone());
+        // Clone derive sanity — both fields preserved byte-equal.
+        let c = s.clone();
+        assert_eq!(c.pattern, "literal: test");
+        assert_eq!(c.snippet, "matched text");
+    }
+
+    #[test]
     fn regexset_short_circuits_clean_bodies() {
         let f = build(
             QuarantineAction::ReplaceWithMarker,

@@ -1054,6 +1054,148 @@ mod tests {
         }
     }
 
+    // ─── round 211 (2026-05-21): pure-helper purity + ownership pins ───
+
+    #[test]
+    fn parse_id_value_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `parse_id_value` is on the YAML line-walker hot path inside
+        // `edit_mode_in_yaml` — called once per `- id: …` line during
+        // every `set_mode` invocation. A refactor that introduced a
+        // thread-local LRU keyed on the input slice's `as_ptr()` "for
+        // hot-path perf" would silently fork outputs on
+        // equal-content-different-allocation inputs and break the
+        // editor's per-line idempotence contract. Pin 50 calls
+        // byte-equal on a representative quoted-scalar input.
+        // Symmetric to the audit_body redact-helper + slack
+        // parse_button_value + oauth/bridge infer_idp RT pins
+        // extended to this sibling line-scanner helper.
+        let input = "id: \"alpha-policy\"  # comment";
+        let baseline = parse_id_value(input).map(|s| s.to_string());
+        for i in 0..50 {
+            let again = parse_id_value(input).map(|s| s.to_string());
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: parse_id_value must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_id_value_return_type_is_borrowed_str_view_into_input_for_zero_alloc_yaml_scan() {
+        // `parse_id_value` returns `Option<&str>` — the returned slice
+        // is a borrowed view into the caller's `&str` argument so the
+        // line-walker can compare ids without allocating one `String`
+        // per line scanned. A refactor to `Option<String>` "for owned
+        // returns symmetric with `find_inline_comment`" would heap-
+        // allocate per line and silently regress the policy-reload
+        // hot path. Pin via pointer-equality between the input slice
+        // and the returned slice's data pointer. Symmetric to round
+        // 207's `slack_notifier_field_types_pinned_for_cross_await_post_contract`
+        // pin (borrowed-view accessor) extended to this YAML helper.
+        let input = "id: alpha";
+        let parsed = parse_id_value(input).expect("matches");
+        // The unquoted-scalar arm returns a slice into the input.
+        let input_base = input.as_ptr() as usize;
+        let parsed_base = parsed.as_ptr() as usize;
+        assert!(
+            parsed_base >= input_base && parsed_base < input_base + input.len(),
+            "parse_id_value must return a borrowed slice into the input, got distinct allocation",
+        );
+        assert_eq!(parsed, "alpha");
+    }
+
+    #[test]
+    fn find_inline_comment_is_referentially_transparent_across_fifty_calls_on_same_input() {
+        // `find_inline_comment` is called from `parse_id_value` on every
+        // matched `id:` line — equal calls must yield equal outputs. A
+        // refactor that introduced a counter-mixin "for fairness across
+        // multiple `#`s on the same line" (round-robin returning a
+        // different `#` index per call) would silently fork the
+        // comment-stripping seam between two consecutive set_mode
+        // invocations. Pin 50 calls byte-equal here. Symmetric to the
+        // parse_id_value RT pin above.
+        let input = "alpha-policy  # comment text";
+        let baseline = find_inline_comment(input);
+        for i in 0..50 {
+            let again = find_inline_comment(input);
+            assert_eq!(
+                again, baseline,
+                "iteration {i}: find_inline_comment must be referentially transparent",
+            );
+        }
+    }
+
+    #[test]
+    fn find_inline_comment_return_type_is_option_usize_not_signed_for_string_slice_indexing() {
+        // `find_inline_comment` returns `Option<usize>` — the unsigned
+        // index is what `parse_id_value`'s `&val[..end]` slice operation
+        // requires (a signed return would need a cast at every call
+        // site, opening room for `-1`-sentinel drift). Pin the type
+        // via `require_option_usize`. Symmetric to round 199's
+        // `BurstConfig 3 fields threshold usize + window Duration +
+        // flush_interval Duration` numeric-type pin extended to this
+        // sibling helper.
+        fn require_option_usize(_: &Option<usize>) {}
+        let out = find_inline_comment("alpha  # c");
+        require_option_usize(&out);
+        // Sanity — the function found the `#` at index 7 (after the
+        // two spaces).
+        assert_eq!(out, Some(7));
+    }
+
+    #[test]
+    fn set_mode_error_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // `SetModeError` has exactly 3 variants today (NotFound / Parse /
+        // Reload) — operator log filters bucket on these arm names via
+        // the round-1037 `Debug` carries-variant-name pin. A refactor
+        // that landed a fourth variant (e.g. a `Schema` arm for a
+        // future strict-schema validator) would silently introduce a
+        // fourth dimension the dashboard's "set_mode error reason"
+        // panel wasn't sized for. Pin via exhaustive-match arm names so
+        // any new variant forces a conscious panel + filter update.
+        // Symmetric to round 194's audit_body_mode variant-count + round
+        // 208's VerifierError 8-variant + round 207's SlackAction
+        // 3-variant exhaustive-match pins extended to this sibling
+        // operator-facing error enum.
+        fn arm_name(e: &SetModeError) -> &'static str {
+            match e {
+                SetModeError::NotFound(_) => "NotFound",
+                SetModeError::Parse(_) => "Parse",
+                SetModeError::Reload(_) => "Reload",
+            }
+        }
+        let three: Vec<SetModeError> = vec![
+            SetModeError::NotFound("x".into()),
+            SetModeError::Parse("y".into()),
+            SetModeError::Reload("z".into()),
+        ];
+        let names: std::collections::HashSet<&'static str> = three.iter().map(arm_name).collect();
+        assert_eq!(names.len(), 3, "3 distinct leaf-variant names walked");
+        assert_eq!(arm_name(&SetModeError::NotFound("a".into())), "NotFound");
+        assert_eq!(arm_name(&SetModeError::Parse("b".into())), "Parse");
+        assert_eq!(arm_name(&SetModeError::Reload("c".into())), "Reload");
+    }
+
+    #[test]
+    fn edit_mode_in_yaml_return_type_is_result_owned_string_for_cross_thread_arc_wrap() {
+        // `edit_mode_in_yaml` returns `Result<String, SetModeError>` —
+        // the owned `String` is required because the caller
+        // (`PolicyHandle::set_mode`) wraps it in `Arc::new(new_yaml)`
+        // for cross-thread sharing through the `ArcSwap<String>`. A
+        // refactor to `Result<Cow<'a, str>, _>` "for zero-alloc on the
+        // no-op path" would introduce a lifetime parameter that the
+        // surrounding `Arc::new(...)` ownership transfer can't satisfy,
+        // AND foreclose the documented happy-path mutation contract.
+        // Pin via require_owned_string. Symmetric to round 206's
+        // `apply_return_type_is_tuple_vec_u8_and_filter_outcome_owned_by_value_...`
+        // pin extended to this sibling editor helper.
+        fn require_owned_string(_: &String) {}
+        let yaml = "- id: alpha\n  vendor: google\n  action: drive.files.get\n  mode: enforce\n  decision: allow\n  required_ops: []\n";
+        let out = edit_mode_in_yaml(yaml, "alpha", Mode::Observe).expect("edit ok");
+        require_owned_string(&out);
+        assert!(out.contains("mode: observe"));
+    }
+
     #[test]
     fn set_mode_via_serde_fallback_round_trips_when_yaml_is_a_flow_mapping() {
         // The line-oriented walker only recognizes block-style YAML; an

@@ -826,4 +826,172 @@ mod tests {
         let _: fn(&mut PolicyTrace, String) = mark_layer_a_failed;
         let _: fn(&mut PolicyTrace, bool, Option<String>, String) = mark_read_filter;
     }
+
+    // ─── round 212 (2026-05-21): policy_trace helper purity + ownership ───
+
+    #[test]
+    fn summary_label_strings_for_each_policy_layer_are_byte_exact_lowercase_snake_case() {
+        // The `summary` helper renders each `PolicyLayer` variant as a
+        // byte-exact lowercase snake_case label (`layer_a` / `layer_b`
+        // / `read_filter`) — these are the Grafana label values on
+        // `proxilion_policy_trace_layer_total` and the operator log
+        // grep targets. A refactor that emitted Title-Case
+        // (`LayerA`) or kebab-case (`read-filter`) would silently
+        // re-label every counter under a new dimension value and
+        // break the dashboard's "by layer" stacked bar. Pin all
+        // three variants via single-layer fresh traces. Symmetric
+        // to round 209's `audit_body_mode_label_strings_are_byte_exact_lowercase_for_grafana_label_axis`
+        // pin extended to this sibling metric-label axis.
+        for (layer, expected) in [
+            (PolicyLayer::LayerA, "layer_a"),
+            (PolicyLayer::LayerB, "layer_b"),
+            (PolicyLayer::ReadFilter, "read_filter"),
+        ] {
+            let t = PolicyTrace::new(vec![LayerOutcome::passed(layer)], Decision::Allow, vec![]);
+            let s = summary(&t);
+            // Lowercase snake_case sweep on the substring we expect.
+            assert!(
+                s.contains(expected),
+                "got {s}, expected substring {expected}"
+            );
+            assert!(
+                !s.chars().any(|c| c.is_ascii_uppercase()),
+                "summary has uppercase: {s}",
+            );
+            assert!(!s.contains('-'), "summary has kebab dash: {s}");
+        }
+    }
+
+    #[test]
+    fn set_layer_and_mark_helpers_return_unit_not_result_for_infallible_mutation_contract() {
+        // `set_layer`, `mark_layer_a_failed`, `mark_read_filter` all
+        // return `()` — the trace mutation is infallible (the find-or-
+        // append shape can't fail). Pin the unit return across all
+        // three helpers so a refactor that surfaced "future strict-
+        // schema validation" via `Result<(), _>` would surface here
+        // as a compile error AND would force a `?` chain through
+        // every adapter call site (which today calls them without
+        // propagation). Symmetric to round 206's
+        // `tee_stream_publish_returns_unit_not_result_...` pin
+        // extended to these sibling mutation helpers.
+        fn require_unit(_: ()) {}
+        let mut t = fresh_trace();
+        let r1: () = set_layer(
+            &mut t,
+            PolicyLayer::LayerA,
+            LayerOutcome::passed(PolicyLayer::LayerA),
+        );
+        require_unit(r1);
+        let r2: () = mark_layer_a_failed(&mut t, "detail-a".into());
+        require_unit(r2);
+        let r3: () = mark_read_filter(&mut t, true, Some("p1".into()), "matched".into());
+        require_unit(r3);
+    }
+
+    #[test]
+    fn mark_read_filter_passed_arm_preserves_matched_policy_id_in_matched_rule_id_field() {
+        // The `blocked=false` arm of `mark_read_filter` constructs a
+        // bare `LayerOutcome { passed: true, matched_rule_id, ... }`
+        // (not via the `LayerOutcome::failed(...)` constructor). A
+        // refactor that swapped the bare-struct shape for a different
+        // constructor that defaulted `matched_rule_id` to None — OR
+        // that landed a "scrub matched_rule_id on the passed arm
+        // because the read filter passed" simplification — would
+        // silently strip the operator-visible policy id from the
+        // trace. Pin the passed-arm field round-trip explicitly.
+        // The existing `mark_read_filter_passed_arm_carries_none_error_code_with_detail_present`
+        // pin checks the error_code + detail axes; this widens to
+        // the matched_rule_id axis the operator dashboard groups by.
+        let mut t = fresh_trace();
+        mark_read_filter(&mut t, false, Some("pol-42".into()), "scan-passed".into());
+        let rf = t
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::ReadFilter)
+            .expect("read_filter slot present");
+        assert!(rf.passed, "blocked=false must set passed=true");
+        assert_eq!(rf.matched_rule_id.as_deref(), Some("pol-42"));
+        assert_eq!(rf.detail.as_deref(), Some("scan-passed"));
+        assert!(rf.error_code.is_none());
+    }
+
+    #[test]
+    fn mark_layer_a_failed_detail_field_is_referentially_transparent_across_fifty_repeated_invocations()
+     {
+        // The existing `mark_layer_a_failed_is_idempotent_across_fifty_repeated_invocations`
+        // pin walks the SAME-output contract for the layer count and
+        // passed flag. Widen the RT axis to the `detail` field
+        // specifically: 50 invocations on a fresh trace each must
+        // leave `detail` byte-equal. A refactor that introduced a
+        // per-call counter mixin (e.g. `format!("{detail} (attempt
+        // {n})")` "for operator triage hints") would silently fork
+        // the detail string across retries — pin byte-equality
+        // here. Symmetric to round 207 + 209 referential-transparency
+        // pins.
+        let canonical_detail = "trust plane refused".to_string();
+        let mut baseline_trace = fresh_trace();
+        mark_layer_a_failed(&mut baseline_trace, canonical_detail.clone());
+        let baseline_detail = baseline_trace
+            .layers
+            .iter()
+            .find(|l| l.layer == PolicyLayer::LayerA)
+            .and_then(|l| l.detail.clone());
+        assert_eq!(baseline_detail.as_deref(), Some("trust plane refused"));
+        for i in 0..50 {
+            let mut t = fresh_trace();
+            mark_layer_a_failed(&mut t, canonical_detail.clone());
+            let got = t
+                .layers
+                .iter()
+                .find(|l| l.layer == PolicyLayer::LayerA)
+                .and_then(|l| l.detail.clone());
+            assert_eq!(
+                got, baseline_detail,
+                "iteration {i}: mark_layer_a_failed must yield byte-equal detail",
+            );
+        }
+    }
+
+    #[test]
+    fn summary_helper_uses_join_with_empty_separator_returning_empty_string_on_zero_layers() {
+        // Boundary symmetric to the existing
+        // `summary_renders_read_filter_label_and_empty_layers` test
+        // (which uses a single-layer trace and asserts the
+        // `read_filter=ok` label). Pin the zero-layer trace explicitly:
+        // a fresh `PolicyTrace::new(vec![], Decision::Allow, vec![])`
+        // must render summary as the empty string (NOT a placeholder
+        // like `"<empty>"` or a leading/trailing comma). A refactor
+        // that special-cased the empty case "for operator readability"
+        // would silently drift the operator-facing log shape on the
+        // not-yet-evaluated path. Pin via assert_eq! of the empty
+        // string.
+        let empty = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+        let s = summary(&empty);
+        assert_eq!(
+            s, "",
+            "zero-layer summary must be exactly empty, got: {s:?}"
+        );
+    }
+
+    #[test]
+    fn emit_function_pointer_is_send_sync_static_for_axum_handler_capture() {
+        // The existing
+        // `set_layer_is_send_safe_fn_pointer_for_axum_handler_state_use`
+        // pin walks the three mutation helpers' fn-pointer Send/Sync/'static
+        // bounds. Widen the same surface to `emit` and `summary` — both
+        // are called from inside the request handler at end-of-request,
+        // and `emit` is the path that crosses the `tracing::info!` /
+        // `warn!` invocation. A refactor that introduced a non-Send
+        // capture in either helper (e.g. via a thread-local rate
+        // limiter on the trace-log emit path) would surface here at
+        // the fn-pointer type boundary rather than at the far-removed
+        // handler-state assembly site. Symmetric to round 206's
+        // `tee_stream_is_send_sync_static_for_app_state_arc_dyn_path`
+        // pin extended to these sibling adapter helpers.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<fn(&PolicyTrace, uuid::Uuid, &str, &str)>();
+        require_send_sync_static::<fn(&PolicyTrace) -> String>();
+        let _: fn(&PolicyTrace, uuid::Uuid, &str, &str) = emit;
+        let _: fn(&PolicyTrace) -> String = summary;
+    }
 }

@@ -642,4 +642,167 @@ mod tests {
         assert!(s.contains("ConnectError"), "got: {s}");
         assert!(s.contains("dns failure"));
     }
+
+    // ─── round 222 (2026-05-22): NatsBridge field count, ConnectError Display
+    // vs Debug, sanitize_token regional-indicator char-count, connect() shape,
+    // ActionStream trait bounds ───
+
+    #[test]
+    fn nats_bridge_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern() {
+        // `NatsBridge { client, prefix }` — exactly 2 fields. A 3rd
+        // field landing (e.g. `subject_overrides: HashMap<String,
+        // String>` for per-vendor subject re-routing, or `js: Option<
+        // async_nats::jetstream::Context>` for a JetStream-publish
+        // path) without matching `connect()` constructor wiring would
+        // silently leave the new field zero-initialized on every
+        // bridge handed out — operators would see partial behaviour
+        // (existing subjects work, the new feature is silently a
+        // no-op). The exhaustive destructure with no `..` rest
+        // pattern forces a 3rd field to update this site in lockstep
+        // with `connect()`. We can't easily construct a NatsBridge
+        // without a real NATS endpoint (the constructor does I/O), so
+        // pin the field count via a closure that destructures inside
+        // a match arm — the body never executes but the compiler
+        // type-checks the exhaustive pattern. Symmetric to the
+        // FederationClaims 8-field + CachedPca 8-field + ActionEvent
+        // 16-field exhaustive-destructure pins on this round's
+        // sibling type.
+        #[allow(dead_code)]
+        fn _destructure_witness(b: NatsBridge) {
+            let NatsBridge {
+                client: _,
+                prefix: _,
+            } = b;
+        }
+    }
+
+    #[test]
+    fn connect_error_display_and_debug_strings_are_byte_distinct_for_separate_log_channels() {
+        // `thiserror` derives Display from the `#[error("nats connect
+        // failed: {0}")]` attribute; `#[derive(Debug)]` produces the
+        // standard `ConnectError("...")`. Operators consume Display
+        // via `tracing::error!(error = %e, "...")` (which uses the
+        // Display impl) and Debug via `tracing::error!(?e, "...")`
+        // (Debug impl). The two surfaces ride on distinct grafana
+        // panels — Display drives the operator-facing alert title,
+        // Debug drives the developer-facing stack-trace channel. Pin
+        // that the two are byte-distinct so a refactor that aliased
+        // Display to Debug (e.g. `#[error("{0:?}")]`) would silently
+        // collapse the two log channels onto one rendering and break
+        // the title vs stack-trace dashboard split. Symmetric to
+        // OAuthError Display vs Debug distinctness pins.
+        let e = ConnectError("dns failure".into());
+        let display = format!("{e}");
+        let debug = format!("{e:?}");
+        assert_ne!(display, debug, "Display and Debug must render distinctly");
+        // Anchored substrings: Display has the operator-readable
+        // prefix; Debug has the struct name.
+        assert!(
+            display.starts_with("nats connect failed:"),
+            "got: {display}"
+        );
+        assert!(debug.starts_with("ConnectError"), "got: {debug}");
+    }
+
+    #[test]
+    fn sanitize_token_collapses_each_grapheme_codepoint_independently_not_as_cluster() {
+        // The sanitizer iterates `chars()` (Unicode codepoints), NOT
+        // graphemes. A regional-indicator flag like 🇺🇸 (U+1F1FA +
+        // U+1F1F8) is ONE grapheme but TWO codepoints — sanitize
+        // produces TWO underscores, not one. Pin this so a refactor
+        // that swapped to `unicode_segmentation::graphemes(true)`
+        // "for human-readable replacement count" would silently halve
+        // the underscore count for emoji flag inputs and break
+        // operator-facing length-mismatch triage. The contract is
+        // per-codepoint, not per-grapheme. Symmetric to the
+        // multi-codepoint sweep across café/→/🔥 multibyte pins on
+        // the BYTE axis — pin the CHAR (codepoint) axis here.
+        // 🇺🇸 = 2 codepoints, both rejected, → 2 underscores.
+        let flag = "🇺🇸";
+        assert_eq!(flag.chars().count(), 2);
+        let out = sanitize_token(flag);
+        assert_eq!(out, "__", "got: {out:?}");
+        // A combining-mark sequence: `é` as U+0065 + U+0301
+        // (combining acute accent) is 2 codepoints. The 'e' is on the
+        // allow-list, the combining mark is not — output is `e_`,
+        // NOT `é` (the precomposed form) and NOT `_` (collapsed).
+        let combined = "e\u{0301}";
+        assert_eq!(combined.chars().count(), 2);
+        let out2 = sanitize_token(combined);
+        assert_eq!(out2, "e_", "got: {out2:?}");
+    }
+
+    #[test]
+    fn connect_error_constructor_round_trips_through_into_at_str_and_string_inputs() {
+        // The `connect()` call site builds the error via
+        // `ConnectError(e.to_string())` — the inner is `String`. Other
+        // call sites in test code build via `ConnectError("...".into())`
+        // (str → String) and `ConnectError(s)` (already String). Pin
+        // that both shapes round-trip the same byte content through
+        // the `pub String` field — a refactor that swapped the inner
+        // to `Cow<'static, str>` "to avoid allocating for static
+        // error messages" would break the dynamic-from-into shape
+        // that `to_string()` produces. Symmetric to the existing
+        // `connect_error_inner_field_is_pub_and_round_trips_through_construction`
+        // pin on identity content; pin the conversion shape here.
+        let from_str: ConnectError = ConnectError("static-str-source".into());
+        assert_eq!(from_str.0, "static-str-source");
+        let owned = String::from("owned-source");
+        let from_owned: ConnectError = ConnectError(owned);
+        assert_eq!(from_owned.0, "owned-source");
+        // And the production shape: `e.to_string()` on a transient
+        // io-like error.
+        let inner = std::io::Error::other("connection timed out");
+        let e = ConnectError(inner.to_string());
+        assert!(e.0.contains("connection timed out"));
+    }
+
+    #[test]
+    fn nats_bridge_implements_action_stream_trait_via_dyn_compat_witness_for_arc_dyn_dispatch() {
+        // `NatsBridge` is wired into AppState as `Arc<dyn ActionStream>`
+        // — the TeeStream fan-out dispatches `publish` through the
+        // trait object. A refactor that gave `NatsBridge` a generic
+        // type parameter (e.g. `NatsBridge<E: ErrorReporter>` for
+        // pluggable error reporting) would break dyn-compatibility
+        // (generics on methods or self can't be object-safe) and the
+        // AppState assembly would fail far from this file. Pin the
+        // dyn-compatibility by constructing an `Arc<dyn ActionStream>`
+        // bound at the type level (no instance needed — the bound
+        // alone is what the trait-object dispatch requires). Symmetric
+        // to the ActionStream Send+Sync+'static super-bounds pin in
+        // round 214.
+        fn require_dyn_action_stream(_: std::sync::Arc<dyn ActionStream>) {}
+        // Compile-time check via a closure that would type-error if
+        // NatsBridge weren't dyn-compatible.
+        #[allow(dead_code)]
+        fn _witness(b: std::sync::Arc<NatsBridge>) {
+            require_dyn_action_stream(b);
+        }
+    }
+
+    #[test]
+    fn sanitize_token_is_referentially_transparent_across_threads_not_just_within_one() {
+        // The existing
+        // `sanitize_token_is_referentially_transparent_across_fifty_calls_on_same_input`
+        // pin walks 50 calls within ONE thread. Pin the
+        // cross-thread variant: spawn N worker threads each calling
+        // sanitize_token on the same input and assert all results
+        // are equal. A refactor that introduced a `thread_local!`
+        // LRU cache "for per-thread fairness" would pass the
+        // single-thread RT pin but silently fork outputs across the
+        // tokio worker pool — and `publish` is called from spawned
+        // tasks that may land on different runtime workers, so a
+        // cross-thread fork is the operationally-visible failure
+        // mode. Pin via `std::thread::scope` so the closures borrow
+        // the input lifetime without `'static` heap-promotion.
+        let input = "drive.files.get*invalid";
+        let baseline = sanitize_token(input);
+        let results: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| sanitize_token(input))).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r, &baseline, "worker {i}: cross-thread sanitize drift");
+        }
+    }
 }

@@ -964,6 +964,211 @@ mod tests {
         assert_eq!(infer_idp(Some(" ")), "oidc");
     }
 
+    // ─── round 221 (2026-05-22): FederationClaims field-count, skew boundary,
+    // BridgeRejected message stability, infer_idp ordering + numeric types ───
+
+    #[test]
+    fn federation_claims_field_count_pinned_at_exactly_eight_via_exhaustive_destructure() {
+        // `FederationClaims` is decoded from the bridge JWT payload and
+        // every field crosses several `.await` boundaries before the
+        // OAuth callback INSERTs the session row. A 9th field landing
+        // (e.g. `nbf: i64` not-before, `aud: String` audience, or
+        // `jti: String` jwt-id) without matching INSERT column wiring
+        // would silently DROP the field on every persist — the bridge
+        // would emit it, the proxy would deserialize it (via
+        // `#[serde(default)]` if added defensively, otherwise hard fail),
+        // and then never persist it. The exhaustive destructure with no
+        // `..` rest pattern catches the field-count drift at compile
+        // time: adding a 9th field forces this destructure to update in
+        // lockstep with the OAuth-callback INSERT site. Symmetric to the
+        // ErrorBody 6-field + CachedPca 8-field + ActionEvent 16-field +
+        // OAuthState 6-field exhaustive-destructure pins.
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": ["drive:read:*"],
+            "pca_0_cbor_b64": "AAECAwQF",
+            "state": "trace-fixed",
+            "iat": now,
+            "exp": now + 60,
+            "iss": "https://acme.okta.com",
+        }));
+        let c = validate_federation_token(&jwt).expect("decode");
+        // Exhaustive destructure: no `..` rest pattern. A 9th field
+        // landing breaks this match and forces an update.
+        let FederationClaims {
+            pca_0_id: _,
+            p_0: _,
+            ops: _,
+            pca_0_cbor_b64: _,
+            state: _,
+            iat: _,
+            exp: _,
+            iss: _,
+        } = c;
+    }
+
+    #[test]
+    fn validate_federation_token_rejects_iat_one_second_past_skew_window_boundary() {
+        // The clock-skew guard is `if claims.iat > now + 60 { ... }`. The
+        // existing `accepts_token_at_exact_60s_clock_skew_boundary` pin
+        // covers the INCLUSIVE 60s edge (iat == now + 60 → accept).
+        // Pin the EXCLUSIVE off-by-one at iat == now + 61 → reject so a
+        // refactor that loosened `>` to `>=` would silently widen the
+        // skew window by 1s (or, more dangerously, tightened it to
+        // reject the canonical 60s boundary). Symmetric to the
+        // pkce boundary 42/43/127/128 + 60s-inclusive pins.
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "user:alice@demo.local",
+            "ops": ["drive:read:*"],
+            "state": "skew-test",
+            "iat": now + 61,
+            "exp": now + 3600,
+        }));
+        let err = validate_federation_token(&jwt).unwrap_err();
+        match err {
+            OAuthError::BridgeRejected(m) => {
+                assert!(m.contains("future"), "got: {m}");
+            }
+            other => panic!("expected BridgeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridge_rejected_message_strings_byte_distinct_for_operator_grep_buckets() {
+        // The three `BridgeRejected` arms in `validate_federation_token`
+        // emit distinct messages: `"malformed JWT"`, `"bad base64"`,
+        // `"bad claims: {e}"`, `"federation token expired"`,
+        // `"federation token issued in the future"`. Operator Loki
+        // / Grafana alerts split on these substrings to bucket
+        // bridge failures into "agent mis-implemented" (malformed) vs.
+        // "bridge mis-encoded" (base64/claims) vs. "clock skew"
+        // (expired/future). Pin pairwise byte-distinctness so a
+        // refactor that softened all four to a single
+        // `"bridge validation failed: {detail}"` umbrella message
+        // would silently collapse the four buckets onto one alert.
+        // Symmetric to the OAuthError Display + ErrorCode wire-string
+        // pairwise-distinct pins.
+        let now = chrono::Utc::now().timestamp();
+        let malformed_err = validate_federation_token("not-a-jwt").unwrap_err();
+        let bad_b64_jwt = "header.!notb64!.signature";
+        let bad_b64_err = validate_federation_token(bad_b64_jwt).unwrap_err();
+        let expired_jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "x", "ops": [], "state": "s",
+            "iat": 0, "exp": 1,
+        }));
+        let expired_err = validate_federation_token(&expired_jwt).unwrap_err();
+        let future_jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "x", "ops": [], "state": "s",
+            "iat": now + 3600, "exp": now + 7200,
+        }));
+        let future_err = validate_federation_token(&future_jwt).unwrap_err();
+        fn msg(e: &OAuthError) -> String {
+            match e {
+                OAuthError::BridgeRejected(m) => m.clone(),
+                other => panic!("expected BridgeRejected, got {other:?}"),
+            }
+        }
+        let ms = [
+            msg(&malformed_err),
+            msg(&bad_b64_err),
+            msg(&expired_err),
+            msg(&future_err),
+        ];
+        // Pairwise distinct.
+        for i in 0..ms.len() {
+            for j in (i + 1)..ms.len() {
+                assert_ne!(ms[i], ms[j], "msg {i} and {j} collide: {:?}", ms[i]);
+            }
+        }
+        // And byte-anchored substrings the operator grep depends on.
+        assert!(ms[0].contains("malformed"));
+        assert!(ms[1].contains("base64"));
+        assert!(ms[2].contains("expired"));
+        assert!(ms[3].contains("future"));
+    }
+
+    #[test]
+    fn infer_idp_priority_order_okta_wins_over_azure_when_both_substrings_present() {
+        // The `infer_idp` cascade uses `if / else if` ordering: okta is
+        // checked first, then azure, then google, then oidc. A
+        // pathological issuer that contains BOTH `okta.com` AND
+        // `microsoftonline.com` substrings would match the FIRST arm
+        // (okta). Pin the priority order so a refactor that switched
+        // to a `HashMap` lookup OR re-ordered the arms (e.g. alphabetized
+        // them to `azure | google | okta`) would silently flip the
+        // dashboard label for an ambiguous fixture. The most likely
+        // way this matters in production: an okta-fronted-by-azure
+        // gateway whose iss URL legitimately contains both substrings.
+        let s = "https://acme.okta.com/realms/microsoftonline.com-proxy";
+        assert_eq!(infer_idp(Some(s)), "okta");
+        // Symmetric: azure wins over google.
+        let s2 = "https://login.microsoftonline.com/tenant/accounts.google.com-proxy";
+        assert_eq!(infer_idp(Some(s2)), "azure");
+        // Symmetric: google wins over oidc fallback.
+        let s3 = "https://accounts.google.com/realms/oidc-alias";
+        assert_eq!(infer_idp(Some(s3)), "google");
+    }
+
+    #[test]
+    fn federation_claims_iat_and_exp_field_types_pinned_i64_for_chrono_timestamp_arithmetic() {
+        // The clock-skew guard does `claims.iat > now + 60` where `now`
+        // is `chrono::Utc::now().timestamp()` (returning `i64`). The exp
+        // guard does `now > claims.exp` symmetrically. A refactor that
+        // typed iat/exp as `u64` "for non-negative epoch semantics"
+        // would force a cast at the comparison site (silent on values
+        // within i64::MAX but a compile error on the bare comparison)
+        // OR a refactor to `i32` "for postgres `integer` column compat"
+        // would silently overflow past 2038-01-19 (the Unix epoch
+        // 2^31). Pin both as `i64` via require_i64 so the type axis
+        // surfaces at the struct boundary. Symmetric to the
+        // ActionEvent.status u16 + ListResponse.policy_count usize
+        // numeric-type pins.
+        fn require_i64(_: i64) {}
+        let now = chrono::Utc::now().timestamp();
+        let jwt = make_jwt(&serde_json::json!({
+            "pca_0_id": "00000000-0000-0000-0000-000000000001",
+            "p_0": "x", "ops": [], "state": "s",
+            "iat": now, "exp": now + 60,
+        }));
+        let c = validate_federation_token(&jwt).expect("decode");
+        require_i64(c.iat);
+        require_i64(c.exp);
+    }
+
+    #[test]
+    fn infer_idp_return_type_is_static_str_via_fn_pointer_witness_for_metric_label_borrow() {
+        // `infer_idp` returns `&'static str` from a closed 5-label set
+        // (`okta | azure | google | oidc | unknown`). The return value
+        // is used as a Prometheus metric label
+        // (`proxilion_oauth_callback_total{idp="okta"}`) — `metrics`
+        // crate label values are `Cow<'static, str>`, so the static
+        // branch avoids per-callback allocation on the hot OAuth
+        // callback path. A refactor to `String` "for ergonomic
+        // dynamic-idp-name extraction from iss" would force a
+        // heap-allocate-per-callback regression. Pin the `&'static
+        // str` return via fn-pointer type capture so the type axis
+        // surfaces at the helper boundary, not at the metric-emit
+        // call site far away.
+        let _f: fn(Option<&str>) -> &'static str = infer_idp;
+        // And exercise across the 5-label set to catch a refactor
+        // that satisfied the fn-pointer pin via a leaked &'static
+        // String — `Box::leak` would still type-check.
+        assert_eq!(infer_idp(Some("https://acme.okta.com")), "okta");
+        assert_eq!(
+            infer_idp(Some("https://login.microsoftonline.com/abc")),
+            "azure"
+        );
+        assert_eq!(infer_idp(Some("https://accounts.google.com")), "google");
+        assert_eq!(infer_idp(Some("https://id.example.org")), "oidc");
+        assert_eq!(infer_idp(None), "unknown");
+    }
+
     #[test]
     fn accepts_fresh_token() {
         let now = chrono::Utc::now().timestamp();

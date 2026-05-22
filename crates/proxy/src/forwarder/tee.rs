@@ -705,4 +705,152 @@ mod tests {
         require_unit(out);
         assert_eq!(primary.0.lock().unwrap().len(), 1);
     }
+
+    // ─── round 224 (2026-05-22): TeeStream field count, new/with_sink return-type
+    // shape, field type pins, sink_count RT, dyn-compatibility witness ───
+
+    #[test]
+    fn tee_stream_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern() {
+        // `TeeStream { primary, sinks }` — exactly 2 fields. A 3rd field
+        // landing (e.g. `metrics_label: String` for per-tee metric
+        // bucketing, OR `failure_policy: FailurePolicy` to make
+        // secondary-sink failures gating in a future revision, OR
+        // `concurrency_limit: usize` to cap the join_all width) without
+        // matching `new()`/`with_sink()` constructor wiring would
+        // silently leave the new field zero-initialized on every
+        // TeeStream handed out — operators would see partial behaviour
+        // (existing sinks work, the new feature is silently a no-op).
+        // The exhaustive destructure with no `..` rest pattern forces a
+        // 3rd field to update this site in lockstep with the
+        // constructors. Symmetric to the NatsBridge 2-field +
+        // FederationClaims 8-field + CachedPca 8-field +
+        // TokenResponse 4-field exhaustive-destructure pins.
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary);
+        let TeeStream {
+            primary: _,
+            sinks: _,
+        } = tee;
+    }
+
+    #[test]
+    fn tee_stream_new_return_type_is_owned_self_by_value_via_fn_pointer_witness() {
+        // `TeeStream::new` returns owned `Self` — the value flows
+        // through the AppState assembly chain
+        // `TeeStream::new(primary).with_sink(s1).with_sink(s2)` which
+        // requires each step to consume + return Self by value (the
+        // fluent builder shape). A refactor to `Arc<Self>` "for
+        // ergonomic cross-handler share at construction" would force
+        // `*tee` deref OR `.as_ref()` at every `with_sink` call site,
+        // AND break the move-into-Arc-after-build path AppState uses
+        // (`Arc::new(TeeStream::new(...).with_sink(...))`). Pin via
+        // fn-pointer witness so the type surfaces at the constructor
+        // boundary, not at the AppState assembly site downstream.
+        // Symmetric to the CachedPca::new + ErrorBody::new owned-Self
+        // fn-pointer pins.
+        let _f: fn(Arc<dyn ActionStream>) -> TeeStream = TeeStream::new;
+        fn require_owned_tee(_: TeeStream) {}
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        require_owned_tee(TeeStream::new(primary));
+    }
+
+    #[test]
+    fn tee_stream_with_sink_consumes_self_and_returns_self_via_fn_pointer_witness() {
+        // `TeeStream::with_sink` is `pub fn with_sink(mut self, sink:
+        // Arc<dyn ActionStream>) -> Self` — consumes self by value AND
+        // returns Self by value (the fluent builder shape that AppState
+        // chains). A refactor to `&mut self -> &mut Self` "for
+        // ergonomic conditional sink registration (no temporaries
+        // required)" would break the move-chain at every
+        // `TeeStream::new(...).with_sink(...).with_sink(...)` site —
+        // the chain depends on the consuming-and-returning shape so
+        // the final binding can be moved into `Arc::new(...)` without
+        // a let-rebind step. Pin via fn-pointer witness — the type
+        // signature `fn(TeeStream, Arc<dyn ActionStream>) -> TeeStream`
+        // only compiles when self is consumed by value. Symmetric to
+        // the ErrorBody fluent-builder owned-Self pins.
+        let _f: fn(TeeStream, Arc<dyn ActionStream>) -> TeeStream = TeeStream::with_sink;
+        // And exercise to confirm the chain works at runtime.
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let s1: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let s2: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary).with_sink(s1).with_sink(s2);
+        assert_eq!(tee.sink_count(), 2);
+    }
+
+    #[test]
+    fn tee_stream_sinks_field_type_is_owned_vec_arc_dyn_for_arbitrary_fan_out_width() {
+        // `TeeStream.sinks: Vec<Arc<dyn ActionStream>>` — OWNED Vec of
+        // Arc-dyn entries. The owned Vec lets `with_sink` push() onto
+        // the trailing position without re-allocating the entire
+        // builder chain. A refactor to `&'a [Arc<dyn ActionStream>]`
+        // "for zero-alloc when the sink list is known at boot" would
+        // force a lifetime parameter through TeeStream that breaks the
+        // Arc<dyn ActionStream> AppState bound. A refactor to
+        // `[Arc<dyn ActionStream>; 4]` fixed-array "for stack alloc"
+        // would cap fan-out width at compile time, silently breaking
+        // any deployment that wires more than 4 sinks (primary + NATS
+        // + SIEM + webhook + future + ... — operators routinely wire 5+
+        // in production). Pin via require_owned_vec on the destructured
+        // field. Symmetric to the ActionEvent owned-String + GoogleClient
+        // owned-String field-type pins.
+        fn require_owned_vec(_: Vec<Arc<dyn ActionStream>>) {}
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary).with_sink(Arc::new(Collector::default()));
+        let TeeStream { primary: _, sinks } = tee;
+        require_owned_vec(sinks);
+    }
+
+    #[test]
+    fn tee_stream_sink_count_is_referentially_transparent_across_fifty_calls() {
+        // `sink_count` is a pure `self.sinks.len()` accessor — no I/O,
+        // no global state, no time-of-day input. Pin referential
+        // transparency across 50 calls so a refactor that, e.g.,
+        // memoized the result keyed on a thread-local cache OR threaded
+        // a per-process counter through the accessor "for sink-count
+        // sampling observability" would surface here as non-
+        // deterministic output. Symmetric to the sanitize_token RT
+        // 50-call + ErrorBody::new RT 50-call + oauth_error_class RT
+        // 50-call pins extended to this sibling pure accessor.
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let mut tee = TeeStream::new(primary);
+        for _ in 0..3 {
+            tee = tee.with_sink(Arc::new(Collector::default()));
+        }
+        let first = tee.sink_count();
+        assert_eq!(first, 3);
+        for i in 0..50 {
+            assert_eq!(
+                tee.sink_count(),
+                first,
+                "iter {i}: sink_count drift on same TeeStream",
+            );
+        }
+    }
+
+    #[test]
+    fn tee_stream_is_dyn_compatible_via_arc_dyn_action_stream_witness_for_nested_tee_composition() {
+        // `TeeStream` itself implements `ActionStream` — so a `TeeStream`
+        // can be wrapped in `Arc<dyn ActionStream>` AND a SECOND TeeStream
+        // can be built atop the first (the round-23 `tee_of_tee_composes
+        // _recursively_through_arc_dyn_action_stream` test exercises this
+        // at runtime). Pin the dyn-compatibility shape at the TYPE level
+        // so a refactor that gave TeeStream a generic type parameter
+        // (e.g. `TeeStream<E: ErrorReporter>` "for pluggable secondary-
+        // sink error reporting") would break object-safety (generics
+        // on methods or self can't be object-safe) and the AppState
+        // `Arc<dyn ActionStream>` bound would fail far from this file.
+        // Pin via require_dyn_action_stream — symmetric to the NatsBridge
+        // dyn-compatibility witness pin in round 222.
+        fn require_dyn_action_stream(_: Arc<dyn ActionStream>) {}
+        #[allow(dead_code)]
+        fn _witness(t: Arc<TeeStream>) {
+            require_dyn_action_stream(t);
+        }
+        // And at runtime: build a TeeStream and Arc-erase it.
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary);
+        let erased: Arc<dyn ActionStream> = Arc::new(tee);
+        require_dyn_action_stream(erased);
+    }
 }

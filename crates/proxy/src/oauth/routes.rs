@@ -1147,4 +1147,181 @@ mod tests {
             "missing grant_type must surface deserialize error",
         );
     }
+
+    // ─── round 223 (2026-05-22): TokenResponse/TokenForm exhaustive destructure,
+    // return-type pins on new_auth_code + pct, oauth_error_class RT, access_token
+    // owned-String contract ───
+
+    #[test]
+    fn token_response_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // RFC 6749 §5.1 — the access-token response shape is exactly 4
+        // fields (plus an optional `refresh_token` we deliberately
+        // omit). The existing
+        // `token_response_serializes_with_exactly_four_known_keys_for_rfc_6749_compat`
+        // pin checks the WIRE shape via HashSet equality at the JSON
+        // boundary; pin the STRUCT shape via an exhaustive destructure
+        // with no `..` rest pattern so a 5th field (e.g.
+        // `refresh_token: String` "now that we persist refresh tokens"
+        // OR `granted_at: DateTime<Utc>` "for client-side TTL
+        // computation") landing without matching `body` construction at
+        // the `token()` handler would break the destructure at compile
+        // time — surfacing in this file rather than at the JSON
+        // serialization site downstream. Symmetric to the
+        // FederationClaims 8-field + CachedPca 8-field + ActionEvent
+        // 16-field + ErrorBody 6-field exhaustive-destructure pins.
+        let body = TokenResponse {
+            access_token: "x".into(),
+            token_type: "Bearer",
+            expires_in: 3600,
+            scope: "openid".into(),
+        };
+        let TokenResponse {
+            access_token: _,
+            token_type: _,
+            expires_in: _,
+            scope: _,
+        } = body;
+    }
+
+    #[test]
+    fn token_form_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest_pattern() {
+        // RFC 6749 §4.1.3 + RFC 7636 §4.5 — the OAuth token endpoint
+        // form-encoded request body is exactly 5 fields. A 6th field
+        // landing (e.g. `client_secret: String` "for the confidential-
+        // client variant" OR `audience: String` "for multi-tenant
+        // resource-server scoping") without matching handler-side
+        // validation at the `token()` site would silently accept and
+        // discard the field — operators using the additional field
+        // would see no error AND no behaviour change. The exhaustive
+        // destructure forces a 6th field to update this site in
+        // lockstep with the handler. Symmetric to the TokenResponse
+        // 4-field exhaustive-destructure pin.
+        let form = TokenForm {
+            grant_type: "authorization_code".into(),
+            code: "c".into(),
+            redirect_uri: "https://example.com/cb".into(),
+            client_id: "client".into(),
+            code_verifier: "v".into(),
+        };
+        let TokenForm {
+            grant_type: _,
+            code: _,
+            redirect_uri: _,
+            client_id: _,
+            code_verifier: _,
+        } = form;
+    }
+
+    #[test]
+    fn new_auth_code_return_type_is_owned_string_by_value_via_fn_pointer_witness() {
+        // `new_auth_code` returns owned `String` — the value flows
+        // through the SQL `INSERT INTO auth_codes (code, ...)` bind
+        // path which requires an owned String / &str. The existing
+        // tests pin LENGTH (52) + ALPHABET (no `=`, no `0/1/8/9`) +
+        // DISTINCTNESS (100-call collision sweep); pin the TYPE shape
+        // via a fn-pointer witness `fn() -> String`. A refactor to
+        // `Cow<'static, str>` "for zero-alloc on a future static-
+        // prefix scheme" would force a lifetime parameter through the
+        // handler `let code = new_auth_code();` site. A refactor to
+        // `Result<String, RngError>` "for fallibility on RNG drain"
+        // would force a `?` chain at every call site. Pin via
+        // require_owned_string. Symmetric to the
+        // FederationClaims-validate-return-type owned-by-value +
+        // ErrorBody::new owned-Self fn-pointer pins.
+        fn require_owned_string(_: String) {}
+        let _f: fn() -> String = new_auth_code;
+        require_owned_string(new_auth_code());
+    }
+
+    #[test]
+    fn pct_return_type_is_owned_string_by_value_via_fn_pointer_witness_for_url_assembly() {
+        // `pct` returns owned `String` — the value is concatenated into
+        // the larger Google OAuth authorize URL via `format!()`. The
+        // existing tests pin SHAPE (reserved chars encoded, unreserved
+        // preserved) + EDGE (empty + multibyte UTF-8); pin the TYPE
+        // shape via a fn-pointer witness `fn(&str) -> String`. A
+        // refactor to `Cow<'a, str>` "for zero-alloc on already-clean
+        // inputs" would tie the lifetime to the input borrow, breaking
+        // the `format!()` site that assembles the cross-await
+        // authorize-URL response body. A refactor that returned `&str`
+        // borrowed from a thread-local buffer "to avoid per-redirect
+        // allocation" would silently break Send. Pin via
+        // require_owned_string. Symmetric to the sanitize_token
+        // owned-String pin in forwarder/nats.rs.
+        fn require_owned_string(_: String) {}
+        let _f: fn(&str) -> String = pct;
+        require_owned_string(pct("hello world"));
+        require_owned_string(pct("abc"));
+        require_owned_string(pct(""));
+    }
+
+    #[test]
+    fn oauth_error_class_is_referentially_transparent_across_fifty_calls_per_variant() {
+        // `oauth_error_class` is a pure variant→label map — no I/O, no
+        // global state, no time-of-day input. The existing tests pin
+        // VALUE (denied/error bucket per variant) + LIFETIME (`&'static
+        // str` return); pin REFERENTIAL TRANSPARENCY across 50 calls
+        // per variant so a refactor that, e.g., introduced a per-call
+        // rate-limit-driven label mutation `after 100th BadRequest in
+        // 10s promote to "throttled"` would fork the operator-alert
+        // bucket on the hot OAuth callback path. Symmetric to the
+        // OAuthError::status RT 50-call pin in round 220 extended to
+        // the sibling oauth_error_class helper.
+        let variants = [
+            OAuthError::BadRequest("bad".into()),
+            OAuthError::UnknownClient,
+            OAuthError::SessionGone,
+            OAuthError::BridgeRejected("nope".into()),
+            OAuthError::PkceFail,
+            OAuthError::BadAuthCode,
+            OAuthError::PicInvariant("hop".into()),
+            OAuthError::Crypto,
+            OAuthError::Internal("boom".into()),
+        ];
+        for v in &variants {
+            let first = oauth_error_class(v);
+            for i in 0..50 {
+                assert_eq!(
+                    oauth_error_class(v),
+                    first,
+                    "iter {i}: class drift on variant {v:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn token_response_access_token_and_scope_fields_pinned_owned_string_for_cross_await_handler() {
+        // `TokenResponse.access_token: String` and
+        // `TokenResponse.scope: String` are both OWNED, not borrowed.
+        // The values cross multiple `.await` boundaries inside the
+        // `token()` handler: `access_token` comes from
+        // `String::from_utf8(bearer_plaintext)` (already owned), `scope`
+        // comes from a sqlx `query_as` Vec row. The response struct is
+        // then moved into `Json(body)` and into `.into_response()` —
+        // both consume by value. A refactor to `Cow<'a, str>` "to avoid
+        // cloning the scope string already in the row buffer" would
+        // require a lifetime parameter on TokenResponse that the
+        // axum `Json<T>` extractor can't satisfy (Json requires
+        // `Serialize + DeserializeOwned + 'static`-ish bounds via its
+        // IntoResponse impl). Pin both fields via require_owned_string
+        // on the destructured values. Symmetric to the
+        // GoogleClient.4-field owned-String pin in round 216.
+        fn require_owned_string(_: String) {}
+        let body = TokenResponse {
+            access_token: "ya29.example".into(),
+            token_type: "Bearer",
+            expires_in: 3600,
+            scope: "openid profile".into(),
+        };
+        let TokenResponse {
+            access_token,
+            token_type: _,
+            expires_in: _,
+            scope,
+        } = body;
+        require_owned_string(access_token);
+        require_owned_string(scope);
+    }
 }

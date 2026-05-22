@@ -459,6 +459,138 @@ mod tests {
     }
 
     #[test]
+    fn cipher_error_variant_count_pinned_at_exactly_two_via_exhaustive_match_no_underscore_fallback()
+     {
+        // `CipherError` has EXACTLY two variants today (`BadKeyLen(usize)` /
+        // `Aead`). Pin the variant count at the type level via an exhaustive
+        // match with NO `_` fallback so a refactor that landed a third
+        // variant (e.g. `KeyRotationStale` for a future per-tenant key-rotation
+        // scheme, or `KmsUnreachable` for a remote-KMS plug-in) would surface
+        // here as a non-exhaustive-match compile error rather than silently
+        // adding a third operator-grep bucket to OAuth-token-persist alerts
+        // (the existing `bad_key_len_error_display_includes_actual_length` +
+        // `aead_error_display_is_stable_for_log_filters` pins anchor on two
+        // Display substrings; a third variant landing without those pins
+        // would silently drift the bucket count). Symmetric to round-191
+        // SlackInteractError + round-215 PkceError exhaustive-2-arm pins.
+        for e in [CipherError::BadKeyLen(0), CipherError::Aead] {
+            match e {
+                CipherError::BadKeyLen(_) => {}
+                CipherError::Aead => {}
+            }
+        }
+    }
+
+    #[test]
+    fn ciphertext_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_dotdot_rest() {
+        // `Ciphertext` has EXACTLY two public fields today (`nonce: Vec<u8>`
+        // / `bytes: Vec<u8>`). Pin the field count at the type level via an
+        // exhaustive destructure with NO `..` rest pattern so a future field
+        // landing without matching INSERT/SELECT column wiring would surface
+        // here as a non-exhaustive-pattern compile error. The OAuth-token-
+        // persist path serializes a `Ciphertext` into two distinct columns
+        // (`*_nonce` / `*_bytes`) — a third field (e.g. `aad: Vec<u8>` for
+        // additional-authenticated-data binding) landing without matching
+        // column wiring would silently drop the field on every persist AND
+        // fill an Aad-shaped default on every fetch, masking the
+        // authentication-data-binding contract drift. Symmetric to round-213
+        // CachedPca field-count + round-214 ActionEvent field-count
+        // exhaustive-destructure pins extended to this sibling persistence-
+        // path struct.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let ct = c.encrypt(b"x").unwrap();
+        let Ciphertext { nonce, bytes } = ct;
+        assert_eq!(nonce.len(), 12);
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn from_bytes_return_type_is_result_token_cipher_cipher_error_via_fn_pointer_witness() {
+        // `TokenCipher::from_bytes` is called at boot from the
+        // OAuth/server-state assembly chain via `?` to bubble key-length
+        // failures into the boot-time error envelope. Pin the return type
+        // as `Result<TokenCipher, CipherError>` via a fn-pointer witness so
+        // a refactor that promoted the error to `anyhow::Error` "for
+        // richer triage at boot" would break the `String`-bodied error-grep
+        // contract pinned by `bad_key_len_error_display_includes_actual_length`
+        // + `cipher_error_bad_key_len_display_carries_byte_exact_prefix_with_actual_length`
+        // — and would silently widen the boot-time error chain shape that
+        // the operator's startup-failure runbook keys on. The fn-pointer
+        // witness is the load-bearing type-level catch: a refactor would
+        // fail to type-check at this line rather than at a far-removed `?`
+        // call site. Symmetric to round-215 verify_pkce_s256 return-type
+        // + round-216 GoogleClient::from_env return-type fn-pointer pins.
+        let _f: fn(&[u8]) -> Result<TokenCipher, CipherError> = TokenCipher::from_bytes;
+    }
+
+    #[test]
+    fn encrypt_return_type_is_result_ciphertext_cipher_error_via_fn_pointer_witness() {
+        // Symmetric to `from_bytes_return_type_is_result_…` — pin the
+        // encrypt method's signature as
+        // `fn(&TokenCipher, &[u8]) -> Result<Ciphertext, CipherError>` via
+        // a fn-pointer witness. The OAuth-token-persist hot path uses
+        // `cipher.encrypt(plaintext)?` to bubble GCM faults into the
+        // anyhow chain; a refactor that promoted the error to
+        // `anyhow::Error` "for inner-cause chain" OR that changed the
+        // success type to `Vec<u8>` "flattening nonce+bytes into a single
+        // wire-format blob for compactness" would break the persist path's
+        // schema mirroring (the table has two distinct columns) AND would
+        // surface here as a fn-pointer-type mismatch rather than at the
+        // far-removed `?` call site. Pin BOTH the success type
+        // (`Ciphertext`) and the error type (`CipherError`).
+        let _f: fn(&TokenCipher, &[u8]) -> Result<Ciphertext, CipherError> = TokenCipher::encrypt;
+    }
+
+    #[test]
+    fn decrypt_return_type_is_result_owned_vec_u8_cipher_error_via_fn_pointer_witness() {
+        // Symmetric pin to the encrypt fn-pointer pin above. The OAuth-token-
+        // refresh-load path uses `cipher.decrypt(&row.ct)?` to bubble
+        // tamper / corrupt-row failures into the anyhow chain; the success
+        // arm is the OWNED `Vec<u8>` plaintext that the caller hands to
+        // `String::from_utf8` for the bearer string. Pin via fn-pointer
+        // witness so a refactor that returned `Cow<'a, [u8]>` "to avoid
+        // allocating on the decrypt hot path" would surface here at the
+        // type boundary rather than at the `String::from_utf8(plaintext)?`
+        // call site (where the diagnostic would mention lifetimes far from
+        // this file). The owned-Vec arm is load-bearing for the cross-await
+        // token-refresh-then-persist chain.
+        let _f: fn(&TokenCipher, &Ciphertext) -> Result<Vec<u8>, CipherError> =
+            TokenCipher::decrypt;
+    }
+
+    #[test]
+    fn encrypt_produces_distinct_nonces_across_fifty_repeated_calls_on_same_plaintext() {
+        // The existing `distinct_nonces` + `encrypt_empty_plaintext_still_yields_distinct_nonces`
+        // pins walk N=2 distinct-nonce shapes. AES-GCM's security argument
+        // depends on the IV (nonce) being unique across every encryption
+        // under a given key — pin a WIDER sweep (N=50) on the same plaintext
+        // under the same key. A refactor that introduced any form of
+        // deterministic-nonce derivation "for AEAD-SIV nonce-misuse-
+        // resistance ergonomics" (e.g. nonce = HKDF(key, plaintext_prefix))
+        // would still pass the N=2 pin if the first two plaintexts happened
+        // to differ — pin N=50 with a HashSet so a deterministic-nonce
+        // regression surfaces immediately as a collision. The collision-
+        // probability on a 96-bit nonce at scale 50 is ~1e-25 — negligible
+        // for a test gate. Symmetric to round-218
+        // `one_thousand_generated_bearers_yield_one_thousand_distinct_hashes`
+        // anti-entropy-loss pin extended to this sibling-IV-uniqueness
+        // contract.
+        use std::collections::HashSet;
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let mut nonces: HashSet<Vec<u8>> = HashSet::with_capacity(50);
+        for _ in 0..50 {
+            let ct = c.encrypt(b"identical plaintext for all 50 calls").unwrap();
+            assert_eq!(ct.nonce.len(), 12);
+            nonces.insert(ct.nonce);
+        }
+        assert_eq!(
+            nonces.len(),
+            50,
+            "AES-GCM IV-uniqueness regression: collision in 50 calls",
+        );
+    }
+
+    #[test]
     fn empty_key_rejected_with_zero_length() {
         // Boundary: a missing env var sometimes shows up as an empty byte
         // slice. The variant must carry `0`, not panic on the indexing path.

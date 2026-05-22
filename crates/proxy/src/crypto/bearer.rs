@@ -457,6 +457,113 @@ mod tests {
     }
 
     #[test]
+    fn bearer_parse_return_type_is_option_borrowed_str_via_fn_pointer_witness() {
+        // `Bearer::parse` is called from the auth middleware on the
+        // Authorization-header bearer-extract path and returns `Some(input)` —
+        // the SAME borrowed slice it was handed. Pin the return type as
+        // `Option<&'a str>` via a fn-pointer witness with explicit lifetime
+        // so a refactor that returned `Option<String>` "to give downstream a
+        // standalone owned value" would silently heap-allocate per request
+        // AND would break the `parse_returns_input_slice_byte_for_byte_when_valid`
+        // byte-equality pin's call chain (which threads the very same
+        // borrowed slice into a SHA-256 hasher; a normalized owned copy
+        // would silently invalidate every persisted bearer hash). The
+        // fn-pointer witness is the load-bearing type-level catch — the
+        // 'a lifetime binds the input borrow to the output borrow.
+        // Symmetric to round-216 GoogleClient::from_env return-type +
+        // round-215 verify_pkce_s256 return-type fn-pointer pins.
+        let _f: for<'a> fn(&'a str) -> Option<&'a str> = Bearer::parse;
+    }
+
+    #[test]
+    fn bearer_hash_of_return_type_is_owned_self_by_value_via_fn_pointer_witness() {
+        // `BearerHash::of` is called from BOTH the auth middleware (hashes
+        // the bearer just extracted from the header) AND the killswitch
+        // path (hashes the bearer string pulled out of a SQL row). Pin the
+        // return type as OWNED `BearerHash` by-value via a fn-pointer
+        // witness so a refactor to `Arc<BearerHash>` "for cheap cross-task
+        // share" would force every call site to deref or .as_ref() —
+        // breaking the kill_cache `Arc<dyn ActionStream>`-shape AppState
+        // contract — AND would silently change the per-call ownership
+        // semantic the killswitch handler relies on. The owned-by-value
+        // shape is load-bearing for the kill_cache `mark` write path
+        // which takes `[u8; 32]` by-value (see kill_cache round-201 pin
+        // `mark_signature_takes_owned_hash_by_value`).
+        let _f: fn(&str) -> BearerHash = BearerHash::of;
+    }
+
+    #[test]
+    fn bearer_generate_return_type_is_owned_self_by_value_via_fn_pointer_witness() {
+        // `Bearer::generate` is the boot-time + ad-hoc bearer-mint helper —
+        // production wires it through the `/api/v1/agents` POST handler.
+        // Pin the return type as OWNED `Bearer` by-value via a fn-pointer
+        // witness so a refactor to `Result<Bearer, RngError>` "for surface-
+        // visible RNG-failure triage" (rand 0.8's `OsRng::fill_bytes` is
+        // infallible by construction; surfacing a Result would break every
+        // handler that today writes `let b = Bearer::generate();` without a
+        // `?`) would surface here at the fn-pointer type rather than at the
+        // far-removed handler call site. The OWNED-by-value (not
+        // `Arc<Bearer>`) arm is also load-bearing — the handler hands the
+        // bearer off into a SQL INSERT then drops it; an Arc-wrap would
+        // force a deref at every accessor call.
+        let _f: fn() -> Bearer = Bearer::generate;
+    }
+
+    #[test]
+    fn bearer_hash_as_bytes_return_type_is_borrowed_slice_view_via_fn_pointer_witness() {
+        // `BearerHash::as_bytes` is called from the killswitch + audit
+        // paths and feeds the slice directly into sqlx's `bearer_sha256 = $1`
+        // bind. Pin the return type as `&[u8]` borrowed-slice-view via a
+        // fn-pointer witness with explicit lifetime so a refactor that
+        // returned `Vec<u8>` "to give downstream an owned copy for cross-
+        // await persistence" would silently heap-allocate per call AND
+        // break the existing `bearer_hash_as_bytes_returns_full_32_byte_view`
+        // pin's slice-identity contract (which checks `bytes == &h.0`).
+        // The borrowed-slice arm is load-bearing for sqlx's `&[u8]` bind
+        // path which avoids the extra Vec allocation on the hot path.
+        // Symmetric to round-210 EmailNotifier::proxy_public_url() &str
+        // borrowed-view pin extended to this sibling accessor.
+        let _f: for<'a> fn(&'a BearerHash) -> &'a [u8] = BearerHash::as_bytes;
+    }
+
+    #[test]
+    fn bearer_hash_inner_field_is_array_32_bytes_not_vec_or_arc_via_destructure() {
+        // `BearerHash` has EXACTLY ONE tuple-struct field: `[u8; 32]`
+        // (the SHA-256 output). Pin the inner-field type via a destructure
+        // with explicit `[u8; 32]` binding so a refactor to `Vec<u8>` "for
+        // dynamic-length-hash future-proofing" OR `Arc<[u8; 32]>` "for
+        // cheap clone" would surface here. The fixed-size array shape is
+        // load-bearing for: (a) the kill_cache's `[u8; 32]` key type
+        // (round-201 `mark_signature_takes_owned_hash_by_value`), (b) the
+        // `as_bytes` zero-copy slice view (it returns `&self.0`), and
+        // (c) the `Debug` impl's `self.0[..4]` slice (which would change
+        // semantics under Vec/Arc indexing). A refactor to either would
+        // ripple through all three consumers.
+        let h = BearerHash::of("pxl_live_AAAA");
+        let BearerHash(inner) = h;
+        let _check: [u8; 32] = inner;
+    }
+
+    #[test]
+    fn prefix_constant_type_is_static_str_for_format_macro_const_concat_compat() {
+        // `PREFIX: &str` is the `&'static str` type the format macro
+        // `format!("{PREFIX}{enc}")` in `Bearer::generate` interpolates
+        // verbatim. Pin the type via a fn-pointer witness so a refactor
+        // to `lazy_static! { static ref PREFIX: String = ... }` "for
+        // runtime-configurable bearer prefix per environment (test/staging/
+        // prod)" would force a Deref coercion at every interpolation site
+        // AND would break the `prefix_constant_is_byte_exact_pxl_underscore_live_underscore`
+        // existing pin's `PREFIX.as_bytes() == b"pxl_live_"` byte-identity
+        // contract (which depends on the static literal's stable allocation).
+        // The `&'static str` lifetime is also load-bearing for: (a) the
+        // `&input[PREFIX.len()..]` slice op in `parse`, and (b) the
+        // `format!("{PREFIX}{enc}")` const-concat optimization. Symmetric
+        // to round-213 CURRENT_PIC_PROFILE &'static str pin.
+        fn require_static_str(_: &'static str) {}
+        require_static_str(PREFIX);
+    }
+
+    #[test]
     fn one_thousand_generated_bearers_yield_one_thousand_distinct_hashes() {
         // 256-bit entropy per token means birthday collisions are
         // negligible at scale 1000 (~5e-71 expected). Pin distinctness

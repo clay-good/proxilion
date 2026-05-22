@@ -658,4 +658,166 @@ mod tests {
             .with_fix("f")
             .with_docs("https://x");
     }
+
+    // ─── round 219 (2026-05-22): ErrorBody struct-shape + purity + axum boundary ───
+
+    #[test]
+    fn error_body_field_count_pinned_at_exactly_six_via_exhaustive_destructure_no_dotdot_rest() {
+        // `ErrorBody` has exactly 6 fields (error / code / detail / fix
+        // / docs / extras). Pin the count via an exhaustive destructure
+        // with NO `..` rest pattern — a refactor that landed a 7th
+        // field (e.g. `correlation_id: &'static str` "for telemetry"
+        // OR `severity: u8` "for client-side log-level mapping") would
+        // compile-fail at THIS destructure site rather than as a
+        // silent wire-shape widening at the operator dashboard. The
+        // existing `error_body_serialized_json_object_carries_exactly_six_known_keys_when_all_set`
+        // pin checks the wire-shape after serialization; this pin
+        // catches the structural drift one step earlier at the
+        // struct-shape boundary, so a refactor that added a
+        // `#[serde(skip)]`-ed field would still surface here even
+        // though the wire-shape pin would pass. Symmetric to round-217
+        // CipherError + round-216 OAuthState + round-214 ActionEvent
+        // exhaustive-destructure pins extended to this central error
+        // envelope's field count.
+        let body = ErrorBody::new("t", "c")
+            .with_detail("d")
+            .with_fix("f")
+            .with_docs("https://x")
+            .with_extras(serde_json::json!({"k": "v"}));
+        let ErrorBody {
+            error,
+            code,
+            detail,
+            fix,
+            docs,
+            extras,
+        } = body;
+        assert_eq!(error, "t");
+        assert_eq!(code, "c");
+        assert_eq!(detail.as_deref(), Some("d"));
+        assert_eq!(fix, Some("f"));
+        assert_eq!(docs, Some("https://x"));
+        assert_eq!(extras["k"], "v");
+    }
+
+    #[test]
+    fn error_body_new_return_type_is_owned_self_by_value_via_fn_pointer_witness() {
+        // `ErrorBody::new(&'static str, &'static str) -> Self` —
+        // returns owned `Self` by value, NOT `Result<Self, _>` (a
+        // future variant that "validates the code is in the registry
+        // and returns Err for unknown codes" would force `?` insertion
+        // at every adapter call site and break the `let body =
+        // ErrorBody::new(...)` chain shape pinned by every existing
+        // construction call site). Pin via a fn-pointer witness with
+        // an exact signature. Symmetric to round-217 from_bytes +
+        // encrypt + decrypt + round-218 Bearer::parse + Bearer::generate
+        // + BearerHash::of fn-pointer-witness pins extended to this
+        // central envelope constructor.
+        let _: fn(&'static str, &'static str) -> ErrorBody = ErrorBody::new;
+    }
+
+    #[test]
+    fn error_body_extras_field_type_is_value_not_option_value_via_destructure() {
+        // `ErrorBody.extras: serde_json::Value` — the field is a raw
+        // `Value`, NOT `Option<Value>`. The skip predicate is
+        // `serde_json::Value::is_null` — load-bearing for the
+        // `with_extras(Value::Null)` reset pattern pinned by
+        // `with_extras_can_reset_to_null_to_re_enable_skip_predicate`.
+        // A refactor that promoted to `Option<Value>` "for explicit
+        // absence semantics" would force every call site to wrap with
+        // `Some(...)` AND would change the skip predicate to
+        // `Option::is_none` — silently flipping the wire behavior on
+        // `with_extras(Value::Null)` from "key omitted" to "extras:
+        // null literal" (Value::Null inside Some is NOT None). Pin
+        // the field type via require_value on a fresh destructure.
+        fn require_value(_: &serde_json::Value) {}
+        let body = ErrorBody::new("t", "c");
+        require_value(&body.extras);
+        assert!(body.extras.is_null());
+    }
+
+    #[test]
+    fn error_body_serialization_field_order_is_exactly_error_code_detail_fix_docs_extras() {
+        // `serde_json` serializes struct fields in declaration order;
+        // the existing `error_body_serialized_json_first_two_keys_are_error_then_code_in_declaration_order`
+        // pin checks the first two keys but NEVER the remaining four.
+        // Operator dashboards that parse the body via streaming/line-
+        // based deserializers (jq via `to_entries[].key`) key on the
+        // full key sequence. A refactor that re-ordered the struct
+        // fields "for required-before-optional grouping" would silently
+        // flip the wire byte sequence beyond key #2 and break any
+        // ordered-keys-based consumer. Pin the full 6-key sequence
+        // when all fields are set so any single field re-order
+        // surfaces here. Symmetric to round-194 audit_body field
+        // declaration order pin extended to this central envelope.
+        let body = ErrorBody::new("t", "c")
+            .with_detail("d")
+            .with_fix("f")
+            .with_docs("https://x")
+            .with_extras(serde_json::json!({"k": "v"}));
+        let s = serde_json::to_string(&body).unwrap();
+        // Extract the key sequence by walking the canonical JSON
+        // output — keys appear in declaration order.
+        let expected_keys = ["error", "code", "detail", "fix", "docs", "extras"];
+        let mut cursor = 0usize;
+        for k in expected_keys {
+            let needle = format!("\"{k}\"");
+            let pos = s[cursor..]
+                .find(&needle)
+                .unwrap_or_else(|| panic!("missing key `{k}` in `{s}` after cursor {cursor}"));
+            cursor += pos + needle.len();
+        }
+    }
+
+    #[tokio::test]
+    async fn into_response_content_type_is_application_json_for_axum_json_response() {
+        // `(status, Json(self)).into_response()` — the Json wrapper
+        // sets the `Content-Type: application/json` header on every
+        // response. Pin both the header presence AND the exact value
+        // — a refactor that switched to `(status, self).into_response()`
+        // for "fewer allocations" would silently drop the
+        // Content-Type header (no Json wrapper means no Content-Type)
+        // and break every agent / dashboard parser that branches on
+        // it. The existing into_response pins check the status code
+        // and the wire body shape but NEVER the Content-Type header.
+        // Symmetric to round-194 audit body Content-Type pin extended
+        // to this central error envelope.
+        let r = ErrorBody::new("t", "c")
+            .with_detail("d")
+            .into_response(StatusCode::BAD_REQUEST);
+        let ct = r
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("Content-Type header present")
+            .to_str()
+            .expect("Content-Type is ASCII");
+        assert_eq!(
+            ct, "application/json",
+            "Content-Type header drifted: {ct:?}",
+        );
+    }
+
+    #[test]
+    fn error_body_new_is_referentially_transparent_across_fifty_calls_on_same_inputs() {
+        // `ErrorBody::new(error, code)` is a pure constructor — no
+        // clock, no random, no atomic counter. The existing
+        // `error_body_serialization_is_referentially_transparent_across_fifty_calls_on_same_envelope`
+        // pin walks the serialization of a fully-built envelope but
+        // NEVER the constructor itself. A refactor that mixed in a
+        // per-call build counter into one of the optional fields
+        // (e.g. `extras: serde_json::json!({"build_id": COUNTER})`
+        // "for adapter-side correlation") would silently fork the
+        // wire body across what should be byte-equal calls. Pin 50
+        // `::new("t", "c")` calls yield byte-equal serialized JSON.
+        // Symmetric to round-198 OAuthError::body referential-transparency
+        // pin extended to this envelope's constructor path.
+        let baseline = serde_json::to_string(&ErrorBody::new("t", "c")).unwrap();
+        for i in 0..50 {
+            let again = serde_json::to_string(&ErrorBody::new("t", "c")).unwrap();
+            assert_eq!(
+                again, baseline,
+                "iter {i}: ErrorBody::new must be referentially transparent",
+            );
+        }
+    }
 }

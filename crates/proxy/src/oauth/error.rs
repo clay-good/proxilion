@@ -940,4 +940,152 @@ mod tests {
             assert_eq!(v.body().code, "internal_error");
         }
     }
+
+    // ─── round 220 (2026-05-22): OAuthError status + body + fix purity surfaces ───
+
+    #[test]
+    fn oauth_error_status_is_referentially_transparent_across_fifty_calls_per_variant() {
+        // `OAuthError::status(&self) -> StatusCode` is a pure
+        // classification — no clock, no atomic counter. The existing
+        // round-198 `oauth_error_body_is_referentially_transparent`
+        // pin walks `body()` purity but never `status()`. A refactor
+        // that mixed in a per-call rate-limit-driven status mutation
+        // (e.g. "after the 100th 401 in 10 seconds, promote to 503
+        // to shed load") would silently fork the operator alert
+        // bucket across what should be byte-equal calls and break the
+        // deterministic-classification contract operator runbooks rely
+        // on. Pin 50 `status()` calls on three distinct variants yield
+        // byte-equal StatusCode. Symmetric to round-198 body() RT pin
+        // extended to this sibling method on the same enum.
+        for variant_builder in [
+            || OAuthError::PkceFail,
+            || OAuthError::PicInvariant("ops missing".into()),
+            || OAuthError::Db(sqlx::Error::RowNotFound),
+        ] {
+            let baseline = variant_builder().status();
+            for i in 0..50 {
+                let again = variant_builder().status();
+                assert_eq!(
+                    again, baseline,
+                    "iter {i}: OAuthError::status must be referentially transparent",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oauth_error_body_return_type_is_owned_error_body_by_value_via_fn_pointer_witness() {
+        // `OAuthError::body(&self) -> ErrorBody` returns owned
+        // `ErrorBody` by value, NOT `&ErrorBody` (a borrow refactor
+        // "to avoid cloning the inner String on every error response"
+        // would tie the body's lifetime to the OAuthError's borrow
+        // and break the `IntoResponse` chain where `self.body()` is
+        // moved into `into_response(status)` — the borrowed return
+        // would force a clone insertion at every call site OR cascade
+        // a lifetime parameter through every consumer). Pin via a
+        // fn-pointer witness with the exact signature. Symmetric to
+        // round-217 from_bytes + round-218 Bearer::parse + round-219
+        // ErrorBody::new fn-pointer-witness pins extended to this
+        // method-return-type contract.
+        let _: fn(&OAuthError) -> ErrorBody = OAuthError::body;
+    }
+
+    #[test]
+    fn oauth_error_pic_invariant_status_is_403_forbidden_integer_level_pin() {
+        // `OAuthError::PicInvariant` maps to `FORBIDDEN` (403) — the
+        // existing `status_codes_match_variant_classification` pin
+        // checks via the `StatusCode::FORBIDDEN` constant. Tighten
+        // via the `as_u16()` integer level so a one-step drift to
+        // 401 ("symmetry with BridgeRejected since both are
+        // auth-related") OR to 400 ("agent should fix the request")
+        // surfaces here at the integer-level. The 403 choice is
+        // deliberate: it signals to the agent that the request was
+        // well-formed but the AGENT (or its operator) lacks the
+        // permission scope to perform the operation — distinct from
+        // 401 (need to re-authenticate) and 400 (request malformed).
+        // Symmetric to round-198 `oauth_error_status_500_branch_is_internal_server_error`
+        // integer-level pin extended to this 403 boundary.
+        assert_eq!(
+            OAuthError::PicInvariant("ops missing".into())
+                .status()
+                .as_u16(),
+            403,
+            "PicInvariant status must be 403 Forbidden",
+        );
+    }
+
+    #[test]
+    fn oauth_error_bridge_rejected_status_is_401_unauthorized_integer_level_pin() {
+        // `OAuthError::BridgeRejected` maps to `UNAUTHORIZED` (401) —
+        // symmetric to the PicInvariant 403 pin one method up. The
+        // 401 choice is deliberate: it signals to the agent that the
+        // federation-bridge JWT is invalid/expired and the user (NOT
+        // the agent) needs to re-authenticate at the IdP. A refactor
+        // that re-classified to 403 "since the bridge rejected the
+        // request, that's an authorization decision" would silently
+        // flip the agent's retry policy from "prompt the human to
+        // re-auth" to "show this as a permission error" — a UX-
+        // breaking drift catchable here at the integer level. The
+        // existing `status_codes_match_variant_classification` pin
+        // checks via the `StatusCode::UNAUTHORIZED` constant; this
+        // pin is the integer-level boundary check.
+        assert_eq!(
+            OAuthError::BridgeRejected("token expired".into())
+                .status()
+                .as_u16(),
+            401,
+            "BridgeRejected status must be 401 Unauthorized",
+        );
+    }
+
+    #[test]
+    fn oauth_error_session_gone_body_fix_mentions_oauth_google_authorize_path_verbatim() {
+        // `SessionGone` body fix instructs the operator to restart
+        // the OAuth flow at the exact path `/oauth/google/authorize`.
+        // The path is the operator-facing entry point for the OAuth
+        // intercept — operator-docs pages anchor on this exact
+        // substring. A refactor that softened to "the authorize
+        // endpoint" OR shortened to `/oauth/authorize` "for symmetry
+        // with the non-Google flow" would orphan the docs cross-
+        // reference AND break operators who copy-paste the path from
+        // the error body into curl/browser. The existing
+        // `body_fix_strings_are_actionable_for_unique_variants` pin
+        // checks for the substring "10 minutes" but NEVER for the
+        // path itself. Pin both substrings independently so a fix
+        // refactor that drops EITHER surfaces here.
+        let fix = OAuthError::SessionGone.body().fix.expect("fix present");
+        assert!(
+            fix.contains("/oauth/google/authorize"),
+            "SessionGone fix must mention canonical authorize path verbatim: {fix}",
+        );
+        assert!(
+            fix.contains("10 minutes"),
+            "SessionGone fix must mention 10-minute TTL: {fix}",
+        );
+    }
+
+    #[test]
+    fn oauth_error_unknown_client_body_docs_link_points_at_oauth_clients_page() {
+        // `UnknownClient` body docs link is
+        // `https://proxilion.com/docs/oauth/clients` — distinct from
+        // every other OAuthError variant's docs link (PkceFail goes
+        // to `/oauth/pkce`, SessionGone to `/oauth/sessions`,
+        // BadRequest to `/oauth/intercept`, PicInvariant to
+        // `/policy/ops`, BridgeRejected to `/federation-bridge`,
+        // internal-trio to `/troubleshooting`). A refactor that
+        // collapsed UnknownClient onto `/oauth/intercept` "since both
+        // are OAuth setup errors" would silently break the operator's
+        // copy-paste-into-browser path away from the dedicated
+        // clients-registration docs page. Pin the FULL docs URL byte-
+        // exact (NOT just substring) so a one-byte drift (e.g.
+        // `.com` → `.io`, or `/clients` → `/client`) surfaces here.
+        // Symmetric to round-219 (this round) field-order pin extending
+        // operator-grep anchors from the central envelope file to this
+        // OAuth-error sibling.
+        assert_eq!(
+            OAuthError::UnknownClient.body().docs,
+            Some("https://proxilion.com/docs/oauth/clients"),
+            "UnknownClient docs link drift",
+        );
+    }
 }

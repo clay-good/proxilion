@@ -491,6 +491,162 @@ mod tests {
     }
 
     #[test]
+    fn google_client_from_env_return_type_is_result_self_string_for_main_caller_chain() {
+        // `server.rs` historically called `GoogleClient::from_env()` and
+        // bubbled the `Err(String)` into the boot-time error log. Pin the
+        // return type as `Result<GoogleClient, String>` via a fn-pointer
+        // witness so a refactor that promoted the error to a structured
+        // type (e.g. `Result<Self, anyhow::Error>` "for richer triage")
+        // would surface here at the type boundary rather than as a
+        // confusing call-site mismatch in the boot path far from this
+        // file. The `String` body shape is load-bearing for the boot-log
+        // grep contract pinned by
+        // `from_env_error_strings_are_byte_exact_for_operator_grep`.
+        let _f: fn() -> Result<GoogleClient, String> = GoogleClient::from_env;
+    }
+
+    #[test]
+    fn oauth_state_field_count_pinned_at_exactly_six_via_exhaustive_destructure() {
+        // Pin OAuthState's field count at EXACTLY 6 via an exhaustive
+        // destructure with NO `..` rest pattern. A future field landing
+        // (e.g. an `audit_log_url` for cross-handler trace export, or a
+        // 7th `oidc_discovery_cache`) without matching wiring at the
+        // OAuth router assembly site would silently start carrying a
+        // zero-value field — pinning the count here forces a compile-time
+        // surface at the type boundary rather than a runtime "field is
+        // empty in the dashboard" bug. The `_pin` fn is never invoked;
+        // its body is type-checked at compile time, which is what we want.
+        #[allow(dead_code)]
+        fn _pin(s: OAuthState) {
+            let OAuthState {
+                db: _,
+                cipher: _,
+                pic: _,
+                google: _,
+                federation_bridge_authorize_url: _,
+                proxy_base_url: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn google_client_field_count_pinned_at_exactly_four_via_exhaustive_destructure() {
+        // Symmetric to the OAuthState destructure pin: GoogleClient has
+        // EXACTLY 4 fields (client_id, client_secret, auth_url, token_url).
+        // A future 5th field (e.g. `scopes: Vec<String>` for per-tenant
+        // scope policy) without matching `from_env` wiring would silently
+        // drop the new field at boot — pinning the count here forces
+        // the refactor to update both this test AND `from_env` in lockstep.
+        // Pinned via destructure with no `..` rest pattern.
+        let g = GoogleClient {
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            auth_url: "u1".into(),
+            token_url: "u2".into(),
+        };
+        let GoogleClient {
+            client_id,
+            client_secret,
+            auth_url,
+            token_url,
+        } = g;
+        // Reference the four bindings so the pattern isn't dead-code-elided.
+        assert_eq!(client_id, "id");
+        assert_eq!(client_secret, "secret");
+        assert_eq!(auth_url, "u1");
+        assert_eq!(token_url, "u2");
+    }
+
+    #[test]
+    fn google_client_field_types_all_owned_string_for_per_request_clone_independence() {
+        // All four GoogleClient fields MUST be owned `String` (not
+        // `&'static str` or `Arc<str>`) so the per-request handler clone
+        // gets its own buffer the OAuth callback can — in principle —
+        // mutate without aliasing back to the AppState-held original.
+        // The existing `google_client_clone_yields_independent_owned_strings`
+        // pin checks mutation-independence at runtime; pin the
+        // require_string TYPE witness explicitly so an `Arc<str>` refactor
+        // would surface at the type boundary BEFORE the mutation test
+        // tripped. Helper takes `String` only.
+        fn require_string(_: String) {}
+        let g = GoogleClient {
+            client_id: "id".into(),
+            client_secret: "s".into(),
+            auth_url: "u1".into(),
+            token_url: "u2".into(),
+        };
+        require_string(g.client_id);
+        require_string(g.client_secret);
+        require_string(g.auth_url);
+        require_string(g.token_url);
+    }
+
+    #[test]
+    fn from_env_is_referentially_transparent_across_repeated_calls_with_stable_env() {
+        // `from_env` is a pure (env-var → struct) lookup. With the env
+        // held stable across 50 sequential calls, the returned struct
+        // MUST be byte-equal across all 50 calls — a refactor that
+        // introduced any form of state (a once-cell-cached struct, a
+        // counter, a per-call rotation for "fairness across regional
+        // endpoints") would surface here. Symmetric to the
+        // `verify_pkce_s256_is_referentially_transparent_across_repeated_calls`
+        // pin in `pkce.rs`.
+        with_clean_env(|| {
+            // SAFETY: serialized by ENV_GUARD via `with_clean_env`.
+            unsafe {
+                std::env::set_var("GOOGLE_CLIENT_ID", "id-rt");
+                std::env::set_var("GOOGLE_CLIENT_SECRET", "secret-rt");
+                std::env::set_var("GOOGLE_AUTH_URL", "https://example.test/auth-rt");
+                std::env::set_var("GOOGLE_TOKEN_URL", "https://example.test/token-rt");
+            }
+            let first = GoogleClient::from_env().unwrap();
+            for _ in 0..50 {
+                let c = GoogleClient::from_env().unwrap();
+                assert_eq!(c.client_id, first.client_id);
+                assert_eq!(c.client_secret, first.client_secret);
+                assert_eq!(c.auth_url, first.auth_url);
+                assert_eq!(c.token_url, first.token_url);
+            }
+        });
+    }
+
+    #[test]
+    fn google_client_default_auth_url_contains_v2_segment_not_v1_or_v3() {
+        // The default `auth_url` byte-exact equality is pinned elsewhere;
+        // pin a path-segment slice of it here so a refactor that "bumped"
+        // the segment to v1 or v3 (a one-char diff that's easy to miss
+        // in review) surfaces as a substring-presence failure on a
+        // distinct axis from the byte-length check pinned by
+        // `from_env_default_urls_match_published_google_oauth_endpoints_byte_exact`.
+        // The published Google OAuth 2.0 user-authorize endpoint is on
+        // `/o/oauth2/v2/auth` — operator-onboarding docs anchor on the
+        // `/v2/` segment.
+        with_clean_env(|| {
+            // SAFETY: serialized by ENV_GUARD via `with_clean_env`.
+            unsafe {
+                std::env::set_var("GOOGLE_CLIENT_ID", "id");
+                std::env::set_var("GOOGLE_CLIENT_SECRET", "secret");
+            }
+            let c = GoogleClient::from_env().unwrap();
+            assert!(
+                c.auth_url.contains("/v2/"),
+                "auth_url default missing /v2/ segment: {}",
+                c.auth_url
+            );
+            assert!(
+                !c.auth_url.contains("/v1/"),
+                "auth_url default carries /v1/ — segment drift: {}",
+                c.auth_url
+            );
+            assert!(
+                !c.auth_url.contains("/v3/"),
+                "auth_url default carries /v3/ — segment drift: {}",
+                c.auth_url
+            );
+        });
+    }
+
+    #[test]
     fn from_env_respects_url_overrides() {
         with_clean_env(|| {
             // SAFETY: serialized by ENV_GUARD via `with_clean_env`.

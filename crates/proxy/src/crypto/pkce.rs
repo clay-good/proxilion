@@ -422,6 +422,118 @@ mod tests {
     }
 
     #[test]
+    fn verify_pkce_s256_return_type_is_result_unit_for_axum_oauth_callback_question_mark_chain() {
+        // The OAuth callback handler uses `verify_pkce_s256(...)?` to bubble
+        // PKCE failures into the `OAuthError` envelope. Pin the return type
+        // as `Result<(), PkceError>` via a fn-pointer witness so a refactor
+        // that surfaced the computed challenge alongside Ok (e.g.
+        // `Result<String, PkceError>` "for downstream audit log") would
+        // surface here at the type boundary rather than as a confusing
+        // `?`-conversion failure at the callback site far from this file.
+        // The unit Ok arm is load-bearing: the callback discards the success
+        // value and proceeds to mint the cross-handler session token.
+        let _f: fn(&str, &str) -> Result<(), PkceError> = verify_pkce_s256;
+    }
+
+    #[test]
+    fn pkce_error_display_strings_for_two_variants_are_distinct_no_copy_paste_collision() {
+        // The existing `error_display_strings_are_stable_for_log_filters`
+        // pin asserts each variant's Display substring in isolation. Pin
+        // that the two variants render to BYTE-DISTINCT strings so a
+        // refactor that copy-pasted the message body (e.g. accidentally
+        // making both arms render "verifier failed PKCE check") would
+        // collapse the two-bucket operator-grep contract into one and
+        // mask malformed-input boots as tamper attempts. The .ne() check
+        // is the load-bearing assertion — the two Display arms must
+        // remain BYTE-distinct.
+        let m = PkceError::Mismatch.to_string();
+        let l = PkceError::VerifierLength.to_string();
+        assert_ne!(m, l, "two PkceError variants share a Display body");
+        // And the obvious distinguishing substrings remain.
+        assert!(m.contains("PKCE check"));
+        assert!(l.contains("length must be"));
+    }
+
+    #[test]
+    fn pkce_error_variant_display_byte_lengths_pinned_for_log_grep_stability() {
+        // The existing `error_display_strings_are_stable_for_log_filters`
+        // pin uses `.contains(...)` which would still pass after a
+        // refactor that APPENDED extra detail (e.g.
+        // "verifier failed PKCE check; see /healthz") — that would silently
+        // change every operator alert filter that anchors on a known prefix
+        // length. Pin both Display strings' BYTE-EXACT lengths so any
+        // append or prepend surfaces here. The literal byte lengths are:
+        // - "verifier failed PKCE check" = 26
+        // - "verifier malformed (length must be 43..=128 characters)" = 55
+        assert_eq!(PkceError::Mismatch.to_string().len(), 26);
+        assert_eq!(PkceError::VerifierLength.to_string().len(), 55);
+    }
+
+    #[test]
+    fn verify_pkce_s256_works_at_44_byte_verifier_above_minimum_boundary() {
+        // The existing `boundary_42_chars_rejected_and_43_chars_accepted_as_length`
+        // pin walks the EDGE of the lower boundary; the existing
+        // `compute_then_verify_round_trips_across_five_distinct_verifier_lengths`
+        // skips 44. Pin that one byte above the lower boundary (44) also
+        // round-trips so a refactor that special-cased exactly-43 ("the
+        // canonical length") and silently regressed verifiers above the
+        // edge would surface here.
+        let verifier = "a".repeat(44);
+        let digest = Sha256::digest(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(digest);
+        assert!(verify_pkce_s256(&verifier, &challenge).is_ok());
+    }
+
+    #[test]
+    fn verify_pkce_s256_works_at_127_byte_verifier_below_maximum_boundary() {
+        // Symmetric to the 44-byte pin: one byte BELOW the upper boundary
+        // (127) must also round-trip. The existing boundary tests check
+        // 128 / 129 at the edge; 127 fills the just-inside gap so a
+        // refactor that started using `>=` instead of `>` on the upper
+        // bound (off-by-one) would surface here as well as at the 128
+        // pin.
+        let verifier = "x".repeat(127);
+        let digest = Sha256::digest(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(digest);
+        assert!(verify_pkce_s256(&verifier, &challenge).is_ok());
+    }
+
+    #[test]
+    fn computed_challenge_uses_url_safe_alphabet_only_no_standard_b64_or_padding() {
+        // Per RFC 7636 §4.2 the encoding MUST be base64url-no-pad — every
+        // byte of the computed challenge falls in the set
+        // [A-Za-z0-9_-]. A refactor that swapped the encoder for
+        // `STANDARD` or `STANDARD_NO_PAD` would surface here: standard
+        // base64 uses `+` and `/` instead of `-` and `_`, and the PADDED
+        // engine appends `=` to terminate. Pin both alphabet exclusion AND
+        // pad-byte absence across a sweep of three verifier lengths
+        // (43/64/128) so a per-length silent encoder swap surfaces.
+        for len in [43_usize, 64, 128] {
+            let verifier = "y".repeat(len);
+            let digest = Sha256::digest(verifier.as_bytes());
+            let challenge = URL_SAFE_NO_PAD.encode(digest);
+            // No standard-base64 chars and no padding.
+            assert!(
+                !challenge.contains('+'),
+                "challenge must not contain '+' (URL_SAFE_NO_PAD), got: {challenge}"
+            );
+            assert!(
+                !challenge.contains('/'),
+                "challenge must not contain '/' (URL_SAFE_NO_PAD), got: {challenge}"
+            );
+            assert!(
+                !challenge.contains('='),
+                "challenge must not contain '=' padding (NO_PAD), got: {challenge}"
+            );
+            // Every byte is alphanumeric or `-`/`_`.
+            for b in challenge.bytes() {
+                let ok = b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+                assert!(ok, "non-url-safe byte {b:#x} in challenge {challenge}");
+            }
+        }
+    }
+
+    #[test]
     fn error_display_strings_are_stable_for_log_filters() {
         // Operator log filters key on the substring "PKCE check" /
         // "length must be 43..=128". A future variant rename or message

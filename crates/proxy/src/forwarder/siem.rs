@@ -1146,4 +1146,147 @@ mod tests {
             "distinct keys must produce distinct signatures (clone preserved bytes)",
         );
     }
+
+    // ─── round 236 (2026-05-22): SiemHmacKey + SiemForwarder + BatchState
+    // exhaustive destructure, new() Result fn-pointer pin, KeyError + BuildError
+    // owned-String inner field pins ───
+
+    #[test]
+    fn siem_hmac_key_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `SiemHmacKey(Vec<u8>)` is a single-field tuple struct holding
+        // the HMAC key. A 2nd field landing (e.g. `algorithm: HashAlg`
+        // for a future SHA-512 override per spec.md §3.3 extension OR
+        // `key_id: String` for multi-key-rotation observability)
+        // without matching `from_hex` constructor wiring would silently
+        // leave the new field zero-initialized. The exhaustive
+        // destructure with no `..` rest pattern forces a 2nd field to
+        // update this site in lockstep with `from_hex`. Symmetric to
+        // the WebhookSecret 1-field + SlackSigningSecret 1-field
+        // exhaustive-destructure pins.
+        let k = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let SiemHmacKey(_inner) = k;
+    }
+
+    #[test]
+    fn siem_forwarder_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest() {
+        // `SiemForwarder { url, key, http, max_retries, batch }` —
+        // exactly 5 fields. A 6th field landing (e.g. `auth_header:
+        // Option<String>` for receivers that require Bearer/Basic auth
+        // in ADDITION to the HMAC signature, OR `circuit_breaker:
+        // CircuitBreaker` for per-endpoint failure-rate damping) without
+        // matching `new()` constructor wiring would silently leave the
+        // new field zero-initialized — operators using the new feature
+        // would see no error AND no behaviour change. The exhaustive
+        // destructure forces a 6th field to update this site in
+        // lockstep with `new()`. Symmetric to the WebhookNotifier
+        // 6-field + SlackNotifier 6-field + TeeStream 2-field
+        // exhaustive-destructure pins.
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let f = SiemForwarder::new("https://siem.example.test/wh".into(), key).unwrap();
+        let SiemForwarder {
+            url: _,
+            key: _,
+            http: _,
+            max_retries: _,
+            batch: _,
+        } = f;
+    }
+
+    #[test]
+    fn batch_state_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // `BatchState { buffer, max_batch_size, flush_interval }` —
+        // module-private holder with exactly 3 fields. A 4th field
+        // landing (e.g. `max_buffer_bytes: usize` for memory bounding
+        // on the batched buffer, OR `compression: bool` for gzip-
+        // encoding the batched POST body) without matching
+        // `with_batching` constructor wiring would silently leave the
+        // new field zero-initialized on every batched forwarder. The
+        // exhaustive destructure forces a 4th field to update this
+        // site in lockstep. Symmetric to the Inner 3-field +
+        // BurstSuppressor 3-field exhaustive-destructure pins extended
+        // to this sibling module-private holder.
+        let bs = BatchState {
+            buffer: Arc::new(Mutex::new(vec![])),
+            max_batch_size: 100,
+            flush_interval: Duration::from_secs(5),
+        };
+        let BatchState {
+            buffer: _,
+            max_batch_size: _,
+            flush_interval: _,
+        } = bs;
+    }
+
+    #[test]
+    fn siem_forwarder_new_return_type_is_result_self_build_error_via_fn_pointer_witness() {
+        // `SiemForwarder::new(String, SiemHmacKey) -> Result<Self,
+        // BuildError>` — the boot path bubbles the error through `?`
+        // symmetric to `WebhookNotifier::new` and `SlackNotifier::new`.
+        // Pin the type via a fn-pointer witness so a refactor that
+        // swapped to `Result<Self, anyhow::Error>` "for ergonomic
+        // boot-path bubbling" OR to a panicking `pub fn new(...) ->
+        // Self` "since reqwest::Client::builder() rarely fails" would
+        // surface here at the constructor boundary. The
+        // `reqwest::Client::builder().build()` error path is the
+        // load-bearing branch operators see when they pass a malformed
+        // env override. Symmetric to the WebhookNotifier::new +
+        // SlackNotifier::new Result fn-pointer pins.
+        let _f: fn(String, SiemHmacKey) -> Result<SiemForwarder, BuildError> = SiemForwarder::new;
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let result = SiemForwarder::new("https://siem.example.test/wh".into(), key);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn key_error_inner_field_pinned_owned_string_via_destructure_for_dynamic_validation_message() {
+        // `KeyError(pub String)` — single-field tuple struct with an
+        // owned `String` carrying the validation failure message. The
+        // value flows through `anyhow::Error` chains at the boot path
+        // which require Send+Sync+'static — owned String satisfies
+        // that trivially AND lets dynamic messages like `format!(
+        // "invalid hex at {i}: {e}")` round-trip without `Box::leak`.
+        // A refactor to `&'static str` "for cheaper passthrough on
+        // common-error fast paths" would force every dynamic
+        // construction site to `Box::leak` OR fragment into a
+        // match-arm enum of static prefixes. Pin via destructure
+        // accessing the inner field as String. Symmetric to the
+        // SlackBuildError + NotifierBuildError + ConnectError inner-
+        // String pins.
+        let e = KeyError("invalid hex at 5: ...".into());
+        let KeyError(inner) = &e;
+        fn require_string(_: &String) {}
+        require_string(inner);
+        assert_eq!(inner, "invalid hex at 5: ...");
+        // Multibyte unicode message round-trips byte-equal.
+        let multi = KeyError("ключ failed: тест".into());
+        let KeyError(m) = &multi;
+        assert_eq!(m, "ключ failed: тест");
+    }
+
+    #[test]
+    fn build_error_inner_field_pinned_owned_string_via_destructure_for_dynamic_message_arm() {
+        // `BuildError(pub String)` — same shape as KeyError but
+        // surfaced from reqwest::Client::builder().build() failures.
+        // The reqwest error message includes runtime detail (DNS
+        // failure, TLS cert error, etc.) that operators need to
+        // diagnose boot failures. Pin owned-String via destructure on
+        // both arms (short canonical message + long detail message)
+        // so a refactor to `&'static str` would surface here at the
+        // field-access level. Symmetric to the KeyError pin above —
+        // both pinned together so the boot-path error-type contract
+        // is enforced symmetrically.
+        let e = BuildError("siem forwarder build: dns failure".into());
+        let BuildError(inner) = &e;
+        fn require_string(_: &String) {}
+        require_string(inner);
+        assert!(inner.starts_with("siem forwarder build:"));
+        // Long detail message round-trips byte-equal.
+        let long = BuildError(
+            "siem forwarder build: error connecting to 127.0.0.1:443 — tls handshake failed (cert expired 2024-01-01)".into(),
+        );
+        let BuildError(m) = &long;
+        assert!(m.contains("tls handshake failed"));
+        assert!(m.contains("cert expired"));
+    }
 }

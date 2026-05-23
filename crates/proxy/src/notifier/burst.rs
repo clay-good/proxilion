@@ -1163,4 +1163,155 @@ mod tests {
         require_string(&summary.details_url);
         require_opt_string(&summary.p_0);
     }
+
+    // ─── round 235 (2026-05-22): BurstConfig + Bucket + BurstSuppressor +
+    // SuppressedEvent + BurstSummary exhaustive destructure, new() Self
+    // by-value pin ───
+
+    #[test]
+    fn burst_config_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // `BurstConfig { threshold, window, flush_interval }` — exactly
+        // 3 fields. A 4th field landing (e.g. `summary_throttle: Option
+        // <Duration>` for rate-limiting summary emissions themselves,
+        // OR `per_bucket_max: Option<usize>` for memory bounding on a
+        // long-running suppressor) without matching `Default::default()`
+        // construction would silently leave the new field zero-defaulted
+        // on every freshly-built suppressor. The exhaustive destructure
+        // with no `..` rest pattern forces a 4th field to update this
+        // site in lockstep with `Default`. Symmetric to the
+        // FilterOutcome 4-field + QuarantineSample 2-field +
+        // CompiledFilter 3-field exhaustive-destructure pins.
+        let cfg = BurstConfig::default();
+        let BurstConfig {
+            threshold: _,
+            window: _,
+            flush_interval: _,
+        } = cfg;
+    }
+
+    #[test]
+    fn bucket_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern() {
+        // `Bucket { timestamps, suppressed, first_suppressed }` — module-
+        // private holder type with exactly 3 fields. A 4th field landing
+        // (e.g. `last_seen: Option<Instant>` for staleness eviction, OR
+        // `policy_id_cache: Option<String>` to avoid re-keying the
+        // HashMap entry on every prune call) without matching
+        // construction sites in `admit()` / `flush_summaries()` would
+        // silently leave the new field default-initialized on every
+        // bucket created. The exhaustive destructure forces a 4th
+        // field to update this site in lockstep with the per-call
+        // construction. Symmetric to the Inner 3-field pin in cat_key.rs
+        // round 233 extended to this sibling module-private holder.
+        let b = Bucket::default();
+        let Bucket {
+            timestamps: _,
+            suppressed: _,
+            first_suppressed: _,
+        } = b;
+    }
+
+    #[test]
+    fn burst_suppressor_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest() {
+        // `BurstSuppressor { default_cfg, resolver, buckets }` — exactly
+        // 3 fields. A 4th field landing (e.g. `metrics_label: String` for
+        // per-suppressor metric bucketing OR `audit_pipe: Option<Sender>`
+        // for surfacing every suppression to the audit log) without
+        // matching `new()` constructor wiring would silently leave the
+        // new field zero-initialized on every suppressor handed out.
+        // The exhaustive destructure forces a 4th field to update this
+        // site in lockstep with `new()`. Symmetric to the TeeStream
+        // 2-field + KillCache 1-field + SlackNotifier 6-field
+        // exhaustive-destructure pins.
+        let s = BurstSuppressor::new(BurstConfig::default());
+        let BurstSuppressor {
+            default_cfg: _,
+            resolver: _,
+            buckets: _,
+        } = s;
+    }
+
+    #[test]
+    fn suppressed_event_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest() {
+        // `SuppressedEvent { policy_id, p_0, vendor, action, layer }` —
+        // exactly 5 fields. A 6th field landing (e.g. `detail: Option<
+        // String>` to surface a representative match reason on the
+        // exemplar, OR `at: DateTime<Utc>` to timestamp the exemplar
+        // pick) without matching the wire-shape contract (5-key JSON
+        // object) would silently change the operator-facing summary
+        // payload — Slack receivers iterating known keys would either
+        // drop the new field OR raise a parse warning. The exhaustive
+        // destructure forces a 6th field to update this site in
+        // lockstep with the construction site. Symmetric to the
+        // FederationClaims 8-field + GoogleClient 4-field
+        // exhaustive-destructure pins extended to this exemplar shape.
+        let e = SuppressedEvent {
+            policy_id: "p".into(),
+            p_0: None,
+            vendor: "v".into(),
+            action: "a".into(),
+            layer: "l".into(),
+        };
+        let SuppressedEvent {
+            policy_id: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            layer: _,
+        } = e;
+    }
+
+    #[test]
+    fn burst_summary_field_count_pinned_at_exactly_seven_via_exhaustive_destructure_no_rest() {
+        // `BurstSummary { schema, policy_id, p_0, suppressed_count,
+        // window_seconds, exemplar, details_url }` — exactly 7 fields.
+        // The existing `burst_summary_serialized_json_object_carries_six_keys_when_details_url_empty_seven_when_set`
+        // pin checks the WIRE shape via key counting at the JSON
+        // boundary; pin the STRUCT shape via an exhaustive destructure
+        // so an 8th field landing (e.g. `severity: Severity` for
+        // tiered burst summaries, OR `details_link_label: String` for
+        // operator-tunable button text) without matching construction
+        // sites in `flush_summaries` / `with_details_url` would break
+        // both the destructure AND the wire-key sweep in lockstep.
+        // Symmetric to the TokenResponse 4-field + ErrorBody 6-field
+        // exhaustive-destructure pins extended to this notification-
+        // payload shape.
+        let s = BurstSummary {
+            schema: BurstSummary::SCHEMA,
+            policy_id: "p".into(),
+            p_0: None,
+            suppressed_count: 0,
+            window_seconds: 60,
+            exemplar: None,
+            details_url: String::new(),
+        };
+        let BurstSummary {
+            schema: _,
+            policy_id: _,
+            p_0: _,
+            suppressed_count: _,
+            window_seconds: _,
+            exemplar: _,
+            details_url: _,
+        } = s;
+    }
+
+    #[test]
+    fn burst_suppressor_new_return_type_is_owned_self_by_value_via_fn_pointer_witness() {
+        // `BurstSuppressor::new(BurstConfig) -> Self` is the constructor
+        // AppState calls when wiring per-notifier burst suppression
+        // (one per webhook/Slack/email driver). The value flows through
+        // the fluent builder chain `BurstSuppressor::new(cfg).
+        // with_resolver(r)` — both steps consume and return Self by
+        // value. Pin via fn-pointer witness `fn(BurstConfig) ->
+        // BurstSuppressor`. A refactor to `Arc<Self>` "for ergonomic
+        // shared construction" would break the move-chain at the
+        // `.with_resolver(r)` site AND would drop the AppState's own
+        // Arc-wrap step. Symmetric to the KillCache::new +
+        // TeeStream::new + CatKeyRegistry::new owned-Self fn-pointer
+        // pins.
+        let _f: fn(BurstConfig) -> BurstSuppressor = BurstSuppressor::new;
+        fn require_owned_suppressor(_: BurstSuppressor) {}
+        require_owned_suppressor(BurstSuppressor::new(BurstConfig::default()));
+    }
 }

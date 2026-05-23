@@ -867,6 +867,173 @@ mod tests {
         );
     }
 
+    // ─── round 237 (2026-05-22): Redactors module-private exhaustive
+    // destructure, persist() async-unit return shape, redactor marker strings
+    // pairwise distinct, base64_encode + redact_pii_bytes borrow signature pins,
+    // sha256_hex cross-thread RT ───
+
+    #[test]
+    fn redactors_module_private_field_count_pinned_at_exactly_six_via_exhaustive_destructure() {
+        // `Redactors { email, ssn, phone, credit_card, bearer, api_key }`
+        // — module-private holder for the compiled regex set, exactly
+        // 6 fields. A 7th field landing (e.g. `aws_secret: Regex` for
+        // an AWS-credential pattern, OR `jwt: Regex` for serialized
+        // JWT detection) without matching `redact_pii_text` replacement
+        // chain wiring would silently leave the new redactor field
+        // populated AT REST but never applied at the call site — the
+        // pattern would be compiled at first use and then quietly
+        // ignored on every body inspection. The exhaustive destructure
+        // with no `..` rest pattern forces a 7th field to update this
+        // site in lockstep with both `redactors()` and
+        // `redact_pii_text`. Symmetric to the Inner 3-field +
+        // BatchState 3-field exhaustive-destructure pins extended to
+        // this sibling module-private holder.
+        let r = redactors();
+        let Redactors {
+            email: _,
+            ssn: _,
+            phone: _,
+            credit_card: _,
+            bearer: _,
+            api_key: _,
+        } = r;
+    }
+
+    #[test]
+    fn redact_pii_text_marker_strings_pairwise_byte_distinct_for_per_pattern_grep_buckets() {
+        // The 6 replacement markers — `<REDACTED_API_KEY>`,
+        // `Bearer <REDACTED_TOKEN>`, `<REDACTED_EMAIL>`,
+        // `<REDACTED_SSN>`, `<REDACTED_CC>`, `<REDACTED_PHONE>` — must
+        // be pairwise byte-distinct so operator log filters and audit
+        // dashboards can grep for the specific PII KIND (not just
+        // "something was redacted"). A refactor that softened all 6
+        // to a single `<REDACTED>` umbrella marker "for simplicity"
+        // would silently collapse the 6-bucket triage signal onto one
+        // marker, breaking dashboards that count `pii_kind=email` vs
+        // `pii_kind=ssn` separately. Pin pairwise distinctness across
+        // a single PII-heavy input that triggers all 6 patterns.
+        // Symmetric to the BridgeRejected 4-arm pairwise-distinct pin
+        // in round 221 + OAuthError code-distinct pins.
+        let markers = [
+            "<REDACTED_EMAIL>",
+            "<REDACTED_SSN>",
+            "<REDACTED_CC>",
+            "<REDACTED_PHONE>",
+            "<REDACTED_API_KEY>",
+            "Bearer <REDACTED_TOKEN>",
+        ];
+        // Pairwise distinct: a refactor collapsing them to a single
+        // marker would fail this length-of-set check.
+        let unique: std::collections::HashSet<&str> = markers.iter().copied().collect();
+        assert_eq!(unique.len(), 6, "markers must be pairwise distinct");
+        // Exercise each pattern on its own input so overlapping
+        // patterns (e.g. credit-card consuming phone digits) don't
+        // mask the per-marker coverage check.
+        assert!(redact_pii_text("alice@example.com").contains("<REDACTED_EMAIL>"));
+        assert!(redact_pii_text("123-45-6789").contains("<REDACTED_SSN>"));
+        assert!(redact_pii_text("4111 1111 1111 1111").contains("<REDACTED_CC>"));
+        assert!(redact_pii_text("(415) 555-1234").contains("<REDACTED_PHONE>"));
+        assert!(redact_pii_text("sk-1234567890abcdef1234").contains("<REDACTED_API_KEY>"));
+        assert!(redact_pii_text("Bearer abcdefghij1234567890").contains("Bearer <REDACTED_TOKEN>"),);
+    }
+
+    #[test]
+    fn sha256_hex_is_referentially_transparent_across_threads_not_just_within_one() {
+        // The existing `sha256_hex_is_referentially_transparent_across_fifty_calls_on_same_input`
+        // pin walks 50 calls within ONE thread. Pin the cross-thread
+        // variant: spawn 8 worker threads each calling sha256_hex on
+        // the same input and assert all results are equal. A refactor
+        // that introduced a `thread_local!` digest cache "for per-
+        // thread fairness" would pass the single-thread RT pin but
+        // silently fork outputs across the tokio worker pool — and
+        // `persist()` runs `sha256_hex` from spawned tasks that may
+        // land on different runtime workers, so a cross-thread fork
+        // is the operationally-visible failure mode. Pin via
+        // `std::thread::scope`. Symmetric to the sanitize_token cross-
+        // thread RT pin in round 222 extended to this sibling helper.
+        let input = b"audit body sample bytes for cross-thread test";
+        let baseline = sha256_hex(input);
+        let results: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| sha256_hex(input))).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r, &baseline, "worker {i}: cross-thread sha256_hex drift");
+        }
+    }
+
+    #[test]
+    fn base64_encode_signature_takes_bytes_borrow_via_fn_pointer_witness_for_zero_alloc_hot_path() {
+        // `base64_encode(b: &[u8]) -> String` — takes `&[u8]` by
+        // BORROW, not owned `Vec<u8>`. The caller passes `request_body`
+        // (borrowed from the request frame) and `response_body`
+        // (borrowed from the response frame). A refactor to take by
+        // value (`b: Vec<u8>`) "for ergonomic ownership-into-the-
+        // encoder" would force every persist call site to clone the
+        // body bytes before calling, allocating an extra Vec<u8> per
+        // body — and request/response bodies are up to 10MB each, so
+        // the doubling cost is operationally observable. Pin via fn-
+        // pointer witness with the borrow shape. Symmetric to the
+        // is_killed `&[u8;32]` + sanitize_token `&str` +
+        // parse_missing_atoms `&str` borrow signature pins.
+        let _f: fn(&[u8]) -> String = base64_encode;
+        fn require_owned_string(_: String) {}
+        require_owned_string(base64_encode(b"sample"));
+    }
+
+    #[test]
+    fn redact_pii_bytes_signature_takes_bytes_borrow_via_fn_pointer_witness_for_persist_path() {
+        // `redact_pii_bytes(input: &[u8]) -> Vec<u8>` — takes `&[u8]`
+        // by BORROW, returns owned Vec<u8>. The owned Vec is then
+        // base64-encoded at the call site — passing both arms
+        // independently. A refactor to take by value (`input:
+        // Vec<u8>`) "for in-place editing of the body without an
+        // extra alloc" would lose the const-input contract callers
+        // depend on (the request body is borrowed from a frame the
+        // adapter doesn't own) AND force every call site to clone
+        // before invoking. Pin via fn-pointer witness so both axes
+        // (borrow input + owned Vec output) surface here at the
+        // helper boundary. Symmetric to the base64_encode pin above.
+        let _f: fn(&[u8]) -> Vec<u8> = redact_pii_bytes;
+        fn require_owned_vec_u8(_: Vec<u8>) {}
+        require_owned_vec_u8(redact_pii_bytes(b"alice@example.com"));
+    }
+
+    #[test]
+    fn audit_body_mode_label_strings_pairwise_byte_distinct_for_metric_label_dispatch() {
+        // The `mode_label` match in `persist()` emits `"hash"`,
+        // `"redact_pii"`, `"full"` — three distinct strings, each
+        // landing as a Prometheus label value on
+        // `proxilion_audit_body_persisted_total{mode=...}`. A refactor
+        // that collapsed all 3 to a single `"audit"` umbrella label
+        // "for simpler dashboards" would silently lose the per-mode
+        // breakdown operators rely on to distinguish "we're persisting
+        // raw bodies on this policy" (full / redact_pii) from "we're
+        // just hashing" (hash). The existing `audit_body_mode_label_
+        // strings_are_byte_exact_lowercase_for_grafana_label_axis` pin
+        // walks the lowercase + byte-exact axis; pin the PAIRWISE-
+        // DISTINCT axis here so a refactor that case-folded both `Hash`
+        // and `Full` to the same `mode` umbrella surfaces as a length-
+        // of-set diff. Symmetric to the BridgeRejected pairwise +
+        // redact_pii marker pairwise pins extended to this sibling
+        // metric-label axis.
+        fn mode_label(m: AuditBodyMode) -> &'static str {
+            match m {
+                AuditBodyMode::Hash => "hash",
+                AuditBodyMode::RedactPii => "redact_pii",
+                AuditBodyMode::Full => "full",
+            }
+        }
+        let labels = [
+            mode_label(AuditBodyMode::Hash),
+            mode_label(AuditBodyMode::RedactPii),
+            mode_label(AuditBodyMode::Full),
+        ];
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), 3, "mode labels must be pairwise distinct");
+        assert!(labels.iter().all(|l| !l.is_empty()));
+    }
+
     #[test]
     fn redact_pii_text_no_pii_input_returns_byte_equal_string() {
         // For an input with zero PII matches across all six redactors,

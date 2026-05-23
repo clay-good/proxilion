@@ -1211,4 +1211,208 @@ mod tests {
         assert_eq!(out[1].email.to_string(), "bob@example.com");
         assert_eq!(out[2].email.to_string(), "carol@example.com");
     }
+
+    // ─── round 238 (2026-05-22): EmailBuildError + EmailNotifier exhaustive
+    // destructure, recipient Vec<Mailbox> field type pins, max_retries u32,
+    // with_max_retries fluent self pin ───
+
+    #[test]
+    fn email_build_error_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `EmailBuildError(pub String)` — single-field tuple struct
+        // carrying the boot-validation failure message. A 2nd field
+        // landing (e.g. `field: &'static str` for the named field that
+        // failed validation — "to" / "from" / "cc" — surfaced
+        // directly on the variant rather than threaded through the
+        // message string, OR `inner: Option<lettre::error::Error>` to
+        // preserve the structured source error for `std::error::
+        // Error::source()`) without matching `new_with_recipients()`
+        // constructor wiring would silently leave the new field
+        // zero-initialized OR break the boot-path filter operators
+        // grep on. The exhaustive destructure with no `..` rest
+        // pattern forces a 2nd field to update this site in lockstep
+        // with `new_with_recipients`. Symmetric to the
+        // NotifierBuildError + SlackBuildError + KeyError + BuildError
+        // 1-field exhaustive-destructure pins.
+        let e = EmailBuildError("from address: invalid format".into());
+        let EmailBuildError(_inner) = e;
+    }
+
+    #[tokio::test]
+    async fn email_notifier_field_count_pinned_at_exactly_nine_via_exhaustive_destructure_no_rest()
+    {
+        // `EmailNotifier { transport, from, to, cc, bcc,
+        // proxy_public_url, db, max_retries, recipients_resolver }` —
+        // exactly 9 fields. A 10th field landing (e.g. `reply_to:
+        // Option<Mailbox>` for a no-reply automated-sender pattern,
+        // OR `signing_key: Option<SmimeKey>` for S/MIME-signed
+        // notification emails) without matching
+        // `new_with_recipients()` constructor wiring would silently
+        // leave the new field zero-initialized — operators using the
+        // new feature would see no error AND no behaviour change. The
+        // exhaustive destructure forces a 10th field to update this
+        // site in lockstep. Symmetric to the SlackNotifier 6-field +
+        // WebhookNotifier 6-field + SiemForwarder 5-field exhaustive-
+        // destructure pins extended to this sibling notifier shape.
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new_with_recipients(
+            "smtp://user:pass@example.com:25",
+            "from@example.com",
+            &["to@example.com".to_string()],
+            &[],
+            &[],
+            "https://proxy.local".into(),
+            pool,
+        )
+        .unwrap();
+        let EmailNotifier {
+            transport: _,
+            from: _,
+            to: _,
+            cc: _,
+            bcc: _,
+            proxy_public_url: _,
+            db: _,
+            max_retries: _,
+            recipients_resolver: _,
+        } = n;
+    }
+
+    #[tokio::test]
+    async fn email_notifier_recipient_fields_to_cc_bcc_all_pinned_owned_vec_mailbox_via_require() {
+        // `EmailNotifier.to: Vec<Mailbox>`, `.cc: Vec<Mailbox>`, and
+        // `.bcc: Vec<Mailbox>` — all three are OWNED `Vec<Mailbox>`.
+        // The lettre `Message::builder()` chain at `notify_inner()`
+        // borrows each field via `.iter()` and crosses the
+        // `.transport.send().await` boundary holding the borrow. A
+        // refactor to `Box<[Mailbox]>` "for slightly cheaper size
+        // since the recipient lists are append-only after boot" would
+        // pass any value-equality test but break the
+        // `with_recipients_resolver` override path that today does
+        // `let mut to = self.to.clone(); to.extend(...)` — Box<[T]>
+        // can't be extended. A refactor to `HashSet<Mailbox>` "for
+        // de-dup of accidental duplicate recipients" would silently
+        // change the iteration ORDER in the To: header. Pin via
+        // require_vec_mailbox on all three fields. Symmetric to the
+        // ActionEvent owned-String + GoogleClient owned-String
+        // field-type pins extended to this sibling notifier shape.
+        fn require_vec_mailbox(_: &Vec<Mailbox>) {}
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new_with_recipients(
+            "smtp://user:pass@example.com:25",
+            "from@example.com",
+            &["to@example.com".to_string()],
+            &["cc@example.com".to_string()],
+            &["bcc@example.com".to_string()],
+            "https://proxy.local".into(),
+            pool,
+        )
+        .unwrap();
+        let EmailNotifier { to, cc, bcc, .. } = n;
+        require_vec_mailbox(&to);
+        require_vec_mailbox(&cc);
+        require_vec_mailbox(&bcc);
+    }
+
+    #[tokio::test]
+    async fn email_notifier_max_retries_field_pinned_u32_for_lettre_retry_budget_type_compat() {
+        // `EmailNotifier.max_retries: u32` — chosen to match the
+        // webhook + SIEM forwarder retry-budget field type. A refactor
+        // to `usize` "to align with collection lengths" would silently
+        // change the platform-specific width (u32 on 32-bit, u64 on
+        // 64-bit), breaking byte-equal serialization on
+        // notifier_config dashboards. A refactor to `u8` "since 3 is
+        // the production default" would cap retries at 255 and
+        // silently truncate any operator-tunable value above that.
+        // The existing fluent setter `with_max_retries(mut self, n:
+        // u32)` pins the parameter type; pin the FIELD type
+        // explicitly via require_u32 so a refactor surfaces here at
+        // the destructure level too. Symmetric to the ActionEvent.
+        // status u16 + ExpirySweepReport.expired_rows u64 numeric-
+        // type pins.
+        fn require_u32(_: u32) {}
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new_with_recipients(
+            "smtp://user:pass@example.com:25",
+            "from@example.com",
+            &["to@example.com".to_string()],
+            &[],
+            &[],
+            "https://proxy.local".into(),
+            pool,
+        )
+        .unwrap();
+        require_u32(n.max_retries);
+        assert_eq!(
+            n.max_retries, 3,
+            "production default per ui-less-surfaces.md §5.4"
+        );
+    }
+
+    #[tokio::test]
+    async fn email_notifier_with_max_retries_consumes_self_and_returns_self_via_fn_pointer_witness()
+    {
+        // `EmailNotifier::with_max_retries(mut self, n: u32) -> Self`
+        // — consumes self by value AND returns Self by value (the
+        // fluent builder shape that AppState chains). A refactor to
+        // `&mut self -> &mut Self` "for ergonomic conditional retry
+        // tuning (no temporaries required)" would break the move-
+        // chain at every `EmailNotifier::new(...).with_max_retries(n)`
+        // site — the chain depends on the consuming-and-returning
+        // shape so the final binding can be moved into `Arc::new(...)`
+        // without a let-rebind step. Pin via fn-pointer witness with
+        // the consuming-self shape. Symmetric to the TeeStream::
+        // with_sink + BurstSuppressor::new owned-Self pins extended
+        // to this sibling fluent setter.
+        let _f: fn(EmailNotifier, u32) -> EmailNotifier = EmailNotifier::with_max_retries;
+        let pool = make_dummy_pool();
+        let n = EmailNotifier::new_with_recipients(
+            "smtp://user:pass@example.com:25",
+            "from@example.com",
+            &["to@example.com".to_string()],
+            &[],
+            &[],
+            "https://proxy.local".into(),
+            pool,
+        )
+        .unwrap();
+        let n = n.with_max_retries(0);
+        assert_eq!(n.max_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn email_notifier_new_with_recipients_return_type_is_result_via_fn_pointer_witness() {
+        // `EmailNotifier::new_with_recipients(&str, &str, &[String],
+        // &[String], &[String], String, PgPool) -> Result<Self,
+        // EmailBuildError>` — the boot path bubbles via `?` symmetric
+        // to `WebhookNotifier::new` / `SlackNotifier::new` /
+        // `SiemForwarder::new`. Pin via fn-pointer witness so a
+        // refactor that swapped to `Result<Self, anyhow::Error>` "for
+        // ergonomic boot-path bubbling" would surface here at the
+        // constructor boundary. The 3 distinct error variants from
+        // this constructor — SMTP URL parse, from-address parse, and
+        // empty-recipients — all flow through the `EmailBuildError`
+        // String inner and are tested individually; pin the type
+        // shape of the OUTER result via fn-pointer. Symmetric to the
+        // SiemForwarder::new + SlackNotifier::new fn-pointer pins.
+        let _f: fn(
+            &str,
+            &str,
+            &[String],
+            &[String],
+            &[String],
+            String,
+            PgPool,
+        ) -> Result<EmailNotifier, EmailBuildError> = EmailNotifier::new_with_recipients;
+        let pool = make_dummy_pool();
+        let result = EmailNotifier::new_with_recipients(
+            "smtp://user:pass@example.com:25",
+            "from@example.com",
+            &["to@example.com".to_string()],
+            &[],
+            &[],
+            "https://proxy.local".into(),
+            pool,
+        );
+        assert!(result.is_ok());
+    }
 }

@@ -1345,4 +1345,265 @@ mod canonical_request_json_tests {
             );
         }
     }
+
+    // ─── round 231 (2026-05-22): BlockedActionRecord + OwnedBlockedNotification
+    // exhaustive destructure, uuid + Option<Uuid> + Option<u32> field type pins,
+    // canonical_request_json input HashMap signature pin ───
+
+    #[test]
+    fn blocked_action_record_field_count_pinned_at_exactly_fourteen_via_exhaustive_destructure_no_rest()
+     {
+        // `BlockedActionRecord<'a>` carries 14 fields: request_id,
+        // session_id, p_0, vendor, action, method, path, layer,
+        // policy_id, detail, predecessor_pca_id, requested_ops,
+        // escalation_after_minutes, request_canonical_json. A 15th
+        // field landing (e.g. `originating_idp: &'a str` for surfacing
+        // the IdP that auth'd the agent, OR `attempt_count: u32` for
+        // retry-attempt observability) without matching INSERT column
+        // wiring in `persist()` would silently DROP the new field on
+        // every write — operators investigating a blocked action in the
+        // audit log would see no error AND no new column. The exhaustive
+        // destructure with no `..` rest pattern forces a 15th field to
+        // update this site in lockstep with the INSERT site. Symmetric
+        // to the PicViolationRecord 13-field + EscalationRow 13-field
+        // + FederationClaims 8-field exhaustive-destructure pins.
+        let ops: &[String] = &[];
+        let r = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "p",
+            layer: "policy",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: ops,
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        let BlockedActionRecord {
+            request_id: _,
+            session_id: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            method: _,
+            path: _,
+            layer: _,
+            policy_id: _,
+            detail: _,
+            predecessor_pca_id: _,
+            requested_ops: _,
+            escalation_after_minutes: _,
+            request_canonical_json: _,
+        } = r;
+    }
+
+    #[test]
+    fn owned_blocked_notification_field_count_pinned_at_exactly_fifteen_via_exhaustive_destructure()
+    {
+        // `OwnedBlockedNotification` is the materialized snapshot used
+        // for cross-spawn-boundary notifier dispatch — 15 fields
+        // matching the borrowed `BlockedNotification` shape PLUS the
+        // owned approve_url/reject_url. A 16th field landing on the
+        // borrowed side (e.g. `idp: &'a str`) without matching
+        // owned-side wiring would break the `from()` mapping AND the
+        // `as_borrowed()` reconstitution — both used across spawn task
+        // boundaries. The exhaustive destructure forces both sides to
+        // update in lockstep. Symmetric to the BlockedActionRecord
+        // 14-field pin above.
+        let owned = OwnedBlockedNotification {
+            blocked_id: Uuid::nil(),
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v".into(),
+            action: "a".into(),
+            method: "m".into(),
+            path: "p".into(),
+            layer: "l".into(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec![],
+            approve_url: "u".into(),
+            reject_url: "u".into(),
+        };
+        let OwnedBlockedNotification {
+            blocked_id: _,
+            request_id: _,
+            session_id: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            method: _,
+            path: _,
+            layer: _,
+            policy_id: _,
+            detail: _,
+            predecessor_pca_id: _,
+            requested_ops: _,
+            approve_url: _,
+            reject_url: _,
+        } = owned;
+    }
+
+    #[test]
+    fn blocked_action_record_uuid_fields_pinned_uuid_type_for_postgres_uuid_column_compat() {
+        // `BlockedActionRecord.request_id` and `.session_id` are both
+        // `uuid::Uuid` matching the postgres `request_id UUID NOT NULL`
+        // and `session_id UUID NOT NULL` column shapes. The existing
+        // field-type sweep pins owned/borrowed string slices and the
+        // requested_ops borrowed-slice but doesn't explicitly pin the
+        // UUID type on the two id fields. A refactor to `String` "for
+        // ergonomic round-trip through the audit log's stringified
+        // request_id" would break the sqlx bind path at the `persist()`
+        // INSERT site (the `$1` bind expects UUID). A refactor to a
+        // custom newtype wrapper would pass the sqlx::Type<Postgres>
+        // impl if added AND silently change the `format!("{id}")` shape
+        // downstream. Pin via require_uuid. Symmetric to the
+        // PicViolationRecord uuid-field pin in round 229 + SessionContext
+        // uuid-field pin in round 227 extended to this sibling shape.
+        fn require_uuid(_: uuid::Uuid) {}
+        let r = BlockedActionRecord {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "p",
+            layer: "l",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &[],
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        require_uuid(r.request_id);
+        require_uuid(r.session_id);
+    }
+
+    #[test]
+    fn blocked_action_record_predecessor_pca_id_field_pinned_option_uuid_for_nullable_read_filter_arm()
+     {
+        // `BlockedActionRecord.predecessor_pca_id: Option<uuid::Uuid>`
+        // — the postgres column is `predecessor_pca_id UUID NULL`. The
+        // doc comment specifically notes: "None for `read_filter`
+        // blocks (the action already crossed the wire) — those are
+        // audit-only." Pin Option<Uuid> via require_opt_uuid so a
+        // refactor to bare `Uuid` with `Uuid::nil()` as the read-filter
+        // sentinel would collapse the two operationally-distinct
+        // states (no predecessor vs explicit-nil predecessor) and
+        // break the override flow which keys on `predecessor_pca_id
+        // IS NOT NULL` for the attested-branch path. Symmetric to the
+        // PicViolationRecord + EscalationRow Option<Uuid> pins.
+        fn require_opt_uuid(_: &Option<uuid::Uuid>) {}
+        let read_filter = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "p",
+            layer: "read_filter",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &[],
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        require_opt_uuid(&read_filter.predecessor_pca_id);
+        assert!(read_filter.predecessor_pca_id.is_none());
+        let policy_block = BlockedActionRecord {
+            predecessor_pca_id: Some(Uuid::new_v4()),
+            ..read_filter
+        };
+        require_opt_uuid(&policy_block.predecessor_pca_id);
+        assert!(policy_block.predecessor_pca_id.is_some());
+    }
+
+    #[test]
+    fn blocked_action_record_escalation_after_minutes_field_pinned_option_u32_for_nullable_ttl() {
+        // `BlockedActionRecord.escalation_after_minutes: Option<u32>`
+        // — the postgres column is `escalation_after_minutes INTEGER
+        // NULL`. The doc comment notes: "`None` → no escalation". Pin
+        // Option<u32> via require_opt_u32 so a refactor to `u32` with
+        // `0` as the "no escalation" sentinel would collapse the
+        // explicit-no-escalation state with the explicit-zero-minute
+        // state (which the sweeper would interpret as "escalate
+        // immediately"). Symmetric to the EscalationRow + ErrorBody
+        // detail Option-typed nullable-column pins extended to this
+        // sibling numeric-typed nullable field.
+        fn require_opt_u32(_: &Option<u32>) {}
+        let no_escalation = BlockedActionRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "p",
+            layer: "l",
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: &[],
+            escalation_after_minutes: None,
+            request_canonical_json: None,
+        };
+        require_opt_u32(&no_escalation.escalation_after_minutes);
+        assert!(no_escalation.escalation_after_minutes.is_none());
+        let with_escalation = BlockedActionRecord {
+            escalation_after_minutes: Some(60),
+            ..no_escalation
+        };
+        require_opt_u32(&with_escalation.escalation_after_minutes);
+        assert_eq!(with_escalation.escalation_after_minutes, Some(60));
+    }
+
+    #[test]
+    fn canonical_request_json_signature_takes_two_hashmap_borrows_via_fn_pointer_witness() {
+        // `canonical_request_json` takes `path_params: &HashMap<String,
+        // String>` and `body_for_policy: &HashMap<String,
+        // serde_json::Value>` — both BORROWS, distinct value types
+        // (path params are plain string; body fields are arbitrary
+        // JSON-typed). Pin the exact signature via a fn-pointer
+        // witness. A refactor to a unified `body_and_params: &serde_
+        // json::Value` "to flatten the two arg shapes" would silently
+        // alphabetize the merged keys (path params and body fields
+        // would no longer be visually separable in the output) AND
+        // would break the default-deny semantics that depend on
+        // path_params being a stable, finite key set. A refactor that
+        // took the maps by value (consuming) "to avoid the borrow
+        // lifetime through await" would force adapter call sites to
+        // clone the maps before every block-record persist on the
+        // hot path. Pin via fn-pointer witness.
+        use std::collections::HashMap;
+        let _f: fn(
+            &str,
+            &str,
+            &str,
+            &str,
+            &HashMap<String, String>,
+            &HashMap<String, serde_json::Value>,
+        ) -> String = canonical_request_json;
+        let path_params: HashMap<String, String> = HashMap::new();
+        let body: HashMap<String, serde_json::Value> = HashMap::new();
+        let s = canonical_request_json(
+            "GET",
+            "/x",
+            "google",
+            "drive.files.get",
+            &path_params,
+            &body,
+        );
+        assert!(s.starts_with('{') && s.ends_with('}'));
+    }
 }

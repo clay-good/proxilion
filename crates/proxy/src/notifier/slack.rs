@@ -1086,4 +1086,165 @@ mod tests {
     /// Silence unused-import warnings on the no-test build paths.
     #[allow(dead_code)]
     fn _used(_: chrono::DateTime<Utc>) {}
+
+    // ─── round 232 (2026-05-22): SlackNotifier + SlackSigningSecret exhaustive
+    // destructure, new() Result fn-pointer, verify bool return, resolve_user
+    // priority, SlackBuildError inner String ───
+
+    #[test]
+    fn slack_signing_secret_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `SlackSigningSecret(Vec<u8>)` is a single-field tuple struct
+        // holding the HMAC key. A 2nd field landing (e.g. `algorithm:
+        // HashAlg` for a future SHA-512 override, OR `created_at:
+        // SystemTime` for rotation observability) without matching
+        // `new()` constructor wiring would silently leave the new field
+        // zero-initialized. The exhaustive destructure with no `..`
+        // rest pattern forces a 2nd field to update this site in
+        // lockstep with `new()`. Symmetric to the WebhookSecret 1-field
+        // + BearerHash array + ExpirySweepReport 1-field exhaustive-
+        // destructure pins.
+        let s = SlackSigningSecret::new("some-secret-32-chars-of-hex-mate");
+        let SlackSigningSecret(_inner) = s;
+    }
+
+    #[test]
+    fn slack_notifier_field_count_pinned_at_exactly_six_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // `SlackNotifier { incoming_webhook_url, signing_secret,
+        // proxy_public_url, http, burst, user_map }` — exactly 6
+        // fields. A 7th field landing (e.g. `default_channel: Option<
+        // String>` for per-policy channel routing, OR `thread_ts_map:
+        // Arc<DashMap<Uuid, String>>` for thread-style notifications
+        // per ui-less-surfaces.md §5.7 dev 1) without matching `new()`
+        // constructor wiring would silently leave the new field
+        // zero-initialized — operators using the new feature would see
+        // no error AND no behaviour change. The exhaustive destructure
+        // with no `..` rest pattern forces a 7th field to update this
+        // site in lockstep with `new()`. Symmetric to the
+        // WebhookNotifier 6-field + TeeStream 2-field + NatsBridge
+        // 2-field exhaustive-destructure pins.
+        let n = SlackNotifier::new(
+            "https://hooks.slack.com/services/T/B/X".into(),
+            SlackSigningSecret::new("secret"),
+            "https://proxy.local".into(),
+        )
+        .unwrap();
+        let SlackNotifier {
+            incoming_webhook_url: _,
+            signing_secret: _,
+            proxy_public_url: _,
+            http: _,
+            burst: _,
+            user_map: _,
+        } = n;
+    }
+
+    #[test]
+    fn slack_notifier_new_return_type_is_result_self_slack_build_error_via_fn_pointer_witness() {
+        // `SlackNotifier::new(...) -> Result<Self, SlackBuildError>` —
+        // the boot path bubbles the error through `?` symmetric to
+        // `WebhookNotifier::new` and `WebhookSecret::from_hex`. Pin the
+        // type via a fn-pointer witness so a refactor that swapped to
+        // `Result<Self, anyhow::Error>` "for ergonomic boot-path
+        // bubbling" OR to a panicking `pub fn new(...) -> Self` "since
+        // reqwest::Client::builder() rarely fails" would surface here at
+        // the constructor boundary. The `reqwest::Client::builder().
+        // build()` error path is the load-bearing branch operators see
+        // when they pass a malformed env override. Symmetric to the
+        // WebhookNotifier::new + WebhookSecret::from_hex Result fn-
+        // pointer pins.
+        let _f: fn(String, SlackSigningSecret, String) -> Result<SlackNotifier, SlackBuildError> =
+            SlackNotifier::new;
+        let result = SlackNotifier::new(
+            "https://hooks.slack.com/services/T/B/X".into(),
+            SlackSigningSecret::new("s"),
+            "https://proxy.local".into(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn slack_signing_secret_verify_return_type_is_bool_via_fn_pointer_witness_for_middleware_branch()
+     {
+        // `SlackSigningSecret::verify(&self, &str, &str, &[u8]) -> bool`
+        // — the inbound interaction-webhook middleware uses
+        // `if !secret.verify(sig, ts, body) { return 401; }`. The
+        // return type MUST be `bool` (not `Result<bool, Error>` or
+        // `Option<bool>`) so the middleware branch is a clean boolean
+        // gate. A refactor to `Result<(), VerifyError>` "for
+        // structured rejection reasons" would force every middleware
+        // call site to `.is_ok()` AND collapse the distinct rejection
+        // reasons (bad prefix, skew, HMAC mismatch) into a single
+        // boolean anyway — the structured variant is value-less unless
+        // also surfaced upstream. Pin via fn-pointer witness so the
+        // boolean return shape surfaces here. Symmetric to the
+        // is_killed bool return pin in round 228 extended to this
+        // sibling middleware-gate signature.
+        let _f: fn(&SlackSigningSecret, &str, &str, &[u8]) -> bool = SlackSigningSecret::verify;
+        let s = SlackSigningSecret::new("secret");
+        let observed: bool = s.verify("not-v0", "0", b"body");
+        assert!(!observed);
+    }
+
+    #[test]
+    fn slack_notifier_resolve_user_prefers_id_over_username_when_both_have_entries_priority_order()
+    {
+        // `resolve_user(slack_user_id, slack_username)` checks the
+        // user_map for the ID FIRST, then falls back to the username.
+        // The existing `user_map_resolves_by_id_then_username` test
+        // pins the "id present, username absent" arm AND the
+        // "username present, id absent" arm separately. Pin the
+        // PRIORITY ORDER explicitly: when BOTH have entries (a Slack
+        // workspace where a user has both an ID-keyed AND a
+        // username-keyed mapping — e.g. during a username-rename
+        // transition), the ID arm wins. A refactor that reordered the
+        // `if/if/None` chain (e.g. alphabetized by symbol name to
+        // `if let Some(u) = slack_username { ... } else if let Some(id)
+        // = slack_user_id { ... }`) would silently flip the resolution
+        // for ambiguous fixtures — operators would see audit rows
+        // tagged with the wrong operator email. Symmetric to the
+        // infer_idp priority-order pin in round 221.
+        let mut map = HashMap::new();
+        map.insert("U01ABC".to_string(), "alice@id-arm.com".to_string());
+        map.insert("alice".to_string(), "alice@username-arm.com".to_string());
+        let n = SlackNotifier::new(
+            "https://hooks.slack.com/services/T/B/X".into(),
+            SlackSigningSecret::new("s"),
+            "https://proxy.local".into(),
+        )
+        .unwrap()
+        .with_user_map(map);
+        let resolved = n.resolve_user(Some("U01ABC"), Some("alice"));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("alice@id-arm.com"),
+            "id arm must win when both have entries",
+        );
+    }
+
+    #[test]
+    fn slack_build_error_inner_field_pinned_owned_string_via_destructure_for_dynamic_message_arm() {
+        // `SlackBuildError(pub String)` — single-field tuple struct
+        // with an owned `String` carrying the reqwest builder error
+        // message. The value flows through `anyhow::Error` chains at
+        // the boot path which require Send+Sync+'static — owned String
+        // satisfies that trivially. A refactor to `&'static str` "for
+        // cheaper passthrough on common-error fast paths" would force
+        // every `SlackBuildError(e.to_string())` site to `Box::leak`
+        // the dynamic message OR fragment the construction into a
+        // match-arm enum of static prefixes. Pin via destructure
+        // accessing the inner field as String. Symmetric to the
+        // NotifierBuildError + ConnectError inner-String pins.
+        let e = SlackBuildError("boot client failed: dns".into());
+        let SlackBuildError(inner) = &e;
+        fn require_string(_: &String) {}
+        require_string(inner);
+        assert_eq!(inner, "boot client failed: dns");
+        // And a multibyte unicode message round-trips byte-equal
+        // through the owned-String field — pin so a future inner
+        // type that normalized Unicode would surface here.
+        let multibyte = SlackBuildError("боот failed: тест".into());
+        let SlackBuildError(m) = &multibyte;
+        assert_eq!(m, "боот failed: тест");
+    }
 }

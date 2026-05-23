@@ -950,4 +950,188 @@ mod tests {
         // substituted byte-exact.
         assert_eq!(e.to_string(), "insufficient scope: need `policy:write`");
     }
+
+    // ─── round 247 (2026-05-22): OperatorPrincipal + ScopeError + state field
+    // counts, require_scope fn-pointer witness, scope-prefix hygiene pin ───
+
+    #[test]
+    fn operator_principal_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest() {
+        // `OperatorPrincipal { token_id, name, scopes, last_used_at }` —
+        // exactly 4 fields. A 5th field landing (e.g.
+        // `tenant_id: Option<Uuid>` for multi-tenant operator scoping OR
+        // `mfa_verified_at: Option<DateTime<Utc>>` for elevated-scope
+        // audit) without matching middleware construction wiring would
+        // silently zero-initialize the new field on every authenticated
+        // request — and any handler reading it would see the default
+        // forever. The exhaustive destructure with no `..` rest pattern
+        // forces a 5th field to update this site in lockstep with the
+        // middleware constructor. Symmetric to round-240's
+        // `blocked_notification_field_count_pinned_at_exactly_sixteen_via_exhaustive_destructure_no_rest`
+        // + round-243's
+        // `auth_state_field_count_pinned_at_exactly_ten_via_exhaustive_destructure_no_rest_pattern`
+        // extended to this sibling axum-extension wrapper.
+        let p = OperatorPrincipal {
+            token_id: Uuid::nil(),
+            name: "op".into(),
+            scopes: Arc::new(vec!["policy:read".to_string()]),
+            last_used_at: None,
+        };
+        let OperatorPrincipal {
+            token_id: _,
+            name: _,
+            scopes: _,
+            last_used_at: _,
+        } = p;
+    }
+
+    #[test]
+    fn scope_error_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern() {
+        // `ScopeError { required, have }` — exactly 2 fields. A 3rd field
+        // landing (e.g. `granted_via: Option<String>` to track WHICH
+        // upstream issued the scope set, OR `expires_at:
+        // DateTime<Utc>` for per-scope expiry observability) without
+        // matching the `require_scope` Err-arm constructor would
+        // silently zero-initialize on every 403 — and the JSON response
+        // body serializer would either drop the field (if it doesn't
+        // derive Serialize) or surface a default value that confuses
+        // operator dashboards keying on the field presence. The
+        // exhaustive destructure with no `..` rest pattern forces a 3rd
+        // field to update this site in lockstep with the
+        // `require_scope` Err construction site. Symmetric to round-238's
+        // `email_build_error_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure`
+        // extended to this sibling 403-response-payload struct.
+        let e = ScopeError {
+            required: "policy:write".to_string(),
+            have: vec!["policy:read".to_string()],
+        };
+        let ScopeError {
+            required: _,
+            have: _,
+        } = e;
+    }
+
+    #[tokio::test]
+    async fn operator_auth_state_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest()
+     {
+        // `OperatorAuthState { db, enforced, touch_cache }` — exactly 3
+        // fields. A 4th field landing (e.g.
+        // `rate_limiter: Arc<RateLimiter>` for per-operator request-rate
+        // observability OR `audit_sink: Arc<dyn AuditSink>` for token-
+        // use forwarding to SIEM) without matching `new()` constructor
+        // wiring would silently zero-initialize on every middleware
+        // invocation — and the per-operator audit log would
+        // permanently emit zero events. The exhaustive destructure with
+        // no `..` rest pattern forces a 4th field to update this site
+        // in lockstep with `OperatorAuthState::new`. Symmetric to
+        // round-243's
+        // `auth_state_field_count_pinned_at_exactly_ten_via_exhaustive_destructure_no_rest_pattern`
+        // extended to this sibling operator-side axum-state shape.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://x:y@127.0.0.1:1/z")
+            .expect("lazy connect");
+        let s = OperatorAuthState::new(pool, true);
+        let OperatorAuthState {
+            db: _,
+            enforced: _,
+            touch_cache: _,
+        } = s;
+    }
+
+    #[test]
+    fn require_scope_method_signature_self_borrow_scope_borrow_returns_result_via_fn_pointer_witness()
+     {
+        // `OperatorPrincipal::require_scope(&self, scope: &str) -> Result<(), ScopeError>` —
+        // takes `&self` BORROW (for cross-handler shared principal access
+        // via axum extensions) AND `&str` BORROW (zero-alloc on the
+        // scope-string-literal hot path) and returns `Result<(),
+        // ScopeError>`. The handler call sites use
+        // `principal.require_scope("policy:write")?` to bubble 403s
+        // into the response envelope. A refactor to `fn
+        // require_scope(self, ...)` "consuming the principal at the
+        // gate" would foreclose the per-request multi-gate pattern
+        // (handlers sometimes check multiple scopes); a refactor that
+        // returned `bool` "for ergonomic `if`-gate" would silently
+        // drop the `have` operator-dashboard context. Pin via
+        // fn-pointer witness. Symmetric to round-246's
+        // `bearer_hash_method_signature_self_borrow_returns_owned_bearer_hash_via_fn_pointer_witness`
+        // extended to this sibling scope-gate method.
+        let _f: fn(&OperatorPrincipal, &str) -> Result<(), ScopeError> =
+            OperatorPrincipal::require_scope;
+    }
+
+    #[test]
+    fn scope_catalogue_strings_all_carry_colon_separator_for_resource_action_split() {
+        // The operator-scope catalogue uses the `resource:action` shape
+        // (e.g. `policy:read`, `blocks:approve`, `killswitch:revoke`).
+        // The colon separator is load-bearing for: (a) the dashboard's
+        // "group scopes by resource" UI rule, and (b) the CLI's
+        // `tokens issue --scope policy:*` glob expansion. A refactor
+        // that swapped to a dotted separator (`policy.read`) "for
+        // symmetry with action_event vendor.action shape" would
+        // silently break both consumers. Pin the colon separator on
+        // every catalogue entry — and pin that the WILDCARD constant
+        // is the lone exception (no colon, single asterisk). Symmetric
+        // to round-219's
+        // `scope_catalogue_carries_exactly_twelve_entries_pinning_the_documented_set_byte_exact`
+        // (which pins the SHAPE of the set) extended to this hyphenated-
+        // syntax contract.
+        for entry in shared_types::operator_scopes::SCOPE_CATALOGUE {
+            let scope = entry.0;
+            // Skip the wildcard sigil — pinned separately below.
+            if scope == WILDCARD {
+                continue;
+            }
+            assert!(
+                scope.contains(':'),
+                "scope `{scope}` missing colon separator"
+            );
+            // Sanity: exactly ONE colon (no nested `resource:sub:action`
+            // shapes today — a refactor adding nested scopes would
+            // surface here as multi-colon entries).
+            assert_eq!(
+                scope.matches(':').count(),
+                1,
+                "scope `{scope}` carries >1 colon",
+            );
+            // Resource half + action half are both non-empty.
+            let (res, act) = scope.split_once(':').expect("colon present");
+            assert!(!res.is_empty(), "scope `{scope}` has empty resource half");
+            assert!(!act.is_empty(), "scope `{scope}` has empty action half");
+        }
+        // WILDCARD intentionally has no colon — it's a sigil, not a
+        // resource:action pair.
+        assert_eq!(WILDCARD, "*");
+        assert!(!WILDCARD.contains(':'));
+    }
+
+    #[test]
+    fn parse_token_prefix_constant_byte_exact_pxl_operator_distinct_from_bearer_pxl_live() {
+        // `PREFIX = "pxl_operator_"` — operator tokens are wire-distinct
+        // from agent bearers (`pxl_live_`) so a leaked operator token
+        // can't slip into the bearer-middleware accept path AND vice
+        // versa. The existing `token_layout_constants_pinned_per_module_docstring`
+        // pin walks the byte-length but not the byte-exact value. A
+        // refactor that "consolidated" the two prefixes (e.g.
+        // `pxl_token_` umbrella for both kinds) would silently break the
+        // wire-distinction contract — operator tokens would parse via
+        // the agent bearer middleware as malformed bearers (length
+        // mismatches), but a future shape that happened to match would
+        // silently authenticate operators on agent endpoints. Pin the
+        // byte-exact prefix AND distinctness from the bearer prefix.
+        // Symmetric to round-246's
+        // `prefix_constant_is_byte_exact_pxl_underscore_live_underscore`
+        // pin extended to this sibling token-family separator.
+        assert_eq!(PREFIX, "pxl_operator_");
+        assert_eq!(PREFIX.len(), 13);
+        assert_eq!(PREFIX.as_bytes(), b"pxl_operator_");
+        // Distinctness from the agent-bearer prefix on BOTH byte
+        // sequences AND structural overlap (no shared SUFFIX that
+        // could be exploited as a forgery path).
+        assert_ne!(PREFIX, "pxl_live_");
+        assert!(
+            !PREFIX.starts_with("pxl_live_") && !"pxl_live_".starts_with(PREFIX),
+            "operator and agent prefixes must be wire-disjoint",
+        );
+    }
 }

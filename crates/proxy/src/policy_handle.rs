@@ -1210,4 +1210,152 @@ mod tests {
         assert!(out.contains("mode: observe"), "rewritten: {out}");
         assert!(out.contains("id: gamma"));
     }
+
+    // ─── round 248 (2026-05-22): PolicyHandle + ReloadReport field counts,
+    // load + source fn-pointer witnesses, WATCH_INTERVAL Duration type pin,
+    // ReloadReport.policy_count usize pin ───
+
+    #[test]
+    fn policy_handle_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // `PolicyHandle { engine, source, raw_yaml, loader, last_version }` —
+        // exactly 5 fields. A 6th field landing (e.g.
+        // `reload_count: Arc<AtomicU64>` for per-handle reload-frequency
+        // observability OR `last_reloaded_at: Arc<ArcSwap<DateTime<Utc>>>`
+        // for staleness alerting) without matching `new()` AND
+        // `with_loader()` constructor wiring would silently zero-
+        // initialize on every handle construction — and the
+        // file-watcher's reload loop would never update the new field.
+        // The exhaustive destructure with no `..` rest pattern forces a
+        // 6th field to update this site in lockstep with BOTH
+        // constructors. Symmetric to round-243's
+        // `auth_state_field_count_pinned_at_exactly_ten_via_exhaustive_destructure_no_rest_pattern`
+        // extended to this sibling hot-reload-state wrapper.
+        let handle = PolicyHandle::new(engine_with(""), None, String::new());
+        let PolicyHandle {
+            engine: _,
+            source: _,
+            raw_yaml: _,
+            loader: _,
+            last_version: _,
+        } = handle;
+    }
+
+    #[test]
+    fn reload_report_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // `ReloadReport { ok, source, policy_count, error }` — exactly
+        // 4 fields. A 5th field landing (e.g. `duration_ms: u64` for
+        // reload-latency observability OR `previous_policy_count: usize`
+        // for delta-reporting on the dashboard) without matching
+        // `reload_from_disk()` AND `swap_from_yaml()` Ok/Err arms would
+        // silently drop the new field on every reload path — and the
+        // existing `reload_report_serializes_with_exactly_four_known_keys`
+        // pin would surface only if a 5th key landed on the wire
+        // through serde, NOT if a `#[serde(skip)]` attribute was added
+        // alongside the new field. The exhaustive destructure with no
+        // `..` rest pattern pins the STRUCT count (not the JSON-key
+        // count) so both axes move in lockstep. Symmetric to round-240's
+        // `blocked_notification_field_count_pinned_at_exactly_sixteen_via_exhaustive_destructure_no_rest`
+        // extended to this sibling operator-facing reload-status struct.
+        let r = ReloadReport {
+            ok: true,
+            source: None,
+            policy_count: 0,
+            error: None,
+        };
+        let ReloadReport {
+            ok: _,
+            source: _,
+            policy_count: _,
+            error: _,
+        } = r;
+    }
+
+    #[test]
+    fn policy_handle_load_return_type_is_arc_engine_via_fn_pointer_witness_for_atomic_swap_share() {
+        // `PolicyHandle::load(&self) -> Arc<Engine>` — returns an
+        // Arc-shared Engine snapshot via `ArcSwap::load_full()`. The
+        // adapter call sites (every request's policy-evaluation path)
+        // depend on the Arc shape so multiple in-flight requests can
+        // hold disjoint snapshots while a reload swaps in a new engine
+        // mid-flight. A refactor to `&Engine` "for zero-alloc per
+        // adapter call" would tie the borrow lifetime to the handle
+        // — and reloads would block until every borrow drained, breaking
+        // the atomic-swap contract that ArcSwap exists to provide.
+        // Pin via fn-pointer witness so a return-type drift surfaces
+        // at this file rather than at the adapter site with an opaque
+        // lifetime error. Symmetric to round-241's
+        // `broadcasting_action_stream_subscribe_return_type_is_broadcast_receiver_via_fn_pointer_witness`
+        // extended to this sibling hot-reload accessor.
+        let _f: fn(&PolicyHandle) -> Arc<Engine> = PolicyHandle::load;
+    }
+
+    #[test]
+    fn policy_handle_source_return_type_is_option_borrowed_pathbuf_via_fn_pointer_witness() {
+        // `PolicyHandle::source(&self) -> Option<&PathBuf>` — returns
+        // a borrowed view into the handle's stored path. The
+        // file-watcher loop calls `source()` on every tick to decide
+        // whether to poll the filesystem; the BORROWED view is
+        // load-bearing for the zero-alloc-per-tick contract. A
+        // refactor to `Option<PathBuf>` "for ergonomic ownership at
+        // the call site" would force a `PathBuf::clone()` per
+        // watcher tick (one syscall + one allocation per 5-second
+        // interval × N handles in a multi-tenant fork), and a
+        // refactor to `Option<String>` "for serde-friendly source
+        // strings" would foreclose the `PathBuf::display()` lossy-
+        // unicode-fallback formatter the operator-facing log uses.
+        // Pin via fn-pointer witness with explicit `for<'a>` lifetime
+        // so a borrow-to-owned refactor surfaces at this file.
+        // Symmetric to round-246's
+        // `bearer_as_str_signature_self_borrow_returns_str_borrow_via_fn_pointer_witness`
+        // extended to this sibling accessor.
+        let _f: for<'a> fn(&'a PolicyHandle) -> Option<&'a PathBuf> = PolicyHandle::source;
+    }
+
+    #[test]
+    fn watch_interval_constant_type_pinned_duration_via_require_duration_for_tokio_sleep_compat() {
+        // `WATCH_INTERVAL: Duration = Duration::from_secs(5)` — the
+        // file-watcher loop calls `tokio::time::sleep(WATCH_INTERVAL)`
+        // on every tick; the `tokio::time::sleep` signature is
+        // `fn sleep(duration: Duration) -> Sleep` (NOT `u64` seconds).
+        // The existing `watch_interval_constant_is_five_seconds_per_documented_fallback_semantics`
+        // pin walks the VALUE (5 seconds) via `as_secs() == 5`; pin the
+        // TYPE via `require_duration` so a refactor to `u64` "for
+        // operator-facing config-file integer surface" would force a
+        // cast at every `sleep(...)` site AND would change the
+        // overflow domain on multiplication (e.g. `WATCH_INTERVAL * 2`
+        // for an exponential backoff refactor would overflow u64
+        // silently above ~580 years vs Duration's saturating ops).
+        // Symmetric to round-242's
+        // `cached_pca_hop_field_pinned_i32_via_require_for_postgres_int4_signed_domain`
+        // extended to this sibling tokio-sleep-typed constant.
+        fn require_duration(_: Duration) {}
+        require_duration(WATCH_INTERVAL);
+    }
+
+    #[test]
+    fn reload_report_policy_count_field_pinned_usize_via_require_for_vec_len_dashboard_compat() {
+        // `ReloadReport.policy_count: usize` — matches the
+        // `Engine::policy_count()` return shape (which is the policy
+        // Vec's `.len()`). The operator dashboard renders this as the
+        // post-reload policy total. A refactor to `u32` "for SQL int4
+        // alignment if the report ever lands in audit_events" would
+        // force a `as u32` cast at every `Engine::policy_count`
+        // assignment AND would silently saturate at 2^32 policies (no
+        // production install gets near that, but the type contract is
+        // the boundary). Pin via require_usize. The `error: Option<String>`
+        // sibling field is symmetrically pinned via the field-types
+        // tests round-219. Symmetric to round-244's
+        // `scenario_quarantined_count_field_is_usize_type_for_vec_len_compat`
+        // extended to this sibling reload-report counter field.
+        fn require_usize(_: usize) {}
+        let r = ReloadReport {
+            ok: true,
+            source: None,
+            policy_count: 42,
+            error: None,
+        };
+        require_usize(r.policy_count);
+    }
 }

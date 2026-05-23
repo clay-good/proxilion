@@ -994,4 +994,202 @@ mod tests {
         let _: fn(&PolicyTrace, uuid::Uuid, &str, &str) = emit;
         let _: fn(&PolicyTrace) -> String = summary;
     }
+
+    // ─── round 250 (2026-05-22): mark_* helper fn-pointer witnesses,
+    // summary unknown-fallback + format byte-exactness, set_layer
+    // replace-vs-append polarities ───
+
+    #[test]
+    fn mark_layer_a_failed_signature_takes_trace_mut_and_owned_string_via_fn_pointer_witness() {
+        // `mark_layer_a_failed(trace: &mut PolicyTrace, detail: String)` —
+        // takes `&mut` BORROW of the trace (in-place mutation, the
+        // adapter holds the trace owned across the request handler)
+        // and OWNED `String` detail (the upstream Trust Plane refusal
+        // body is moved into the `LayerOutcome.detail` field, NOT
+        // borrowed — the adapter call site uses
+        // `body.to_string()` before this call). A refactor to
+        // `&str` detail "for zero-alloc on the cold-path refusal"
+        // would tie the LayerOutcome's lifetime to the request frame
+        // — but `LayerOutcome.detail` is `Option<String>` (owned) and
+        // crosses the `.await` boundary to `emit(...)`, producing a
+        // use-after-free. Pin via fn-pointer witness so a signature
+        // drift surfaces at this file. Symmetric to round-238's
+        // `email_notifier_with_max_retries_consumes_self_and_returns_self_via_fn_pointer_witness`
+        // extended to this sibling mutation helper.
+        let _f: fn(&mut PolicyTrace, String) = mark_layer_a_failed;
+    }
+
+    #[test]
+    fn mark_read_filter_signature_takes_four_args_via_fn_pointer_witness_with_owned_string_detail()
+    {
+        // `mark_read_filter(trace: &mut PolicyTrace, blocked: bool,
+        // matched_policy_id: Option<String>, detail: String)` — the
+        // 4-arg signature is load-bearing: `blocked` flips the
+        // `LayerOutcome.passed` bit AND selects between the
+        // `ErrorCode::ReadFilterBlocked`-bearing `failed` arm and the
+        // `passed=true` arm. `matched_policy_id` flows into the
+        // `matched_rule_id` slot on BOTH arms — operator dashboards
+        // bucket on the rule id even on passing reads (to attribute
+        // read-filter quarantine actions to a policy). A refactor
+        // that collapsed the 4-arg signature to a single
+        // `outcome: LayerOutcome` "for consistency with set_layer"
+        // would foreclose the callsite ergonomics that thread the
+        // 4 atoms straight through. Pin via fn-pointer witness.
+        let _f: fn(&mut PolicyTrace, bool, Option<String>, String) = mark_read_filter;
+    }
+
+    #[test]
+    fn summary_failed_layer_with_none_error_code_falls_back_to_unknown_label_byte_exact() {
+        // `summary` renders failed layers as `<layer>=<error_code>`
+        // using `l.error_code.map(|c| c.as_str()).unwrap_or("unknown")`.
+        // A failed layer with `error_code: None` MUST surface the
+        // literal `"unknown"` fallback string — a refactor that
+        // changed the fallback to `"failed"` or `""` "for clearer
+        // dashboard rendering" would silently break every operator
+        // alert filter keyed on the `=unknown` substring. The
+        // existing `summary_label_strings_for_each_policy_layer_are_byte_exact_lowercase_snake_case`
+        // pin walks the LAYER half of the `<layer>=<code>` format;
+        // pin the FALLBACK half here on the same byte-exact basis.
+        let outcome = LayerOutcome {
+            layer: PolicyLayer::ReadFilter,
+            passed: false,
+            matched_rule_id: None,
+            error_code: None,
+            detail: None,
+        };
+        let trace = PolicyTrace::new(vec![outcome], Decision::Allow, vec![]);
+        let s = summary(&trace);
+        assert_eq!(s, "read_filter=unknown");
+    }
+
+    #[test]
+    fn summary_failed_layer_with_some_error_code_renders_layer_equals_code_format_byte_exact() {
+        // Symmetric to the None-fallback pin above: when `error_code`
+        // is `Some(code)`, the format is `<layer>=<code.as_str()>` —
+        // byte-exact, no quoting, no padding. A refactor that wrapped
+        // the code in quotes (`<layer>="<code>"` "for JSON-quotable
+        // log lines") OR that prepended/appended any decoration would
+        // surface here. Pin all THREE layer × code combinations across
+        // the canonical 3-layer set to exercise the full grid of
+        // `summary` output shapes.
+        let trace = PolicyTrace::new(
+            vec![
+                LayerOutcome::failed(
+                    PolicyLayer::LayerA,
+                    ErrorCode::PicInvariantViolation,
+                    None,
+                    None,
+                ),
+                LayerOutcome::failed(PolicyLayer::LayerB, ErrorCode::PolicyBlocked, None, None),
+                LayerOutcome::failed(
+                    PolicyLayer::ReadFilter,
+                    ErrorCode::ReadFilterBlocked,
+                    None,
+                    None,
+                ),
+            ],
+            Decision::Allow,
+            vec![],
+        );
+        let s = summary(&trace);
+        // Each layer rendered as `<layer>=<code.as_str()>` joined by
+        // commas — pin the full byte-exact string.
+        let expected = format!(
+            "layer_a={},layer_b={},read_filter={}",
+            ErrorCode::PicInvariantViolation.as_str(),
+            ErrorCode::PolicyBlocked.as_str(),
+            ErrorCode::ReadFilterBlocked.as_str(),
+        );
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn set_layer_replaces_existing_entry_in_place_preserving_vec_position_for_zero_drift() {
+        // `set_layer` is documented as "replace OR append": when the
+        // target layer already exists in `trace.layers`, the helper
+        // replaces it IN PLACE rather than appending a duplicate. The
+        // existing `mark_layer_a_failed_detail_field_lands_in_layer_outcome_detail_as_owned_string`
+        // pin walks the post-flip detail content but not the
+        // structural in-place-vs-append polarity. A refactor that
+        // changed the replace path to a push (`trace.layers.push(replacement)`
+        // unconditionally) "for ergonomic history-of-flips
+        // observability" would silently DOUBLE every flipped layer in
+        // the emitted `summary()` output AND would break the
+        // `trace.allowed()` check (which iterates `layers` and
+        // short-circuits on `passed=false` — duplicates wouldn't
+        // change semantics but would inflate the audit-log line
+        // size). Pin the in-place replacement: vec length stays
+        // constant AND the slot at the original index carries the
+        // new outcome.
+        let mut trace = PolicyTrace::new(
+            vec![LayerOutcome {
+                layer: PolicyLayer::LayerA,
+                passed: true,
+                matched_rule_id: None,
+                error_code: None,
+                detail: Some("originally passed".into()),
+            }],
+            Decision::Allow,
+            vec![],
+        );
+        assert_eq!(trace.layers.len(), 1);
+        set_layer(
+            &mut trace,
+            PolicyLayer::LayerA,
+            LayerOutcome::failed(
+                PolicyLayer::LayerA,
+                ErrorCode::PicInvariantViolation,
+                None,
+                Some("now failed".into()),
+            ),
+        );
+        // Length unchanged — replace, not append.
+        assert_eq!(
+            trace.layers.len(),
+            1,
+            "set_layer must replace in place, not append duplicate",
+        );
+        // Slot now carries the replacement.
+        assert!(!trace.layers[0].passed);
+        assert_eq!(trace.layers[0].detail.as_deref(), Some("now failed"));
+    }
+
+    #[test]
+    fn set_layer_appends_when_target_layer_absent_for_initial_population_path() {
+        // Symmetric to the in-place-replace pin above: when the
+        // target layer is ABSENT from `trace.layers`, the helper
+        // pushes a fresh entry. A refactor that changed the absent
+        // path to a no-op (`if let Some(slot) = ... { *slot = ... }`
+        // dropping the else branch) "to enforce that callers
+        // pre-populate the trace" would silently drop the first
+        // mark on every adapter call — and the engine's policy
+        // trace would be missing the layer entry entirely, breaking
+        // the dashboard's "every request shows all 3 layers" UI
+        // expectation. Pin the append-on-absent contract by
+        // starting with an empty `layers` vec and verifying the
+        // post-call length is exactly 1.
+        let mut trace = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+        assert_eq!(trace.layers.len(), 0);
+        set_layer(
+            &mut trace,
+            PolicyLayer::ReadFilter,
+            LayerOutcome {
+                layer: PolicyLayer::ReadFilter,
+                passed: true,
+                matched_rule_id: Some("drive-quarantine-policy".into()),
+                error_code: None,
+                detail: Some("quarantined 2 attachments".into()),
+            },
+        );
+        assert_eq!(
+            trace.layers.len(),
+            1,
+            "set_layer must append when layer is absent",
+        );
+        assert_eq!(trace.layers[0].layer, PolicyLayer::ReadFilter);
+        assert_eq!(
+            trace.layers[0].matched_rule_id.as_deref(),
+            Some("drive-quarantine-policy")
+        );
+    }
 }

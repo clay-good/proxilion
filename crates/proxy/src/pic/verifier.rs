@@ -1332,4 +1332,219 @@ mod tests {
         require_result_unit(Err(VerifierError::Missing(Uuid::nil())));
         require_result_unit(Ok(()));
     }
+
+    // ─── round 249 (2026-05-22): PicVerifier + VerificationResult field
+    // counts, struct-variant 2-field layouts on HopOrder/ContinuityBroken/
+    // P0Mismatch, PicVerifier::new fn-pointer witness, invariant_kind
+    // signature pin ───
+
+    #[tokio::test]
+    async fn pic_verifier_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // `PicVerifier { pca_cache, cat_keys, cache }` — exactly 3
+        // fields. A 4th field landing (e.g.
+        // `metrics_label: &'static str` for per-verifier metric
+        // bucketing OR `circuit_breaker: CircuitBreaker` per-Trust-Plane
+        // damping on CAT key fetches) without matching `new()`
+        // constructor wiring would silently zero-initialize the new
+        // field on every verifier construction — and any handler
+        // reading it would see the default forever. The exhaustive
+        // destructure with no `..` rest pattern forces a 4th field to
+        // update this site in lockstep with the constructor.
+        // Symmetric to round-241's
+        // `broadcasting_action_stream_field_count_pinned_at_exactly_two_via_exhaustive_destructure`
+        // + round-242's
+        // `cached_pca_field_count_pinned_exactly_eight_via_exhaustive_destructure`
+        // extended to this sibling chain-walker wrapper.
+        let cache = PcaCache::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("postgres://x:y@127.0.0.1:1/z")
+                .expect("lazy connect"),
+        );
+        let cat_keys = CatKeyRegistry::new("http://127.0.0.1:1/".into());
+        let v = PicVerifier::new(cache, cat_keys);
+        let PicVerifier {
+            pca_cache: _,
+            cat_keys: _,
+            cache: _,
+        } = v;
+    }
+
+    #[test]
+    fn verification_result_field_count_pinned_at_exactly_seven_via_exhaustive_destructure_no_rest()
+    {
+        // `VerificationResult { intact, links_verified, p_0, broken_at,
+        // reason, pic_profile, pic_profile_mismatch_at }` — exactly
+        // 7 fields. A 8th field landing (e.g.
+        // `duration_micros: u64` for per-verify-latency observability
+        // OR `walked_chain: Vec<Uuid>` for full-chain audit-trail
+        // export) without matching `verify()` Ok/Err arm wiring would
+        // silently drop the new field on every verification — and the
+        // existing
+        // `verification_result_serializes_with_exactly_seven_known_keys`
+        // pin would catch JSON-shape drift via serde, BUT a
+        // `#[serde(skip)]` attribute alongside the new field would
+        // bypass that check. The exhaustive destructure with no `..`
+        // rest pattern pins the STRUCT count (not the JSON-key count)
+        // so both axes move in lockstep. Symmetric to round-248's
+        // `reload_report_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest_pattern`
+        // extended to this sibling chain-verification-status struct.
+        let r = VerificationResult {
+            intact: true,
+            links_verified: 0,
+            p_0: None,
+            broken_at: None,
+            reason: None,
+            pic_profile: None,
+            pic_profile_mismatch_at: None,
+        };
+        let VerificationResult {
+            intact: _,
+            links_verified: _,
+            p_0: _,
+            broken_at: _,
+            reason: _,
+            pic_profile: _,
+            pic_profile_mismatch_at: _,
+        } = r;
+    }
+
+    #[test]
+    fn verifier_error_struct_variants_continuity_p0_hop_all_pinned_two_named_fields_via_destructure()
+     {
+        // Three of VerifierError's eight variants are STRUCT variants
+        // with exactly 2 named fields each:
+        //   * `ContinuityBroken { child: Uuid, parent: Uuid }`
+        //   * `P0Mismatch { child_p0: String, parent_p0: String }`
+        //   * `HopOrder { child: u32, parent: u32 }`
+        // A 3rd field landing on any (e.g.
+        // `HopOrder { child: u32, parent: u32, gap: u32 }` "for
+        // delta-reporting on multi-hop skips") without matching the
+        // thiserror Display format string OR the operator log-grep
+        // contract would silently break the byte-exact Display
+        // pinned by `verifier_error_display_prefix_sweep_distinguishes_all_eight_variants`.
+        // The exhaustive destructure with no `..` rest pattern on each
+        // struct variant forces a 3rd field to update this site in
+        // lockstep with the Display attribute. Symmetric to round-230's
+        // `app_error_policy_blocked_struct_variant_field_count_pinned_at_exactly_three_via_exhaustive_destructure`
+        // extended to this triple of sibling chain-walker struct
+        // variants.
+        let cb = VerifierError::ContinuityBroken {
+            child: Uuid::nil(),
+            parent: Uuid::nil(),
+        };
+        match cb {
+            VerifierError::ContinuityBroken {
+                child: _,
+                parent: _,
+            } => {}
+            _ => unreachable!(),
+        }
+        let p0 = VerifierError::P0Mismatch {
+            child_p0: "a".into(),
+            parent_p0: "b".into(),
+        };
+        match p0 {
+            VerifierError::P0Mismatch {
+                child_p0: _,
+                parent_p0: _,
+            } => {}
+            _ => unreachable!(),
+        }
+        let ho = VerifierError::HopOrder {
+            child: 2,
+            parent: 0,
+        };
+        match ho {
+            VerifierError::HopOrder {
+                child: _,
+                parent: _,
+            } => {}
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn verifier_error_tuple_variants_missing_bad_cat_signature_inner_field_pinned_uuid_via_destructure()
+     {
+        // `VerifierError::Missing(Uuid)` and `BadCatSignature(Uuid)`
+        // — both tuple variants with exactly one positional `Uuid`
+        // inner. The chain-walker's failure path threads the offending
+        // PCA's UUID through the variant inner so operators can
+        // correlate the failure with the `pca_cache` row in the
+        // dashboard. A refactor to `Missing(String)` "for ergonomic
+        // logging" would force every consumer to `Uuid::parse_str` at
+        // every grep site AND would silently break the `broken_at:
+        // Option<Uuid>` field on VerificationResult that the verifier
+        // populates from these variants. Pin both arms via destructure
+        // with explicit `let _: Uuid = inner;` type binding. Symmetric
+        // to round-242's
+        // `cache_error_db_variant_layout_pinned_tuple_via_exhaustive_destructure_one_positional_inner_sqlx`
+        // extended to this pair of sibling chain-walker tuple variants.
+        let id = Uuid::new_v4();
+        let m = VerifierError::Missing(id);
+        match m {
+            VerifierError::Missing(inner) => {
+                let _check: Uuid = inner;
+                assert_eq!(inner, id);
+            }
+            _ => unreachable!(),
+        }
+        let b = VerifierError::BadCatSignature(id);
+        match b {
+            VerifierError::BadCatSignature(inner) => {
+                let _check: Uuid = inner;
+                assert_eq!(inner, id);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn pic_verifier_new_signature_takes_pca_cache_and_cat_keys_by_value_returns_self_via_fn_pointer()
+     {
+        // `PicVerifier::new(pca_cache: PcaCache, cat_keys: CatKeyRegistry) -> Self` —
+        // takes BOTH dependencies by VALUE (Arc-shared internally via
+        // their own constructors) and returns OWNED `Self`. server.rs
+        // calls `PicVerifier::new(pool.into_pca_cache(), cat_keys.clone())`
+        // — both arguments are cheap to clone (Arc bump under the
+        // hood) but the by-value boundary lets the caller hand off
+        // without an extra wrapper. A refactor to `&PcaCache` /
+        // `&CatKeyRegistry` "to avoid the clone" would foreclose the
+        // no-lifetime-parameter shape AppState relies on. A refactor
+        // to `Result<Self, _>` "for structured construction errors"
+        // would force every call site to handle the Err arm even
+        // though both constructors today are infallible — and would
+        // surface as ?-chain breakage at the AppState assembly site.
+        // Pin via fn-pointer witness so a signature drift surfaces at
+        // this file. Symmetric to round-242's
+        // `pca_cache_new_constructor_type_signature_takes_pg_pool_by_value`
+        // extended to this sibling chain-walker constructor.
+        let _f: fn(PcaCache, CatKeyRegistry) -> PicVerifier = PicVerifier::new;
+    }
+
+    #[test]
+    fn invariant_kind_signature_takes_verifier_error_borrow_returns_static_str_via_fn_pointer_witness()
+     {
+        // `invariant_kind(e: &VerifierError) -> &'static str` — takes a
+        // BORROW (no consumption of the error) and returns a
+        // `&'static str` label from the canonical 8-entry set. The
+        // BORROW shape is load-bearing for the chain-walker's failure
+        // path which threads `?` to bubble the VerifierError up to the
+        // top-level `verify()` function while ALSO labelling it for
+        // metrics via this helper. A refactor that consumed the error
+        // (`fn invariant_kind(e: VerifierError) -> &'static str`)
+        // would foreclose the bubble-and-label dual-use pattern. A
+        // refactor returning `String` "for runtime-formatted labels"
+        // would silently break the existing
+        // `invariant_kind_returns_static_str_from_canonical_eight_label_set`
+        // pin (which checks &'static str-ness implicitly via
+        // require_static_str). Pin via fn-pointer witness with
+        // explicit `for<'a>` lifetime so a signature drift surfaces.
+        // Symmetric to round-216's
+        // `google_client_from_env_return_type_is_result_self_string_for_main_caller_chain`
+        // extended to this sibling internal-helper signature.
+        let _f: fn(&VerifierError) -> &'static str = invariant_kind;
+    }
 }

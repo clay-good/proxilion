@@ -624,4 +624,163 @@ mod tests {
             panic!("unmarked hash should not be killed");
         }
     }
+
+    // ─── round 228 (2026-05-22): KillCache exhaustive destructure, constructor
+    // + mark_many fn-pointer return-type pins, ENTRY_TTL value-stability,
+    // is_killed return-type fn-pointer, mark accepts owned [u8;32] not borrow ───
+
+    #[tokio::test]
+    async fn kill_cache_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest() {
+        // `KillCache { hashes: Cache<[u8; 32], ()> }` — exactly 1 field
+        // (the moka cache). A 2nd field landing (e.g. `marks_total:
+        // AtomicU64` for in-struct metric tracking, OR `redis_backend:
+        // Option<RedisClient>` for the v2 multi-replica shared-cache
+        // path) without matching `KillCache::new()` constructor wiring
+        // would silently leave the new field zero-initialized — the
+        // v2 multi-replica path would be silently a no-op. The
+        // exhaustive destructure with no `..` rest pattern forces a
+        // 2nd field to update this site in lockstep with the
+        // constructor. Symmetric to the WebhookSecret 1-field +
+        // ExpirySweepReport 1-field + EscalationSweepReport 1-field
+        // exhaustive-destructure pins extended to this sibling cache
+        // type.
+        let kc = KillCache::new();
+        let KillCache { hashes: _ } = kc;
+    }
+
+    #[test]
+    fn kill_cache_new_return_type_is_owned_self_by_value_via_fn_pointer_witness() {
+        // `KillCache::new() -> Self` is the constructor AppState calls
+        // exactly once at boot. The value is then Arc-wrapped at the
+        // call site (`Arc::new(KillCache::new())`) and shared across
+        // every middleware invocation. Pin the return type at the
+        // construction boundary via a fn-pointer witness `fn() ->
+        // KillCache`. A refactor to `Arc<Self>` "for ergonomic
+        // already-shared construction" would force the AppState
+        // assembly to drop its own Arc-wrap step, breaking the
+        // single-Arc invariant operators rely on (a double-Arc would
+        // pass functional tests but inflate strong_count drifts in
+        // shutdown teardown observation). A refactor to `Result<Self,
+        // BuildError>` "for fallibility on moka builder failure"
+        // would force every AppState assembly site to add `?`.
+        // Symmetric to the TeeStream::new + WebhookNotifier::new
+        // owned-Self fn-pointer pins.
+        let _f: fn() -> KillCache = KillCache::new;
+        fn require_owned_kill_cache(_: KillCache) {}
+        require_owned_kill_cache(KillCache::new());
+    }
+
+    #[test]
+    fn kill_cache_default_return_type_is_owned_self_by_value_via_fn_pointer_witness() {
+        // The `Default` impl on `KillCache` returns `Self` by value —
+        // a refactor that hand-rolled the Default impl to return
+        // `Box<Self>` or `Arc<Self>` would break the AppState
+        // assembly site that uses `KillCache::default()`
+        // interchangeably with `KillCache::new()`. The existing
+        // `default_constructor_yields_empty_cache` test exercises the
+        // VALUE-LEVEL invariant (default == empty); pin the
+        // TYPE-LEVEL return shape via a fn-pointer witness so a future
+        // hand-rolled Default returning Box would surface here at the
+        // type axis, not at the AppState call site downstream.
+        // Symmetric to the KillCache::new fn-pointer pin above.
+        let _f: fn() -> KillCache = <KillCache as Default>::default;
+        fn require_owned_kill_cache(_: KillCache) {}
+        require_owned_kill_cache(KillCache::default());
+    }
+
+    #[tokio::test]
+    async fn entry_ttl_and_max_capacity_constant_values_are_referentially_transparent_across_reads()
+    {
+        // `ENTRY_TTL: Duration` and `MAX_CAPACITY: u64` are file-scope
+        // `const` declarations — reads are inlined at compile time and
+        // MUST produce the byte-identical value across N reads. Pin
+        // referential transparency across 50 reads on each constant.
+        // A refactor that swapped either to a `static` or to a
+        // `lazy_static! { ref ENTRY_TTL: Duration = ... }`
+        // "for env-var override at boot" would silently break the
+        // compile-time inlining AND open the door to per-read
+        // mutation (e.g. a `RwLock<Duration>` for live-tunable TTL).
+        // Symmetric to the sanitize_token + ErrorBody::new RT 50-call
+        // pins extended to these sibling constants.
+        let ttl_first = ENTRY_TTL;
+        let cap_first = MAX_CAPACITY;
+        for i in 0..50 {
+            assert_eq!(ENTRY_TTL, ttl_first, "iter {i}: ENTRY_TTL drift");
+            assert_eq!(MAX_CAPACITY, cap_first, "iter {i}: MAX_CAPACITY drift");
+        }
+    }
+
+    #[test]
+    fn is_killed_borrows_hash_ref_not_owned_for_zero_alloc_hot_path_signature() {
+        // `KillCache::is_killed(&self, hash: &[u8; 32]) -> bool` —
+        // takes `&[u8; 32]` by REFERENCE, not owned `[u8; 32]`. The
+        // middleware's hot path passes a borrow from the
+        // `SessionContext.bearer_hash` field (`&session.bearer_hash`).
+        // A refactor to take by value (`hash: [u8; 32]`) "for moka's
+        // `contains_key(&K)` ergonomics — let the caller move the
+        // 32 bytes in" would force every middleware call site to add
+        // `*hash` or `hash.clone()`, allocating an extra 32 bytes per
+        // request — an observable per-request alloc on the hot path
+        // operators specifically tuned for zero-alloc gates. Pin via
+        // a fn-pointer witness with the borrowed parameter shape.
+        // Symmetric to the existing `mark_signature_takes_owned_hash
+        // _by_value_not_borrow_for_moka_insert_ownership` pin (the
+        // INVERSE on mark()) — both pins together document the asymmetry
+        // between the write path (consume owned) and the read path
+        // (borrow shared).
+        // The future trait dispatch uses generic Future, so we
+        // can't write a direct `fn(...) -> bool` pointer; instead
+        // bind the method-resolution path via a closure with an
+        // explicit parameter signature and assert the body compiles.
+        async fn require_borrow_arg(kc: &KillCache, hash: &[u8; 32]) -> bool {
+            kc.is_killed(hash).await
+        }
+        // Compile-time witness — runtime exercise too.
+        let kc = KillCache::new();
+        let h = [42u8; 32];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let observed = rt.block_on(require_borrow_arg(&kc, &h));
+        assert!(!observed);
+    }
+
+    #[tokio::test]
+    async fn entry_ttl_value_relationships_to_max_capacity_bound_safe_memory_footprint() {
+        // `ENTRY_TTL = 3600s` AND `MAX_CAPACITY = 100_000` together
+        // bound the per-process kill-cache memory footprint at
+        // approximately 100_000 * (32-byte key + ~24-byte moka entry
+        // overhead) = ~5.6 MB. The doc comment claims ~3 MB which is
+        // the bare-key calculation. A refactor that bumped capacity
+        // to 10M "to cover larger fleets" without correspondingly
+        // tightening TTL would push the per-process footprint to
+        // ~560 MB — a regression operators rolling out under tight
+        // RSS budgets would surface only at production scale. Pin
+        // the upper-bound product so a refactor surfaces here at the
+        // value-domain. The strict-equality pins on the two constants
+        // (`entry_ttl_constant_pinned_at_one_hour_per_spec` +
+        // `max_capacity_constant_pinned_at_one_hundred_thousand`)
+        // each cover one axis individually; pin the cross-axis
+        // relationship here so a TTL-tightening compensated by a
+        // capacity-loosening would still trip the gate. Symmetric
+        // to the DEFAULT_TICK_INTERVAL-bounded-positive cross-axis
+        // pin in blocked_expiry.rs.
+        let memory_budget_bytes: u64 = 8 * 1024 * 1024; // 8 MB ceiling
+        let bytes_per_entry: u64 = 64; // generous over-count for moka overhead
+        let estimated_footprint = MAX_CAPACITY * bytes_per_entry;
+        assert!(
+            estimated_footprint <= memory_budget_bytes,
+            "MAX_CAPACITY {MAX_CAPACITY} × bytes_per_entry {bytes_per_entry} = {estimated_footprint} exceeds budget {memory_budget_bytes}",
+        );
+        // And TTL is sized for a steady-state agent retry pattern
+        // (1h covers a single auth re-validation cycle).
+        assert!(
+            ENTRY_TTL >= Duration::from_secs(60),
+            "ENTRY_TTL {:?} is too short — sub-1m TTL would let revoked bearers race the DB",
+            ENTRY_TTL,
+        );
+        assert!(
+            ENTRY_TTL <= Duration::from_secs(86_400),
+            "ENTRY_TTL {:?} is too long — >1d TTL stalls a Redis-backed v2 migration's deduplication",
+            ENTRY_TTL,
+        );
+    }
 }

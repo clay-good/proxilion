@@ -746,4 +746,141 @@ mod tests {
             );
         }
     }
+
+    // ─── round 227 (2026-05-22): SessionContext + SessionCtx exhaustive destructure,
+    // UUID field type pins, SessionExtractError into_response shape +
+    // integer-level 401 status pin ───
+
+    #[test]
+    fn session_context_field_count_pinned_at_exactly_eight_via_exhaustive_destructure_no_rest() {
+        // `SessionContext` carries 8 fields: agent_session_id,
+        // bearer_hash, p_0, leaf_pca_id, leaf_pca_cbor, granted_ops,
+        // google_access_token, google_token_scope. A 9th field landing
+        // (e.g. `refresh_token_ciphertext: Option<Vec<u8>>` to thread
+        // refresh tokens into the adapter layer, OR `idp: &'static str`
+        // for per-IdP adapter routing) without matching auth-middleware
+        // construction would silently zero-default on every session AND
+        // require an update to the manual Debug impl (the manual impl
+        // hand-lists 6 visible fields; a 9th non-redacted field landing
+        // would be silently invisible in operator log output). The
+        // exhaustive destructure with no `..` rest pattern forces a 9th
+        // field to update this site in lockstep with the middleware
+        // construction. Symmetric to the WebhookNotifier 6-field +
+        // TeeStream 2-field + FederationClaims 8-field exhaustive-
+        // destructure pins.
+        let ctx = sample_ctx();
+        let SessionContext {
+            agent_session_id: _,
+            bearer_hash: _,
+            p_0: _,
+            leaf_pca_id: _,
+            leaf_pca_cbor: _,
+            granted_ops: _,
+            google_access_token: _,
+            google_token_scope: _,
+        } = ctx;
+    }
+
+    #[test]
+    fn session_ctx_tuple_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `SessionCtx(pub Arc<SessionContext>)` is a single-field tuple
+        // struct. A 2nd field landing (e.g. `request_id: Uuid` "for
+        // per-handler correlation directly inside the extractor's
+        // tuple wrapper") would force every handler signature `fn h(
+        // SessionCtx(s): SessionCtx)` to update in lockstep AND would
+        // require the FromRequestParts impl to be re-plumbed. The
+        // exhaustive destructure with no `..` rest pattern forces a
+        // 2nd field to update this site so the breakage surfaces here
+        // rather than at every (potentially distant) handler signature.
+        // Symmetric to the WebhookSecret 1-field + ExpirySweepReport
+        // 1-field exhaustive-destructure pins.
+        let ctx = Arc::new(sample_ctx());
+        let session_ctx = SessionCtx(ctx);
+        let SessionCtx(_inner) = session_ctx;
+    }
+
+    #[test]
+    fn session_context_uuid_fields_pinned_uuid_type_for_postgres_uuid_column_compat() {
+        // `SessionContext.agent_session_id` and `SessionContext.leaf_pca_id`
+        // are both `uuid::Uuid` matching the postgres `oauth_sessions.id
+        // UUID NOT NULL` and `pcas.id UUID NOT NULL` column shapes. The
+        // existing field-type sweep pins owned-String + [u8;32] +
+        // Vec<u8> + Vec<String> on the other 6 fields, but doesn't
+        // explicitly pin the UUID type on these two. A refactor to
+        // `String` "for ergonomic round-trip through the audit log's
+        // request_id field" would break the sqlx bind path at every
+        // INSERT site that uses these IDs. A refactor to a custom
+        // newtype `wrapper::AgentSessionId(Uuid)` "for type-level
+        // mixing-prevention between agent_session_id and leaf_pca_id"
+        // would pass any string-formatter test AND silently change
+        // the `format!("{id}")` shape downstream. Pin via require_uuid
+        // on both fields. Symmetric to the EscalationRow uuid-field
+        // pin in round 226 extended to this sibling session shape.
+        fn require_uuid(_: uuid::Uuid) {}
+        let ctx = sample_ctx();
+        require_uuid(ctx.agent_session_id);
+        require_uuid(ctx.leaf_pca_id);
+    }
+
+    #[tokio::test]
+    async fn session_extract_error_into_response_return_type_is_response_via_fn_pointer_witness() {
+        // `SessionExtractError::into_response(self) -> Response` is
+        // the IntoResponse trait impl that axum invokes when the
+        // extractor rejects. Pin the return type via a fn-pointer
+        // witness `fn(SessionExtractError) -> Response`. A refactor
+        // that returned `(StatusCode, &'static str)` directly "for
+        // ergonomic tuple-return symmetry with axum's blanket impl"
+        // would still satisfy `IntoResponse` at the trait level but
+        // would break this fn-pointer binding because the concrete
+        // type would no longer be `Response`. The fixed body the
+        // operator log filters key on (`unauthorized` 12-byte exact)
+        // depends on the `Response` constructor path that the manual
+        // impl emits. Symmetric to the OAuthError into_response +
+        // ErrorBody into_response Content-Type pins.
+        let _f: fn(SessionExtractError) -> Response =
+            <SessionExtractError as IntoResponse>::into_response;
+        fn require_response(_: Response) {}
+        require_response(SessionExtractError.into_response());
+    }
+
+    #[tokio::test]
+    async fn session_extract_error_into_response_status_pinned_401_via_as_u16_integer_level() {
+        // The existing `session_extract_error_into_response_is_401`
+        // pin checks `StatusCode::UNAUTHORIZED` via the typed constant.
+        // Pin the same value at the INTEGER level (`.as_u16() == 401`)
+        // so a refactor that introduced a custom `StatusCode` from a
+        // bad `try_from(401)` site OR a refactor that swapped to a
+        // freshly-declared `const PROXY_AUTH_REQUIRED: u16 = 407`
+        // "for proxy-authenticate semantics" would surface here at
+        // the integer comparison, not at the typed-constant check
+        // which auto-coerces. Symmetric to the OAuthError PicInvariant
+        // 403 + BridgeRejected 401 integer-level status pins.
+        let r = SessionExtractError.into_response();
+        assert_eq!(
+            r.status().as_u16(),
+            401,
+            "401 is the wire-shape operator alerts key on; refactor that drifted to 407/403 would surface here",
+        );
+    }
+
+    #[test]
+    fn session_ctx_rejection_associated_type_pinned_session_extract_error_via_type_binding() {
+        // The `FromRequestParts<S> for SessionCtx` impl declares
+        // `type Rejection = SessionExtractError`. Pin the associated
+        // type at the type-binding level so a refactor that widened
+        // it to `axum::http::Response` (the most-permissive valid
+        // shape) "for ergonomic ad-hoc error rendering inside the
+        // extractor" would silently break operator-facing log
+        // filters that key on the 12-byte `unauthorized` body
+        // SessionExtractError emits. The type binding compiles only
+        // when `<SessionCtx as FromRequestParts<()>>::Rejection ==
+        // SessionExtractError`. Symmetric to the OAuthError variant-
+        // count + ErrorCode wire-string-stability pins extended to
+        // this trait-impl associated-type slot.
+        fn require_rejection_is_session_extract_error<
+            T: axum::extract::FromRequestParts<(), Rejection = SessionExtractError>,
+        >() {
+        }
+        require_rejection_is_session_extract_error::<SessionCtx>();
+    }
 }

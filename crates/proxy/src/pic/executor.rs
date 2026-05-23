@@ -1050,4 +1050,194 @@ mod tests {
         // = 46 bytes — pin a single-byte drift would surface here.
         assert_eq!(kid.len(), 46, "kid length drift: {kid:?}");
     }
+
+    // ─── round 239 (2026-05-22): ExecutorError + SuccessorOutcome variant
+    // counts, PicExecutor + Inner + IssuePcaResponse field counts, and
+    // PicExecutor::new return-type fn-pointer witness ───
+
+    #[test]
+    fn executor_error_variant_count_pinned_at_exactly_five_via_exhaustive_match_no_underscore_fallback()
+     {
+        // `ExecutorError { Upstream, Transport, Invariant, Core, Base64 }` —
+        // exactly 5 variants. A 6th variant landing (e.g.
+        // `Timeout(Duration)` for a per-call deadline-exceeded surface OR
+        // `RateLimited { retry_after: u32 }` for the Trust Plane's 429
+        // response branch) without matching arms in `into_response`-style
+        // handler error code and in the operator-grep alert filters would
+        // silently fall through any existing wildcard `_ => …` and lose its
+        // distinct triage bucket. Pin the variant count via an exhaustive
+        // match with NO underscore fallback so the compiler forces every
+        // call site to update in lockstep with a new variant addition.
+        // Symmetric to the `AppError` 11-variant + `OAuthError` exhaustive-
+        // match pins in rounds 230 + 220 extended to this sibling error
+        // type. The Transport / Base64 / Core arms construct minimal real
+        // inner values; Upstream uses named fields.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let transport_err = rt.block_on(async {
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(1))
+                .build()
+                .unwrap()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+                .expect_err("must error")
+        });
+        let b64_err = base64::engine::general_purpose::STANDARD
+            .decode("@@@")
+            .expect_err("non-b64 must error");
+        let variants: [ExecutorError; 5] = [
+            ExecutorError::Upstream {
+                status: 503,
+                body: "x".into(),
+            },
+            ExecutorError::Transport(transport_err),
+            ExecutorError::Invariant("x".into()),
+            ExecutorError::Core("x".into()),
+            ExecutorError::Base64(b64_err),
+        ];
+        for e in variants {
+            match e {
+                ExecutorError::Upstream { .. } => {}
+                ExecutorError::Transport(_) => {}
+                ExecutorError::Invariant(_) => {}
+                ExecutorError::Core(_) => {}
+                ExecutorError::Base64(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn pic_executor_field_count_pinned_at_exactly_one_inner_arc_via_exhaustive_destructure() {
+        // `PicExecutor { inner: Arc<Inner> }` — exactly 1 field. A 2nd
+        // field landing on the outer wrapper (e.g.
+        // `metrics_label: &'static str` for per-executor metric
+        // bucketing OR `circuit_breaker: CircuitBreaker` per-Trust-Plane
+        // damping) without matching `Clone` and `new()` wiring would
+        // silently leave the new field defaulted on every clone (the
+        // current derive(Clone) clones `inner` only — a 2nd field would
+        // need explicit handling). The exhaustive destructure with no
+        // `..` rest pattern forces a 2nd field to update this site in
+        // lockstep with both the constructor and the Clone derive.
+        // Symmetric to the `TeeStream` 2-field + `BurstSuppressor`
+        // 3-field exhaustive-destructure pins in rounds 224 + 235
+        // extended to this sibling Arc-wrapping shape.
+        let exec = PicExecutor::dev_ephemeral("http://127.0.0.1:1/".into()).unwrap();
+        let PicExecutor { inner: _ } = exec;
+    }
+
+    #[test]
+    fn inner_module_private_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest()
+    {
+        // `Inner { http, trust_plane_url, keypair, kid, registered }` —
+        // module-private holder for executor state, exactly 5 fields. A
+        // 6th field landing (e.g. `executor_kid_signature: Signature` for
+        // a self-signed kid-binding payload OR
+        // `last_register_at: OnceCell<Instant>` for re-registration
+        // backoff observability) without matching `new()` wiring would
+        // silently zero-initialize the new field on every PicExecutor
+        // construction — and re-registration logic keyed on
+        // `last_register_at` would see `None` forever, never tripping.
+        // The exhaustive destructure with no `..` rest pattern forces a
+        // 6th field to update this site in lockstep with the constructor.
+        // Symmetric to the `BatchState` 3-field + `Bucket` 3-field
+        // module-private exhaustive-destructure pins in rounds 236 + 235
+        // extended to this sibling holder.
+        let exec = PicExecutor::dev_ephemeral("http://127.0.0.1:1/".into()).unwrap();
+        let Inner {
+            http: _,
+            trust_plane_url: _,
+            keypair: _,
+            kid: _,
+            registered: _,
+        } = &*exec.inner;
+    }
+
+    #[test]
+    fn successor_outcome_variant_count_pinned_at_exactly_two_via_exhaustive_match_no_underscore() {
+        // `SuccessorOutcome { Issued, AuditFallback }` — exactly 2
+        // variants for the audit-aware mint wrapper (spec.md §2.4). A 3rd
+        // variant landing (e.g. `RuntimeGateRefused(String)` to split
+        // "audit mode passed through" from "runtime-gate refused" at the
+        // OUTCOME level rather than at the Err path OR `Pending` for an
+        // async-mint-not-yet-complete state if the Trust Plane added a
+        // queued-issuance API) without matching arms at the adapter's
+        // `match outcome { ... }` dispatch site would silently fall
+        // through any existing wildcard `_ => …`. Pin the variant count
+        // via an exhaustive match with NO underscore fallback. Symmetric
+        // to the `ExecutorError` 5-variant pin above and the `AppError`
+        // 11-variant exhaustive-match pin extended to this two-bucket
+        // outcome type. The Issued arm carries a `ProcessPocResponse`,
+        // the AuditFallback arm a struct payload — pin both shapes.
+        let issued = SuccessorOutcome::Issued(ProcessPocResponse {
+            pca: "b64".into(),
+            hop: 1,
+            p_0: "alice".into(),
+            ops: vec![],
+            exp: None,
+        });
+        let fallback = SuccessorOutcome::AuditFallback {
+            detail: "ops not subset".into(),
+        };
+        for outcome in [issued, fallback] {
+            match outcome {
+                SuccessorOutcome::Issued(_) => {}
+                SuccessorOutcome::AuditFallback { detail: _ } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn issue_pca_response_field_count_pinned_at_exactly_five_via_exhaustive_destructure() {
+        // `IssuePcaResponse { pca, hop, p_0, ops, exp }` — Trust Plane
+        // wire response on PCA_0 issuance, exactly 5 fields. A 6th field
+        // landing (e.g. `kid: String` for the Trust Plane's signing key
+        // identifier OR `chain_root: String` for the federation entry
+        // marker the Layer-A invariant check keys on) without matching
+        // both `#[derive(Deserialize)]` field-by-field bindings AND
+        // downstream consumer reads at the adapter / pic/cache assembly
+        // site would silently drop the new field on the floor. The
+        // exhaustive destructure with no `..` rest pattern forces a 6th
+        // field to update this site in lockstep with the wire-shape
+        // consumer chain. Symmetric to the `ProcessPocResponse` 5-field
+        // implicit shape (covered by `process_poc_response_round_trips_ops_and_hop`)
+        // pinned EXPLICITLY here for IssuePcaResponse.
+        let raw = r#"{"pca":"b64","hop":0,"p_0":"alice","ops":["drive:read:x"],"exp":"2026-12-31T23:59:59Z"}"#;
+        let resp: IssuePcaResponse = serde_json::from_str(raw).unwrap();
+        let IssuePcaResponse {
+            pca: _,
+            hop: _,
+            p_0: _,
+            ops: _,
+            exp: _,
+        } = resp;
+    }
+
+    #[test]
+    fn pic_executor_new_return_type_is_result_self_executor_error_via_fn_pointer_witness() {
+        // `PicExecutor::new(String, String, &[u8; 32]) -> Result<Self,
+        // ExecutorError>` — the boot path bubbles via `?` symmetric to
+        // `SiemForwarder::new` / `EmailNotifier::new_with_recipients` /
+        // `SlackNotifier::new`. Pin via fn-pointer witness so a refactor
+        // that swapped to `Result<Self, anyhow::Error>` "for ergonomic
+        // boot-path bubbling" OR to a panicking `pub fn new` "for ease of
+        // construction at the call site" would surface here at the
+        // constructor boundary rather than as a confusing trait-bound
+        // failure at the distant boot site. The 3 distinct error
+        // pathways from this constructor — KeyPair seed-validation
+        // (`Core`), reqwest client build (`Transport` via `?`) — all
+        // flow through the `ExecutorError` enum and are tested
+        // individually elsewhere; pin the OUTER result type shape here.
+        // Symmetric to the SiemForwarder::new + EmailNotifier::new_with_recipients
+        // fn-pointer pins extended to this sibling boot-path constructor.
+        let _f: fn(String, &[u8; 32]) -> Result<PicExecutor, ExecutorError> =
+            |url, seed| PicExecutor::new(url, "proxy-test".into(), seed);
+        let _f2: fn(String) -> Result<PicExecutor, ExecutorError> = PicExecutor::dev_ephemeral;
+        let result = PicExecutor::new(
+            "http://127.0.0.1:1/".into(),
+            "proxy-fn-pointer".into(),
+            &[3u8; 32],
+        );
+        assert!(result.is_ok());
+    }
 }

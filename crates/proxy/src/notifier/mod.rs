@@ -664,4 +664,195 @@ mod tests {
             );
         }
     }
+
+    // ─── round 240 (2026-05-22): BlockedNotification field count
+    // exhaustive-destructure, from_record return type + record-borrow + url-
+    // ownership + uuid-typed-id + slice-borrow fn-pointer witnesses ───
+
+    #[test]
+    fn blocked_notification_field_count_pinned_at_exactly_sixteen_via_exhaustive_destructure_no_rest()
+     {
+        // The existing
+        // `blocked_notification_serializes_with_exactly_sixteen_known_keys_for_webhook_consumer_contract`
+        // pin walks the JSON KEY set, but a `#[serde(skip)]` attribute on
+        // a new field would silently bypass that check — the struct would
+        // grow a 17th field that never lands on the wire and never
+        // updates the JSON-key set. Pin the STRUCT field count directly
+        // via an exhaustive destructure with no `..` rest pattern so a
+        // 17th field landing (e.g. `escalation_after_minutes: Option<u32>`
+        // for per-row escalation observability OR `severity: Severity`
+        // for tiered notification routing) without matching `from_record`
+        // construction wiring would silently leave the new field
+        // zero-initialized on every notification. Symmetric to the
+        // `BlockedActionRecord` 14-field + `OwnedBlockedNotification`
+        // 15-field exhaustive-destructure pins in round 231 extended to
+        // this sibling envelope shape.
+        let ops: Vec<String> = vec!["x".into()];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        let BlockedNotification {
+            schema: _,
+            blocked_id: _,
+            request_id: _,
+            session_id: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            method: _,
+            path: _,
+            layer: _,
+            policy_id: _,
+            detail: _,
+            predecessor_pca_id: _,
+            requested_ops: _,
+            approve_url: _,
+            reject_url: _,
+        } = n;
+    }
+
+    #[test]
+    fn from_record_signature_takes_record_borrow_via_fn_pointer_witness_no_owned_consume() {
+        // `BlockedNotification::from_record(Uuid, &'a BlockedActionRecord<'_>,
+        // &str) -> BlockedNotification<'a>` — takes the record by BORROW
+        // and propagates `'a` through to the returned notification. A
+        // refactor to take the record by VALUE (`r: BlockedActionRecord<'_>`)
+        // "for ergonomic consumption at the call site" would force every
+        // caller to either clone the record (allocating Vec<String> for
+        // requested_ops + 12 owned String fields) OR rebuild the record
+        // from owned values — the persist-row + send-notification fan-out
+        // path in adapters/error.rs reads the SAME record twice (once
+        // for the audit row, once for the notifier envelope) and depends
+        // on the borrow shape so it can be passed to both without
+        // cloning. Pin via fn-pointer witness. Symmetric to the
+        // `email_notifier_new_with_recipients_return_type_is_result_via_fn_pointer_witness`
+        // + `siem_forwarder_new_return_type_is_result_self_build_error_via_fn_pointer_witness`
+        // fn-pointer pins extended to this borrow-shape constructor.
+        fn pin_signature<'a, 'b>(
+            _f: fn(
+                Uuid,
+                &'a crate::blocked::BlockedActionRecord<'b>,
+                &str,
+            ) -> BlockedNotification<'a>,
+        ) {
+        }
+        pin_signature(BlockedNotification::from_record);
+    }
+
+    #[test]
+    fn blocked_notification_approve_and_reject_url_fields_pinned_owned_string_via_destructure_for_cross_await_ownership()
+     {
+        // `approve_url: String` and `reject_url: String` — both OWNED
+        // `String` values, not `&'a str` borrows. The notification flows
+        // through a `tokio::spawn(async move { driver.notify(&n).await })`
+        // fan-out (one spawn per driver: webhook, slack, email); the URL
+        // strings cross the spawn boundary inside the moved notification.
+        // A refactor to `&'a str` "for zero-alloc construction" would
+        // tie the URL lifetime to the `proxy_public_url: &str` parameter,
+        // breaking the move-into-spawn — the parameter's lifetime ends
+        // at the call site, not after the spawn awaits. Pin both fields
+        // are owned `String` via a destructure binding the values and
+        // exercising `require_string` on each. Symmetric to the
+        // `EmailNotifier.to/cc/bcc` owned-Vec<Mailbox> pin in round 238
+        // extended to URL fields on this fan-out envelope.
+        fn require_string(_: String) {}
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        let BlockedNotification {
+            approve_url,
+            reject_url,
+            ..
+        } = n;
+        require_string(approve_url);
+        require_string(reject_url);
+    }
+
+    #[test]
+    fn blocked_notification_uuid_typed_id_fields_pinned_uuid_via_require_uuid_for_sqlx_bind_compat()
+    {
+        // `blocked_id`, `request_id`, `session_id` — three fields all
+        // typed `uuid::Uuid` (NOT `String`). The downstream blocked
+        // approval API binds these as Postgres UUID columns via
+        // `sqlx::query!(...).bind(n.blocked_id)`; a refactor to `String`
+        // "for ergonomic JSON wire shape" would force every API site to
+        // call `Uuid::parse_str` on the inbound and rebind, AND surface
+        // here as a type mismatch at the require_uuid call. The
+        // `predecessor_pca_id` field is intentionally OPTIONAL Uuid
+        // (the audit-only branch sets it to None) — pin the three
+        // mandatory id fields are `Uuid` and the optional one is
+        // `Option<Uuid>` together. Symmetric to the
+        // `blocked_action_record_uuid_fields_pinned_uuid_via_require_uuid`
+        // pin in round 231 extended to this sibling envelope.
+        fn require_uuid(_: Uuid) {}
+        fn require_option_uuid(_: Option<Uuid>) {}
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let id = Uuid::new_v4();
+        let n = BlockedNotification::from_record(id, &r, "https://x");
+        require_uuid(n.blocked_id);
+        require_uuid(n.request_id);
+        require_uuid(n.session_id);
+        require_option_uuid(n.predecessor_pca_id);
+        assert_eq!(n.blocked_id, id);
+    }
+
+    #[test]
+    fn blocked_notification_requested_ops_field_pinned_slice_borrow_via_fn_pointer_for_zero_alloc()
+    {
+        // `requested_ops: &'a [String]` — slice BORROW from the source
+        // record's `requested_ops` field, not an owned `Vec<String>`.
+        // The notification envelope is built once per blocked row and
+        // serialized into N driver bodies (webhook + slack + email +
+        // future SIEM); the slice borrow lets all N drivers read the
+        // same backing Vec without cloning. A refactor to owned
+        // `Vec<String>` "for `'static`-friendliness on the spawn
+        // boundary" would force every `from_record` call to clone the
+        // backing Vec — and the fan-out spawns would clone again per
+        // driver, multiplying allocation cost by 4× per blocked row.
+        // Pin via a fn that asserts the slice type matches at the
+        // field destructure boundary. Symmetric to the
+        // `cat_key_registry_get_dispatched_via_self_borrow` pin in round 233
+        // extended to this slice-borrow field.
+        fn require_string_slice(_: &[String]) {}
+        let ops = vec!["a:read:x".to_string(), "b:write:y".to_string()];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        require_string_slice(n.requested_ops);
+        assert_eq!(n.requested_ops.len(), 2);
+        // And the borrow points at the source record's storage — not a
+        // fresh allocation. Compare backing-Vec data pointers.
+        assert!(
+            std::ptr::eq(n.requested_ops.as_ptr(), ops.as_ptr()),
+            "requested_ops must borrow the source slice, not allocate a fresh Vec",
+        );
+    }
+
+    #[test]
+    fn blocked_notification_schema_field_pinned_static_str_via_require_static_for_zero_alloc_propagation()
+     {
+        // `schema: &'static str` — the field on a constructed instance
+        // is the SAME static-lifetime `&str` as the `SCHEMA` constant,
+        // NOT an `&'a str` re-borrow (which would tie schema's lifetime
+        // to `'a` from the record). The existing
+        // `schema_constant_is_static_str_lifetime_for_zero_alloc_webhook_header_propagation`
+        // pin walks the require_static on the CONSTANT and on the
+        // post-construction `n.schema` — but the test there doesn't
+        // demonstrate `n.schema` independently outlives the `'a`
+        // notification borrow (the notification is dropped first, but
+        // schema is `&'static str` so it must outlive 'a unbounded).
+        // Pin via a fn-pointer witness on the field shape: bind
+        // `n.schema` into a `&'static str` slot AFTER dropping `n` to
+        // demonstrate the static lifetime is real, not a coincidental
+        // re-borrow. A refactor to `schema: &'a str` "for symmetry
+        // with the other &str fields" would compile-fail this test at
+        // the `let schema: &'static str = n.schema; drop(n);` boundary.
+        let ops: Vec<String> = vec![];
+        let r = sample_record(&ops);
+        let n = BlockedNotification::from_record(Uuid::nil(), &r, "https://x");
+        let schema: &'static str = n.schema;
+        drop(n);
+        // Static-lifetime schema survives the notification drop.
+        assert_eq!(schema, "proxilion.blocked_action.v1");
+        assert_eq!(schema, BlockedNotification::SCHEMA);
+    }
 }

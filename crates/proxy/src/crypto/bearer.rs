@@ -583,4 +583,140 @@ mod tests {
         }
         assert_eq!(seen.len(), 1000, "bearer collision in 1000 generations");
     }
+
+    // ─── round 246 (2026-05-22): Bearer tuple-struct field-count + inner-
+    // type layout, as_str + hash fn-pointer witnesses, BearerHash derived-
+    // traits, RAW_BYTES + TOKEN_LEN usize-static type pins ───
+
+    #[test]
+    fn bearer_tuple_struct_field_count_pinned_at_exactly_one_string_via_exhaustive_destructure() {
+        // `Bearer(String)` — tuple struct with EXACTLY 1 positional
+        // field. A 2nd field landing (e.g. `Bearer(String,
+        // chrono::DateTime<Utc>)` "for capturing mint-time on each
+        // bearer for telemetry" OR `Bearer(String, BearerHash)` "to
+        // pre-compute the hash and avoid recomputing on every middleware
+        // dispatch") without matching `Bearer::generate()` construction
+        // wiring would silently zero-initialize the new field on every
+        // bearer mint — and the manual `Debug` impl
+        // ([bearer.rs:53](crates/proxy/src/crypto/bearer.rs#L53)) would
+        // also need updating to redact the new field. Pin the
+        // 1-positional layout via exhaustive destructure with no `..`
+        // rest pattern so a refactor surfaces at this file. Symmetric
+        // to round-242's `cache_error_db_variant_layout_pinned_tuple_via_exhaustive_destructure_one_positional_inner_sqlx`
+        // extended to this sibling secret-bearing wrapper.
+        let b = Bearer::generate();
+        let Bearer(_inner) = b;
+    }
+
+    #[test]
+    fn bearer_inner_field_pinned_owned_string_via_explicit_type_destructure_binding() {
+        // `Bearer(String)` — the inner is owned `String`, NOT
+        // `&'static str` or `Cow<'static, str>`. The bearer is minted
+        // at runtime via random RNG (no static literal); the wrapper
+        // crosses an `.await` in the POST `/api/v1/agents` handler
+        // (the SQL INSERT path holds the bearer string until persistence
+        // completes). A refactor to `Bearer(&'static str)` is
+        // impossible by construction (no static literal for random
+        // tokens), but a refactor to `Bearer(Cow<'a, str>)` "for
+        // borrow-or-own flexibility" would introduce a lifetime
+        // parameter that cascades through every `AuthState` accessor.
+        // Pin via explicit `let s: String = inner;` type ascription
+        // after destructure so a width-drift refactor surfaces here.
+        // Symmetric to round-242's
+        // `cached_pca_pic_profile_field_pinned_owned_string_via_require_for_runtime_drift_marker`
+        // extended to this sibling secret-bearing wrapper inner.
+        let b = Bearer::generate();
+        let Bearer(inner) = b;
+        let _check: String = inner;
+    }
+
+    #[test]
+    fn bearer_as_str_signature_self_borrow_returns_str_borrow_via_fn_pointer_witness() {
+        // `Bearer::as_str(&self) -> &str` — takes `&self` BORROW,
+        // returns `&str` BORROW into the inner String. The auth
+        // middleware feeds this slice directly into `BearerHash::of`
+        // — the borrow's lifetime is the Bearer's lifetime. A refactor
+        // to `pub fn as_str(self) -> String` "for ownership transfer"
+        // OR `pub fn as_str(&self) -> String` "to give downstream an
+        // owned copy" would force a heap allocation per middleware
+        // dispatch AND would break the SHA-256 hash identity (the
+        // owned String's bytes would equal the borrow's bytes, but the
+        // call shape would force consumers to bind a temporary that
+        // shortens the slice's lifetime). Pin via fn-pointer witness
+        // with explicit `for<'a> fn(&'a Bearer) -> &'a str` so a
+        // signature drift surfaces here at the type boundary.
+        // Symmetric to round-218's
+        // `bearer_hash_as_bytes_return_type_is_borrowed_slice_view_via_fn_pointer_witness`
+        // extended to this sibling accessor.
+        let _f: for<'a> fn(&'a Bearer) -> &'a str = Bearer::as_str;
+    }
+
+    #[test]
+    fn bearer_hash_method_signature_self_borrow_returns_owned_bearer_hash_via_fn_pointer_witness() {
+        // `Bearer::hash(&self) -> BearerHash` — takes `&self` BORROW,
+        // returns OWNED `BearerHash` by value. The middleware's
+        // hot-path bearer-revocation check calls
+        // `bearer.hash()` to compare against the kill_cache; the
+        // owned-by-value return shape lets the caller move the
+        // BearerHash into the kill_cache lookup without an Arc bump.
+        // A refactor to `Bearer::hash(&self) -> Arc<BearerHash>` "for
+        // cheap cross-task share" OR to `Bearer::hash(self) ->
+        // BearerHash` "consuming the bearer at hash time" would
+        // foreclose: (a) the `cache.contains(bearer.hash())` lookup
+        // pattern that holds the bearer for subsequent reads, and
+        // (b) the bearer-survives-hash invariant the auth middleware
+        // relies on for `req.extensions_mut().insert(Arc::new(session))`
+        // mid-flow. Pin via fn-pointer witness. Symmetric to
+        // round-218's
+        // `bearer_hash_of_return_type_is_owned_self_by_value_via_fn_pointer_witness`
+        // extended to this sibling builder-method.
+        let _f: fn(&Bearer) -> BearerHash = Bearer::hash;
+    }
+
+    #[test]
+    fn bearer_hash_required_derived_traits_clone_partial_eq_eq_via_require_for_revocation_lookup() {
+        // `#[derive(Clone, PartialEq, Eq)]` on `BearerHash` — the
+        // killswitch + audit paths rely on all three:
+        //   * `Clone` — the kill_cache write path takes the hash
+        //     by-value; the caller clones to retain a reference for
+        //     subsequent reads.
+        //   * `PartialEq + Eq` — the middleware compares the inbound
+        //     bearer's hash against the kill_cache's recorded hash via
+        //     `==` for the revocation check.
+        // A refactor that dropped any of the three derives "for
+        // explicit semantics" would: drop Clone → force every caller
+        // to manually copy the `[u8; 32]` and rebuild a BearerHash;
+        // drop PartialEq+Eq → force every comparison site to walk
+        // `.0` byte-by-byte. Pin all three via require_traits so a
+        // derive removal surfaces here rather than at the kill_cache
+        // call site. Symmetric to round-225's webhook signing-secret
+        // derived-traits pin extended to this sibling revocation-
+        // identity wrapper.
+        fn require_clone_eq<T: Clone + PartialEq + Eq>() {}
+        require_clone_eq::<BearerHash>();
+    }
+
+    #[test]
+    fn raw_bytes_and_token_len_constants_both_usize_for_layout_invariant_compile_time_compat() {
+        // Module-private constants `RAW_BYTES: usize = 32` and
+        // `TOKEN_LEN: usize = 61` (= 9 + 52). Both ARE pinned as `usize`
+        // implicitly by the `pub fn parse(input: &str)` slice-index op
+        // (`input[PREFIX.len()..]` requires `usize`) but the TYPE has
+        // never been DIRECTLY pinned. A refactor to `u32` "for SQL
+        // int4 alignment when surfaced via API envelope" would force a
+        // cast at every slice site AND would silently change the
+        // overflow domain on the `if input.len() != TOKEN_LEN` guard
+        // (string len is `usize`; a `u32` comparison would force a
+        // `usize→u32` cast that panics on inputs above `u32::MAX` on
+        // 64-bit hosts). Pin both constants as `usize` via
+        // require_usize. Symmetric to round-242's
+        // `cached_pca_hop_field_pinned_i32_via_require_for_postgres_int4_signed_domain`
+        // (which pins `i32` for postgres int4 contract); this pins
+        // `usize` for str-len compatibility. The existing
+        // `token_len_equals_prefix_plus_fifty_two_base32_chars_per_spec`
+        // pin walks the VALUES; pin the TYPES here in lockstep.
+        fn require_usize(_: usize) {}
+        require_usize(RAW_BYTES);
+        require_usize(TOKEN_LEN);
+    }
 }

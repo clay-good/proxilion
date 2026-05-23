@@ -602,4 +602,174 @@ mod tests {
             Ok(_) => panic!("expected error for empty key"),
         }
     }
+
+    // ─── round 245 (2026-05-22): CipherError variant-payload layouts +
+    // AES-256-only key-size contract + Ciphertext field-types ───
+
+    #[test]
+    fn cipher_error_bad_key_len_inner_field_pinned_usize_via_explicit_type_destructure_binding() {
+        // `CipherError::BadKeyLen(usize)` — the existing
+        // `cipher_error_bad_key_len_display_carries_byte_exact_prefix_with_actual_length`
+        // pin walks the Display passthrough but not the INNER TYPE.
+        // A refactor to `BadKeyLen(u32)` "for SQL int4 alignment when
+        // surfaced via /api/v1/setup error envelope" would silently
+        // truncate `usize` lengths above `u32::MAX` (pathological env-var
+        // shapes) AND would change the Display format spec on
+        // 32-vs-64-bit platforms. The error is currently `pub` but the
+        // INNER usize is positional — pin via destructure with explicit
+        // `let n: usize = …` binding so a width-drift refactor surfaces
+        // here at the type boundary. Symmetric to round-242's
+        // `cached_pca_hop_field_pinned_i32_via_require_for_postgres_int4_signed_domain`
+        // extended to this sibling tuple-variant inner.
+        let e = CipherError::BadKeyLen(17);
+        let CipherError::BadKeyLen(n) = e else {
+            panic!("expected BadKeyLen variant");
+        };
+        let _check: usize = n;
+        assert_eq!(n, 17);
+    }
+
+    #[test]
+    fn cipher_error_aead_unit_variant_layout_pinned_via_match_arm_no_pattern_binding() {
+        // `CipherError::Aead` — UNIT variant (no inner data), distinct
+        // from the tuple-with-usize layout of `BadKeyLen`. A refactor
+        // to a tuple variant (`Aead(aes_gcm::Error)` "for inner-cause
+        // chain through anyhow's source() walk") would force every
+        // operator log filter that anchors on the byte-exact
+        // `"AES-GCM operation failed"` Display string (pinned by
+        // `aead_error_display_is_stable_for_log_filters`) to also
+        // ingest the variant's inner debug. The unit-variant layout
+        // is load-bearing for the no-secret-leak contract (the
+        // existing `auth_fail_decrypt_does_not_carry_cipher_internals_in_message`
+        // pin extends this: AuthFail::Decrypt also masks inner cipher
+        // details). Pin the unit-variant layout via a match arm with
+        // NO inner-binding pattern. Symmetric to round-242's
+        // `cache_error_db_variant_layout_pinned_tuple_via_exhaustive_destructure_one_positional_inner_sqlx`
+        // (which pins a TUPLE-positional layout); this pins the
+        // UNIT-no-inner counterpart.
+        let e = CipherError::Aead;
+        match e {
+            CipherError::Aead => {} // unit-variant — NO inner-binding pattern
+            other => panic!("expected Aead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_bytes_rejects_16_byte_aes_128_and_24_byte_aes_192_keys_for_aes_256_only_contract() {
+        // The cipher is specifically AES-256-GCM — 32-byte keys ONLY.
+        // 16-byte (AES-128) and 24-byte (AES-192) keys ARE valid AES key
+        // sizes per FIPS 197, but the proxy's threat model requires
+        // 256-bit envelope encryption for OAuth tokens at rest (spec.md
+        // §1.2). The existing `short_key_rejected` pin walks 16 bytes;
+        // pin 24-byte AES-192 as well so an operator pasting a 24-byte
+        // key (the "compromise between 128 and 256" mistake) surfaces
+        // the same BadKeyLen-with-actual-length triage. Pin both sizes
+        // here together with their canonical AES-variant names in the
+        // error context, so a refactor to accept AES-128/192 "for
+        // backward-compat with smaller keys" would silently weaken the
+        // envelope-encryption contract on every persisted OAuth-token
+        // row. Symmetric to round-218's
+        // `parse_rejects_digits_outside_base32_alphabet` extended to
+        // this sibling key-size domain check.
+        match TokenCipher::from_bytes(&[0u8; 16]) {
+            Err(CipherError::BadKeyLen(16)) => {}
+            Err(e) => panic!("16-byte (AES-128): expected BadKeyLen(16), got {e:?}"),
+            Ok(_) => panic!("16-byte (AES-128) key must be rejected"),
+        }
+        match TokenCipher::from_bytes(&[0u8; 24]) {
+            Err(CipherError::BadKeyLen(24)) => {}
+            Err(e) => panic!("24-byte (AES-192): expected BadKeyLen(24), got {e:?}"),
+            Ok(_) => panic!("24-byte (AES-192) key must be rejected"),
+        }
+        // Sanity: 32 bytes (AES-256) is accepted — this differentiates
+        // the rejection above from a blanket-reject regression.
+        assert!(TokenCipher::from_bytes(&[0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn ciphertext_nonce_and_bytes_fields_both_pinned_owned_vec_u8_via_require_for_postgres_bytea_persist()
+     {
+        // `Ciphertext { nonce: Vec<u8>, bytes: Vec<u8> }` — both fields
+        // OWNED `Vec<u8>`. The OAuth-token-persist path serializes each
+        // into a distinct Postgres `bytea` column via `.bind(&ct.nonce)`
+        // + `.bind(&ct.bytes)`. sqlx's `Encode<Postgres>` for `&Vec<u8>`
+        // routes to the `bytea` column type. A refactor to `bytes::Bytes`
+        // "for cheap clone across the OAuth-callback fan-out" would
+        // change the sqlx Encode resolution path (Bytes doesn't have a
+        // direct Postgres encode; it would force `.as_ref()` at every
+        // bind site) AND would tie the buffer lifetime to the upstream
+        // Google response's body buffer freed at the `.json().await`
+        // boundary — producing a use-after-free when the row outlives
+        // the response. Pin BOTH fields are owned `Vec<u8>` via
+        // `require_vec_u8`. Symmetric to round-242's
+        // `cached_pca_cbor_signature_fields_both_pinned_owned_vec_u8_via_require_for_postgres_bytea_bind`
+        // extended to this sibling Ciphertext envelope.
+        fn require_vec_u8(_: Vec<u8>) {}
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let ct = c.encrypt(b"sample plaintext").unwrap();
+        require_vec_u8(ct.nonce);
+        let ct2 = c.encrypt(b"sample plaintext").unwrap();
+        require_vec_u8(ct2.bytes);
+    }
+
+    #[test]
+    fn encrypt_ciphertext_length_is_referentially_transparent_across_fifty_calls_same_plaintext() {
+        // `cipher.encrypt(plaintext)` produces a ciphertext whose
+        // `bytes.len()` is deterministically `plaintext.len() + 16`
+        // (16-byte GCM auth tag) — the BYTES content varies per call
+        // (due to random nonce), but the LENGTH is referentially
+        // transparent. The existing
+        // `encrypt_ciphertext_overhead_is_always_plaintext_len_plus_sixteen`
+        // pin walks 4 distinct plaintext sizes; pin the LENGTH-RT
+        // contract across 50 SEQUENTIAL calls on the same plaintext
+        // here so a refactor that introduced any form of length-
+        // dependent state (a thread-local pad-byte counter, a
+        // compression layer "for at-rest size savings") would surface
+        // here as the 50-call sweep diverging from the baseline length.
+        // Symmetric to round-242's
+        // `cached_pca_new_referentially_transparent_across_fifty_calls_on_same_input`
+        // extended to this sibling length-determinism contract.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        let plaintext = b"identical plaintext across all 50 calls";
+        let baseline = c.encrypt(plaintext).unwrap();
+        let expected_len = plaintext.len() + 16; // GCM tag
+        assert_eq!(baseline.bytes.len(), expected_len);
+        for i in 0..50 {
+            let again = c.encrypt(plaintext).unwrap();
+            assert_eq!(
+                again.bytes.len(),
+                expected_len,
+                "iter {i}: ciphertext length drifted from baseline",
+            );
+            assert_eq!(again.nonce.len(), 12, "iter {i}: nonce length drifted");
+        }
+    }
+
+    #[test]
+    fn self_encrypted_ciphertext_decrypts_to_byte_equal_plaintext_across_twenty_five_random_inputs()
+    {
+        // The fundamental AEAD round-trip contract: `decrypt(encrypt(pt))
+        // == pt` for any plaintext under the same key. The existing
+        // pins walk specific inputs (Google access token, "hi",
+        // 4096-byte, empty); pin the wider contract via 25 random
+        // plaintexts of varying lengths (1, 2, 3, ..., 25 bytes — small
+        // enough to exercise the per-message GCM block-padding edge
+        // cases). A refactor that introduced any form of plaintext-
+        // length-dependent corruption (e.g. a chunking layer for "future
+        // streaming support" that mishandled non-block-aligned tails)
+        // would surface here at one of the 25 lengths. Distinct from
+        // the existing length-fixed RT pins because this varies the
+        // plaintext shape, not just the count of trials. Symmetric to
+        // round-218's
+        // `one_thousand_generated_bearers_yield_one_thousand_distinct_hashes`
+        // anti-regression-at-scale pin extended to this sibling
+        // round-trip-at-varying-length contract.
+        let c = TokenCipher::from_bytes(&key()).unwrap();
+        for len in 1usize..=25 {
+            let pt: Vec<u8> = (0..len).map(|i| ((i * 13 + 7) % 251) as u8).collect();
+            let ct = c.encrypt(&pt).unwrap();
+            let back = c.decrypt(&ct).unwrap();
+            assert_eq!(back, pt, "round-trip failed for plaintext length {len}",);
+        }
+    }
 }

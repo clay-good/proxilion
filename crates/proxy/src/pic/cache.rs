@@ -707,4 +707,190 @@ mod tests {
         let e = maybe().unwrap_err();
         assert!(matches!(e, CacheError::Db(_)));
     }
+
+    // ─── round 242 (2026-05-22): CachedPca field-type pins + pic_profile
+    // owned-String + cbor/signature owned-Vec<u8> + hop i32 + predecessor
+    // Option<Uuid> + CacheError::Db tuple-variant layout ───
+
+    #[test]
+    fn cached_pca_pic_profile_field_pinned_owned_string_via_require_for_runtime_drift_marker() {
+        // `pic_profile: String` — OWNED `String`, NOT `&'static str` (even
+        // though `CURRENT_PIC_PROFILE` is a static-str literal). The
+        // verifier reads `pca.pic_profile` from a Postgres SELECT row
+        // where the runtime value MAY differ from the compile-time
+        // `CURRENT_PIC_PROFILE` constant — historical rows backfilled
+        // through the migration carry the prior profile string, and a
+        // mid-rollout cluster may have rows minted under multiple
+        // profiles concurrently. A refactor to `pic_profile: &'static
+        // str` "for zero-alloc dispatch on the hot path" would force
+        // every read site to match against a static-set enum and lose
+        // the ability to observe runtime profile drift. Pin via
+        // require_owned_string. Symmetric to round-238's
+        // `email_build_error_inner_field_pinned_owned_string_via_destructure`
+        // extended to this sibling runtime-drift marker field.
+        fn require_owned_string(_: String) {}
+        let pca = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 0, None);
+        require_owned_string(pca.pic_profile);
+        // Symmetric pin on `p_0` — the principal is end-user-supplied
+        // and crosses an `.await` in the persist path; it MUST be
+        // owned String too (the same lifetime reasoning as round-238).
+        let pca = CachedPca::new(Uuid::nil(), vec![], "alice@x".into(), vec![], 0, None);
+        require_owned_string(pca.p_0);
+    }
+
+    #[test]
+    fn cached_pca_hop_field_pinned_i32_via_require_for_postgres_int4_signed_domain() {
+        // `hop: i32` — pinned to signed 32-bit, matching the Postgres
+        // `int4` column type the cache row binds to. The existing
+        // `cached_pca_new_round_trips_hop_at_i32_max_without_overflow`
+        // pin walks BOUNDARY VALUES but does not pin the TYPE at the
+        // field level. A refactor to `u32` "for non-negative hop
+        // domain hygiene" would silently change the `bind` width at
+        // the sqlx call site AND change the postgres column-driver
+        // path (u32 doesn't have a built-in `Encode<Postgres>` impl
+        // for the int4 column — sqlx would route through int8 or
+        // numeric, breaking the migration contract). Pin via
+        // require_i32 fn-pointer witness at the field type so a
+        // u32 / i64 / u64 refactor surfaces here. Symmetric to
+        // round-238's
+        // `email_notifier_max_retries_field_pinned_u32_for_lettre_retry_budget_type_compat`
+        // extended to this sibling postgres-column-typed integer.
+        fn require_i32(_: i32) {}
+        let pca = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 7, None);
+        require_i32(pca.hop);
+    }
+
+    #[test]
+    fn cached_pca_predecessor_id_field_pinned_option_uuid_via_require_for_chain_root_nullable() {
+        // `predecessor_id: Option<Uuid>` — nullable on the wire (chain
+        // root has no predecessor — `PCA_0` is the federation entry
+        // marker per spec.md §1.1 and gets `predecessor_id IS NULL` in
+        // the cache row). A refactor to bare `Uuid` with `Uuid::nil()`
+        // as the chain-root sentinel "for non-nullable column hygiene"
+        // would collapse two distinct shapes — explicit-no-predecessor
+        // (PCA_0) vs. successor-with-nil-uuid (a corruption — a real
+        // chain link's predecessor is never nil) — onto a single
+        // value and break the verifier's chain-walk's None-stop
+        // condition. Pin via require_option_uuid. Symmetric to round-
+        // 231's `blocked_action_record_predecessor_pca_id_pinned_option_uuid_for_nullable_column`
+        // pin extended to this sibling chain-root field.
+        fn require_option_uuid(_: Option<Uuid>) {}
+        // None arm (chain root).
+        let root = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 0, None);
+        require_option_uuid(root.predecessor_id);
+        assert!(root.predecessor_id.is_none());
+        // Some arm (successor).
+        let pred = Uuid::new_v4();
+        let succ = CachedPca::new(Uuid::new_v4(), vec![], "p".into(), vec![], 1, Some(pred));
+        require_option_uuid(succ.predecessor_id);
+        assert_eq!(succ.predecessor_id, Some(pred));
+    }
+
+    #[test]
+    fn cached_pca_cbor_signature_fields_both_pinned_owned_vec_u8_via_require_for_postgres_bytea_bind()
+     {
+        // `cbor: Vec<u8>` and `signature: Vec<u8>` — BOTH OWNED
+        // `Vec<u8>`, NOT `&'a [u8]` borrows or `bytes::Bytes`
+        // ref-counted. The persist path binds these through sqlx's
+        // `&[u8]` deref-target on the Vec — sqlx's `Encode<Postgres>`
+        // for `&Vec<u8>` routes to the `bytea` column. A refactor to
+        // `bytes::Bytes` "for cheap clone on the hot fan-out path"
+        // would change the sqlx Encode resolution (Bytes doesn't have
+        // a direct Postgres encode; it would force `.as_ref()` at
+        // every bind site) AND would tie the CBOR buffer's lifetime
+        // to the upstream Trust Plane response's body buffer freed at
+        // the `.json().await` boundary — producing a use-after-free
+        // when the cache row outlives the response. Pin BOTH fields
+        // are owned `Vec<u8>` via require_vec_u8. Symmetric to
+        // round-237's
+        // `redact_pii_bytes_signature_takes_bytes_borrow_via_fn_pointer_witness_for_persist_path`
+        // (which pins the BORROW direction on a different function);
+        // here we pin the OWNED direction on these field types.
+        fn require_vec_u8(_: Vec<u8>) {}
+        let mut pca = CachedPca::new(Uuid::nil(), vec![1, 2, 3], "p".into(), vec![], 0, None);
+        pca.signature = vec![0xAA, 0xBB, 0xCC];
+        require_vec_u8(pca.cbor);
+        let mut pca2 = CachedPca::new(Uuid::nil(), vec![], "p".into(), vec![], 0, None);
+        pca2.signature = vec![0xDD, 0xEE];
+        require_vec_u8(pca2.signature);
+    }
+
+    #[test]
+    fn current_pic_profile_no_trailing_whitespace_no_newline_no_null_bytes_for_postgres_text_column()
+     {
+        // `CURRENT_PIC_PROFILE: &str` lands directly in the
+        // `pic_profile` Postgres text column via `.bind(&pca.pic_profile)`.
+        // The string MUST NOT carry trailing whitespace, embedded
+        // newlines, or NUL bytes — Postgres's text column type
+        // rejects NUL ("invalid byte sequence for encoding"), and a
+        // trailing space would make SELECT-with-equality queries miss
+        // rows that don't carry the surplus whitespace. The existing
+        // `current_pic_profile_byte_length_pinned_at_twelve_with_ascii_only_contract`
+        // pin walks the length + ASCII-only contract; pin the
+        // hygiene contract here so a refactor that inadvertently
+        // included a trailing `\n` (e.g. a `format!("proxilion.v1\n")`
+        // somewhere in the constant's derivation chain) would
+        // surface at this file. Symmetric to round-225's hygiene
+        // pins on webhook headers extended to this DB-column
+        // constant.
+        assert!(
+            !CURRENT_PIC_PROFILE.contains('\n'),
+            "no embedded newline: {CURRENT_PIC_PROFILE:?}"
+        );
+        assert!(
+            !CURRENT_PIC_PROFILE.contains('\r'),
+            "no carriage return: {CURRENT_PIC_PROFILE:?}"
+        );
+        assert!(
+            !CURRENT_PIC_PROFILE.contains('\t'),
+            "no tab character: {CURRENT_PIC_PROFILE:?}"
+        );
+        assert!(
+            !CURRENT_PIC_PROFILE.contains('\0'),
+            "no NUL byte: {CURRENT_PIC_PROFILE:?}"
+        );
+        assert!(
+            !CURRENT_PIC_PROFILE.starts_with(' '),
+            "no leading space: {CURRENT_PIC_PROFILE:?}"
+        );
+        assert!(
+            !CURRENT_PIC_PROFILE.ends_with(' '),
+            "no trailing space: {CURRENT_PIC_PROFILE:?}"
+        );
+        // And the trimmed form equals the raw form — the constant
+        // has no surplus whitespace anywhere.
+        assert_eq!(CURRENT_PIC_PROFILE.trim(), CURRENT_PIC_PROFILE);
+    }
+
+    #[test]
+    fn cache_error_db_variant_layout_pinned_tuple_via_exhaustive_destructure_one_positional_inner_sqlx()
+     {
+        // `CacheError::Db(sqlx::Error)` — TUPLE variant with EXACTLY
+        // one positional inner (the sqlx::Error). A refactor to a
+        // STRUCT variant (`Db { inner: sqlx::Error }`) "for ergonomic
+        // named-field access at the log site" OR to a multi-field
+        // tuple (`Db(sqlx::Error, String)` adding an operator-context
+        // string "for triage") would break the `#[from]` blanket impl
+        // (which requires a one-positional-field variant) AND would
+        // force every `?` conversion site to rebuild the variant by
+        // hand. Pin the tuple-with-one-positional shape via
+        // exhaustive destructure on a `match` arm — `CacheError::Db(_)`
+        // with no struct-style braces forces the tuple-positional
+        // layout to remain stable. Symmetric to round-230's
+        // `app_error_policy_blocked_struct_variant_field_count_pinned_at_exactly_three_via_exhaustive_destructure`
+        // extended to this sibling tuple-positional variant layout.
+        let e = CacheError::from(sqlx::Error::RowNotFound);
+        match e {
+            CacheError::Db(_inner) => {}
+        }
+        // And the `?` conversion path lands on the SAME tuple-
+        // positional variant — pin both shapes move in lockstep.
+        let from_q: Result<(), CacheError> = (|| -> Result<(), CacheError> {
+            Err::<(), sqlx::Error>(sqlx::Error::RowNotFound)?;
+            Ok(())
+        })();
+        match from_q.unwrap_err() {
+            CacheError::Db(_inner) => {}
+        }
+    }
 }

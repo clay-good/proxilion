@@ -726,4 +726,157 @@ mod tests {
         let _s: LoggingStream = LoggingStream;
         let _s2: LoggingStream = Default::default();
     }
+
+    // ─── round 241 (2026-05-22): BroadcastingActionStream + ActionEvent
+    // field-shape + Arc<dyn> dispatch surfaces ───
+
+    #[tokio::test]
+    async fn broadcasting_action_stream_field_count_pinned_at_exactly_two_via_exhaustive_destructure()
+     {
+        // `BroadcastingActionStream { db, tx }` — exactly 2 fields. A 3rd
+        // field landing (e.g. `metrics_label: &'static str` for per-
+        // stream metric bucketing OR
+        // `dropped_counter: Arc<AtomicU64>` for slow-consumer-lag
+        // observability) without matching `new()` constructor wiring
+        // would silently zero-initialize the new field on every
+        // construction — and any handler reading it would see
+        // `AtomicU64::new(0)` forever, never tripping. The exhaustive
+        // destructure with no `..` rest pattern forces a 3rd field to
+        // update this site in lockstep with the constructor. Symmetric
+        // to the `TeeStream` 2-field + `BurstSuppressor` 3-field +
+        // `PicExecutor` 1-field exhaustive-destructure pins in rounds
+        // 224 / 235 / 239 extended to this sibling persist-and-fan-out
+        // sink. Construction needs a `PgPool` which can't be cheaply
+        // built without a connection; use `lazy_no_connection` so the
+        // pool struct exists but doesn't open a socket — the
+        // destructure runs at compile time anyway.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://x:y@127.0.0.1:1/z")
+            .expect("lazy connect");
+        let stream = BroadcastingActionStream::new(pool);
+        let BroadcastingActionStream { db: _, tx: _ } = stream;
+    }
+
+    #[test]
+    fn action_event_send_sync_static_for_arc_dyn_action_stream_publish_boundary() {
+        // `ActionEvent` crosses the `tokio::spawn(async move { sink.publish(event).await })`
+        // fan-out boundary in TeeStream; `Send + Sync + 'static` are
+        // load-bearing for that path. The existing
+        // `logging_stream_is_send_sync_static_for_app_state_arc_dyn_path`
+        // pin walks the SINK type, not the EVENT type — a refactor
+        // that swapped any field for `Rc<...>` "for cheap clone on
+        // a single-thread test runner" would break Send without
+        // surfacing here; the breakage would land at TeeStream's
+        // spawn site with an unrelated trait-bound error. Pin the
+        // three-trait combo on ActionEvent so the type boundary
+        // fails fast at this file. Symmetric to round-239's
+        // `pic_executor_and_error_and_outcome_are_send_sync_static`
+        // pin extended to this sibling event envelope.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<ActionEvent>();
+    }
+
+    #[test]
+    fn action_event_policy_id_field_pinned_owned_option_string_via_require_for_cross_await_db_bind()
+    {
+        // `policy_id: Option<String>` — OWNED `Option<String>`, NOT
+        // `Option<&'a str>` borrow. The event is held across an
+        // `.await` in `BroadcastingActionStream::publish` (the sqlx
+        // `INSERT … .execute(&self.db).await` chain binds
+        // `event.policy_id.as_deref()` after the await suspension)
+        // and crosses the `tokio::spawn` boundary inside TeeStream's
+        // fan-out. A refactor to `Option<&'a str>` "for zero-alloc
+        // logging-stream construction" would tie the lifetime to the
+        // request frame's `policy_id` borrow — and the frame is freed
+        // before the spawn awaits, producing a use-after-free. Pin
+        // the owned-Option-String shape via require_option_string.
+        // Symmetric to round-238's
+        // `email_notifier_recipient_fields_to_cc_bcc_all_pinned_owned_vec_mailbox_via_require`
+        // extended to this sibling owned-Option field.
+        fn require_option_string(_: Option<String>) {}
+        let e = sample();
+        require_option_string(e.policy_id);
+        // And the symmetric `block_reason` field carries the SAME
+        // owned-Option-String shape — pin via the same require fn so
+        // a refactor changing one and not the other (silently breaking
+        // operator dashboard policy-vs-reason cross-references) would
+        // surface here.
+        let e = sample();
+        require_option_string(e.block_reason);
+    }
+
+    #[test]
+    fn broadcasting_action_stream_subscribe_return_type_is_broadcast_receiver_via_fn_pointer_witness()
+     {
+        // `BroadcastingActionStream::subscribe(&self) -> broadcast::Receiver<Arc<ActionEvent>>` —
+        // returns a tokio broadcast receiver typed on the Arc-shared
+        // event payload. The admin SSE endpoint calls
+        // `stream.subscribe()` and forwards messages over an HTTP
+        // response stream; a refactor that swapped the payload type
+        // to `Arc<serde_json::Value>` "for ergonomic mid-pipeline
+        // mutation" would force every subscriber to re-derive the
+        // ActionEvent shape and would surface only at the SSE site as
+        // a confusing trait-bound mismatch. Pin via fn-pointer witness
+        // on the method type so a payload-type change surfaces at the
+        // boundary here. Symmetric to round-216's
+        // `oauth_state_session_token_return_type_is_string_via_fn_pointer_witness`
+        // extended to this sibling subscribe accessor.
+        let _f: fn(&BroadcastingActionStream) -> broadcast::Receiver<Arc<ActionEvent>> =
+            BroadcastingActionStream::subscribe;
+    }
+
+    #[test]
+    fn action_event_extra_default_for_missing_field_pinned_value_null_not_unit_value() {
+        // The `extra: Value` field carries `#[serde(default)]` so a
+        // wire payload omitting the key deserializes successfully. The
+        // existing `round_trips_through_json_with_absent_extra` test
+        // pins the deserialize path; pin the DEFAULT value's shape
+        // here — it MUST be `Value::Null`, NOT some other Value
+        // variant (e.g. `Value::Object(Default::default())` "for
+        // ergonomic key-presence checks downstream"). A refactor of
+        // `serde_json::Value::default()` (it's `Value::Null` today,
+        // but a downstream serde_json bump could shift it) would
+        // surface here as a deserialize value drift. Pin via direct
+        // construction + assertion on the resulting `extra` field.
+        // Symmetric to round-237's
+        // `audit_body_mode_label_strings_pairwise_byte_distinct_for_metric_label_dispatch`
+        // extended to this sibling default-value contract.
+        let s = r#"{
+            "request_id":"00000000-0000-0000-0000-000000000000",
+            "agent_session_id":"00000000-0000-0000-0000-000000000000",
+            "p_0":"x","leaf_pca_id":null,
+            "vendor":"v","action":"a","method":"M","path":"/p",
+            "status":200,"decision":"allow","block_reason":null,
+            "read_filter_triggered":false,"quarantined_count":0,
+            "at":"2026-05-22T00:00:00Z","policy_id":null
+        }"#;
+        let ev: ActionEvent = serde_json::from_str(s).unwrap();
+        // The default MUST be `Value::Null` specifically — not Object,
+        // not Array, not the empty-string Value. Pin via direct
+        // discriminant matching.
+        assert!(matches!(ev.extra, Value::Null));
+        assert_eq!(ev.extra, Value::Null);
+    }
+
+    #[test]
+    fn action_event_at_field_pinned_datetime_utc_not_local_via_require_for_grafana_alignment() {
+        // `at: DateTime<Utc>` — pinned to the UTC timezone marker, NOT
+        // `DateTime<Local>` or a bare `chrono::NaiveDateTime`. The
+        // existing `at_datetime_serializes_as_rfc3339_with_z_suffix_not_offset_form`
+        // pin walks the WIRE shape (`Z` suffix); pin the TYPE shape
+        // here so a refactor to `DateTime<Local>` "for ergonomic dev-
+        // mode log reading" would silently shift the serialized
+        // suffix to `+HH:MM` (matching the host's TZ) on every
+        // operator's laptop AND in CI runners with non-UTC system
+        // clocks — breaking the byte-exact suffix pin only on
+        // non-UTC hosts. Pin via fn-pointer require on the field
+        // type so a TZ refactor surfaces at the field boundary, not
+        // at the wire boundary downstream. Symmetric to round-231's
+        // `blocked_action_record_uuid_fields_request_id_session_id_both_pinned_uuid_via_require_uuid`
+        // extended to this sibling typed-timestamp field.
+        fn require_datetime_utc(_: DateTime<Utc>) {}
+        let e = sample();
+        require_datetime_utc(e.at);
+    }
 }

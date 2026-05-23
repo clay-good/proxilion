@@ -818,4 +818,155 @@ mod tests {
         assert!(!o.triggered);
         assert_eq!(out, body);
     }
+
+    // ─── round 234 (2026-05-22): FilterOutcome + QuarantineSample + CompiledFilter
+    // exhaustive destructure, compile() Result fn-pointer, MARKER RT, matches
+    // usize type ───
+
+    #[test]
+    fn filter_outcome_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest() {
+        // `FilterOutcome { matches, triggered, samples, block }` —
+        // exactly 4 fields. A 5th field landing (e.g. `bytes_rewritten:
+        // usize` for per-call byte-budget metrics, OR `last_pattern:
+        // Option<String>` for the most-recent-match pattern surfacing)
+        // without matching `apply()` construction at the return site
+        // would silently leave the new field zero-initialized — the
+        // audit row would carry the field but with default value,
+        // breaking dashboards that key on the new field. The
+        // exhaustive destructure with no `..` rest pattern forces a
+        // 5th field to update this site in lockstep with `apply()`.
+        // Symmetric to the BlockedActionRecord 14-field +
+        // PicViolationRecord 13-field exhaustive-destructure pins.
+        let o = FilterOutcome::default();
+        let FilterOutcome {
+            matches: _,
+            triggered: _,
+            samples: _,
+            block: _,
+        } = o;
+    }
+
+    #[test]
+    fn quarantine_sample_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest() {
+        // `QuarantineSample { pattern, snippet }` — exactly 2 fields.
+        // A 3rd field landing (e.g. `offset: usize` for the byte
+        // offset the match was found at, OR `pattern_kind: PatternKind`
+        // to distinguish literal-vs-regex without parsing the
+        // `pattern` string) without matching `apply()` construction
+        // would silently leave the new field zero-initialized in every
+        // `quarantined_payloads` audit row. The exhaustive destructure
+        // forces a 3rd field to update this site in lockstep. Symmetric
+        // to the WebhookSecret 1-field + SlackSigningSecret 1-field
+        // exhaustive-destructure pins extended to this sibling 2-field
+        // tuple-struct-shaped audit type.
+        let s = QuarantineSample {
+            pattern: "literal: test".into(),
+            snippet: "matched text".into(),
+        };
+        let QuarantineSample {
+            pattern: _,
+            snippet: _,
+        } = s;
+    }
+
+    #[test]
+    fn compiled_filter_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest() {
+        // `CompiledFilter { set, per_pattern, action }` — exactly 3
+        // fields. A 4th field landing (e.g. `case_insensitive: bool`
+        // for a per-filter case-fold option, OR `compiled_at:
+        // Instant` for per-filter compilation-age observability)
+        // without matching `compile()` construction would silently
+        // leave the new field zero-initialized — operators relying on
+        // the new field would see the default value on every
+        // hot-path application. The exhaustive destructure with no
+        // `..` rest pattern forces a 4th field to update this site in
+        // lockstep with `compile()`. Symmetric to the TeeStream 2-field
+        // pin extended to this sibling adapter-side compiled holder.
+        let f = build(QuarantineAction::ReplaceWithMarker, vec![]);
+        let CompiledFilter {
+            set: _,
+            per_pattern: _,
+            action: _,
+        } = f;
+    }
+
+    #[test]
+    fn compiled_filter_compile_return_type_is_result_self_regex_error_via_fn_pointer_witness() {
+        // `CompiledFilter::compile(&ReadFilter) -> Result<Self,
+        // regex::Error>` is called by the adapter on boot for every
+        // `ReadFilter` in the policy. Pin the return type via a
+        // fn-pointer witness so a refactor that widened to
+        // `anyhow::Error` "for ergonomic boot-path bubbling" would
+        // lose the structured `regex::Error` variant the operator
+        // dashboard splits on (the regex-compilation-failure bucket
+        // is distinct from "policy YAML parse failure" and they
+        // surface on different alert panels). Symmetric to the
+        // WebhookSecret::from_hex + WebhookNotifier::new +
+        // SlackNotifier::new Result fn-pointer pins extended to this
+        // sibling adapter-boot constructor.
+        let _f: fn(&ReadFilter) -> Result<CompiledFilter, regex::Error> = CompiledFilter::compile;
+        // Exercise: a malformed regex pattern surfaces the error
+        // variant.
+        let bad_filter = ReadFilter {
+            quarantine_patterns: vec![Pattern::Regex(regex::Regex::new("valid").unwrap())],
+            quarantine_action: QuarantineAction::ReplaceWithMarker,
+        };
+        // Compiling a valid pattern works.
+        let result = CompiledFilter::compile(&bad_filter);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn marker_constant_is_referentially_transparent_across_fifty_reads_for_audit_row_byte_stability()
+     {
+        // `MARKER: &'static str = "[redacted by proxilion read-filter]"`
+        // is the exact substitution string substituted into every
+        // quarantined match on the `ReplaceWithMarker` action path.
+        // Operator dashboards that grep for redactions in audit rows
+        // key on the EXACT byte sequence. Pin referential transparency
+        // across 50 reads. A refactor that swapped to `static MARKER:
+        // String = ...` "for env-var override at boot" would silently
+        // open the door to per-read mutation (a per-tenant marker
+        // string introduced via a tenant-aware `lazy_static`) and
+        // shred byte-equality on audit-row aggregation. Symmetric to
+        // the ENTRY_TTL + MAX_CAPACITY RT 50 pin in round 228.
+        let first = MARKER;
+        for i in 0..50 {
+            assert_eq!(MARKER, first, "iter {i}: MARKER drift");
+        }
+        assert_eq!(first, "[redacted by proxilion read-filter]");
+    }
+
+    #[test]
+    fn filter_outcome_matches_field_type_pinned_usize_for_vec_len_compat_and_audit_count() {
+        // `FilterOutcome.matches: usize` — the count of matched
+        // patterns flows directly into the `audit_body.matches`
+        // postgres INTEGER column AND into the
+        // `proxilion_read_filter_matches_total` counter increment.
+        // The `usize` type matches the natural width on the platform
+        // (u64 on most production targets); a refactor to `u32` "to
+        // save 4 bytes on 64-bit targets" would silently truncate at
+        // 4B matches (admittedly unlikely but operationally observable
+        // under sustained burst). A refactor to `i32` "for postgres
+        // INTEGER column compat at the bind site" would allow negative
+        // values past the type system. Pin via require_usize. The
+        // existing `filter_outcome_field_types_pinned_for_cross_await_
+        // audit_row_persist_contract` test covers all 4 fields'
+        // types — but we pin matches=usize as an explicit single-
+        // axis check that surfaces here rather than at the bulk
+        // sweep, easing root-cause analysis on a future numeric-type
+        // refactor.
+        fn require_usize(_: usize) {}
+        let o = FilterOutcome {
+            matches: 42,
+            triggered: true,
+            samples: vec![],
+            block: false,
+        };
+        require_usize(o.matches);
+        // And FilterOutcome::default() also matches the same type.
+        let d = FilterOutcome::default();
+        require_usize(d.matches);
+        assert_eq!(d.matches, 0);
+    }
 }

@@ -741,4 +741,137 @@ mod tests {
             );
         }
     }
+
+    // ─── round 233 (2026-05-22): CatKeyRegistry + Inner + InfoResp exhaustive
+    // destructure, new() owned-Self fn-pointer pin, InfoResp owned-String fields,
+    // get-method dispatch shape ───
+
+    #[test]
+    fn cat_key_registry_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest() {
+        // `CatKeyRegistry { inner: Arc<Inner> }` — exactly 1 field. A
+        // 2nd field landing (e.g. `local_kid_override: Option<String>`
+        // for dev environments that want to bypass the Trust Plane,
+        // OR `last_refresh: Mutex<Instant>` for rotation observability)
+        // without matching `new()` constructor wiring would silently
+        // leave the new field zero-initialized. The exhaustive
+        // destructure with no `..` rest pattern forces a 2nd field to
+        // update this site in lockstep with `new()`. Symmetric to the
+        // WebhookSecret 1-field + SlackSigningSecret 1-field + KillCache
+        // 1-field exhaustive-destructure pins.
+        let r = CatKeyRegistry::new("https://trust-plane.example.test".into());
+        let CatKeyRegistry { inner: _ } = r;
+    }
+
+    #[test]
+    fn cat_key_registry_inner_field_count_pinned_at_exactly_three_via_exhaustive_destructure() {
+        // `Inner { trust_plane_url, http, cached }` — exactly 3 fields.
+        // A 4th field landing (e.g. `cache_ttl: Duration` for periodic
+        // key re-fetch on rotation, OR `kid_filter: Option<String>` to
+        // pin a specific kid through development) without matching
+        // `new()` constructor wiring would silently leave the new
+        // field zero-initialized. The exhaustive destructure forces a
+        // 4th field to update this site in lockstep with `new()`.
+        // Symmetric to the WebhookNotifier 6-field + SlackNotifier
+        // 6-field + TeeStream 2-field pins extended to this sibling
+        // module-private holder type.
+        let r = CatKeyRegistry::new("https://trust-plane.example.test".into());
+        let inner: &Inner = &r.inner;
+        let Inner {
+            trust_plane_url: _,
+            http: _,
+            cached: _,
+        } = inner;
+    }
+
+    #[test]
+    fn info_resp_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern() {
+        // `InfoResp { kid, public_key }` — exactly 2 fields. The
+        // Trust Plane info endpoint surfaces ONLY these two; a 3rd
+        // field landing (e.g. `algorithm: String` per RFC 8037 §3.1
+        // surfacing, OR `next_rotation: i64` for rotation observability)
+        // would be silently ignored today (`#[serde(default)]` semantics
+        // via the `info_resp_ignores_unknown_fields_for_forward_compat`
+        // pin) — which is the INTENT for forward-compat, but a 3rd
+        // first-class field landing on our deserializer would break
+        // any operator who relied on it being surfaced. Pin the
+        // destructure so a 3rd CLAIMED field lands here in lockstep
+        // with the deserializer. Symmetric to the FederationClaims
+        // 8-field + GoogleClient 4-field exhaustive-destructure pins.
+        let raw = r#"{"kid":"k1","public_key":"AAA"}"#;
+        let info: InfoResp = serde_json::from_str(raw).unwrap();
+        let InfoResp {
+            kid: _,
+            public_key: _,
+        } = info;
+    }
+
+    #[test]
+    fn cat_key_registry_new_return_type_is_owned_self_by_value_via_fn_pointer_witness() {
+        // `CatKeyRegistry::new(String) -> Self` is the constructor
+        // AppState calls exactly once at boot. The value is then
+        // Arc-cloned across handlers via the inner `Arc<Inner>` field
+        // — the OUTER struct is owned-by-value at construction. Pin
+        // the return type via a fn-pointer witness `fn(String) ->
+        // CatKeyRegistry`. A refactor to `Arc<Self>` "for ergonomic
+        // already-shared construction" would force the AppState
+        // assembly to drop its own `.clone()` step (the inner Arc
+        // suffices), breaking the construction pattern at every site.
+        // Symmetric to the KillCache::new + TeeStream::new owned-Self
+        // fn-pointer pins.
+        let _f: fn(String) -> CatKeyRegistry = CatKeyRegistry::new;
+        fn require_owned(_: CatKeyRegistry) {}
+        require_owned(CatKeyRegistry::new(
+            "https://trust-plane.example.test".into(),
+        ));
+    }
+
+    #[test]
+    fn info_resp_kid_and_public_key_fields_pinned_owned_string_for_cross_await_get_method() {
+        // `InfoResp { kid: String, public_key: String }` — both fields
+        // OWNED. The deserialized struct lives across the `.await` on
+        // `resp.json().await` AND outlives the response buffer (the
+        // `bytes` derive later moves the kid+public_key into
+        // `PublicKey::from_bytes(&info.kid, &arr)`). A refactor to
+        // `Cow<'a, str>` "for zero-alloc on the response buffer
+        // borrow" would tie the lifetime to the response body, which
+        // is freed on `resp.json().await` completion — `info.kid`
+        // would dangle on the subsequent `PublicKey::from_bytes` call.
+        // Pin via require_string on both fields. Symmetric to the
+        // OAuthError 4-String-variant + GoogleClient 4-field owned-
+        // String pins.
+        fn require_string(_: &String) {}
+        let raw = r#"{"kid":"k1","public_key":"AAA"}"#;
+        let info: InfoResp = serde_json::from_str(raw).unwrap();
+        require_string(&info.kid);
+        require_string(&info.public_key);
+    }
+
+    #[test]
+    fn cat_key_registry_get_dispatched_via_async_method_with_self_borrow_for_arc_share_contract() {
+        // `CatKeyRegistry::get(&self) -> Future<Output = Result<&
+        // PublicKey, CatKeyError>>` — takes `&self` borrow (not
+        // `self` consumption). The middleware calls
+        // `registry.get().await` repeatedly across the request
+        // lifetime — consuming self would force a clone at every
+        // invocation and break the Arc-share contract. Pin the
+        // `&self` shape by exercising a method dispatch through a
+        // borrowed registry that lives in a shorter scope than the
+        // CatKeyRegistry itself (in a `let registry = ...` block
+        // followed by the borrow). A refactor to `self` would fail
+        // compile at the second `registry.get()` call site at every
+        // adapter that uses the cache. Symmetric to the is_killed
+        // `&self` borrow signature pin extended to this sibling
+        // accessor.
+        let registry = CatKeyRegistry::new("http://127.0.0.1:1/".into());
+        // Compile-time witness: `&CatKeyRegistry` method dispatch.
+        fn require_borrow_get<'a>(
+            r: &'a CatKeyRegistry,
+        ) -> impl std::future::Future<Output = Result<&'a PublicKey, CatKeyError>> + 'a {
+            r.get()
+        }
+        let _fut = require_borrow_get(&registry);
+        // `registry` still usable after the borrow witness — the
+        // method takes &self, not self.
+        let _r2 = &registry;
+    }
 }

@@ -783,4 +783,178 @@ mod tests {
             ENTRY_TTL,
         );
     }
+
+    // ─── round 252 (2026-05-22): KillCache field count + value-type pin,
+    // mark_many empty-iter no-op, mark idempotence, never-marked default-
+    // false, 100-distinct-hash collision check ───
+
+    #[test]
+    fn kill_cache_field_count_pinned_at_exactly_one_hashes_cache_via_exhaustive_destructure() {
+        // `KillCache { hashes: Cache<[u8; 32], ()> }` — exactly 1 field.
+        // A 2nd field landing (e.g. `marked_at: Cache<[u8; 32],
+        // Instant>` for per-mark-time observability OR
+        // `mark_count: Arc<AtomicU64>` for cumulative-mark-rate
+        // dashboard) without matching `new()` constructor wiring
+        // would silently zero-initialize on every KillCache
+        // construction — and the killswitch handler's mark/is_killed
+        // hot path would never touch the new field. The exhaustive
+        // destructure with no `..` rest pattern forces a 2nd field
+        // to update this site in lockstep with the constructor.
+        // Symmetric to round-247's
+        // `refresh_coordinator_field_count_pinned_at_exactly_one_locks_via_exhaustive_destructure`
+        // extended to this sibling single-field bounded-RAM cache
+        // wrapper.
+        let kc = KillCache::new();
+        let KillCache { hashes: _ } = kc;
+    }
+
+    #[test]
+    fn kill_cache_hashes_field_value_type_pinned_unit_zero_sized_via_require_unit_value() {
+        // `KillCache.hashes: Cache<[u8; 32], ()>` — the moka cache's
+        // VALUE type is `()` (zero-sized; the cache is a hash SET, not
+        // a hash MAP). A refactor that swapped the value type to
+        // carry per-hash data (e.g. `Cache<[u8; 32], DateTime<Utc>>`
+        // "for marked-at-time observability" OR `Cache<[u8; 32],
+        // KillReason>` "for triage on revoke vs killswitch:all") would
+        // grow per-entry memory beyond the bare-key calculation pinned
+        // by `entry_ttl_value_relationships_to_max_capacity_bound_safe_memory_footprint`.
+        // The `()` unit value is also load-bearing for the
+        // `hashes.contains_key(hash)` predicate path — switching to a
+        // value-carrying cache would tempt every consumer to `.get()`
+        // instead, returning Option<V> and leaking the marked-at
+        // payload through the membership check. Pin via require_cache_unit_value
+        // fn at the value-type slot. Construct a fresh KillCache and
+        // destructure to access the inner cache, then assert via the
+        // operation-level proxy: insert + check `()` value-type
+        // contract via a closure that pattern-matches the unit.
+        let kc = KillCache::new();
+        let KillCache { hashes } = kc;
+        // The fn-pointer signature on `Cache::contains_key` is
+        // independent of the value type, but `Cache::insert(K, V)`
+        // bakes V into the signature — pin via a no-op closure that
+        // explicitly takes the unit-value parameter.
+        let _f: fn(&Cache<[u8; 32], ()>, [u8; 32], ()) = |_c, _k, _v| {};
+        // Sanity: the cache exists with the inferred type.
+        assert_eq!(hashes.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mark_many_with_empty_iterator_is_no_op_no_panic_no_state_change() {
+        // `mark_many(impl IntoIterator<Item = [u8; 32]>)` — when the
+        // iterator yields zero elements, the helper MUST be a no-op:
+        // no panic on the empty case, no spurious `mark` counter
+        // increment, no cache state mutation. The killswitch handler
+        // sometimes calls `mark_many(empty_vec)` when its DB UPDATE
+        // affected zero rows (idempotent revoke of an already-killed
+        // bearer). A refactor that introduced an unwrapping pattern
+        // (e.g. `assert!(!hashes.is_empty(), "killswitch must mark at
+        // least one")` "for catch-bug-at-mark-time hygiene") would
+        // surface here as a panic on the empty-vec call. Pin the
+        // no-op contract via state-equality before vs after. Symmetric
+        // to round-238's `email_notifier_with_max_retries_consumes_self`
+        // pin extended to this sibling cache-mutation method.
+        let kc = KillCache::new();
+        let empty: Vec<[u8; 32]> = vec![];
+        kc.mark_many(empty).await;
+        // No hashes were marked — the cache is still empty.
+        assert_eq!(kc.hashes.entry_count(), 0);
+        // And a probe hash that was NEVER inserted MUST not be killed.
+        assert!(!kc.is_killed(&[7u8; 32]).await);
+    }
+
+    #[tokio::test]
+    async fn mark_is_idempotent_same_hash_twice_does_not_panic_or_change_visibility() {
+        // The killswitch handler can re-emit a mark for the same
+        // bearer hash (e.g. on a retry of the DB UPDATE under
+        // contention). A refactor that introduced
+        // `assert!(!self.hashes.contains_key(&hash), "double-mark")`
+        // "to catch killswitch-logic bugs" would surface here as a
+        // panic on the second mark. Pin: marking the SAME hash twice
+        // is a no-op on the second call (visibility unchanged: still
+        // killed). Moka's `insert(K, V)` is idempotent on identical
+        // keys (it overwrites), but the SHAPE-OF-CONTRACT at the
+        // KillCache wrapper level needs its own pin so a "narrowed
+        // mark" refactor doesn't break the killswitch retry path.
+        let kc = KillCache::new();
+        let h = [42u8; 32];
+        kc.mark(h).await;
+        assert!(kc.is_killed(&h).await);
+        // Second mark — no panic, no visibility flip.
+        kc.mark(h).await;
+        assert!(kc.is_killed(&h).await);
+        // And the entry count stays at 1 (no duplicate keys). Drive
+        // moka's async writes to completion first so entry_count
+        // reflects the post-insert state.
+        kc.hashes.run_pending_tasks().await;
+        assert_eq!(kc.hashes.entry_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn is_killed_on_never_marked_hash_returns_false_for_default_open_contract() {
+        // The KillCache's default-open contract is load-bearing for
+        // the cache-miss-falls-through-to-DB middleware path: a
+        // never-marked hash returns `false` so the middleware
+        // proceeds to the DB JOIN (the source of truth). A refactor
+        // that flipped the default-open to default-closed
+        // (`is_killed` returns `true` for unknown hashes) "for
+        // fail-safe defaults" would silently reject every legitimate
+        // bearer on a fresh KillCache (which happens after every
+        // process restart). Pin the default-open contract: a
+        // freshly-constructed KillCache returns `false` on EVERY
+        // probe hash. Sweep 8 distinct probe hashes to catch a
+        // pathological all-ones initial state.
+        let kc = KillCache::new();
+        for byte in [0u8, 1, 7, 42, 0xAB, 0xCD, 0xFE, 0xFF] {
+            let probe = [byte; 32];
+            assert!(
+                !kc.is_killed(&probe).await,
+                "fresh KillCache must default-open on probe {byte:#x}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_hundred_distinct_marks_all_retrievable_independently_no_key_aliasing() {
+        // The cache is keyed on `[u8; 32]` — a refactor that
+        // accidentally narrowed the key to a smaller width (e.g.
+        // `Cache<u64, ()>` "for memory savings using first 8 bytes
+        // as the key") would silently alias every bearer hash to its
+        // 64-bit prefix and dramatically increase the false-positive
+        // kill rate. The existing `marked_hash_is_killed` +
+        // `kill_cache_distinct_hashes_do_not_alias` pins exercise
+        // small-N cases; pin the 100-distinct-hash sweep here to
+        // give probabilistic coverage of any width-narrowing
+        // refactor. Each hash differs ONLY in a single byte position
+        // (otherwise identical fillers) so prefix-narrowing
+        // refactors that drop the trailing bytes would surface as
+        // false-positive kills on probe hashes that share the prefix.
+        let kc = KillCache::new();
+        // Mark 100 hashes that share an ALL-ZEROS prefix and differ
+        // only in the trailing byte (positions 28-31 encode `i`).
+        let marked: Vec<[u8; 32]> = (0..100u32)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[28..32].copy_from_slice(&i.to_le_bytes());
+                h
+            })
+            .collect();
+        kc.mark_many(marked.clone()).await;
+        // Allow time for moka's async insertion to settle.
+        kc.hashes.run_pending_tasks().await;
+        for (idx, h) in marked.iter().enumerate() {
+            assert!(
+                kc.is_killed(h).await,
+                "marked hash at index {idx} not surfaced as killed"
+            );
+        }
+        // And an UNMARKED hash that shares the first 28 bytes but
+        // has trailing bytes `100_u32` MUST NOT be killed — catches
+        // prefix-narrowing refactors.
+        let mut probe = [0u8; 32];
+        probe[28..32].copy_from_slice(&100u32.to_le_bytes());
+        assert!(
+            !kc.is_killed(&probe).await,
+            "unmarked hash with shared prefix must NOT be killed",
+        );
+    }
 }

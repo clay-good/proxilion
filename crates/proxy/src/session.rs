@@ -883,4 +883,190 @@ mod tests {
         }
         require_rejection_is_session_extract_error::<SessionCtx>();
     }
+
+    // ─── round 251 (2026-05-22): SessionContext Debug omission of crypto
+    // material, SessionCtx Clone Arc-share, SessionExtractError unit layout
+    // + IntoResponse trait + redacted-marker byte-exactness ───
+
+    #[test]
+    fn session_context_debug_omits_bearer_hash_and_leaf_pca_cbor_for_sensitive_crypto_material_redaction()
+     {
+        // The manual `Debug` impl ([session.rs:38]()) carries EXACTLY 6
+        // fields: `agent_session_id`, `p_0`, `leaf_pca_id`,
+        // `granted_ops`, `google_access_token`, `google_token_scope`.
+        // The two SENSITIVE fields — `bearer_hash` (raw SHA-256 of the
+        // live bearer; ui-less-surfaces.md §4.4 anti-replay) and
+        // `leaf_pca_cbor` (raw signed-PCA CBOR bytes; signature
+        // material) — are INTENTIONALLY OMITTED. The existing
+        // `debug_redacts_google_access_token` pin covers the
+        // `[redacted]` marker for the access token but does NOT pin
+        // the OMISSION of these two crypto fields. A refactor that
+        // mechanically updated the Debug impl to track every struct
+        // field (e.g. via `#[derive(Debug)]` "for consistency with
+        // every other state struct") would silently start rendering
+        // both crypto buffers in every `tracing::warn!(?ctx, ...)`
+        // log line — pasting them straight into operator-shared
+        // tickets and SIEM ingest at scale. Pin the OMISSION via
+        // substring NEGATION on a SessionContext with distinctive
+        // non-zero bytes in BOTH fields so the absence is provable.
+        let ctx = SessionContext {
+            agent_session_id: Uuid::nil(),
+            bearer_hash: [0xAB; 32], // distinctive byte for grep
+            p_0: "alice".into(),
+            leaf_pca_id: Uuid::nil(),
+            leaf_pca_cbor: vec![0xCD; 64], // distinctive byte
+            granted_ops: vec![],
+            google_access_token: "token".into(),
+            google_token_scope: "scope".into(),
+        };
+        let s = format!("{ctx:?}");
+        // Field names absent — a `#[derive(Debug)]` refactor would
+        // surface `bearer_hash` and `leaf_pca_cbor` substrings.
+        assert!(
+            !s.contains("bearer_hash"),
+            "Debug must omit bearer_hash field name: {s}"
+        );
+        assert!(
+            !s.contains("leaf_pca_cbor"),
+            "Debug must omit leaf_pca_cbor field name: {s}"
+        );
+        // And the distinctive byte values (0xAB / 0xCD) must NOT
+        // surface in any rendering form (decimal 171 / 205).
+        assert!(!s.contains("171"), "bearer_hash byte 0xAB leaked: {s}");
+        assert!(!s.contains("205"), "leaf_pca_cbor byte 0xCD leaked: {s}");
+    }
+
+    #[test]
+    fn session_ctx_clone_shares_inner_arc_via_ptr_eq_for_cheap_fan_out_contract() {
+        // `SessionCtx` is `#[derive(Clone)]` over an `Arc<SessionContext>`
+        // tuple. The middleware inserts `Arc<SessionContext>` into
+        // request extensions, and the extractor clones the SessionCtx
+        // into per-handler scope — every clone MUST be an Arc bump
+        // (zero-copy of the inner SessionContext), NOT a deep copy.
+        // The existing
+        // `session_ctx_inner_field_is_arc_session_context_for_cheap_clone_fan_out_contract`
+        // pin walks the FIELD TYPE; pin the BEHAVIORAL Arc-share
+        // contract here via `Arc::ptr_eq`. A refactor that swapped
+        // `Arc<SessionContext>` for owned `SessionContext` "for
+        // ergonomic accessor-elimination" would surface here as
+        // ptr_eq returning false on a fresh clone — AND would force a
+        // 100MB-class deep copy of `leaf_pca_cbor` on every
+        // request-scoped extractor invocation. Symmetric to round-247's
+        // `operator_principal_scopes_cloned_through_arc_share`
+        // extended to this sibling Arc-tuple newtype.
+        let ctx = Arc::new(sample_ctx());
+        let a = SessionCtx(ctx.clone());
+        let b = a.clone();
+        assert!(
+            Arc::ptr_eq(&a.0, &b.0),
+            "SessionCtx::clone must share the underlying Arc"
+        );
+        // And triple-clone preserves the ptr — no clone-time mutation
+        // chain across multiple Arc bumps.
+        let c = b.clone();
+        assert!(Arc::ptr_eq(&a.0, &c.0));
+    }
+
+    #[test]
+    fn session_extract_error_unit_struct_layout_pinned_no_inner_field_via_exhaustive_destructure() {
+        // `SessionExtractError` is a unit struct (NO fields). The
+        // existing `session_extract_error_into_response_is_401` pin
+        // walks the response shape, but the STRUCTURAL layout (no
+        // inner data) is independently load-bearing — a refactor that
+        // added an inner field (`SessionExtractError(String)` "for
+        // debug-mode rich rejection messages" OR
+        // `SessionExtractError { reason: AuthFail }` "for cross-layer
+        // error context") would foreclose the no-data-fast-401 contract
+        // AND would surface as a value-binding requirement at every
+        // `Err(SessionExtractError)` construction site at the
+        // `from_request_parts` boundary. Pin the unit-struct shape via
+        // explicit pattern match with no inner pattern. Symmetric to
+        // round-245's `cipher_error_aead_unit_variant_layout_pinned_via_match_arm_no_pattern_binding`
+        // extended to this sibling unit-struct.
+        let e = SessionExtractError;
+        // Bind via pattern — `SessionExtractError {}` (struct-style)
+        // OR plain `SessionExtractError` (unit-style) both work; the
+        // canonical form is the unit-style which would FAIL TO COMPILE
+        // if a refactor changed to tuple or struct variant. Use the
+        // unit pattern to pin the unit layout specifically.
+        match e {
+            SessionExtractError => {}
+        }
+        // And a fresh construction call with NO ARGS — a refactor to
+        // `SessionExtractError::new(reason)` would surface here at the
+        // construction site.
+        let _e2 = SessionExtractError;
+    }
+
+    #[test]
+    fn session_extract_error_implements_into_response_via_require_trait_bound_witness() {
+        // `SessionExtractError` implements `IntoResponse` so the
+        // FromRequestParts trait can use it directly as the Rejection
+        // associated type (axum auto-wires `Rejection: IntoResponse`).
+        // The existing
+        // `session_ctx_rejection_associated_type_pinned_session_extract_error_via_type_binding`
+        // pin walks the associated-type binding; pin the trait-impl
+        // independently via require_into_response so a refactor that
+        // dropped the `impl IntoResponse for SessionExtractError {}`
+        // block (e.g. "use a generic Response builder instead")
+        // would surface here at the trait-bound rather than at the
+        // axum router assembly site with an opaque trait-bound error.
+        // Symmetric to round-246's
+        // `bearer_hash_required_derived_traits_clone_partial_eq_eq_via_require_for_revocation_lookup`
+        // extended to this sibling axum-extractor trait surface.
+        fn require_into_response<T: IntoResponse>() {}
+        require_into_response::<SessionExtractError>();
+    }
+
+    #[test]
+    fn session_context_debug_redacted_marker_literal_is_exactly_bracketed_redacted_byte_exact() {
+        // The `Debug` impl renders `google_access_token` as the LITERAL
+        // string `"[redacted]"` (square brackets, lowercase, no
+        // surrounding quotes inside the marker — the formatter's
+        // `:?` debug-print wraps the &str field in DOUBLE quotes).
+        // The existing `debug_redacts_google_access_token` pin walks
+        // `.contains("[redacted]")` substring; pin the surrounding
+        // CONTEXT here so a refactor to `"<REDACTED>"` (angle
+        // brackets, uppercase) OR to `""` (empty string elision) OR
+        // to omitting the field entirely would surface at this file.
+        // The post-Debug-format string contains `"[redacted]"`
+        // (WITH surrounding double quotes from the &str debug-format).
+        // Pin: literal bracketed-lowercase-redacted token AND the
+        // absence of common alternative spellings.
+        let ctx = sample_ctx();
+        let s = format!("{ctx:?}");
+        assert!(
+            s.contains("\"[redacted]\""),
+            "Debug must wrap [redacted] marker in double quotes (str debug-format): {s}"
+        );
+        // Alternative spellings MUST NOT appear — catches refactors
+        // that softened to a different marker style.
+        assert!(!s.contains("[REDACTED]"), "uppercase variant leaked: {s}");
+        assert!(
+            !s.contains("<redacted>"),
+            "angle-bracket variant leaked: {s}"
+        );
+        assert!(!s.contains("***"), "asterisk-mask variant leaked: {s}");
+        assert!(!s.contains("xxx"), "x-mask variant leaked: {s}");
+    }
+
+    #[test]
+    fn session_ctx_required_derived_traits_clone_via_require_for_axum_extractor_share() {
+        // `SessionCtx` is `#[derive(Clone)]` — axum's `FromRequestParts`
+        // returns the extractor by value, and downstream `.clone()`
+        // calls at handler entry (e.g. spawning a tokio task that
+        // needs a separate handle) MUST be cheap. The existing
+        // `session_ctx_inner_field_is_arc_session_context_for_cheap_clone_fan_out_contract`
+        // pin walks the FIELD TYPE; pin the TRAIT-DERIVE here via
+        // require_clone so a refactor that dropped the `#[derive(Clone)]`
+        // attribute "for explicit semantics" would surface at this
+        // file rather than as a confusing trait-bound failure at a
+        // distant handler. The clone is cheap by construction (Arc
+        // bump), but the TRAIT itself must be wired. Symmetric to
+        // round-243's
+        // `auth_state_is_clone_for_axum_state_propagation`
+        // extended to this sibling extractor-wrapper trait surface.
+        fn require_clone<T: Clone>() {}
+        require_clone::<SessionCtx>();
+    }
 }

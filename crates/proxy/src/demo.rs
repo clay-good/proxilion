@@ -873,4 +873,174 @@ mod tests {
         assert!(decisions.contains("block"));
         assert!(decisions.contains("require_confirmation"));
     }
+
+    // ─── round 244 (2026-05-22): Scenario field-count exhaustive destructure,
+    // synth_event + start fn-pointer witnesses, const-table type pins, Copy
+    // semantics + ActionEvent extra marker JSON-shape pin ───
+
+    #[test]
+    fn scenario_field_count_pinned_at_exactly_ten_via_exhaustive_destructure_no_rest_pattern() {
+        // `Scenario { vendor, action, method, path_template, decision,
+        // status, policy, read_filter_triggered, quarantined_count,
+        // block_reason }` — exactly 10 fields. A 11th field landing
+        // (e.g. `latency_ms: u32` for synthetic-latency-bucket demo
+        // panel OR `extra_jsonb: &'static str` for per-scenario extra
+        // payload variety) without matching `synth_event()` assignment
+        // wiring would silently leave the new field unread on every
+        // synthesized event — and the demo dashboard's "this is how
+        // ActionEvent rows shape up" beat would silently fall behind
+        // the SCENARIOS const-table. The exhaustive destructure with no
+        // `..` rest pattern forces a 11th field to update this site in
+        // lockstep with both the constant entries AND the
+        // `synth_event` builder. Symmetric to round-242's
+        // `cached_pca_field_count_pinned_exactly_eight_via_exhaustive_destructure`
+        // + round-240's
+        // `blocked_notification_field_count_pinned_at_exactly_sixteen_via_exhaustive_destructure_no_rest`
+        // extended to this sibling const-table struct.
+        let s = block_scenario();
+        let Scenario {
+            vendor: _,
+            action: _,
+            method: _,
+            path_template: _,
+            decision: _,
+            status: _,
+            policy: _,
+            read_filter_triggered: _,
+            quarantined_count: _,
+            block_reason: _,
+        } = s;
+    }
+
+    #[test]
+    fn synth_event_signature_takes_scenario_borrow_returns_action_event_by_value_via_fn_pointer_witness()
+     {
+        // `synth_event(scenario: &Scenario, now: DateTime<Utc>) -> ActionEvent`
+        // — takes the scenario by BORROW and the timestamp by VALUE,
+        // returns an OWNED `ActionEvent` by value. The `ticker` async
+        // loop holds a `scenario` value across the `sleep.await` and
+        // passes `&scenario` into `synth_event` after the await — the
+        // borrow shape lets the scenario live in stack across the
+        // await without moving. A refactor to take the scenario by
+        // VALUE (`scenario: Scenario`) "for ergonomic consumption"
+        // would force every call site to `.clone()` (cheap via Copy,
+        // but still a copy) OR to construct fresh scenarios per-call,
+        // and would foreclose the SCENARIOS const-table direct-deref
+        // pattern. Pin via fn-pointer witness so a signature drift
+        // surfaces at the boundary here. Symmetric to round-240's
+        // `from_record_signature_takes_record_borrow_via_fn_pointer_witness_no_owned_consume`
+        // extended to this sibling const-table builder.
+        let _f: fn(&Scenario, chrono::DateTime<Utc>) -> ActionEvent = synth_event;
+    }
+
+    #[test]
+    fn start_signature_takes_arc_dyn_action_stream_returns_join_handle_unit_via_fn_pointer_witness()
+    {
+        // `start(stream: Arc<dyn ActionStream>) -> JoinHandle<()>` —
+        // takes an Arc-erased ActionStream and returns the tokio task
+        // handle so the caller can keep it alive for the program's
+        // lifetime. The `Arc<dyn>` shape lets server.rs hand off
+        // either a `LoggingStream`, `BroadcastingActionStream`, or
+        // `TeeStream` interchangeably. A refactor that swapped the
+        // input to a concrete `BroadcastingActionStream` "for
+        // type-level safety" would foreclose the dev-mode
+        // `LoggingStream` fallback and break the `Tee...` composition
+        // path. The `JoinHandle<()>` return shape (NOT
+        // `JoinHandle<Result<(), _>>`) signals the task is
+        // infallible at the handle level — errors are warn-logged
+        // internally. Pin via fn-pointer witness. Symmetric to
+        // round-241's
+        // `broadcasting_action_stream_subscribe_return_type_is_broadcast_receiver_via_fn_pointer_witness`
+        // extended to this sibling demo-mode startup helper.
+        let _f: fn(Arc<dyn ActionStream>) -> tokio::task::JoinHandle<()> = start;
+    }
+
+    #[test]
+    fn scenario_type_is_copy_and_clone_via_require_for_scenarios_choose_copied_compat() {
+        // `Scenario: Copy + Clone` (via manual impls — `impl Copy for
+        // Scenario {}` and the delegating Clone impl). The `ticker`
+        // async loop calls `SCENARIOS.choose(&mut rng).copied()` —
+        // `.copied()` requires `Copy` on the element type to escape
+        // the slice's borrow before the `.await` site (which would
+        // otherwise hold the slice borrow across await and force a
+        // Send-bound failure on the spawn). The existing
+        // `scenario_type_clone_and_copy_preserves_every_field_byte_equal`
+        // pin walks the BEHAVIORAL Copy semantics; pin the TYPE-LEVEL
+        // trait bounds here via require_copy_clone so a refactor that
+        // dropped either impl "for explicit semantics" would surface
+        // at this file at the type-bound level rather than at the
+        // `ticker` call site with a confusing trait-bound error.
+        // Symmetric to round-237's
+        // `audit_body_mode_copy_bound_explicit_via_require_copy`
+        // extended to this sibling const-table struct.
+        fn require_copy_clone<T: Copy + Clone>() {}
+        require_copy_clone::<Scenario>();
+    }
+
+    #[test]
+    fn scenarios_and_users_const_types_pinned_static_slice_via_let_binding_for_const_table_embed() {
+        // Both `SCENARIOS: &[Scenario]` and `USERS: &[&str]` are
+        // `&'static`-lifetime slices in `.rodata`. The existing
+        // `users_const_all_carry_user_colon_prefix_and_are_static_str`
+        // walks the INNER &str lifetime; pin the OUTER slice lifetime
+        // here via a let-binding with explicit `&'static [T]` type
+        // annotation so a refactor that swapped either to a `lazy_static!`
+        // wrapper "for runtime configurability" would surface at this
+        // file as a non-static-lifetime type mismatch. The let-binding
+        // also pins the slice ELEMENT count is non-zero (a 0-element
+        // empty const would still type-check as `&'static [Scenario]`
+        // but would foreclose the `choose(&mut rng)` call's None-handling
+        // contract). Symmetric to round-219's
+        // `scope_catalogue_const_field_type_is_static_slice_of_three_tuple_for_compile_time_embed`
+        // extended to these sibling demo-mode const tables.
+        let scenarios: &'static [Scenario] = SCENARIOS;
+        let users: &'static [&'static str] = USERS;
+        assert!(
+            !scenarios.is_empty(),
+            "SCENARIOS const must be non-empty for choose(...) None-handling contract"
+        );
+        assert!(
+            !users.is_empty(),
+            "USERS const must be non-empty for choose(...) unwrap_or-USERS[0] fallback"
+        );
+    }
+
+    #[test]
+    fn synth_event_extra_field_demo_marker_is_json_boolean_not_string_for_postgres_jsonb_filter() {
+        // The `extra: {"demo": true}` marker — operator audit queries
+        // filter via `WHERE extra->>'demo' = 'true'`, which in
+        // Postgres JSONB returns the TEXT form of the value (so a
+        // boolean `true` becomes the string `"true"`, and a string
+        // `"true"` becomes the string `"true"` — both match the SQL
+        // text comparison). BUT operator dashboards may also use
+        // `WHERE extra @> '{"demo": true}'` (containment), which is
+        // a TYPED match — the value MUST be boolean, not string, for
+        // containment to hit. The existing
+        // `synth_event_extra_field_is_demo_true_jsonb_marker_across_all_scenarios`
+        // pin walks `extra["demo"] == true` via serde_json::Value's
+        // PartialEq (which compares any-to-bool intelligently); pin
+        // the underlying JSON TYPE here via `is_boolean()` so a
+        // refactor that wrapped the marker as `"true"` (string)
+        // "for ergonomic Slack-template rendering" would silently
+        // break the containment-filter path on every operator
+        // dashboard. Symmetric to round-241's
+        // `read_filter_triggered_serializes_as_bare_json_boolean_not_string`
+        // extended to this sibling demo-marker JSON-type contract.
+        let ev = synth_event(&drive_scenario(), Utc::now());
+        let demo_value = &ev.extra["demo"];
+        assert!(
+            demo_value.is_boolean(),
+            "extra.demo must be JSON boolean (for @> containment filter), got: {demo_value}"
+        );
+        assert_eq!(demo_value.as_bool(), Some(true));
+        // And the symmetric negative pin: the marker is NOT the
+        // string `"true"` (which would still pass the
+        // `.contains("demo")` and `== true` Value equality checks
+        // via serde_json's lenient PartialEq if it ever shifted).
+        assert_ne!(
+            demo_value,
+            &serde_json::Value::String("true".into()),
+            "extra.demo must NOT be the string \"true\"",
+        );
+    }
 }

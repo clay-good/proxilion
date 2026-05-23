@@ -993,4 +993,203 @@ mod tests {
         // Multibyte unicode prefix preserved.
         assert!(s.contains("café-é-→-🔥"), "multibyte prefix must survive");
     }
+
+    // ─── round 243 (2026-05-22): AuthState + RefreshCoordinator field
+    // counts, AuthFail tuple-variant layouts, unauthorized() fn-pointer
+    // witness ───
+
+    #[tokio::test]
+    async fn auth_state_field_count_pinned_at_exactly_ten_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // `AuthState { db, cipher, pca_cache, cat_keys, refresh_coordinator,
+        // google_token_url, google_client_id, google_client_secret, http,
+        // kill_cache }` — exactly 10 fields. A 11th field landing (e.g.
+        // `metrics_label: &'static str` for per-state metric bucketing OR
+        // `rate_limiter: Arc<RateLimiter>` for bearer-throttle per-IP
+        // observability) without matching `build_auth_state()` constructor
+        // wiring at [crates/proxy/src/server.rs](server.rs) would silently
+        // zero-initialize the new field on every middleware invocation —
+        // and any handler reading it would see the default forever, never
+        // tripping. The exhaustive destructure with no `..` rest pattern
+        // forces a 11th field to update this site in lockstep with the
+        // constructor. Symmetric to round-241's
+        // `broadcasting_action_stream_field_count_pinned_at_exactly_two_via_exhaustive_destructure`
+        // extended to this sibling axum-state shape. Uses
+        // `connect_lazy` for the PgPool (no socket opened) so the
+        // destructure runs without a postgres connection.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://x:y@127.0.0.1:1/z")
+            .expect("lazy connect");
+        let cipher = std::sync::Arc::new(
+            crate::crypto::TokenCipher::from_bytes(&[0u8; 32])
+                .expect("32-byte key must build cipher"),
+        );
+        let state = AuthState {
+            db: pool.clone(),
+            cipher,
+            pca_cache: crate::pic::PcaCache::new(pool),
+            cat_keys: crate::pic::CatKeyRegistry::new("http://127.0.0.1:1/".into()),
+            refresh_coordinator: RefreshCoordinator::default(),
+            google_token_url: "https://oauth2.googleapis.com/token".into(),
+            google_client_id: "client".into(),
+            google_client_secret: "secret".into(),
+            http: reqwest::Client::new(),
+            kill_cache: crate::kill_cache::KillCache::new(),
+        };
+        let AuthState {
+            db: _,
+            cipher: _,
+            pca_cache: _,
+            cat_keys: _,
+            refresh_coordinator: _,
+            google_token_url: _,
+            google_client_id: _,
+            google_client_secret: _,
+            http: _,
+            kill_cache: _,
+        } = state;
+    }
+
+    #[test]
+    fn refresh_coordinator_field_count_pinned_at_exactly_one_locks_via_exhaustive_destructure() {
+        // `RefreshCoordinator { locks: Cache<[u8; 32], Arc<Mutex<()>>> }` —
+        // exactly 1 field. A 2nd field landing (e.g.
+        // `inflight_counter: Arc<AtomicU64>` for per-bearer in-flight
+        // refresh observability OR `total_locks_minted: AtomicU64` for
+        // operator dashboard refresh-fan-out metric) without matching
+        // `Default` impl AND `Clone` derive wiring would silently leave
+        // the new field at its `AtomicU64::default() = 0` state on every
+        // construction. The exhaustive destructure with no `..` rest
+        // pattern forces a 2nd field to update this site in lockstep
+        // with the constructor. Symmetric to round-239's
+        // `pic_executor_field_count_pinned_at_exactly_one_inner_arc_via_exhaustive_destructure`
+        // extended to this sibling single-field wrapper.
+        let c = RefreshCoordinator::default();
+        let RefreshCoordinator { locks: _ } = c;
+    }
+
+    #[test]
+    fn auth_fail_db_variant_layout_pinned_tuple_one_positional_inner_sqlx_via_exhaustive_destructure()
+     {
+        // `AuthFail::Db(#[from] sqlx::Error)` — TUPLE variant with
+        // EXACTLY one positional inner (the sqlx::Error wrapped via
+        // `#[from]`). A refactor to a STRUCT variant
+        // (`Db { inner: sqlx::Error }`) "for ergonomic named-field
+        // access at the log site" OR to a multi-field tuple
+        // (`Db(sqlx::Error, String)` adding triage context) would
+        // break the `#[from]` blanket impl (which requires a
+        // one-positional-field variant) AND would force every `?`
+        // conversion site at [build_session](auth_middleware.rs:133)
+        // to rebuild the variant by hand. Pin the tuple-with-one-
+        // positional shape via exhaustive destructure on a `match`
+        // arm — `AuthFail::Db(_)` with no struct-style braces forces
+        // the tuple-positional layout to remain stable. Symmetric to
+        // round-242's
+        // `cache_error_db_variant_layout_pinned_tuple_via_exhaustive_destructure_one_positional_inner_sqlx`
+        // extended to this sibling tuple-positional variant layout
+        // on the auth-middleware error enum.
+        let e = AuthFail::from(sqlx::Error::RowNotFound);
+        match e {
+            AuthFail::Db(_inner) => {}
+            other => panic!("expected Db, got {other:?}"),
+        }
+        // And the `?` conversion path lands on the SAME tuple-
+        // positional variant — pin both shapes move in lockstep.
+        let from_q: Result<(), AuthFail> = (|| -> Result<(), AuthFail> {
+            Err::<(), sqlx::Error>(sqlx::Error::PoolClosed)?;
+            Ok(())
+        })();
+        match from_q.unwrap_err() {
+            AuthFail::Db(_inner) => {}
+            other => panic!("expected Db from ?-conversion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_fail_refresh_cat_key_other_all_tuple_variant_layout_pinned_via_exhaustive_destructure_one_inner()
+     {
+        // Symmetric to the Db tuple-variant pin above — pin that ALL
+        // THREE String-bearing variants (Refresh / CatKey / Other) are
+        // TUPLE variants with EXACTLY one positional inner each. The
+        // existing
+        // `auth_fail_refresh_cat_key_and_other_inner_fields_are_owned_string`
+        // pin walks the inner TYPE (String) but NOT the variant LAYOUT
+        // (tuple-with-one-positional vs struct-with-named-field). A
+        // refactor that swapped any to a struct variant
+        // (`Refresh { upstream: String }` "for ergonomic named-field
+        // logging") would foreclose the `AuthFail::Refresh(s) => s`
+        // destructure pattern at every operator log-formatting site.
+        // Pin via exhaustive destructure on `match` arms. Symmetric
+        // to round-230's
+        // `app_error_policy_blocked_struct_variant_field_count_pinned_at_exactly_three_via_exhaustive_destructure`
+        // (which pins a struct variant shape) — this pins the
+        // tuple-variant counterparts.
+        let r = AuthFail::Refresh("network timeout".into());
+        match r {
+            AuthFail::Refresh(_inner) => {}
+            other => panic!("expected Refresh, got {other:?}"),
+        }
+        let c = AuthFail::CatKey("trust plane 503".into());
+        match c {
+            AuthFail::CatKey(_inner) => {}
+            other => panic!("expected CatKey, got {other:?}"),
+        }
+        let o = AuthFail::Other("internal state error".into());
+        match o {
+            AuthFail::Other(_inner) => {}
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unauthorized_signature_takes_no_args_returns_response_via_fn_pointer_witness() {
+        // `unauthorized() -> Response` — takes NO arguments and returns
+        // OWNED `axum::response::Response` by value. The middleware's
+        // four reject paths
+        // ([crates/proxy/src/auth_middleware.rs:93](),
+        // [:104]()) all dispatch through this helper. A refactor that
+        // added a `reason: &str` parameter "for richer 401 body" would
+        // break the call-site signature contract — and worse, would
+        // tempt operators to leak the rejection cause in the body
+        // (the existing
+        // `auth_fail_decrypt_does_not_carry_cipher_internals_in_message`
+        // pin enforces NO-leak at the AuthFail layer; this fn-pointer
+        // witness extends that contract to the helper's signature).
+        // A refactor to `async fn unauthorized() -> Response` "for
+        // tracing-span-aware metric emit" would change the fn-pointer
+        // shape (the return type would become `impl Future<...>`) and
+        // surface here. Pin via fn-pointer witness. Symmetric to
+        // round-239's
+        // `pic_executor_new_return_type_is_result_self_executor_error_via_fn_pointer_witness`
+        // extended to this no-arg helper.
+        let _f: fn() -> Response = unauthorized;
+    }
+
+    #[test]
+    fn auth_state_cipher_field_pinned_arc_token_cipher_via_require_arc_for_zero_alloc_clone_share()
+    {
+        // `cipher: Arc<TokenCipher>` — pinned to `Arc<TokenCipher>`
+        // wrapping (NOT bare `TokenCipher` by value). axum clones
+        // `AuthState` on every middleware invocation; an unwrapped
+        // `TokenCipher` would clone its inner `Aes256Gcm` key state on
+        // every clone (or, with `#[derive(Clone)]` blocked by aes-gcm,
+        // would compile-fail outright). The Arc wrap lets all clones
+        // share the SAME compiled key schedule — pin via
+        // `require_arc_token_cipher` so a refactor that dropped the Arc
+        // "for ergonomic direct-method-call" would surface here at the
+        // field-type boundary rather than at AppState assembly. The
+        // SAME reasoning applies to `db: PgPool` (sqlx::PgPool is
+        // internally Arc-shared, no outer Arc needed) and `pca_cache:
+        // PcaCache` (carries an internal `PgPool` field) — only the
+        // `cipher` field needs the outer Arc. Symmetric to round-238's
+        // `email_notifier_recipient_fields_to_cc_bcc_all_pinned_owned_vec_mailbox_via_require`
+        // extended to this Arc-wrapped state field.
+        fn require_arc_token_cipher(_: std::sync::Arc<crate::crypto::TokenCipher>) {}
+        let cipher = std::sync::Arc::new(
+            crate::crypto::TokenCipher::from_bytes(&[0u8; 32])
+                .expect("32-byte key must build cipher"),
+        );
+        require_arc_token_cipher(cipher);
+    }
 }

@@ -868,4 +868,192 @@ mod tests {
         let fix = body.fix.expect("fix present");
         assert!(fix.contains("Live feed") || fix.contains("/admin"));
     }
+
+    // ─── round 230 (2026-05-22): AppError variant count, PolicyBlocked struct-
+    // variant exhaustive destructure, code/status fn-pointer pins, body() RT,
+    // Internal owned-String contract ───
+
+    #[test]
+    fn app_error_variant_count_pinned_at_exactly_eleven_via_exhaustive_match_no_underscore_fallback()
+     {
+        // `AppError` has 11 variants: PolicyBlocked, RequireConfirmation,
+        // RateLimit, PicInvariantViolation, UpstreamTooLarge, Upstream,
+        // Policy, OpsTemplate, ReadFilterBlocked, Db, Internal. A 12th
+        // variant landing (e.g. `OperatorOverride(String)` for a
+        // ui-less-surfaces.md follow-up, OR `CircuitBreakerOpen` for a
+        // per-vendor circuit breaker) without matching `code()` /
+        // `status()` / `body()` arms would silently default to whatever
+        // wildcard catches it (today there's none — exhaustive matches
+        // are required). The exhaustive-match witness with no `_`
+        // fallback forces a 12th variant to update every match arm in
+        // lockstep — surfacing here at compile time, not at the wire-
+        // shape mismatch downstream. Symmetric to the CipherError 2-
+        // variant + CacheError 1-variant + SetupError 1-variant
+        // exhaustive-match pins.
+        fn _exhaustive_variant_check(e: &AppError) -> &'static str {
+            match e {
+                AppError::PolicyBlocked { .. } => "policy_blocked",
+                AppError::RequireConfirmation(_) => "require_confirmation",
+                AppError::RateLimit => "rate_limit",
+                AppError::PicInvariantViolation(_) => "pic_invariant",
+                AppError::UpstreamTooLarge => "upstream_too_large",
+                AppError::Upstream(_) => "upstream",
+                AppError::Policy(_) => "policy",
+                AppError::OpsTemplate(_) => "ops_template",
+                AppError::ReadFilterBlocked => "read_filter_blocked",
+                AppError::Db(_) => "db",
+                AppError::Internal(_) => "internal",
+            }
+        }
+        // Exercise on a representative variant so the witness runs.
+        let e = AppError::RateLimit;
+        assert_eq!(_exhaustive_variant_check(&e), "rate_limit");
+    }
+
+    #[test]
+    fn app_error_policy_blocked_struct_variant_field_count_pinned_at_exactly_three_via_destructure()
+    {
+        // `AppError::PolicyBlocked { policy_id, reason, override_allowed }`
+        // — exactly 3 fields. A 4th field landing (e.g. `matched_rule:
+        // Option<String>` for surfacing the specific rule inside the
+        // policy that fired, OR `severity: Severity` for a tiered
+        // policy-block enum) without matching `body()` extras
+        // construction at the PolicyBlocked arm would silently lose
+        // the new field on every wire response. The exhaustive
+        // destructure with no `..` rest pattern forces a 4th field to
+        // update both the destructure AND the body() construction in
+        // lockstep — surfacing here. Symmetric to the FederationClaims
+        // 8-field + EscalationRow 13-field exhaustive-destructure pins
+        // extended to a struct-variant case.
+        let e = AppError::PolicyBlocked {
+            policy_id: Some("pol1".into()),
+            reason: "denied".into(),
+            override_allowed: true,
+        };
+        if let AppError::PolicyBlocked {
+            policy_id: _,
+            reason: _,
+            override_allowed: _,
+        } = e
+        {
+            // Destructure compiled — 3-field shape confirmed.
+        } else {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn app_error_code_return_type_is_error_code_via_fn_pointer_witness_for_metric_label_propagation()
+     {
+        // `AppError::code(&self) -> ErrorCode` is invoked on every
+        // error response to attach the `code=...` metric label AND to
+        // construct the wire envelope's `code` field. Pin the return
+        // type via a fn-pointer witness so a refactor that widened to
+        // `Option<ErrorCode>` "for variants that don't map to a
+        // canonical code yet" would surface here at the type axis,
+        // breaking the metric-emit + envelope construction sites that
+        // depend on infallibility. The classifier MUST be total — every
+        // variant has a code, none are skipped — and the type axis is
+        // where that contract lives. Symmetric to the OAuthError::body
+        // owned-ErrorBody fn-pointer pin in round 220.
+        let _f: fn(&AppError) -> ErrorCode = AppError::code;
+        // Exercise across a representative variant.
+        let e = AppError::RateLimit;
+        let code: ErrorCode = e.code();
+        let _ = code;
+    }
+
+    #[test]
+    fn app_error_status_return_type_is_status_code_via_fn_pointer_witness_for_axum_into_response() {
+        // `AppError::status(&self) -> StatusCode` is invoked by
+        // `into_response` to set the HTTP status on the wire envelope.
+        // Pin the return type via a fn-pointer witness so a refactor
+        // that widened to `u16` "for ergonomic integer-level
+        // operator-override at the boundary" would surface here at the
+        // type axis. The axum `into_response` site depends on the
+        // typed StatusCode for correct 4xx/5xx bucket classification.
+        // Symmetric to the OAuthError::status fn-pointer + status
+        // integer-level pins.
+        let _f: fn(&AppError) -> StatusCode = AppError::status;
+        let e = AppError::RateLimit;
+        let _: StatusCode = e.status();
+    }
+
+    #[test]
+    fn app_error_body_is_referentially_transparent_across_fifty_calls_per_variant() {
+        // `AppError::body()` is a pure function of `&self` — no I/O, no
+        // global state, no time-of-day input. Pin referential
+        // transparency across 50 calls per variant so a refactor that,
+        // e.g., introduced a per-call rate-limit-driven detail mutation
+        // ("promote rate-limit-of-rate-limits to PicInvariantViolation
+        // after 100th in 10s") would surface here as non-deterministic
+        // output. Operator dashboards depend on the `code` + `detail`
+        // wire shape being byte-stable across all error emissions of
+        // the same variant. Symmetric to the OAuthError::body RT
+        // 50-call + ErrorBody::new RT 50-call pins.
+        let variants = [
+            AppError::PolicyBlocked {
+                policy_id: Some("p1".into()),
+                reason: "r".into(),
+                override_allowed: true,
+            },
+            AppError::RequireConfirmation("reason".into()),
+            AppError::RateLimit,
+            AppError::PicInvariantViolation("hop".into()),
+            AppError::UpstreamTooLarge,
+            AppError::ReadFilterBlocked,
+            AppError::Internal("boom".into()),
+        ];
+        for v in &variants {
+            let first_body = v.body();
+            for i in 0..50 {
+                let next = v.body();
+                assert_eq!(
+                    next.code, first_body.code,
+                    "iter {i}: code drift on variant {v:?}",
+                );
+                assert_eq!(
+                    next.detail, first_body.detail,
+                    "iter {i}: detail drift on variant {v:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn app_error_internal_inner_field_pinned_owned_string_for_cross_await_anyhow_chain_propagation()
+    {
+        // `AppError::Internal(String)` — the inner field is OWNED
+        // `String`, NOT `&'static str` or `Cow<'static, str>`. The
+        // value is constructed at adapter call sites via `format!()`
+        // / `e.to_string()` — both produce owned String — and is
+        // moved across `.await` boundaries through `tokio::spawn`
+        // (audit emit) before finally landing in `into_response`. A
+        // refactor to `&'static str` "for cheaper passthrough on
+        // static-prefix error paths" would force every adapter call
+        // site to switch to leaked-string OR `Box::leak`, fragmenting
+        // the construction shape across 20+ adapter files. Pin via
+        // require_owned_string. Symmetric to the OAuthError 4-String-
+        // variant owned-String pin in round 220 + GoogleClient
+        // 4-field owned-String pin in round 216 extended to this
+        // catchall variant.
+        fn require_owned_string(s: String) -> String {
+            s
+        }
+        let inner = require_owned_string(String::from("synthesized error message"));
+        let e = AppError::Internal(inner);
+        if let AppError::Internal(s) = &e {
+            // Confirm the owned-String shape at the field-access level.
+            require_owned_string(s.clone());
+            assert_eq!(s, "synthesized error message");
+        } else {
+            unreachable!()
+        }
+        // And exercise the RequireConfirmation arm with the same
+        // contract — also single-tuple String variant.
+        let e2 = AppError::RequireConfirmation(String::from("confirm please"));
+        if let AppError::RequireConfirmation(s) = &e2 {
+            require_owned_string(s.clone());
+        }
+    }
 }

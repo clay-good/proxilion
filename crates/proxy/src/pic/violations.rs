@@ -753,4 +753,210 @@ mod tests {
             assert_eq!(mode, &mode.to_lowercase(), "mode must be lowercase");
         }
     }
+
+    // ─── round 229 (2026-05-22): PicViolationRecord exhaustive destructure,
+    // UUID + Option<Uuid> field type pins, parse_missing_atoms return-type
+    // fn-pointer + input borrow contract, colon passthrough ───
+
+    #[test]
+    fn pic_violation_record_field_count_pinned_at_exactly_thirteen_via_exhaustive_destructure_no_rest()
+     {
+        // `PicViolationRecord<'_>` carries 13 fields: request_id,
+        // session_id, p_0, vendor, action, method, path, policy_id,
+        // predecessor_pca_id, attempted_ops, missing_atoms, pic_mode,
+        // detail. A 14th field landing (e.g. `pcal_chain_root: Uuid`
+        // for surfacing the chain root in the audit row, OR
+        // `policy_evaluation_id: Uuid` for cross-referencing the
+        // policy-engine trace) without matching INSERT column wiring
+        // in `persist()` would silently DROP the new field on every
+        // write — operators investigating a PIC violation in the audit
+        // log would see no error AND no new column. The exhaustive
+        // destructure with no `..` rest pattern forces a 14th field to
+        // update this site in lockstep with the INSERT site. Symmetric
+        // to the EscalationRow 13-field + FederationClaims 8-field +
+        // ActionEvent 16-field exhaustive-destructure pins.
+        let ops: &[String] = &[];
+        let atoms: &[String] = &[];
+        let r = PicViolationRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "p",
+            policy_id: None,
+            predecessor_pca_id: None,
+            attempted_ops: ops,
+            missing_atoms: atoms,
+            pic_mode: "audit",
+            detail: None,
+        };
+        let PicViolationRecord {
+            request_id: _,
+            session_id: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            method: _,
+            path: _,
+            policy_id: _,
+            predecessor_pca_id: _,
+            attempted_ops: _,
+            missing_atoms: _,
+            pic_mode: _,
+            detail: _,
+        } = r;
+    }
+
+    #[test]
+    fn pic_violation_record_uuid_fields_pinned_uuid_type_for_postgres_uuid_column_compat() {
+        // `PicViolationRecord.request_id` and `.session_id` are both
+        // `uuid::Uuid` matching the postgres `request_id UUID NOT NULL`
+        // and `session_id UUID NOT NULL` column shapes. The existing
+        // field-type sweep pins `&'static str` on pic_mode and
+        // borrowed slices on attempted_ops/missing_atoms, but doesn't
+        // explicitly pin the UUID type on the two id fields. A refactor
+        // to `String` "for ergonomic round-trip through the audit log's
+        // string-formatted request_id" would break the sqlx bind path
+        // at the `persist()` INSERT site (the `$1` bind expects UUID).
+        // A refactor to a custom newtype wrapper would pass the
+        // sqlx::Type<Postgres> impl if added AND silently change the
+        // `format!("{id}")` shape downstream in any tracing emit.
+        // Pin via require_uuid on both fields. Symmetric to the
+        // EscalationRow uuid-field pin in round 226 + SessionContext
+        // uuid-field pin in round 227 extended to this sibling shape.
+        fn require_uuid(_: uuid::Uuid) {}
+        let r = PicViolationRecord {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "p",
+            policy_id: None,
+            predecessor_pca_id: None,
+            attempted_ops: &[],
+            missing_atoms: &[],
+            pic_mode: "audit",
+            detail: None,
+        };
+        require_uuid(r.request_id);
+        require_uuid(r.session_id);
+    }
+
+    #[test]
+    fn pic_violation_record_predecessor_pca_id_field_pinned_option_uuid_for_nullable_chain_root() {
+        // `PicViolationRecord.predecessor_pca_id: Option<Uuid>` — the
+        // postgres column is `predecessor_pca_id UUID NULL` (the PCA
+        // chain root has no predecessor; intermediate links do). A
+        // refactor to bare `uuid::Uuid` with `Uuid::nil()` as the root
+        // sentinel would break the sqlx FromRow derive AND collapse
+        // "this is a chain root" with "predecessor was explicitly
+        // nil-Uuid" — both important operator-triage distinctions when
+        // investigating a broken PIC chain. Pin via require_opt_uuid on
+        // both arms (None for chain root, Some for intermediate links).
+        // Symmetric to the EscalationRow predecessor_pca_id pin in
+        // round 226 extended to this sibling shape.
+        fn require_opt_uuid(_: &Option<uuid::Uuid>) {}
+        let root = PicViolationRecord {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            p_0: None,
+            vendor: "v",
+            action: "a",
+            method: "m",
+            path: "p",
+            policy_id: None,
+            predecessor_pca_id: None,
+            attempted_ops: &[],
+            missing_atoms: &[],
+            pic_mode: "audit",
+            detail: None,
+        };
+        require_opt_uuid(&root.predecessor_pca_id);
+        assert!(root.predecessor_pca_id.is_none());
+        let link = PicViolationRecord {
+            predecessor_pca_id: Some(Uuid::new_v4()),
+            ..root
+        };
+        require_opt_uuid(&link.predecessor_pca_id);
+        assert!(link.predecessor_pca_id.is_some());
+    }
+
+    #[test]
+    fn parse_missing_atoms_return_type_is_owned_vec_string_via_fn_pointer_witness_for_persist_bind()
+    {
+        // `parse_missing_atoms(&str) -> Vec<String>` — the value flows
+        // into `PicViolationRecord.missing_atoms: &'a [String]` via a
+        // borrow at the persist call site, which then crosses the
+        // `.await` at `sqlx::query.bind(...).execute(db)`. The
+        // owned Vec lives in the caller's frame across that await. A
+        // refactor to `Vec<&'a str>` "for zero-alloc on the upstream
+        // detail borrow" would tie the lifetime to the detail input,
+        // breaking the cross-await Vec ownership the persist binds
+        // require. A refactor to `SmallVec<[String; 4]>` "for hot-path
+        // small-N alloc avoidance" would change the type at every call
+        // site. Pin via fn-pointer witness `fn(&str) -> Vec<String>`.
+        // Symmetric to the new_auth_code + pct + WebhookSecret::sign
+        // owned-return-type fn-pointer pins extended to this sibling
+        // helper.
+        let _f: fn(&str) -> Vec<String> = parse_missing_atoms;
+        fn require_owned_vec(_: Vec<String>) {}
+        require_owned_vec(parse_missing_atoms("missing [a, b]"));
+    }
+
+    #[test]
+    fn parse_missing_atoms_treats_colon_as_atom_byte_not_separator_for_scope_op_passthrough() {
+        // Atoms have the canonical shape `drive:read:bob/secret.docx` —
+        // colons are byte-level separators WITHIN an atom (between the
+        // vendor:verb:resource segments), NOT the inter-atom
+        // separator (which is `,`). The existing `parse_atoms_bracketed`
+        // test happens to exercise atoms with colons but doesn't
+        // explicitly pin that colons are NOT treated as atom
+        // boundaries. A refactor that introduced a second separator
+        // (e.g. `s.split(|c| c == ',' || c == ':')`) "for liberal
+        // tokenization" would silently fragment every atom into 3
+        // pieces, blowing up the missing_atoms array width on every
+        // persist and breaking dashboards that group by atom. Pin
+        // colon byte-passthrough across the canonical 3-segment shape.
+        let atoms = parse_missing_atoms("missing [drive:read:bob/secret.docx]");
+        assert_eq!(atoms, vec!["drive:read:bob/secret.docx".to_string()]);
+        // And multi-atom with colons in each — the COMMA is the
+        // separator, the colons must stay intact.
+        let atoms2 = parse_missing_atoms("missing [drive:read:a, gmail:send:b, calendar:write:c]");
+        assert_eq!(
+            atoms2,
+            vec![
+                "drive:read:a".to_string(),
+                "gmail:send:b".to_string(),
+                "calendar:write:c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_missing_atoms_input_borrowed_not_owned_via_fn_signature_for_zero_alloc_caller_hot_path()
+     {
+        // `parse_missing_atoms(detail: &str)` takes the input by
+        // BORROW — the caller passes `&record.detail` or a borrowed
+        // slice of the upstream response body. A refactor to take by
+        // value (`detail: String`) "for ownership-into-the-allocator
+        // ergonomic" would force every call site to clone the detail
+        // string before calling, allocating an extra String per
+        // persist on the (already cold) PIC-violation path — but more
+        // operationally important, the type axis surfaces here at the
+        // signature boundary. Pin via a fn-pointer witness with the
+        // borrow shape. Symmetric to the is_killed `&[u8;32]` borrow
+        // pin + sanitize_token `&str` borrow pin in earlier rounds.
+        let _f: fn(&str) -> Vec<String> = parse_missing_atoms;
+        // Runtime exercise on a borrowed input that lives in a scope
+        // smaller than the output Vec — pins that the output owns
+        // its strings.
+        let owned_input = String::from("missing [a, b]");
+        let result = parse_missing_atoms(&owned_input);
+        drop(owned_input); // input dropped, but result must still be valid
+        assert_eq!(result, vec!["a".to_string(), "b".to_string()]);
+    }
 }

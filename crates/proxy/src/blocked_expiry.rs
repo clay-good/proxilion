@@ -749,4 +749,192 @@ mod tests {
         assert_eq!(DEFAULT_TICK_INTERVAL.subsec_nanos(), 0);
         assert_eq!(DEFAULT_TICK_INTERVAL.as_secs(), 60);
     }
+
+    // ─── round 226 (2026-05-22): ExpirySweepReport + EscalationSweepReport +
+    // EscalationRow field-count exhaustive destructure, uuid + Option<Uuid>
+    // type pins, Default+Clone+Debug auto-trait combo ───
+
+    #[test]
+    fn expiry_sweep_report_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `ExpirySweepReport { expired_rows: u64 }` — exactly 1 field.
+        // A 2nd field landing (e.g. `started_at: DateTime<Utc>` for
+        // sweep-duration logging, OR `errors: Vec<sqlx::Error>` for
+        // per-row failure surfacing) without matching `sweep_once`
+        // construction at `Ok(ExpirySweepReport { expired_rows: n })`
+        // would silently leave the new field zero-initialized on every
+        // sweep — operator dashboards summing `expired_rows` would see
+        // no error AND no behaviour change. The exhaustive destructure
+        // with no `..` rest pattern forces a 2nd field to update this
+        // site in lockstep with the constructor. Symmetric to the
+        // TeeStream 2-field + WebhookSecret 1-field exhaustive-
+        // destructure pins.
+        let r = ExpirySweepReport { expired_rows: 42 };
+        let ExpirySweepReport { expired_rows: _ } = r;
+    }
+
+    #[test]
+    fn escalation_sweep_report_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `EscalationSweepReport { escalated_rows: u64 }` — exactly 1
+        // field. A 2nd field landing (e.g. `next_escalation_at:
+        // Option<DateTime<Utc>>` "for the next-tick batched-escalation
+        // window") without matching `sweep_escalations` construction at
+        // `Ok(EscalationSweepReport { escalated_rows: n })` would
+        // silently leave the new field zero-initialized. The
+        // exhaustive destructure forces a 2nd field to update this
+        // site in lockstep with the constructor. Symmetric to the
+        // ExpirySweepReport 1-field pin above.
+        let r = EscalationSweepReport { escalated_rows: 17 };
+        let EscalationSweepReport { escalated_rows: _ } = r;
+    }
+
+    #[test]
+    fn escalation_row_field_count_pinned_at_exactly_thirteen_via_exhaustive_destructure_no_rest() {
+        // `EscalationRow` is the deserialized return type of the
+        // claim-and-stamp UPDATE in `sweep_escalations`. The RETURNING
+        // clause projects 13 columns: id, request_id, session_id, p_0,
+        // vendor, action, method, path, layer, policy_id, detail,
+        // predecessor_pca_id, requested_ops. A 14th column landing in
+        // the RETURNING clause (e.g. `escalation_count INT` for a
+        // multi-escalation policy, OR `original_at TIMESTAMP` for
+        // latency observability) without matching the EscalationRow
+        // struct fields would FAIL the sqlx FromRow derive at compile
+        // time — but the symmetric drift in the OTHER direction (a 14th
+        // field added to EscalationRow without the matching RETURNING
+        // column) would silently zero-default at runtime. The exhaustive
+        // destructure forces both directions to update this site in
+        // lockstep. Symmetric to the ActionEvent 16-field + CachedPca
+        // 8-field + FederationClaims 8-field exhaustive-destructure
+        // pins extended to this sibling FromRow shape.
+        let row = EscalationRow {
+            id: uuid::Uuid::nil(),
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            p_0: None,
+            vendor: "v".into(),
+            action: "a".into(),
+            method: "m".into(),
+            path: "p".into(),
+            layer: "l".into(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec![],
+        };
+        let EscalationRow {
+            id: _,
+            request_id: _,
+            session_id: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            method: _,
+            path: _,
+            layer: _,
+            policy_id: _,
+            detail: _,
+            predecessor_pca_id: _,
+            requested_ops: _,
+        } = row;
+    }
+
+    #[test]
+    fn escalation_row_uuid_fields_all_pinned_uuid_type_for_postgres_uuid_column_compat() {
+        // `EscalationRow.id` / `request_id` / `session_id` — all three
+        // are `uuid::Uuid` matching the postgres `UUID NOT NULL` column
+        // shape. A refactor to `String` "for ergonomic round-trip
+        // through the notifier's URL-encoded blocked_id" would break
+        // the sqlx FromRow derive at compile time, but a refactor to a
+        // custom newtype `wrapper::SessionId(Uuid)` "for type-level
+        // mixing-prevention between request_id and session_id" would
+        // pass the FromRow derive (if it implemented Type<Postgres>)
+        // AND silently change the format of the field in any
+        // `format!("{id}")` site downstream. Pin via require_uuid on
+        // all three id fields. Symmetric to the EscalationRow
+        // owned-String + Option<String> + Vec<String> field-type pins
+        // in round 196 extended to the symmetric UUID arm.
+        fn require_uuid(_: uuid::Uuid) {}
+        let row = EscalationRow {
+            id: uuid::Uuid::new_v4(),
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            p_0: None,
+            vendor: "v".into(),
+            action: "a".into(),
+            method: "m".into(),
+            path: "p".into(),
+            layer: "l".into(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec![],
+        };
+        require_uuid(row.id);
+        require_uuid(row.request_id);
+        require_uuid(row.session_id);
+    }
+
+    #[test]
+    fn escalation_row_predecessor_pca_id_field_pinned_option_uuid_for_nullable_pic_chain_root() {
+        // `EscalationRow.predecessor_pca_id: Option<uuid::Uuid>` — the
+        // postgres column is `predecessor_pca_id UUID NULL` (the PCA
+        // chain root has no predecessor; intermediate links do). A
+        // refactor to bare `uuid::Uuid` "with `Uuid::nil()` as the
+        // root sentinel" would break the sqlx FromRow derive at
+        // compile time (nullable column → non-nullable Rust type),
+        // but a refactor that defaulted to nil via `COALESCE(
+        // predecessor_pca_id, '00000000-0000-0000-0000-000000000000')`
+        // in the SQL would silently collapse "this is a chain root"
+        // with "predecessor was explicitly nil" — both important
+        // operator-triage distinctions when investigating a broken
+        // PIC chain. Pin via require_opt_uuid. Symmetric to the
+        // EscalationRow 3-field Option<String> + ErrorBody.detail
+        // Option<String> + KillBody 3-Option<String> nullable-field
+        // pins extended to this sibling Option<Uuid> shape.
+        fn require_opt_uuid(_: &Option<uuid::Uuid>) {}
+        let row_root = EscalationRow {
+            id: uuid::Uuid::nil(),
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            p_0: None,
+            vendor: "v".into(),
+            action: "a".into(),
+            method: "m".into(),
+            path: "p".into(),
+            layer: "l".into(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec![],
+        };
+        require_opt_uuid(&row_root.predecessor_pca_id);
+        assert!(row_root.predecessor_pca_id.is_none());
+        let row_link = EscalationRow {
+            predecessor_pca_id: Some(uuid::Uuid::new_v4()),
+            ..row_root
+        };
+        require_opt_uuid(&row_link.predecessor_pca_id);
+        assert!(row_link.predecessor_pca_id.is_some());
+    }
+
+    #[test]
+    fn sweep_reports_implement_default_clone_debug_auto_trait_combo_via_require_combo_witness() {
+        // Both `ExpirySweepReport` and `EscalationSweepReport` derive
+        // `Default + Clone + Debug` — the three auto-traits the
+        // sweeper loop relies on at distinct call sites: `Default` for
+        // the no-overdue-rows early-return arm and the `EmailHandle =
+        // None` early-return arm in `sweep_escalations`; `Clone` for
+        // the spawn-arm move into the per-row notifier (the report
+        // value is borrowed AND cloned across the `.await` in the
+        // info log line); `Debug` for the `tracing::debug!(?r, ...)`
+        // match arm in the spawn loop. A refactor that dropped any one
+        // of the three derives (e.g. removing `Default` "since
+        // `sweep_once` always constructs with an explicit count")
+        // would silently break the early-return path or a logging
+        // arm. Pin the 3-trait combo at the TYPE level so a refactor
+        // surfaces here at the bound, not at the (potentially distant)
+        // call site. Symmetric to the Send+Sync+'static combo pins.
+        fn require_default_clone_debug<T: Default + Clone + std::fmt::Debug>() {}
+        require_default_clone_debug::<ExpirySweepReport>();
+        require_default_clone_debug::<EscalationSweepReport>();
+    }
 }

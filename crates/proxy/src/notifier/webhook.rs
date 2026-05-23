@@ -915,4 +915,155 @@ mod tests {
             );
         }
     }
+
+    // ─── round 225 (2026-05-22): WebhookSecret/WebhookNotifier exhaustive
+    // destructure field counts, return-type pins on from_hex/sign/new,
+    // WebhookSecret inner field type pin ───
+
+    #[test]
+    fn webhook_secret_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `WebhookSecret(Vec<u8>)` is a single-field tuple struct holding
+        // the HMAC key. A 2nd field landing (e.g. `algorithm: HashAlg`
+        // for a future "SHA-512 instead of SHA-256 per-deployment"
+        // override, OR `created_at: DateTime<Utc>` "for key-rotation
+        // observability") without matching `from_hex` constructor wiring
+        // would silently leave the new field zero-initialized on every
+        // secret handed out, breaking the rotation path or quietly
+        // defaulting to a less-safe algorithm. The exhaustive
+        // destructure with no `..` rest pattern forces a 2nd field to
+        // update this site in lockstep with `from_hex`. Symmetric to
+        // the BearerHash inner-array pin + ErrorBody 6-field +
+        // FederationClaims 8-field exhaustive-destructure pins.
+        let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let WebhookSecret(_inner) = s;
+    }
+
+    #[test]
+    fn webhook_notifier_field_count_pinned_at_exactly_six_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // `WebhookNotifier { url, secret, http, max_retries,
+        // proxy_public_url, burst }` — exactly 6 fields. A 7th field
+        // landing (e.g. `auth_header: Option<String>` for receivers
+        // that require Bearer/Basic auth in ADDITION to the HMAC
+        // signature, OR `circuit_breaker: CircuitBreaker` for per-
+        // endpoint failure-rate damping) without matching `new()`
+        // constructor wiring would silently leave the new field
+        // zero-initialized on every notifier — operators would see no
+        // error AND no behaviour change. The exhaustive destructure
+        // forces a 7th field to update this site in lockstep with
+        // `new()`. Symmetric to the TeeStream 2-field + NatsBridge
+        // 2-field + WebhookSecret 1-field exhaustive-destructure
+        // pins extended to this sibling notifier shape.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(
+            "https://hook.example.test/wh".into(),
+            secret,
+            "https://proxy.local".into(),
+        )
+        .unwrap();
+        let WebhookNotifier {
+            url: _,
+            secret: _,
+            http: _,
+            max_retries: _,
+            proxy_public_url: _,
+            burst: _,
+        } = n;
+    }
+
+    #[test]
+    fn webhook_secret_from_hex_return_type_is_result_self_notifier_build_error_via_fn_pointer_witness()
+     {
+        // `WebhookSecret::from_hex` returns `Result<Self,
+        // NotifierBuildError>` — the boot path bubbles the error
+        // through `?` via `anyhow::Error` chains for structured
+        // logging. Pin the type via a fn-pointer witness so a
+        // refactor that widened the Err arm to `anyhow::Error` "for
+        // ergonomic boot-path bubbling" would lose the structured
+        // `NotifierBuildError` variant the operator setup-status
+        // dashboard splits on at the wire (boot logs key on the
+        // `notifier build:` prefix). Symmetric to the
+        // FederationClaims-validate + new_auth_code +
+        // pct + TeeStream::new fn-pointer-return-type pins extended
+        // to this sibling boot-path constructor.
+        let _f: fn(&str) -> Result<WebhookSecret, NotifierBuildError> = WebhookSecret::from_hex;
+        // Exercise on both arms (Ok + Err) so the witness covers the
+        // value-domain as well as the type axis.
+        assert!(WebhookSecret::from_hex("00112233445566778899aabbccddeeff").is_ok());
+        assert!(WebhookSecret::from_hex("").is_err());
+    }
+
+    #[test]
+    fn webhook_secret_sign_return_type_is_owned_string_by_value_via_fn_pointer_witness_for_header_set()
+     {
+        // `WebhookSecret::sign` returns owned `String` — the signature
+        // is set as the `x-proxilion-signature` HTTP header value in
+        // `notify`, which crosses the `.await` boundary at
+        // `self.http.post(...).send().await`. The value MUST be owned
+        // (not `Cow<'a, str>`) because the header builder consumes the
+        // value. A refactor to `Cow<'a, str>` "for zero-alloc on a
+        // small-input fast-path" would tie the lifetime to `self` or
+        // `body` and break the cross-await header-set path. Pin via
+        // fn-pointer witness `fn(&WebhookSecret, &[u8]) -> String` so
+        // the type surfaces at the signing boundary, not at the
+        // header-set call site downstream. Symmetric to the
+        // sanitize_token + pct + new_auth_code owned-String
+        // fn-pointer pins extended to this sibling secret method.
+        let _f: fn(&WebhookSecret, &[u8]) -> String = WebhookSecret::sign;
+        fn require_owned_string(_: String) {}
+        let s = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        require_owned_string(s.sign(b"body"));
+    }
+
+    #[test]
+    fn webhook_notifier_new_return_type_is_result_self_notifier_build_error_via_fn_pointer_witness()
+    {
+        // `WebhookNotifier::new` returns `Result<Self,
+        // NotifierBuildError>` — the boot path bubbles the error
+        // through `?` symmetric to `WebhookSecret::from_hex`. Pin the
+        // type via a fn-pointer witness so a refactor that swapped to
+        // `Result<Self, anyhow::Error>` "for ergonomic boot-path
+        // bubbling" OR to a panicking `pub fn new(...) -> Self` "since
+        // reqwest::Client::builder() rarely fails" would surface here
+        // at the constructor boundary rather than at the boot-path call
+        // site downstream. The `reqwest::Client::builder().build()`
+        // error path is the load-bearing branch — operators who pass
+        // a malformed `user_agent` env override would see this fire.
+        // Symmetric to the WebhookSecret::from_hex Result pin above.
+        let _f: fn(String, WebhookSecret, String) -> Result<WebhookNotifier, NotifierBuildError> =
+            WebhookNotifier::new;
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let result = WebhookNotifier::new(
+            "https://hook.example.test/wh".into(),
+            secret,
+            "https://proxy.local".into(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn webhook_secret_clone_preserves_inner_bytes_byte_exact_via_destructure() {
+        // The existing `secret_clone_yields_same_signature_as_original`
+        // pin checks that cloning preserves the OUTPUT (signature
+        // byte-equal) of `sign`; pin the symmetric INPUT axis (the
+        // inner Vec<u8> bytes are preserved verbatim through Clone)
+        // via a destructure-then-compare. A refactor that introduced a
+        // per-clone derived value (e.g. `Vec<u8>::from(&self.0[..])`
+        // accidentally truncating one byte) would pass the
+        // sign-output pin if the truncation happened to produce a
+        // consistent signature, but would surface here as a length
+        // diff. Pin both length AND byte-equality on the inner
+        // destructured field. Symmetric to the BearerHash
+        // partial-eq distinct-inputs + Bearer Clone-independent-array
+        // pins extended to this sibling Vec-backed secret type.
+        let original = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let cloned = original.clone();
+        let WebhookSecret(orig_bytes) = original;
+        let WebhookSecret(clone_bytes) = cloned;
+        assert_eq!(orig_bytes.len(), clone_bytes.len(), "byte count diverged");
+        assert_eq!(orig_bytes, clone_bytes, "inner bytes diverged after clone");
+        // And the length matches the hex input / 2 (16 bytes for
+        // 32 hex chars).
+        assert_eq!(orig_bytes.len(), 16);
+    }
 }

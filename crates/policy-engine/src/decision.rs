@@ -669,6 +669,169 @@ mod tests {
     }
 
     #[test]
+    fn decision_variant_count_pinned_at_exactly_four_via_exhaustive_match() {
+        // Pin the Decision variant count at exactly 4 via exhaustive
+        // match expression. A 5th variant landing (e.g. `RouteToHuman
+        // { ticket_id }` for a future approver-queue rework, or
+        // `Quarantine { duration_seconds }` to distinguish response-
+        // body quarantine from request-time block on dashboards)
+        // without matching every `enforce_pre_request_decision`
+        // adapter call site + the engine's `evaluate_with_trace`
+        // arm + the operator-facing wire-tag snapshot would surface
+        // here as a non-exhaustive compile error. The enum is NOT
+        // `#[non_exhaustive]` — within the workspace the match is
+        // fully closed and a new variant MUST update every dispatch
+        // site in lockstep.
+        fn variant_witness(d: &Decision) -> u8 {
+            match d {
+                Decision::Allow => 0,
+                Decision::Block { .. } => 1,
+                Decision::RequireConfirmation { .. } => 2,
+                Decision::RateLimit { .. } => 3,
+            }
+        }
+        let all = [
+            Decision::Allow,
+            Decision::Block {
+                reason: "x".into(),
+                override_allowed: false,
+            },
+            Decision::RequireConfirmation { reason: "x".into() },
+            Decision::RateLimit {
+                burst: 1,
+                per_seconds: 1,
+            },
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for d in &all {
+            assert!(seen.insert(variant_witness(d)));
+        }
+        assert_eq!(seen.len(), 4);
+    }
+
+    #[test]
+    fn quarantine_action_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // Pin the QuarantineAction variant count at exactly 3 via
+        // exhaustive match. A 4th variant landing (e.g. `RedactPii`
+        // for a future PII-redaction quarantine path, or
+        // `EscalateToReviewer` to route quarantined chunks to a
+        // human-review queue) without matching the dispatcher call
+        // sites in `adapters/read_filter.rs` would surface here as a
+        // non-exhaustive compile error. Symmetric to the Decision
+        // variant-count pin — the read-filter dispatcher relies on
+        // pattern-match exhaustivity to stay current with policy
+        // engine extensions.
+        fn variant_witness(a: QuarantineAction) -> u8 {
+            match a {
+                QuarantineAction::ReplaceWithMarker => 0,
+                QuarantineAction::StripSilently => 1,
+                QuarantineAction::BlockRequest => 2,
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for a in [
+            QuarantineAction::ReplaceWithMarker,
+            QuarantineAction::StripSilently,
+            QuarantineAction::BlockRequest,
+        ] {
+            assert!(seen.insert(variant_witness(a)));
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn pattern_variant_count_pinned_at_exactly_two_via_exhaustive_match() {
+        // Pin the Pattern variant count at exactly 2 via exhaustive
+        // match. A 3rd variant landing (e.g. `Glob(String)` for
+        // shell-style glob patterns in the YAML schema, or
+        // `Aho(AhoCorasick)` for multi-pattern bulk-scan
+        // optimization) without matching the read-filter scanner's
+        // `is_match` dispatch + the `pattern_literal_debug` /
+        // `pattern_regex_debug` symmetric Debug pins would surface
+        // here as a non-exhaustive compile error.
+        fn variant_witness(p: &Pattern) -> u8 {
+            match p {
+                Pattern::Literal(_) => 0,
+                Pattern::Regex(_) => 1,
+            }
+        }
+        assert_eq!(variant_witness(&Pattern::Literal("x".into())), 0);
+        assert_eq!(
+            variant_witness(&Pattern::Regex(regex::Regex::new("a").unwrap())),
+            1,
+        );
+    }
+
+    #[test]
+    fn pattern_is_match_signature_pinned_via_fn_pointer_witness() {
+        // Pin Pattern::is_match signature as `fn(&Pattern, &str) ->
+        // bool` via fn-pointer witness. A refactor that flipped to
+        // `&mut self` ("for a lazy compile-on-first-match cache") or
+        // to `self` (consuming) would silently change the call-site
+        // ergonomics across the read-filter dispatcher. The borrow
+        // shape on the haystack arg is load-bearing because the
+        // scanner operates on borrowed slices of the upstream response
+        // body without owning them.
+        let _f: fn(&Pattern, &str) -> bool = Pattern::is_match;
+    }
+
+    #[test]
+    fn read_filter_field_count_pinned_at_exactly_two_via_exhaustive_destructure() {
+        // Pin ReadFilter struct field count at exactly 2 via
+        // exhaustive destructure with no `..` rest pattern. A 3rd
+        // field landing (e.g. `scan_budget_bytes: usize` for a
+        // future per-request scan-cost cap, or
+        // `bypass_for_content_types: Vec<String>` to widen the
+        // content-type allowlist beyond the hardcoded set in
+        // `adapters/read_filter.rs::should_scan`) would silently
+        // bloat the per-policy ReadFilter struct on every Engine
+        // snapshot AND every per-request clone into the scanner.
+        // The existing `read_filter_clone_carries_patterns_and_action`
+        // test exercises the Clone semantic but doesn't catch a
+        // runtime-only 3rd field — exhaustive destructure is the
+        // canonical pin.
+        let f = ReadFilter {
+            quarantine_patterns: vec![],
+            quarantine_action: QuarantineAction::ReplaceWithMarker,
+        };
+        let ReadFilter {
+            quarantine_patterns: _,
+            quarantine_action: _,
+        } = f;
+    }
+
+    #[test]
+    fn decision_block_struct_variant_field_count_pinned_at_exactly_two_via_exhaustive_destructure()
+    {
+        // Pin the `Decision::Block { reason, override_allowed }`
+        // struct-variant field count at exactly 2 via exhaustive
+        // destructure with no `..` rest pattern. A 3rd field landing
+        // (e.g. `policy_id: Option<String>` for back-attribution
+        // from Block decision to the rule that emitted it — a real
+        // proposal in spec.md §3 for richer trace context, or
+        // `severity: Severity` to distinguish soft-block from hard-
+        // block on dashboards) would silently bloat every
+        // `Decision::Block` instance flowing through the engine →
+        // adapter handoff path AND silently change the existing
+        // `decision_block_carries_reason_and_override_flag` JSON
+        // shape on the wire. The existing struct-variant-keys snapshot
+        // walks the JSON wire keys but doesn't catch a `#[serde(skip)]`
+        // runtime-only 3rd field — exhaustive destructure on the
+        // struct-variant pattern is the canonical pin.
+        let b = Decision::Block {
+            reason: "x".into(),
+            override_allowed: false,
+        };
+        match b {
+            Decision::Block {
+                reason: _,
+                override_allowed: _,
+            } => {}
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
     fn decision_rate_limit_burst_and_per_seconds_fields_are_u32_type_for_metric_label_range() {
         // RateLimit's `burst` + `per_seconds` fields are u32 — the
         // operator-facing metric `proxilion_policy_rate_limit_total{

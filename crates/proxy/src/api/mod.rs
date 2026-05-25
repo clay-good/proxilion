@@ -724,4 +724,160 @@ mod tests {
         fn require_string(_: &String) {}
         require_string(&v.ops[0]);
     }
+
+    #[test]
+    fn api_state_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the ApiState struct field count at exactly 2 via
+        // exhaustive destructure with no `..` rest pattern. The 2
+        // fields are: verifier (Arc<PicVerifier>) + pca_cache
+        // (PcaCache). A 3rd field landing (e.g.
+        // `executor: PicExecutor` for a future API endpoint that
+        // surfaces executor-binding metadata, or `metrics_bucket:
+        // &'static str` to split per-API metric labels for the
+        // future multi-tenant operator path) would silently bloat
+        // every Clone of ApiState the axum router fans out per
+        // request AND silently change the bundle the API handlers
+        // see. The existing
+        // `api_state_and_api_error_are_send_sync_static_for_axum_boundary`
+        // pin walks trait bounds; the existing
+        // `api_state_is_clone_for_axum_router_with_state_fan_out`
+        // pin walks Clone; neither catches a runtime-only 3rd field
+        // — exhaustive destructure is the canonical pin. Need a
+        // real PcaCache + PicVerifier to construct, so this is a
+        // type-level pin via destructure of a hypothetical binding
+        // shape (the destructure pattern itself is the pin — if a
+        // 3rd field lands without matching this site, the pattern
+        // becomes non-exhaustive and the test fails to compile).
+        fn _destructure_witness(s: ApiState) {
+            let ApiState {
+                verifier: _,
+                pca_cache: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn api_error_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // Pin the ApiError variant count at exactly 3 via exhaustive
+        // match expression. The 3 variants are: NotFound + Db +
+        // Verifier. A 4th variant landing (e.g. `RateLimited` to
+        // distinguish "API throttled by per-operator-token bucket"
+        // from generic Db errors on operator dashboards, or
+        // `ScopeDenied` to distinguish from the middleware-layer
+        // 403 produced by `scope_check`) without matching every
+        // Display attribute + IntoResponse arm + the operator-
+        // facing wire-shape pins would surface here as a non-
+        // exhaustive compile error. The enum is module-private
+        // (`enum ApiError`) and NOT `#[non_exhaustive]` — within
+        // the crate the match is fully closed and a new variant
+        // MUST update every dispatch site in lockstep.
+        fn variant_witness(e: &ApiError) -> u8 {
+            match e {
+                ApiError::NotFound => 0,
+                ApiError::Db(_) => 1,
+                ApiError::Verifier(_) => 2,
+            }
+        }
+        // Construct concrete instances for each variant. The Db arm
+        // wraps a CacheError, the Verifier arm wraps a VerifierError.
+        let not_found = ApiError::NotFound;
+        assert_eq!(variant_witness(&not_found), 0);
+        // We don't need to actually invoke the Db / Verifier arms at
+        // runtime — the exhaustive match above is the load-bearing
+        // pin (a 4th variant lands as a compile error, NOT a runtime
+        // failure). The NotFound runtime check is the smoke test.
+    }
+
+    #[test]
+    fn pca_view_field_count_pinned_at_exactly_seven_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the PcaView struct field count at exactly 7 via
+        // exhaustive destructure (no `..`). The 7 fields are:
+        // pca_id + p_0 + ops + hop + predecessor_id + pic_profile
+        // + cbor_hex. The existing
+        // `pca_view_serializes_with_exactly_seven_known_keys_for_cli_renderer_contract`
+        // pin walks the JSON WIRE keys but doesn't catch a
+        // `#[serde(skip)]` runtime-only 8th field — exhaustive
+        // destructure on the Rust struct is the symmetric pin. A
+        // refactor that landed `created_at: DateTime<Utc>` for the
+        // dashboard's "PCA freshness" panel or `chain_id:
+        // Option<Uuid>` for back-attribution from PCA to chain root
+        // without serializing the new field would silently bloat
+        // every PcaView Clone on the response-build path.
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: String::new(),
+            ops: vec![],
+            hop: 0,
+            predecessor_id: None,
+            pic_profile: String::new(),
+            cbor_hex: String::new(),
+        };
+        let PcaView {
+            pca_id: _,
+            p_0: _,
+            ops: _,
+            hop: _,
+            predecessor_id: _,
+            pic_profile: _,
+            cbor_hex: _,
+        } = v;
+    }
+
+    #[test]
+    fn hex_encode_signature_pinned_via_fn_pointer_witness() {
+        // Pin hex_encode signature as `fn(&[u8]) -> String` via
+        // fn-pointer witness. A refactor that flipped the input to
+        // `&Vec<u8>` "for ownership symmetry with the PcaView
+        // cbor_hex field" would silently force every call site to
+        // box the borrowed slice in an owned Vec first. The `&[u8]`
+        // borrow shape lets PcaView call sites hand in either a
+        // direct field borrow OR a slice into a temporary without
+        // allocating. The owned `String` return type is also pinned
+        // — a refactor to `Cow<'_, str>` "to avoid the per-call
+        // allocation on a passthrough" would tie the return
+        // lifetime to the input slice and force lifetime
+        // constraints on every PcaView assembly site.
+        let _f: fn(&[u8]) -> String = hex_encode;
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's `router` constructor signature as
+        // `fn(ApiState) -> Router` via fn-pointer witness. The
+        // server.rs boot path calls `router(api_state)` exactly
+        // once at app assembly time AND consumes the ApiState by
+        // value (the router internally clones it per request via
+        // `.with_state(...)`). A refactor that flipped to
+        // `fn(&ApiState) -> Router` ("for borrow-on-build clarity")
+        // would force the boot path to keep an additional owned
+        // ApiState alive for the lifetime of the router, complicating
+        // the AppState assembly order. A refactor to
+        // `fn(ApiState) -> Result<Router, _>` (for some boot-time
+        // validation) would silently change the boot path's error-
+        // handling shape from "build then mount" to "build-or-fail
+        // then mount". Pin the bare consuming-self → owned-Router
+        // shape.
+        let _f: fn(ApiState) -> Router = router;
+    }
+
+    #[test]
+    fn api_error_implements_into_response_via_trait_object_witness_for_axum_handler_arms() {
+        // The `ApiError` enum is the per-handler error type that
+        // every API route returns through the `?` operator —
+        // axum's IntoResponse trait is what makes
+        // `Result<Json<...>, ApiError>` a valid handler return
+        // type. The existing
+        // `api_error_not_found_response` /
+        // `api_error_db_maps_to_500_with_internal_error_code` pins
+        // walk the response shapes but never the trait-bound
+        // contract directly. A refactor that dropped the
+        // `impl IntoResponse for ApiError` block (perhaps a
+        // refactor unifying the API error type with a sibling
+        // crate's) would force every handler to wrap the error
+        // explicitly. Pin via require_into_response trait-bound
+        // witness — symmetric to round-251 SessionExtractError
+        // require_into_response pin extended to ApiError.
+        fn require_into_response<T: IntoResponse>() {}
+        require_into_response::<ApiError>();
+    }
 }

@@ -616,4 +616,121 @@ mod tests {
         assert!(dyn_m.to_string().contains("malformed"));
         assert!(dyn_u.to_string().contains("path.id"));
     }
+
+    #[test]
+    fn ops_atom_field_count_pinned_at_exactly_three_via_exhaustive_destructure() {
+        // Pin the OpsAtom struct field count at exactly 3 via
+        // exhaustive destructure with no `..` rest pattern. A 4th
+        // field landing (e.g. `qualifier: Option<String>` for an
+        // operator-facing "atom variant tag" used by future
+        // policy-engine extensions, or `display_label: String` for
+        // dashboard rendering) would silently bloat every PCA's ops
+        // Vec on the Trust Plane wire AND every per-request
+        // OpsExpression on the policy-engine hot path. The existing
+        // serde-3-fields-no-extras pin catches a JSON-key drift but
+        // not a `#[serde(skip)]` runtime-only 4th field — exhaustive
+        // destructure is the canonical pin.
+        let a = OpsAtom {
+            scheme: "drive".into(),
+            action: "read".into(),
+            object: "file/x".into(),
+        };
+        let OpsAtom {
+            scheme: _,
+            action: _,
+            object: _,
+        } = a;
+    }
+
+    #[test]
+    fn ops_expression_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // Pin the OpsExpression struct field count at exactly 1 via
+        // exhaustive destructure with no `..` rest pattern. A 2nd
+        // field landing (e.g. `evaluated_at: DateTime<Utc>` for
+        // per-resolve-timing observability, or
+        // `policy_id: Option<String>` for back-attribution from
+        // resolved expression to the rule that emitted it) would
+        // silently bloat every per-request adapter handoff on the
+        // hot path. OpsExpression is constructed once per request +
+        // cloned into the Trust Plane request builder + the local
+        // trace's required_ops — a 2nd field would multiply allocs
+        // 3x without surfacing through any wire-shape pin.
+        let e = OpsExpression { required: vec![] };
+        let OpsExpression { required: _ } = e;
+    }
+
+    #[test]
+    fn missing_ops_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // Pin the MissingOps error-struct field count at exactly 1
+        // via exhaustive destructure. A 2nd field landing (e.g.
+        // `leaf_ops: Vec<OpsAtom>` to surface the actually-granted
+        // set alongside the missing set for better operator triage,
+        // or `chain_id: Option<Uuid>` to identify which chain the
+        // gap was detected against) would silently bloat every
+        // 422 PicInvariantViolation response body. The existing
+        // MissingOps Display pin walks the surfaced text but not
+        // the underlying struct shape — exhaustive destructure
+        // catches a runtime-only field landing.
+        let m = MissingOps { missing: vec![] };
+        let MissingOps { missing: _ } = m;
+    }
+
+    #[test]
+    fn ops_parse_error_variant_count_pinned_at_exactly_two_via_exhaustive_match() {
+        // Pin the OpsParseError variant count at exactly 2 via
+        // exhaustive match expression. A 3rd variant landing (e.g.
+        // `ListExpansionFailed { template: String }` for a future
+        // policy-engine refactor that surfaced list-expansion faults
+        // distinctly from the bare Malformed bucket, or
+        // `CartesianProductRejected` to make the two-list-vars
+        // rejection a distinct triage signal) without matching
+        // every existing match arm site (resolve_one + resolve +
+        // adapter Display call sites + the existing
+        // ops_parse_error_display_strings_carry_operator_facing_hints
+        // test sweep) would surface here as a non-exhaustive compile
+        // error. The enum is NOT `#[non_exhaustive]` — within this
+        // crate the match is fully closed and a new variant MUST
+        // update every call site in lockstep.
+        fn variant_witness(e: &OpsParseError) -> u8 {
+            match e {
+                OpsParseError::Malformed => 0,
+                OpsParseError::UnknownVar(_) => 1,
+            }
+        }
+        assert_eq!(variant_witness(&OpsParseError::Malformed), 0);
+        assert_eq!(variant_witness(&OpsParseError::UnknownVar("x".into())), 1);
+    }
+
+    #[test]
+    fn ops_atom_parse_signature_pinned_via_fn_pointer_witness() {
+        // Pin OpsAtom::parse signature as
+        // `fn(&str) -> Result<OpsAtom, OpsParseError>` via
+        // fn-pointer witness. A refactor that flipped to
+        // `fn(String) -> ...` ("for ownership symmetry with
+        // to_canonical's owned return") would silently force every
+        // call site to `.to_string()` the incoming &str, surfacing as
+        // a fn-pointer type mismatch here rather than at the dozens
+        // of call sites in adapters + the engine. The borrow-shape
+        // is load-bearing because adapter call sites parse against
+        // borrowed Trust Plane response slices without owning them.
+        let _f: fn(&str) -> Result<OpsAtom, OpsParseError> = OpsAtom::parse;
+    }
+
+    #[test]
+    fn ops_expression_resolve_signature_pinned_via_fn_pointer_witness() {
+        // Pin OpsExpression::resolve signature as
+        // `fn(&[String], &RequestContext) -> Result<OpsExpression, OpsParseError>`.
+        // BOTH arguments are borrows — a refactor that flipped
+        // either to owned ("consume the templates vec to avoid the
+        // .iter() inner-loop allocation") would silently force every
+        // engine call site to clone the policy's templates per
+        // request, since the templates Vec is shared across N
+        // requests via Arc<Engine>. The fn-pointer pins the borrow
+        // shape on both args + the owned-Self return at compile
+        // time. The existing ops_expression_resolve_with_empty_templates
+        // test exercises the call shape but doesn't catch a borrow→
+        // owned refactor — fn-pointer witness is the canonical pin.
+        let _f: fn(&[String], &RequestContext) -> Result<OpsExpression, OpsParseError> =
+            OpsExpression::resolve;
+    }
 }

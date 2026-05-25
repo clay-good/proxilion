@@ -492,6 +492,147 @@ mod tests {
     }
 
     #[test]
+    fn request_context_field_count_pinned_at_exactly_seven_via_exhaustive_destructure() {
+        // Pin the RequestContext struct field count at exactly 7 via
+        // exhaustive destructure with no `..` rest pattern. A 8th
+        // field landing (e.g. `request_id: Uuid` for per-evaluation
+        // attribution into structured logs, or `trace_id: Option<Uuid>`
+        // for back-attribution from PolicyTrace to the inbound request)
+        // would silently bloat every per-request adapter handoff on
+        // the hot path AND silently change the existing
+        // `request_context_serde_round_trip_preserves_every_map_and_field`
+        // JSON wire shape. The serde test walks 7 named fields by
+        // hand; exhaustive destructure catches a `#[serde(skip)]`
+        // runtime-only 8th field bypass.
+        let c = RequestContext::default();
+        let RequestContext {
+            vendor: _,
+            action: _,
+            user: _,
+            path: _,
+            body: _,
+            headers: _,
+            customer_domain: _,
+        } = c;
+    }
+
+    #[test]
+    fn user_ctx_field_count_pinned_at_exactly_two_via_exhaustive_destructure() {
+        // Pin the UserCtx struct field count at exactly 2 via
+        // exhaustive destructure with no `..` rest pattern. A 3rd
+        // field landing (e.g. `name: String` for operator-facing
+        // attribution in approver UI, or `id: Option<String>` for
+        // stable user identity across email changes) would silently
+        // bloat every per-request UserCtx clone AND silently change
+        // the existing `user_ctx_default_yields_empty_email_and_no_groups`
+        // contract surface. Pin via exhaustive destructure.
+        let u = UserCtx::default();
+        let UserCtx {
+            email: _,
+            groups: _,
+        } = u;
+    }
+
+    #[test]
+    fn request_context_lookup_signature_pinned_via_fn_pointer_witness() {
+        // Pin RequestContext::lookup signature as
+        // `fn(&RequestContext, &str) -> Option<String>` via fn-pointer
+        // witness. A refactor that flipped the dotted-path arg from
+        // `&str` to `String` ("for ownership clarity in cached
+        // dispatch") would silently force every call site to allocate
+        // a String per template variable per request, surfacing as a
+        // fn-pointer type mismatch here rather than at the dozens of
+        // OpsExpression resolve sites. The Option<String> return type
+        // is also pinned — a refactor to `Option<Cow<'_, str>>` "to
+        // avoid the clone on the bare customer_domain path" would
+        // tie the return lifetime to &self and force lifetime
+        // constraints at every substitute() call site.
+        let _f: fn(&RequestContext, &str) -> Option<String> = RequestContext::lookup;
+    }
+
+    #[test]
+    fn request_context_lookup_list_signature_pinned_via_fn_pointer_witness() {
+        // Symmetric to lookup signature pin above. Pin
+        // RequestContext::lookup_list as
+        // `fn(&RequestContext, &str) -> Option<Vec<String>>` via
+        // fn-pointer witness. The owned Vec<String> return is
+        // load-bearing — `OpsExpression::resolve` consumes the Vec
+        // by moving each String into a fresh atom on a tokio task
+        // boundary that outlives the &self reference. A refactor to
+        // `Option<&[String]>` "for zero-alloc list traversal" would
+        // tie the return lifetime to &self and surface here as a
+        // fn-pointer type mismatch rather than at the spawned-task
+        // borrow-checker.
+        let _f: fn(&RequestContext, &str) -> Option<Vec<String>> = RequestContext::lookup_list;
+    }
+
+    #[test]
+    fn lookup_is_referentially_transparent_across_fifty_repeated_calls_on_body_string_fixture() {
+        // Symmetric to `lookup_list_is_referentially_transparent` —
+        // pin that `lookup` produces byte-equal output across 50
+        // repeated calls on the same fixture. The helper is invoked
+        // by `OpsExpression::substitute` once per `${var}` per
+        // template per policy per request — a refactor that
+        // memoized in a stale per-context cache (keyed on `&self as
+        // *const _`) would silently return stale values on a
+        // body-rewrite middleware path. Pin three distinct dispatch
+        // paths: customer_domain (bare), path.id (path arm),
+        // body.subject (body string arm).
+        let c = sample_ctx();
+        let baselines: Vec<(&str, Option<String>)> = vec![
+            ("customer_domain", c.lookup("customer_domain")),
+            ("path.id", c.lookup("path.id")),
+            ("body.subject", c.lookup("body.subject")),
+        ];
+        for i in 0..50 {
+            for (key, want) in &baselines {
+                assert_eq!(
+                    &c.lookup(key),
+                    want,
+                    "iter {i}: lookup({key}) must be referentially transparent",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn request_context_clone_is_independent_across_every_field_after_mutation() {
+        // RequestContext derives Clone — the engine clones the
+        // context per evaluation to avoid mutating the caller's
+        // ownership. Pin that the Clone is a DEEP copy across every
+        // field (a refactor to `Arc<HashMap<...>>` inner field "for
+        // cheap-clone sharing" would silently alias the body Vec
+        // back to the original, breaking the per-request snapshot
+        // contract). Mutate every field on the clone and assert the
+        // original is unchanged. The existing
+        // `lookup_customer_domain_carries_through_clone` pin walks
+        // ONE field; this walks all 7.
+        let original = sample_ctx();
+        let mut cloned = original.clone();
+        cloned.vendor.push_str("-modified");
+        cloned.action.push_str("-modified");
+        cloned.customer_domain.push_str("-modified");
+        cloned.user.email.push_str("-modified");
+        cloned.user.groups.push("new-group".into());
+        cloned.path.insert("new-key".into(), "new-val".into());
+        cloned
+            .body
+            .insert("new-body-key".into(), serde_json::json!("new"));
+        cloned
+            .headers
+            .insert("new-header".into(), "new-value".into());
+        // Original unchanged across all 7 fields + nested UserCtx.
+        assert_eq!(original.vendor, "google");
+        assert_eq!(original.action, "drive.files.get");
+        assert_eq!(original.customer_domain, "acme.com");
+        assert_eq!(original.user.email, "alice@acme.com");
+        assert_eq!(original.user.groups, vec!["eng".to_string(), "sec".into()]);
+        assert!(!original.path.contains_key("new-key"));
+        assert!(!original.body.contains_key("new-body-key"));
+        assert!(!original.headers.contains_key("new-header"));
+    }
+
+    #[test]
     fn lookup_user_groups_returns_none_because_user_ctx_only_exposes_email_via_lookup_dispatch() {
         // UserCtx carries `groups: Vec<String>` but the `lookup`
         // dispatch on `user.*` only matches `email` (line 64-66 of

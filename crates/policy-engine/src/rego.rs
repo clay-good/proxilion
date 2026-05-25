@@ -42,6 +42,14 @@ pub enum Error {
     Ops(#[from] OpsParseError),
 }
 
+/// Per-policy email recipient override: `(to, cc, bcc)`. Each list is `Some`
+/// only when the policy explicitly set that field.
+pub type EmailRecipientOverride = (
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+);
+
 pub struct Engine {
     policies: Vec<PolicyDoc>,
 }
@@ -67,14 +75,7 @@ impl Engine {
     /// explicitly set that list. `None` outer → policy doesn't exist OR has
     /// no `notifier_recipients:` block. The email notifier substitutes each
     /// `Some` list for the global value at send time.
-    pub fn email_recipients_for(
-        &self,
-        policy_id: &str,
-    ) -> Option<(
-        Option<Vec<String>>,
-        Option<Vec<String>>,
-        Option<Vec<String>>,
-    )> {
+    pub fn email_recipients_for(&self, policy_id: &str) -> Option<EmailRecipientOverride> {
         let p = self.policies.iter().find(|p| p.id == policy_id)?;
         let r = p.notifier_recipients.as_ref()?;
         Some((r.to.clone(), r.cc.clone(), r.bcc.clone()))

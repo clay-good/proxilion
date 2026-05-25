@@ -578,6 +578,156 @@ mod tests {
     }
 
     #[test]
+    fn policy_trace_field_count_pinned_at_exactly_six_via_exhaustive_destructure() {
+        // Pin the STRUCT field count (not just the JSON wire keys —
+        // those are pinned separately in
+        // `policy_trace_json_carries_trace_id_and_layers`). A
+        // `#[serde(skip)]` 7th field (e.g. `request_id: Option<Uuid>` for
+        // a future "join traces to requests by id" panel, or
+        // `engine_version: &'static str` for the dashboard's
+        // "which engine produced this trace" header) would silently
+        // satisfy the existing serde key-count check while quietly
+        // bloating every in-memory trace clone on the hot path.
+        // Exhaustive destructure with no `..` rest pattern forces every
+        // new field to be added here in lockstep with its construction
+        // site — a refactor that lands a field but skips this match
+        // surfaces as a non-exhaustive-pattern compile error.
+        let t = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+        let PolicyTrace {
+            trace_id: _,
+            evaluated_at: _,
+            duration_micros: _,
+            layers: _,
+            final_decision: _,
+            required_ops: _,
+        } = t;
+    }
+
+    #[test]
+    fn layer_outcome_field_count_pinned_at_exactly_five_via_exhaustive_destructure() {
+        // Symmetric to the PolicyTrace pin above. `LayerOutcome` is the
+        // per-layer record the dashboard's "explain this denial" panel
+        // iterates — a `#[serde(skip)]` 6th field (e.g.
+        // `evaluated_at: DateTime<Utc>` for per-layer latency
+        // attribution, or `evaluator_kind: &'static str` to distinguish
+        // YAML evaluators from a future WASM evaluator) would bloat
+        // every Vec<LayerOutcome> on the wire without surfacing through
+        // the existing 5-key serde pin. The exhaustive destructure with
+        // no `..` rest pattern forces every landed field to be added
+        // here in lockstep with its production-side use sites.
+        let o = LayerOutcome::passed(PolicyLayer::LayerB);
+        let LayerOutcome {
+            layer: _,
+            passed: _,
+            matched_rule_id: _,
+            error_code: _,
+            detail: _,
+        } = o;
+    }
+
+    #[test]
+    fn ops_atom_view_field_count_pinned_at_exactly_three_via_exhaustive_destructure() {
+        // `OpsAtomView` is the wire-friendly projection of `OpsAtom`
+        // surfaced in `PolicyTrace.required_ops` — the Trust Plane's
+        // adapter request builder parses the 3-key shape verbatim. A
+        // 4th field landing (e.g. `display_label: String` for the
+        // dashboard's "human-readable atom" panel, or
+        // `policy_id: Option<String>` for back-attribution from atom to
+        // the rule that emitted it) would silently bloat every required
+        // ops Vec on the hot path without surfacing through the
+        // existing 3-key serde pin. Exhaustive destructure with no
+        // `..` rest pattern is the canonical struct-count pin.
+        let v = OpsAtomView {
+            scheme: "drive".into(),
+            action: "read".into(),
+            object: "file/x".into(),
+        };
+        let OpsAtomView {
+            scheme: _,
+            action: _,
+            object: _,
+        } = v;
+    }
+
+    #[test]
+    fn policy_trace_new_signature_pinned_via_fn_pointer_witness() {
+        // `PolicyTrace::new` takes its three Vecs / Decision by VALUE —
+        // pin the signature shape so a refactor that flipped to
+        // `&[LayerOutcome]` + `&[OpsAtomView]` (for "zero-alloc trace
+        // construction") would surface here as a fn-pointer type
+        // mismatch rather than at every engine call site. The
+        // `Decision` argument is by-value so the caller-side
+        // `Decision::Block { reason, .. }` builder path can move the
+        // owned String into the trace without forcing a clone on the
+        // hot path. The fn-pointer witness is zero-cost at runtime —
+        // the assignment alone enforces the signature shape at compile
+        // time.
+        let _f: fn(Vec<LayerOutcome>, Decision, Vec<OpsAtomView>) -> PolicyTrace = PolicyTrace::new;
+    }
+
+    #[test]
+    fn ops_atom_view_from_takes_borrow_not_owned_via_fn_pointer_witness() {
+        // `From<&OpsAtom> for OpsAtomView` is the canonical conversion
+        // path used by `Engine::evaluate_with_trace` — pin that the impl
+        // takes a BORROW (`&OpsAtom`) not the owned `OpsAtom`. The
+        // borrow shape lets the engine surface the same `OpsAtom` to
+        // both the local trace AND the adapter's Trust Plane request
+        // builder without an extra clone. A refactor to
+        // `From<OpsAtom>` (the obvious "tidy up unnecessary borrow"
+        // change) would silently force the engine to clone every
+        // resolved atom for the trace view, which on a multi-atom
+        // policy adds N allocations per request on the hot path. The
+        // fn-pointer witness pins the exact `From::from` signature at
+        // compile time.
+        fn require_from_borrow<'a, T: From<&'a OpsAtom>>() {}
+        require_from_borrow::<OpsAtomView>();
+        // And exercise the borrow at runtime so the From impl actually
+        // takes a `&OpsAtom` (not a tuple, not by-value).
+        let a = OpsAtom {
+            scheme: "drive".into(),
+            action: "read".into(),
+            object: "file/x".into(),
+        };
+        let _v: OpsAtomView = (&a).into();
+        // `a` still owned afterwards — confirms the impl took a borrow.
+        assert_eq!(a.scheme, "drive");
+    }
+
+    #[test]
+    fn policy_trace_evaluated_at_within_one_second_of_constructor_call() {
+        // `PolicyTrace::new` stamps `evaluated_at: Utc::now()` — pin
+        // recency (within 1 second of the surrounding wall-clock call)
+        // so a refactor that swapped `Utc::now()` for a once-cell
+        // static initializer ("share the trace timestamp across all
+        // engine calls for deterministic snapshot replay") would
+        // silently collapse every per-request timestamp onto the
+        // engine's first-call time and break the dashboard's
+        // chronological replay. 1s window is wide enough to survive
+        // CI's stop-the-world GC ticks but tight enough to catch a
+        // static initializer's hour-scale drift across a long test
+        // run. Both `evaluated_at <= now()` (no future stamps) and
+        // `now() - evaluated_at < 1s` (no stale stamps) are pinned.
+        let before = Utc::now();
+        let t = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+        let after = Utc::now();
+        assert!(
+            t.evaluated_at >= before && t.evaluated_at <= after,
+            "evaluated_at {ev} must be within [{before}, {after}]",
+            ev = t.evaluated_at,
+        );
+        // Also pin no-subsecond explosion across a tight loop: 5
+        // back-to-back constructions all land within 1 second.
+        let start = Utc::now();
+        let mut last = start;
+        for _ in 0..5 {
+            let tt = PolicyTrace::new(vec![], Decision::Allow, vec![]);
+            assert!(tt.evaluated_at >= last);
+            last = tt.evaluated_at;
+        }
+        assert!((last - start).num_seconds() < 1);
+    }
+
+    #[test]
     fn policy_trace_json_carries_trace_id_and_layers() {
         let t = PolicyTrace::new(
             vec![LayerOutcome::passed(PolicyLayer::LayerA)],

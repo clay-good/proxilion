@@ -839,4 +839,142 @@ mod tests {
         require_string(&body.mode);
         assert_eq!(body.mode, "observe");
     }
+
+    #[test]
+    fn policy_api_state_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the PolicyApiState struct field count at exactly 1 via
+        // exhaustive destructure pattern (no `..` rest). The 1 field
+        // is: policy (PolicyHandle). A 2nd field landing (e.g.
+        // `audit_sink: Arc<dyn ActionStream>` to emit a per-mode-
+        // change audit row when set_mode succeeds, or
+        // `metrics_bucket: &'static str` to split per-state metric
+        // labels) would silently bloat every Clone of PolicyApiState
+        // the axum router fans out per request AND silently change
+        // what the policy API handlers see. The existing
+        // `policy_api_state_is_send_sync_static` pin walks trait
+        // bounds; the existing Clone derivation walks the trait;
+        // neither catches a runtime-only 2nd field — exhaustive
+        // destructure is the canonical pin.
+        fn _destructure_witness(s: PolicyApiState) {
+            let PolicyApiState { policy: _ } = s;
+        }
+    }
+
+    #[test]
+    fn policy_view_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the PolicyView struct field count at exactly 5 via
+        // exhaustive destructure (no `..`). The 5 fields are: id +
+        // vendor + action + mode + pic_mode. A 6th field landing
+        // (e.g. `updated_at: DateTime<Utc>` for the dashboard's
+        // "last edited" column, or `audit_body: Option<String>` to
+        // surface the per-policy audit-body setting in the admin UI
+        // table) would silently bloat every PolicyView Vec on the
+        // response-build path. The existing
+        // `policy_view_serializes_with_exactly_five_known_keys`
+        // pin walks JSON wire keys; this pins the Rust struct
+        // shape symmetrically so a `#[serde(skip)]` runtime-only
+        // 6th field can't bypass.
+        let v = PolicyView {
+            id: String::new(),
+            vendor: String::new(),
+            action: String::new(),
+            mode: String::new(),
+            pic_mode: String::new(),
+        };
+        let PolicyView {
+            id: _,
+            vendor: _,
+            action: _,
+            mode: _,
+            pic_mode: _,
+        } = v;
+    }
+
+    #[test]
+    fn list_response_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the ListResponse struct field count at exactly 3 via
+        // exhaustive destructure (no `..`). The 3 fields are:
+        // source + policy_count + policies. A 4th field landing
+        // (e.g. `last_reload_at: Option<DateTime<Utc>>` for the
+        // dashboard's "policies were last reloaded N seconds ago"
+        // operator-facing indicator, or `engine_version:
+        // &'static str` for back-attribution from listing to engine
+        // build) would silently bloat every list_policies response
+        // AND silently change the existing
+        // `list_response_serializes_with_exactly_three_known_keys`
+        // JSON wire shape via `#[serde(skip)]` runtime-only field
+        // bypass.
+        let v = ListResponse {
+            source: None,
+            policy_count: 0,
+            policies: vec![],
+        };
+        let ListResponse {
+            source: _,
+            policy_count: _,
+            policies: _,
+        } = v;
+    }
+
+    #[test]
+    fn set_mode_body_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // Pin the SetModeBody request-body struct field count at
+        // exactly 1 via exhaustive destructure (no `..`). The 1
+        // field is: mode (String). A 2nd field landing (e.g.
+        // `actor: Option<String>` for operator-attribution into the
+        // audit log of mode flips, or `expires_at:
+        // Option<DateTime<Utc>>` for a future time-bounded mode
+        // override per ui-less-surfaces.md §8.4 future work)
+        // would silently extend the CLI's expected request body
+        // shape AND silently change the handler's deserialize
+        // contract. The existing
+        // `set_mode_body_accepts_unknown_extra_fields` test pins
+        // forward-compat acceptance (serde permissive default),
+        // but doesn't catch the addition of a NEW required field
+        // — exhaustive destructure is the canonical pin.
+        let v = SetModeBody {
+            mode: String::new(),
+        };
+        let SetModeBody { mode: _ } = v;
+    }
+
+    #[test]
+    fn parse_listing_signature_pinned_via_fn_pointer_witness() {
+        // Pin parse_listing signature as `fn(&str) -> Vec<PolicyView>`
+        // via fn-pointer witness. A refactor that flipped to
+        // `fn(String) -> Vec<PolicyView>` ("for consume-and-cache
+        // on the rare-but-large-policy path") would silently force
+        // every call site to clone the raw_yaml() arc-string. The
+        // borrow shape lets the list_policies handler call
+        // parse_listing(&raw) without owning the bytes. The owned
+        // `Vec<PolicyView>` return type is also pinned — a refactor
+        // to `&'a [PolicyView]` "to avoid the per-call allocation"
+        // would tie the return lifetime to the input buffer and
+        // force lifetime parameters on the response shape. The
+        // function is `Vec<PolicyView>` (not `Result<...>`) — pin
+        // the no-error infallible contract (silently-skip-bad-yaml
+        // is the documented behavior, ensuring the admin UI never
+        // 500s on a malformed-but-recoverable yaml stage).
+        let _f: fn(&str) -> Vec<PolicyView> = parse_listing;
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's router constructor signature as
+        // `fn(PolicyApiState) -> Router` via fn-pointer witness.
+        // Symmetric to round-262 api/mod.rs router fn-pointer pin
+        // extended to the policy API surface. The server.rs boot
+        // path calls `router(policy_state)` exactly once at app
+        // assembly time AND consumes the state by value (the
+        // router internally clones it per request via
+        // `.with_state(...)`). A refactor to
+        // `fn(&PolicyApiState) -> Router` or
+        // `fn(PolicyApiState) -> Result<Router, _>` would silently
+        // change the boot path's ownership AND error-handling
+        // shape.
+        let _f: fn(PolicyApiState) -> Router = router;
+    }
 }

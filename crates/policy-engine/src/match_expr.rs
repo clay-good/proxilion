@@ -961,4 +961,204 @@ body.tier:
             "Debug missing Template variant name: {template:?}",
         );
     }
+
+    #[test]
+    fn match_error_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // Pin the MatchError variant count at exactly 3 via exhaustive
+        // match expression. A 4th variant landing (e.g.
+        // `UnsupportedYamlType { type_name: &'static str }` to give
+        // a distinct triage bucket for non-mapping match expressions
+        // that BadShape currently collapses, or `EvalLimit { depth }`
+        // for a future recursion-depth ceiling per spec.md §9 future
+        // work) without matching every Display attribute + the rego
+        // module's `#[from]` chain + the operator-facing dashboard
+        // panel would surface here as a non-exhaustive compile error.
+        // The enum is NOT `#[non_exhaustive]` — within the workspace
+        // the match is fully closed and a new variant MUST update
+        // every dispatch site in lockstep.
+        fn variant_witness(e: &MatchError) -> u8 {
+            match e {
+                MatchError::UnsupportedOp(_) => 0,
+                MatchError::BadShape { .. } => 1,
+                MatchError::Template(_) => 2,
+            }
+        }
+        let unsupported = MatchError::UnsupportedOp("weird".into());
+        let bad_shape = MatchError::BadShape {
+            op: "in".into(),
+            expected: "sequence",
+            got: "number".into(),
+        };
+        let template: MatchError = crate::ops::OpsParseError::UnknownVar("ctx.x".into()).into();
+        let mut seen = std::collections::HashSet::new();
+        for e in [&unsupported, &bad_shape, &template] {
+            assert!(seen.insert(variant_witness(e)));
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn match_error_bad_shape_struct_variant_field_count_pinned_at_exactly_three_via_exhaustive_destructure()
+     {
+        // Pin the BadShape struct-variant field count at exactly 3
+        // via exhaustive destructure (no `..`). The 3 fields are:
+        // op + expected + got. A 4th field landing (e.g.
+        // `policy_id: Option<String>` for back-attribution from
+        // match error to the rule that emitted it, or
+        // `field_path: Vec<String>` for nested-mapping breadcrumbs)
+        // would silently bloat every MatchError::BadShape instance
+        // flowing through the engine → policy_handle error log AND
+        // silently change the existing Display rendering. The
+        // existing `match_error_bad_shape_display_renders_all_three_named_fields_in_order`
+        // pin walks the Display string; exhaustive destructure
+        // catches a runtime-only 4th field that doesn't surface
+        // through Display.
+        let e = MatchError::BadShape {
+            op: "in".into(),
+            expected: "sequence",
+            got: "number".into(),
+        };
+        match e {
+            MatchError::BadShape {
+                op: _,
+                expected: _,
+                got: _,
+            } => {}
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn match_error_bad_shape_expected_field_type_is_static_str_for_zero_alloc_label_propagation() {
+        // The `expected` field on BadShape is `&'static str` (NOT
+        // `String`) — pin via require_static_str. The 11-operator
+        // vocabulary embeds literal strings ("sequence", "string",
+        // "scalar", etc) at compile time; a refactor to `String`
+        // "for ownership symmetry with op/got" would silently
+        // allocate one String per BadShape construction on every
+        // policy-author-error path. The
+        // `match_error_bad_shape_display_static_str_expected_field_supports_typical_descriptors`
+        // pin walks the values via Display; this pins the type
+        // contract directly at compile time.
+        fn require_static_str(_: &'static str) {}
+        // Pull the field out via a destructure and pass it to the
+        // require fn — if the field type were `String`, the
+        // expression `expected` would be `String` (not `&'static
+        // str`) and the call would fail to compile.
+        let e = MatchError::BadShape {
+            op: "in".into(),
+            expected: "sequence",
+            got: "number".into(),
+        };
+        if let MatchError::BadShape { expected, .. } = e {
+            require_static_str(expected);
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn evaluate_signature_pinned_via_fn_pointer_witness() {
+        // Pin evaluate signature as
+        // `fn(&Yaml, &RequestContext) -> Result<bool, MatchError>`
+        // via fn-pointer witness. BOTH arguments are borrows — the
+        // engine calls this per policy per request without owning
+        // the parsed match expression (the Engine holds the Yaml
+        // tree behind `Arc<PolicyDoc>`). A refactor to
+        // `fn(Yaml, ...)` "for consume-and-cache opt" would silently
+        // force the engine to clone the Yaml tree per evaluation,
+        // on the hot path. The `Result<bool, MatchError>` return
+        // is also pinned — a `Result<Outcome, ...>` refactor "to
+        // unify the engine/match-expr error types" would force
+        // every call site through the rego `?`-chain conversion.
+        let _f: fn(&Yaml, &RequestContext) -> Result<bool, MatchError> = evaluate;
+    }
+
+    #[test]
+    fn match_error_template_variant_implements_from_ops_parse_error_via_serde_question_mark_chain()
+    {
+        // `MatchError::Template(#[from] OpsParseError)` is the
+        // load-bearing conversion path between the ops-substitute
+        // helper and the match-expr interpreter — `apply_op`'s
+        // `as_str_subst(rhs, ctx)?` bubbles OpsParseError up
+        // through this From impl. The existing
+        // `match_error_template_display_carries_template_error_prefix_with_inner_passthrough`
+        // pin walks the Display rendering; the existing
+        // `match_error_debug_carries_variant_name_for_operator_log_grep_bucketing`
+        // test exercises the From impl but doesn't pin its signature.
+        // Pin the From<OpsParseError> impl via require_from_impl AND
+        // round-trip the inner OpsParseError through Template back
+        // out so a refactor that lost the `#[from]` (and required
+        // explicit `MatchError::Template(e)` at every call site)
+        // would surface here as a missing trait-bound + a unwrap
+        // failure on the inner extraction. Symmetric to round-255
+        // OpsAtomView From<&OpsAtom> trait-bound pin extended to
+        // MatchError::Template.
+        fn require_from<T, S: From<T>>(t: T) -> S {
+            S::from(t)
+        }
+        let inner = crate::ops::OpsParseError::UnknownVar("x.y".into());
+        let m: MatchError = require_from::<crate::ops::OpsParseError, MatchError>(inner);
+        match m {
+            MatchError::Template(crate::ops::OpsParseError::UnknownVar(name)) => {
+                assert_eq!(name, "x.y");
+            }
+            other => panic!("expected Template(UnknownVar), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_handles_eleven_operator_vocabulary_via_spec_documented_set() {
+        // The match-expression operator vocabulary per spec.md §0.3
+        // is the closed set: `in`, `not_in`, `equals`, `not_equals`,
+        // `matches`, `greater_than`, `less_than`, `all`, `any`,
+        // `not`, `exists` (11 total). The existing per-operator
+        // tests cover happy + sad paths individually; pin the FULL
+        // 11-operator set as an end-to-end sweep so a refactor that
+        // dropped an operator from `eval_entry` or `apply_op`
+        // (without touching the docs) would surface here. Each YAML
+        // fixture is a valid match expression that triggers ONE
+        // operator's dispatch path. The contract: `evaluate(&yaml,
+        // &ctx)` must return Ok for every operator (Ok(true) or
+        // Ok(false) — we don't care which; we care that no operator
+        // surfaces UnsupportedOp).
+        let mut path = std::collections::HashMap::new();
+        path.insert("id".to_string(), "abc".to_string());
+        let ctx = RequestContext {
+            vendor: "google".into(),
+            action: "drive.files.get".into(),
+            customer_domain: "acme.com".into(),
+            path,
+            ..Default::default()
+        };
+        let fixtures: &[(&str, &str)] = &[
+            // Top-level operators (eval_entry dispatch path).
+            ("all", "all: []"),
+            ("any", "any: []"),
+            ("not", "not: ~"),
+            ("exists", "exists: path.id"),
+            // Field-level operators (apply_op dispatch path).
+            ("equals", "path.id: { equals: abc }"),
+            ("not_equals", "path.id: { not_equals: xyz }"),
+            ("in", "path.id: { in: [abc, def] }"),
+            ("not_in", "path.id: { not_in: [xyz] }"),
+            ("matches", "path.id: { matches: 'a.*' }"),
+            ("greater_than", "path.id: { greater_than: 0 }"),
+            ("less_than", "path.id: { less_than: 999999 }"),
+        ];
+        for (op_name, yaml_str) in fixtures {
+            let yaml: Yaml = serde_yaml::from_str(yaml_str)
+                .unwrap_or_else(|e| panic!("bad fixture for {op_name}: {e}"));
+            let r = evaluate(&yaml, &ctx);
+            assert!(
+                r.is_ok(),
+                "operator {op_name} must not error on spec-documented shape: got {r:?}",
+            );
+            // And it must NOT surface UnsupportedOp.
+            if let Err(MatchError::UnsupportedOp(name)) = &r {
+                panic!("operator {op_name} surfaces UnsupportedOp({name})");
+            }
+        }
+        assert_eq!(fixtures.len(), 11, "spec.md §0.3 documents 11 operators");
+    }
 }

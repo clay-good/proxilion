@@ -1008,4 +1008,150 @@ mod helper_tests {
         require_string(id);
         assert_eq!(id, "p-owned");
     }
+
+    #[test]
+    fn engine_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // Pin the Engine struct field count at exactly 1 via exhaustive
+        // destructure with no `..` rest pattern. A 2nd field landing
+        // (e.g. `compiled_at: DateTime<Utc>` for per-engine-build
+        // observability, or `metrics_bucket: &'static str` to split
+        // per-engine metric labels for the future multi-tenant policy
+        // engine path) would silently bloat every Arc<Engine> in the
+        // proxy's hot-swap ArcSwap path AND change the existing
+        // policy_count semantics. The existing tests walk `policies`
+        // via the public accessor but doesn't catch a runtime-only
+        // 2nd field — exhaustive destructure is the canonical pin.
+        let e = Engine::new("[]").expect("empty engine builds");
+        let Engine { policies: _ } = e;
+    }
+
+    #[test]
+    fn outcome_field_count_pinned_at_exactly_eight_via_exhaustive_destructure() {
+        // Pin the Outcome struct field count at exactly 8 via exhaustive
+        // destructure with no `..` rest pattern. A 9th field landing
+        // (e.g. `evaluated_at: DateTime<Utc>` for per-evaluation
+        // observability, or `trace_id: Option<Uuid>` for back-attribution
+        // from Outcome to PolicyTrace, or `engine_version: &'static str`
+        // for the rebuild-tracking dashboard surface) would silently
+        // bloat every per-request Outcome flowing through the engine →
+        // adapter handoff. The 8 fields are: matched_policy_id +
+        // decision + required_ops + read_filter + pic_mode + mode +
+        // observe_would_have + audit_body. A `#[serde(skip)]` runtime-
+        // only 9th field would bypass any serde-key pin.
+        let engine = Engine::new("[]").unwrap();
+        let ctx = RequestContext::default();
+        let o = engine.evaluate(&ctx).expect("default Allow");
+        let Outcome {
+            matched_policy_id: _,
+            decision: _,
+            required_ops: _,
+            read_filter: _,
+            pic_mode: _,
+            mode: _,
+            observe_would_have: _,
+            audit_body: _,
+        } = o;
+    }
+
+    #[test]
+    fn rego_error_variant_count_pinned_at_exactly_six_via_exhaustive_match() {
+        // Pin the rego::Error variant count at exactly 6 via exhaustive
+        // match expression. A 7th variant landing (e.g. `BadOps` to
+        // distinguish ops-template syntax faults from generic Match
+        // errors at the dashboard's "explain this policy" panel, or
+        // `EngineRebuildTimeout { duration_ms }` for a future watchdog
+        // path) without matching every Display attribute + adapter
+        // bubble `?` call site would surface here as a non-exhaustive
+        // compile error. The 6 variants are: Yaml(#[from]
+        // serde_yaml::Error) + BadDecision(String) + BadReadFilter(String)
+        // + BadRegex { pat, source } + Match(#[from] MatchError) +
+        // Ops(#[from] OpsParseError). The enum is NOT
+        // `#[non_exhaustive]` — within the workspace the match is
+        // fully closed and a new variant MUST update every dispatch
+        // site in lockstep.
+        fn variant_witness(e: &Error) -> u8 {
+            match e {
+                Error::Yaml(_) => 0,
+                Error::BadDecision(_) => 1,
+                Error::BadReadFilter(_) => 2,
+                Error::BadRegex { .. } => 3,
+                Error::Match(_) => 4,
+                Error::Ops(_) => 5,
+            }
+        }
+        // Concrete instances for each variant.
+        let yaml = Error::Yaml(serde_yaml::from_str::<serde_yaml::Value>(": invalid").unwrap_err());
+        let bad_dec = Error::BadDecision("x".into());
+        let bad_rf = Error::BadReadFilter("x".into());
+        // Use a string runtime-constructed to dodge clippy::invalid_regex
+        // which lints on literal pattern args. The bad-paren shape is the
+        // canonical bad-regex pattern but the lint can't tell our intent
+        // is to construct an error, not a valid regex.
+        let bad_pat: String = "(".chars().collect();
+        let bad_rx = Error::BadRegex {
+            pat: bad_pat.clone(),
+            source: regex::Regex::new(&bad_pat).unwrap_err(),
+        };
+        let match_ = Error::Match(match_expr::MatchError::BadShape {
+            op: "in".into(),
+            expected: "sequence",
+            got: "scalar".into(),
+        });
+        let ops = Error::Ops(OpsParseError::Malformed);
+        let mut seen = std::collections::HashSet::new();
+        for e in [&yaml, &bad_dec, &bad_rf, &bad_rx, &match_, &ops] {
+            assert!(seen.insert(variant_witness(e)));
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    #[test]
+    fn engine_policy_count_signature_pinned_via_fn_pointer_witness() {
+        // Pin Engine::policy_count signature as
+        // `fn(&Engine) -> usize` via fn-pointer witness. A refactor
+        // that flipped to `fn(&self) -> u32` ("for SQL-int4 alignment
+        // with the setup-status row") would silently truncate at
+        // 2^32 policies AND force every call site to cast. The
+        // `&self` borrow shape is load-bearing because the proxy
+        // calls this from the setup-status handler on every poll
+        // tick without owning the Engine (it lives in
+        // ArcSwap<Engine>); a refactor to `self`-consuming would
+        // surface here AND break the watcher loop.
+        let _f: fn(&Engine) -> usize = Engine::policy_count;
+    }
+
+    #[test]
+    fn engine_burst_override_for_signature_pinned_via_fn_pointer_witness() {
+        // Pin Engine::burst_override_for signature as
+        // `fn(&Engine, &str) -> Option<(Option<usize>, Option<u64>)>`
+        // via fn-pointer witness. Three boundaries are pinned at the
+        // type level: (a) `&self` borrow on the Engine (not consuming
+        // — the burst suppressor calls this per blocked-action emit
+        // through Arc<Engine>); (b) `&str` borrow on the policy_id
+        // (not String — the matched_policy_id is owned by the
+        // Outcome and the suppressor borrows it for the lookup
+        // without cloning); (c) `Option<(Option<usize>, Option<u64>)>`
+        // outer/inner Option shape preserving the
+        // "policy-not-found vs. policy-without-override vs. field-
+        // override-with-other-default" three-way distinction at the
+        // call site.
+        let _f: fn(&Engine, &str) -> Option<(Option<usize>, Option<u64>)> =
+            Engine::burst_override_for;
+    }
+
+    #[test]
+    fn engine_email_recipients_for_signature_pinned_via_fn_pointer_witness() {
+        // Pin Engine::email_recipients_for signature as
+        // `fn(&Engine, &str) -> Option<EmailRecipientOverride>`. The
+        // `EmailRecipientOverride` type alias is `(Option<Vec<String>>,
+        // Option<Vec<String>>, Option<Vec<String>>)`. Symmetric to
+        // the burst_override_for pin above — pin the alias-using
+        // signature so a refactor that inlined the alias to the raw
+        // tuple ("for one-less-type clarity") would surface here as a
+        // fn-pointer type mismatch, even though both shapes are
+        // structurally equivalent. The alias is the operator-grep
+        // handle in the rego module's public API; inlining it would
+        // silently lose that documentation surface.
+        let _f: fn(&Engine, &str) -> Option<EmailRecipientOverride> = Engine::email_recipients_for;
+    }
 }

@@ -374,6 +374,179 @@ mod tests {
     }
 
     #[test]
+    fn error_code_variant_count_pinned_at_exactly_ten_via_exhaustive_match() {
+        // Pin the variant count via an exhaustive match expression so an
+        // 11th variant landing (e.g. `OperatorScopeDenied` for a future
+        // 403 split between policy-blocked vs missing-operator-scope, or
+        // `KillSwitchRevoked` to distinguish bearer-revoked from
+        // policy-blocked on dashboards) without matching as_str +
+        // default_status site updates would surface here as a
+        // non-exhaustive compile error. Symmetric to the
+        // `parse_decision`-style exhaustive match in policy-engine but
+        // applied to the canonical wire registry — `#[non_exhaustive]`
+        // is a Rust-side affordance for downstream crates, not a
+        // license to skip enumerate-then-update lockstep when adding
+        // operator-visible variants.
+        fn variant_witness(c: ErrorCode) -> u8 {
+            match c {
+                ErrorCode::PicInvariantViolation => 0,
+                ErrorCode::PolicyBlocked => 1,
+                ErrorCode::RequireConfirmation => 2,
+                ErrorCode::RateLimited => 3,
+                ErrorCode::ReadFilterBlocked => 4,
+                ErrorCode::UpstreamUnavailable => 5,
+                ErrorCode::UpstreamTooLarge => 6,
+                ErrorCode::PolicyEngineError => 7,
+                ErrorCode::DatabaseError => 8,
+                ErrorCode::InternalError => 9,
+            }
+        }
+        // Sweep produces 10 distinct discriminant values
+        let mut seen = std::collections::HashSet::new();
+        for c in [
+            ErrorCode::PicInvariantViolation,
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RequireConfirmation,
+            ErrorCode::RateLimited,
+            ErrorCode::ReadFilterBlocked,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::UpstreamTooLarge,
+            ErrorCode::PolicyEngineError,
+            ErrorCode::DatabaseError,
+            ErrorCode::InternalError,
+        ] {
+            assert!(seen.insert(variant_witness(c)));
+        }
+        assert_eq!(seen.len(), 10);
+    }
+
+    #[test]
+    fn as_str_signature_pinned_via_fn_pointer_witness() {
+        // `as_str` consumes `self` by value (the enum is Copy — the
+        // method-level Copy semantic preserves the original at the
+        // call site). Pin the exact signature `fn(ErrorCode) ->
+        // &'static str` so a refactor that flipped to `&self`
+        // ("borrow for symmetry with default_status") would force
+        // every call site to add `&` or `.clone()` AND silently shift
+        // the lifetime contract — the existing static-str pin would
+        // still pass but the borrow shape would surface as a
+        // fn-pointer type mismatch here.
+        let _f: fn(ErrorCode) -> &'static str = ErrorCode::as_str;
+    }
+
+    #[test]
+    fn default_status_signature_pinned_via_fn_pointer_witness() {
+        // Symmetric to `as_str_signature_pinned_via_fn_pointer_witness`.
+        // Pin `default_status` as `fn(ErrorCode) -> u16` (self by
+        // value, u16 return — NOT `http::StatusCode`). The existing
+        // `default_status_returns_u16_type_not_status_code_for_adapter_override_freedom`
+        // pin uses a require_u16 closure which doesn't catch a
+        // `&self` borrow refactor — fn-pointer witness pins both
+        // axes (receiver shape + return type) at compile time.
+        let _f: fn(ErrorCode) -> u16 = ErrorCode::default_status;
+    }
+
+    #[test]
+    fn display_matches_as_str_byte_exact_across_every_variant() {
+        // The existing `display_uses_wire_string` pin walks only 3
+        // variants (PolicyBlocked, RateLimited, InternalError). Pin
+        // the symmetric byte-exact `Display == as_str` contract across
+        // ALL 10 variants so a refactor that special-cased one
+        // variant's Display impl (e.g. "render PicInvariantViolation
+        // as 'PIC violation' for the operator-facing 403 body") would
+        // silently break the operator log filters that grep on the
+        // wire string. The contract is: `format!("{c}")` must be
+        // byte-identical to `c.as_str()` for every variant — the
+        // canonical Display impl above delegates to `as_str` via
+        // `write_str`, and this pin enforces no future divergence.
+        for c in [
+            ErrorCode::PicInvariantViolation,
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RequireConfirmation,
+            ErrorCode::RateLimited,
+            ErrorCode::ReadFilterBlocked,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::UpstreamTooLarge,
+            ErrorCode::PolicyEngineError,
+            ErrorCode::DatabaseError,
+            ErrorCode::InternalError,
+        ] {
+            assert_eq!(
+                format!("{c}"),
+                c.as_str(),
+                "Display for {c:?} must match as_str byte-exact",
+            );
+        }
+    }
+
+    #[test]
+    fn partial_eq_distinguishes_database_error_and_internal_error_at_variant_level() {
+        // Load-bearing despite the two variants sharing the wire
+        // string `"internal_error"` — Rust-side dispatch in
+        // `AppError::from_sqlx_error` etc relies on the two being
+        // distinguishable at the variant level (the wire layer
+        // collapses them, the type layer does not). A refactor that
+        // collapsed the two into one variant (in the name of "they
+        // serialize the same anyway") would silently lose the
+        // type-level dispatch every adapter relies on for sqlx-vs-
+        // anyhow error routing. Pin distinct-equality directly.
+        assert_ne!(ErrorCode::DatabaseError, ErrorCode::InternalError);
+        assert_eq!(ErrorCode::DatabaseError, ErrorCode::DatabaseError);
+        assert_eq!(ErrorCode::InternalError, ErrorCode::InternalError);
+        // Hash distinctness — required for `HashMap<ErrorCode, _>` use
+        // sites (the existing copy_and_hash_traits test inserts both
+        // but never asserts they bucket separately). Calculate Hash
+        // manually so a future PartialEq-but-not-Hash drift surfaces.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h1 = DefaultHasher::new();
+        ErrorCode::DatabaseError.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        ErrorCode::InternalError.hash(&mut h2);
+        assert_ne!(
+            h1.finish(),
+            h2.finish(),
+            "DatabaseError and InternalError must hash distinctly even though wire strings alias",
+        );
+    }
+
+    #[test]
+    fn partial_eq_distinguishes_every_pair_of_distinct_variants_across_full_ten_variant_sweep() {
+        // Pin the full equality matrix — for every pair of distinct
+        // variants, `==` must return false. A refactor that collapsed
+        // any two variants into one (e.g. merged RateLimited into
+        // PolicyBlocked under a unified "deny" label) would surface
+        // here as the merged pair returning equal. The existing
+        // copy_and_hash_traits test inserts pairs into a HashMap but
+        // never asserts pair-wise distinct-equality across the full
+        // ten-variant catalogue. Reflexive equality is also pinned
+        // (every variant equals itself).
+        let all = [
+            ErrorCode::PicInvariantViolation,
+            ErrorCode::PolicyBlocked,
+            ErrorCode::RequireConfirmation,
+            ErrorCode::RateLimited,
+            ErrorCode::ReadFilterBlocked,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::UpstreamTooLarge,
+            ErrorCode::PolicyEngineError,
+            ErrorCode::DatabaseError,
+            ErrorCode::InternalError,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert_eq!(a, a, "reflexive equality for {a:?}");
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "variants {a:?} and {b:?} at indices {i}/{j} must be distinct",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn default_status_returns_only_4xx_or_5xx_codes_never_2xx_3xx_across_all_variants() {
         // Every ErrorCode represents an OPERATOR-FACING FAILURE — by
         // definition, the recommended HTTP status MUST be in the 4xx

@@ -796,6 +796,153 @@ mod tests {
         assert_eq!(prev_rev, 50);
     }
 
+    #[test]
+    fn policy_bundle_field_count_pinned_at_exactly_two_via_exhaustive_destructure() {
+        // Pin the PolicyBundle struct field count at exactly 2 via
+        // exhaustive destructure with no `..` rest pattern. A 3rd
+        // field landing (e.g. `loaded_at: DateTime<Utc>` for
+        // operator-facing "how stale is this snapshot" attribution,
+        // or `source_kind: SourceKind` to distinguish file-vs-db
+        // backends in the watcher log line) would silently bloat
+        // every reload tick's `ArcSwap<Engine>` swap path AND change
+        // the existing
+        // `policy_bundle_equality_ignores_neither_yaml_nor_version`
+        // equality contract. The existing PartialEq pin walks 2
+        // fields but doesn't catch a `#[serde(skip)]`-style or
+        // `#[derive(PartialEq)]`-skip runtime-only 3rd field —
+        // exhaustive destructure is the canonical pin.
+        let b = PolicyBundle {
+            yaml: "[]".into(),
+            version: "rev:0".into(),
+        };
+        let PolicyBundle {
+            yaml: _,
+            version: _,
+        } = b;
+    }
+
+    #[test]
+    fn policy_load_error_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // Pin the PolicyLoadError variant count at exactly 3 via
+        // exhaustive match expression. A 4th variant landing (e.g.
+        // `PermissionDenied { path }` to distinguish from generic
+        // Io and produce a distinct operator alert bucket, or
+        // `BackendUnavailable { retry_after }` for a future
+        // DbPolicyLoader's circuit-breaker shape) without matching
+        // every Display attribute site + the existing operator-
+        // facing prefix pins + every adapter call site that
+        // bubbles PolicyLoadError through `?` would surface here as
+        // a non-exhaustive compile error. The enum is NOT
+        // `#[non_exhaustive]` — within the workspace the match is
+        // fully closed and a new variant MUST update every dispatch
+        // site in lockstep.
+        fn variant_witness(e: &PolicyLoadError) -> u8 {
+            match e {
+                PolicyLoadError::Io(_) => 0,
+                PolicyLoadError::NotFound(_) => 1,
+                PolicyLoadError::Backend(_) => 2,
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for e in [
+            PolicyLoadError::Io("x".into()),
+            PolicyLoadError::NotFound("x".into()),
+            PolicyLoadError::Backend("x".into()),
+        ] {
+            assert!(seen.insert(variant_witness(&e)));
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn file_loader_path_method_signature_pinned_via_fn_pointer_witness() {
+        // Pin FilePolicyLoader::path signature as
+        // `fn(&FilePolicyLoader) -> &Path` via fn-pointer witness.
+        // The borrow shape is load-bearing — the proxy's watcher
+        // task reads the path on every tick without owning it, so
+        // a refactor to `fn(&self) -> PathBuf` ("for ownership
+        // clarity in the watcher's per-tick log render") would
+        // silently force a per-tick allocation on every poll cycle.
+        // The existing `file_loader_path_and_source_label_round_trip`
+        // pin exercises the helper at runtime but doesn't catch a
+        // borrow→owned refactor at the signature level.
+        let _f: for<'a> fn(&'a FilePolicyLoader) -> &'a Path = FilePolicyLoader::path;
+    }
+
+    #[test]
+    fn file_loader_version_token_sync_signature_pinned_via_fn_pointer_witness() {
+        // Pin FilePolicyLoader::version_token_sync signature as
+        // `fn(&FilePolicyLoader) -> Result<String, PolicyLoadError>`
+        // via fn-pointer witness. The borrow-on-receiver shape lets
+        // server.rs call this on the boot path BEFORE the tokio
+        // runtime is up (the proxy's startup sequence: parse args
+        // → build loader → fetch initial version token → init
+        // runtime → start watcher loop). A refactor that consumed
+        // `self` ("for ergonomic move-and-forget on boot") would
+        // surface here AND break the watcher loop which needs the
+        // SAME loader for both the sync bootstrap and the async
+        // poll-tick. The `Result<String, ...>` owned return type
+        // is also pinned — a `Result<&str, ...>` refactor would tie
+        // the return lifetime to &self and force AppState to hold a
+        // borrow across the runtime-init boundary.
+        let _f: fn(&FilePolicyLoader) -> Result<String, PolicyLoadError> =
+            FilePolicyLoader::version_token_sync;
+    }
+
+    #[test]
+    fn static_loader_set_yaml_is_callable_on_shared_reference_via_interior_mutability() {
+        // Pin that `StaticPolicyLoader::set_yaml` is callable on a
+        // shared `&self` reference (not `&mut self`) — the interior
+        // `Mutex<String>` + `AtomicU64` is the canonical Rust shape
+        // for "mutate-through-shared-reference" without forcing
+        // every caller to wrap the loader in an `Arc<Mutex<...>>`
+        // outer layer. The proxy stores `Arc<dyn PolicyLoader>`
+        // which is `!DerefMut`; a refactor that changed the
+        // receiver to `&mut self` ("for clarity") would silently
+        // break every call site in `policy_handle.rs` that
+        // currently calls through the Arc + the trait-object
+        // borrow. Pin the receiver shape by exercising via a
+        // shared borrow from inside an Arc — the existing tests
+        // call `set_yaml` directly on an owned binding which
+        // doesn't catch the &self contract.
+        let loader: Arc<StaticPolicyLoader> = Arc::new(StaticPolicyLoader::new("[]"));
+        let shared_ref: &StaticPolicyLoader = &loader;
+        shared_ref.set_yaml("- id: x");
+        // Also pin that set_yaml accepts `impl Into<String>` — three
+        // distinct shapes round-trip.
+        shared_ref.set_yaml(String::from("string-owned"));
+        shared_ref.set_yaml("&str-shape");
+        // And no `&mut` was needed at any call site.
+    }
+
+    #[test]
+    fn policy_loader_source_label_returns_owned_string_via_trait_dispatch() {
+        // `PolicyLoader::source_label(&self) -> String` returns OWNED
+        // bytes. A refactor to `fn source_label(&self) -> &str` ("to
+        // avoid the per-call clone on the FilePolicyLoader path") would
+        // tie the return lifetime to &self AND force every caller
+        // (the watcher log render, the setup-status panel) to hold
+        // a borrow across the trait-object dispatch. The owned shape
+        // also lets implementations build the label dynamically
+        // (e.g. "postgres://host:port/db" for a future DbPolicyLoader)
+        // without leaking the underlying connection state. Pin the
+        // owned-String trait-method return via require_string on both
+        // implementations + via trait-object dispatch (the proxy holds
+        // an `Arc<dyn PolicyLoader>` and calls `.source_label()`
+        // through the trait object — pin that path directly).
+        fn require_string(s: String) {
+            assert!(!s.is_empty() || s.is_empty()); // tautology — just consume by value
+        }
+        let file_loader = FilePolicyLoader::new("/tmp/x.yaml");
+        require_string(file_loader.source_label());
+        let static_loader = StaticPolicyLoader::new("[]").with_label("inline");
+        require_string(static_loader.source_label());
+        // Trait-object dispatch path (mirrors the proxy's call shape).
+        let dyn_loader: Arc<dyn PolicyLoader> = Arc::new(static_loader);
+        let label = dyn_loader.source_label();
+        assert_eq!(label, "inline");
+    }
+
     #[tokio::test]
     async fn static_loader_load_yields_owned_policy_bundle_via_clone_not_borrowed_slice() {
         // `StaticPolicyLoader::load()` returns `Result<PolicyBundle,

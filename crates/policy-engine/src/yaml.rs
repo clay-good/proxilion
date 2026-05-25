@@ -925,4 +925,179 @@ mod tests {
             "unknown-field object must NOT silently deserialize as either variant",
         );
     }
+
+    #[test]
+    fn policy_doc_field_count_pinned_at_exactly_thirteen_via_exhaustive_destructure() {
+        // Pin the PolicyDoc struct field count at exactly 13 via
+        // exhaustive destructure with no `..` rest pattern. The 13
+        // fields are: id + vendor + action + match_ + decision +
+        // read_filter + required_ops + pic_mode + mode + override_ +
+        // notifier_burst + notifier_recipients + audit_body. A 14th
+        // field landing (e.g. `severity: Severity` for dashboard
+        // ranking, `tags: Vec<String>` for grouped operator views, or
+        // `enabled_since: Option<DateTime<Utc>>` for staged rollouts)
+        // would silently bloat every PolicyDoc Vec on the engine's
+        // ArcSwap hot-swap path AND silently extend the wire JSON
+        // shape consumers see. The existing serde tests walk individual
+        // fields but a `#[serde(skip)]` runtime-only 14th field would
+        // bypass any wire-key pin — exhaustive destructure is the
+        // canonical pin.
+        let yaml = "- id: x\n  vendor: g\n  action: a\n";
+        let docs = parse_policies(yaml).unwrap();
+        let doc = docs.into_iter().next().unwrap();
+        let PolicyDoc {
+            id: _,
+            vendor: _,
+            action: _,
+            match_: _,
+            decision: _,
+            read_filter: _,
+            required_ops: _,
+            pic_mode: _,
+            mode: _,
+            override_: _,
+            notifier_burst: _,
+            notifier_recipients: _,
+            audit_body: _,
+        } = doc;
+    }
+
+    #[test]
+    fn recipients_cfg_field_count_pinned_at_exactly_four_via_exhaustive_destructure() {
+        // Pin the RecipientsCfg struct field count at exactly 4 via
+        // exhaustive destructure (no `..`). The 4 fields are: to + cc
+        // + bcc + escalation_after_minutes. A 5th field landing (e.g.
+        // `reply_to: Option<Vec<String>>` for an operator-friendly
+        // replies-bounce-back feature, or `subject_prefix:
+        // Option<String>` for a per-policy email subject override)
+        // would silently bloat every per-policy RecipientsCfg clone
+        // through the engine + email notifier handoff AND silently
+        // change the existing `to/cc/bcc/escalation_after_minutes`
+        // wire shape. The escalation_after_minutes round-trip pin
+        // walks one field; exhaustive destructure is the canonical
+        // catch-all-fields pin.
+        let r = RecipientsCfg {
+            to: None,
+            cc: None,
+            bcc: None,
+            escalation_after_minutes: None,
+        };
+        let RecipientsCfg {
+            to: _,
+            cc: _,
+            bcc: _,
+            escalation_after_minutes: _,
+        } = r;
+    }
+
+    #[test]
+    fn mode_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // Pin the Mode variant count at exactly 3 via exhaustive
+        // match expression. A 4th variant landing (e.g. `DryRun` to
+        // distinguish "evaluate fully but never act AND never record
+        // an audit row" from `Observe` "evaluate, record, but allow",
+        // or `Quarantine` for a future per-policy temporary disable
+        // shape) without matching every `Engine::evaluate` arm + the
+        // operator-facing wire-string snapshot + the
+        // ui-less-surfaces.md §2.1 dashboard toggle would surface
+        // here as a non-exhaustive compile error. The enum is NOT
+        // `#[non_exhaustive]` — within the workspace the match is
+        // fully closed and a new variant MUST update every dispatch
+        // site in lockstep. Symmetric to round-256 Decision +
+        // round-258 PolicyLoadError variant-count pins extended to
+        // the Mode enum.
+        fn variant_witness(m: Mode) -> u8 {
+            match m {
+                Mode::Enforce => 0,
+                Mode::Observe => 1,
+                Mode::Disabled => 2,
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for m in [Mode::Enforce, Mode::Observe, Mode::Disabled] {
+            assert!(seen.insert(variant_witness(m)));
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn audit_body_mode_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // Pin the AuditBodyMode variant count at exactly 3 via
+        // exhaustive match. A 4th variant landing (e.g. `Encrypted`
+        // for a future at-rest-encrypted body persistence path
+        // per ui-less-surfaces.md §6.4 future-work, or `MetadataOnly`
+        // to store body length + content-type without bytes) without
+        // matching every adapter audit-body dispatch site would
+        // surface here as a non-exhaustive compile error.
+        fn variant_witness(m: AuditBodyMode) -> u8 {
+            match m {
+                AuditBodyMode::Hash => 0,
+                AuditBodyMode::RedactPii => 1,
+                AuditBodyMode::Full => 2,
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for m in [
+            AuditBodyMode::Hash,
+            AuditBodyMode::RedactPii,
+            AuditBodyMode::Full,
+        ] {
+            assert!(seen.insert(variant_witness(m)));
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn quarantine_action_cfg_variant_count_pinned_at_exactly_three_via_exhaustive_match() {
+        // Pin the QuarantineActionCfg variant count at exactly 3 via
+        // exhaustive match. A 4th variant landing (e.g. `RedactPii`
+        // for a future per-pattern PII redaction action, or
+        // `EscalateToReviewer` to route quarantined chunks to a
+        // human-review queue) without matching every read-filter
+        // dispatcher site would surface here as a non-exhaustive
+        // compile error. Symmetric to round-256
+        // quarantine_action_variant_count pin on
+        // `decision::QuarantineAction` extended to the YAML schema
+        // type — the two are intentionally kept separate so the
+        // wire shape can evolve independently from the engine-
+        // internal representation, but they must stay in lockstep.
+        fn variant_witness(a: QuarantineActionCfg) -> u8 {
+            match a {
+                QuarantineActionCfg::ReplaceWithMarker => 0,
+                QuarantineActionCfg::StripSilently => 1,
+                QuarantineActionCfg::BlockRequest => 2,
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for a in [
+            QuarantineActionCfg::ReplaceWithMarker,
+            QuarantineActionCfg::StripSilently,
+            QuarantineActionCfg::BlockRequest,
+        ] {
+            assert!(seen.insert(variant_witness(a)));
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn parse_policies_signature_pinned_via_fn_pointer_witness() {
+        // Pin parse_policies signature as
+        // `fn(&str) -> Result<Vec<PolicyDoc>, serde_yaml::Error>`
+        // via fn-pointer witness. A refactor that flipped the input
+        // from `&str` to `&[u8]` ("for binary-input parity with
+        // serde_yaml::from_slice") or to `String` ("for
+        // ownership-symmetry with the return") would silently force
+        // every call site to materialize a String (the proxy's
+        // policy_handle holds the YAML in an `Arc<String>`; a
+        // `String` arg would force a clone per reload). The owned
+        // `Vec<PolicyDoc>` return type is also pinned — a refactor
+        // to `&'a [PolicyDoc]` "to avoid the per-call allocation"
+        // would tie the return lifetime to the input buffer's
+        // lifetime, forcing constraints on the engine's hot-swap
+        // ArcSwap path. The `serde_yaml::Error` error type is the
+        // operator-facing parse error rendered verbatim in the
+        // policy-reload log line via the rego::Error::Yaml `#[from]`
+        // chain.
+        let _f: fn(&str) -> Result<Vec<PolicyDoc>, serde_yaml::Error> = parse_policies;
+    }
 }

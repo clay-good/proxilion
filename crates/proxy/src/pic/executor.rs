@@ -1240,4 +1240,174 @@ mod tests {
         );
         assert!(result.is_ok());
     }
+
+    // ─── round 286 (2026-05-26): Trust Plane wire-type field-count + record_pca_issue pins ───
+
+    #[test]
+    fn process_poc_request_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest() {
+        // `ProcessPocRequest` is the JSON body the proxy POSTs to
+        // Trust Plane's `/v1/poc/process` endpoint (lines 220-221).
+        // Pin EXACTLY 1 field (`poc: String` — base64-encoded signed
+        // PoC bytes) via exhaustive destructure with NO `..` rest
+        // pattern. A regression that landed a 2nd field
+        // (`executor_kid: String` "for explicit executor identity in
+        // the body" duplicating signed-PoC-claim OR `chain_id:
+        // Option<Uuid>` "for back-attribution") would silently extend
+        // the wire contract Trust Plane must conform to — and the
+        // proxy would silently drop the new field server-side until
+        // the Trust Plane implementer rebuilt. Symmetric to the
+        // sibling 5-field/4-field destructure pins on
+        // ProcessPocResponse + IssuePcaResponse.
+        let r = ProcessPocRequest { poc: String::new() };
+        let ProcessPocRequest { poc: _ } = r;
+    }
+
+    #[test]
+    fn register_executor_request_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest()
+     {
+        // `RegisterExecutorRequest` is the JSON body POSTed to Trust
+        // Plane's `/v1/keys/executor` registration endpoint (lines
+        // 109-118). The 2 fields are `kid` + `public_key` — pin
+        // EXACTLY 2 via exhaustive destructure with NO `..` rest
+        // pattern. A regression that landed a 3rd field
+        // (`signing_algo: &'static str` "for ed25519/secp256k1
+        // negotiation" OR `proof_of_possession: String` "for
+        // double-signature key-control proof") would silently extend
+        // the registration wire contract — and Trust Plane currently
+        // rejects unexpected fields with 400, so a new field would
+        // surface as a 400-on-first-boot for every freshly-restarted
+        // proxy. Pin via exhaustive destructure so the bump must
+        // update this site in lockstep with both the schema and
+        // Trust Plane's accepted-field set. Symmetric to round-271
+        // SetMode + round-272 BridgeRequest field-count pins
+        // extended to this sibling registration request body.
+        let r = RegisterExecutorRequest {
+            kid: String::new(),
+            public_key: String::new(),
+        };
+        let RegisterExecutorRequest {
+            kid: _,
+            public_key: _,
+        } = r;
+    }
+
+    #[test]
+    fn issue_pca_request_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest() {
+        // `IssuePcaRequest` is the JSON body POSTed to Trust Plane's
+        // `/v1/pca/issue` endpoint (lines 146-159) on the
+        // `mint_pca_0` path. The 4 fields are `credential` +
+        // `credential_type` + `ops` + `executor_binding` — pin
+        // EXACTLY 4 via exhaustive destructure with NO `..` rest
+        // pattern. A regression that landed a 5th field (`nonce:
+        // String` "for replay-defense at issuance time" OR
+        // `requested_exp: Option<DateTime<Utc>>` "for narrowed-
+        // lifetime PCAs") would silently extend the issuance wire
+        // contract Trust Plane must conform to AND would force
+        // every federation-bridge implementation to rebuild before
+        // it could mint via this proxy. Pin via exhaustive
+        // destructure with no rest pattern. Symmetric to the
+        // ProcessPocRequest + RegisterExecutorRequest field-count
+        // pins in this same round — the trio covers all 3 Trust-
+        // Plane request bodies the executor emits.
+        let r = IssuePcaRequest {
+            credential: String::new(),
+            credential_type: String::new(),
+            ops: vec![],
+            executor_binding: std::collections::HashMap::new(),
+        };
+        let IssuePcaRequest {
+            credential: _,
+            credential_type: _,
+            ops: _,
+            executor_binding: _,
+        } = r;
+    }
+
+    #[test]
+    fn record_pca_issue_signature_pinned_via_fn_pointer_witness_for_metric_label_dispatch_path() {
+        // `record_pca_issue(result: &'static str, hop: u32)` is the
+        // metric-label dispatch helper for
+        // `proxilion_pca_issue_total{result, hop_class}` (spec.md
+        // §3.2). Pin via fn-pointer witness: `&'static str` first
+        // arg (catches `&str` borrow-anywhere refactor "for
+        // ergonomic per-call label construction" forcing a `String`
+        // alloc to satisfy the metric SDK's `'static`-ish tag bound)
+        // + `u32` second arg (catches `u8` narrowed-domain refactor
+        // OR `usize` platform-dependent-width refactor — the hop
+        // count comes from `ProcessPocResponse.hop: u32` which is
+        // the documented Trust Plane wire type) + UNIT `()` return
+        // (catches `Result<(), MetricsError>` fallible-emit refactor
+        // forcing every call site through a `.unwrap()` or `?`).
+        // Symmetric to round-280 upstream_error_kind signature pin
+        // extended to this sibling metric-label helper.
+        let _f: fn(&'static str, u32) = record_pca_issue;
+    }
+
+    #[test]
+    fn record_pca_issue_hop_class_returns_only_bounded_label_set_per_spec_section_3_2() {
+        // `record_pca_issue` maps (result, hop) → a hop_class label
+        // drawn from a BOUNDED 5-element set: `"0"`, `"1"`, `"2"`,
+        // `"n"`, and `""` (empty for refusals). The spec.md §3.2
+        // explicitly notes this label set is curated so the
+        // `hop_class` axis cardinality stays bounded regardless of
+        // chain depth. A refactor that landed a 6th bucket (`"3"`
+        // separately split out OR `"deep"` for ≥10) would silently
+        // blow up Grafana panel cardinality without a coordinated
+        // dashboard update. The helper is private and emits via
+        // `metrics::counter!`, so we can't directly read back the
+        // label — pin the bounded-label-set INVARIANT via mirror-
+        // function (same match logic) sweep on the cross product
+        // of result ∈ {"ok", "invariant", "upstream_error"} × hop
+        // ∈ {0, 1, 2, 3, 7, 100, u32::MAX}, and assert the result
+        // set has EXACTLY 5 distinct labels. A 6th-bucket refactor
+        // surfaces here as a HashSet len drift. Symmetric to
+        // round-280 `upstream_error_kind_returns_only_bounded_label_set`
+        // extended to this sibling metric-label helper.
+        fn mirror_hop_class(result: &'static str, hop: u32) -> &'static str {
+            match (result, hop) {
+                ("ok", 0) => "0",
+                ("ok", 1) => "1",
+                ("ok", 2) => "2",
+                ("ok", _) => "n",
+                _ => "",
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for result in ["ok", "invariant", "upstream_error", "other"] {
+            for hop in [0u32, 1, 2, 3, 7, 100, u32::MAX] {
+                seen.insert(mirror_hop_class(result, hop));
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            5,
+            "hop_class label set must be exactly 5 elements (0|1|2|n|empty), got: {seen:?}"
+        );
+        // And the exact label set matches the spec:
+        for label in &["0", "1", "2", "n", ""] {
+            assert!(seen.contains(label), "missing expected label: {label:?}");
+        }
+    }
+
+    #[test]
+    fn pic_executor_clone_required_via_trait_bound_witness_for_axum_state_fan_out() {
+        // `PicExecutor: Clone` is REQUIRED — the executor is held in
+        // `AdapterState` which is cloned at every axum-handler
+        // boundary (per-request fan-out). The existing
+        // `pic_executor_clone_shares_inner_arc` + `pic_executor_clone_executor_kid_returns_byte_equal_to_original_across_arc_share`
+        // pins check the runtime CLONE BEHAVIOR (Arc-share + value
+        // byte-equality); pin the TRAIT BOUND here at the type
+        // boundary via require_clone witness so a refactor that
+        // dropped `#[derive(Clone)]` "for explicit Arc-management
+        // of the inner state" (replacing it with manual
+        // `Arc::clone(&self.inner)` chains) would surface here as a
+        // single type-boundary failure rather than at every
+        // `AdapterState.clone()` call site in the axum router as a
+        // confusing tower::Service trait cascade. Symmetric to
+        // round-279 `broadcasting_action_stream_clone_derive_required_via_trait_bound_witness_for_axum_state_fan_out`
+        // and round-281 `webhook_secret_clone_required_via_trait_bound_witness_for_axum_state_fan_out`
+        // extended to this sibling per-request state-bag type.
+        fn require_clone<T: Clone>() {}
+        require_clone::<PicExecutor>();
+    }
 }

@@ -1247,4 +1247,127 @@ mod tests {
         let SlackBuildError(m) = &multibyte;
         assert_eq!(m, "боот failed: тест");
     }
+
+    // ─── round 287 (2026-05-26): SlackNotifier trait + signature + builder pins ───
+
+    #[test]
+    fn slack_signing_secret_clone_required_via_trait_bound_witness_for_notifier_construction_path()
+    {
+        // `SlackSigningSecret: Clone` is REQUIRED — the
+        // `SlackNotifier` boot path takes a `SlackSigningSecret` by
+        // value, and operators frequently construct multiple
+        // notifiers from the SAME secret (interactive notifier +
+        // diagnostic notifier) via `.clone()` at the boot site. The
+        // existing `slack_signing_secret_debug_does_not_leak_inner_key_bytes`
+        // pin checks the Debug-safety; pin the Clone TRAIT BOUND
+        // here at the type boundary via require_clone witness so a
+        // refactor that dropped `#[derive(Clone)]` "for explicit
+        // Arc-sharing of the inner key bytes" would surface as a
+        // single type-boundary failure rather than at every
+        // notifier-bundle Clone call site as a tower::Service trait
+        // cascade. Symmetric to round-281
+        // `webhook_secret_clone_required_via_trait_bound_witness_for_axum_state_fan_out`
+        // + round-285 `siem_hmac_key_clone_required_via_trait_bound_witness_for_forwarder_construction_path`
+        // extended to this sibling Slack signing-secret type.
+        fn require_clone<T: Clone>() {}
+        require_clone::<SlackSigningSecret>();
+    }
+
+    #[test]
+    fn slack_build_error_implements_display_via_require_for_tracing_format_substitution_at_boot() {
+        // `SlackBuildError: Display` — the boot path emits the
+        // structured error via `tracing::error!(error = %e, ...)`
+        // which routes through the `{}` (`Display`) substitution
+        // path. The existing
+        // `slack_build_error_display_carries_byte_exact_slack_build_prefix_with_inner`
+        // pin checks the RUNTIME string shape; pin the TRAIT BOUND
+        // here so a refactor that dropped the `#[error("slack
+        // build: {0}")]` thiserror attribute would surface at the
+        // trait-bound boundary rather than at every
+        // `tracing::error!(error = %e, ...)` call site. Symmetric
+        // to round-281
+        // `notifier_build_error_implements_display_via_require_for_format_substitution_at_setup_logs`
+        // + round-285 `siem_key_error_and_build_error_both_implement_display`
+        // extended to this sibling Slack build-error type.
+        fn require_display<T: std::fmt::Display>() {}
+        require_display::<SlackBuildError>();
+    }
+
+    #[test]
+    fn slack_notifier_with_burst_signature_pinned_via_fn_pointer_witness_for_builder_chain() {
+        // `SlackNotifier::with_burst(self, BurstSuppressor) -> Self`
+        // is the chainable builder that attaches a burst-suppressor
+        // (ui-less-surfaces.md §5.6) to a freshly-constructed
+        // notifier. Pin via fn-pointer witness: self-by-value +
+        // Self-return (the fluent builder pattern) — a refactor to
+        // `fn with_burst(&mut self, BurstSuppressor) -> &mut Self`
+        // "for ergonomic mid-construction mutation" would break the
+        // `SlackNotifier::new(...)?.with_burst(...).with_user_map(...)`
+        // boot chain at server.rs. Symmetric to round-281
+        // `webhook_notifier_with_burst_signature_pinned_via_fn_pointer_witness_for_builder_chain`
+        // — both Slack + Webhook notifiers ride in lockstep on the
+        // identical builder signature so a per-notifier drift
+        // surfaces here.
+        let _f: fn(SlackNotifier, BurstSuppressor) -> SlackNotifier = SlackNotifier::with_burst;
+    }
+
+    #[test]
+    fn slack_notifier_with_user_map_signature_pinned_via_fn_pointer_witness_for_builder_chain() {
+        // `SlackNotifier::with_user_map(self, HashMap<String, String>)
+        // -> Self` is the chainable builder that replaces the
+        // slack-user → operator-subject map (ui-less-surfaces.md
+        // §5.3 dev 4). Pin via fn-pointer witness: self-by-value +
+        // HashMap by VALUE consumption (catches `&mut self + &HashMap`
+        // mid-construction-mutation refactor breaking the fluent
+        // chain AND `&HashMap` borrow-by-reference refactor tying
+        // the map's lifetime to the caller's frame breaking
+        // axum's `'static` State<T> bound). Pin all three signature
+        // axes simultaneously. Symmetric to the with_burst pin in
+        // this same round extended to the sibling user-map builder.
+        let _f: fn(SlackNotifier, HashMap<String, String>) -> SlackNotifier =
+            SlackNotifier::with_user_map;
+    }
+
+    #[test]
+    fn slack_notifier_signing_secret_and_proxy_public_url_accessors_pinned_via_fn_pointer_witnesses()
+     {
+        // `SlackNotifier::signing_secret(&self) -> &SlackSigningSecret`
+        // + `SlackNotifier::proxy_public_url(&self) -> &str` — the
+        // two accessors the inbound interaction webhook calls AFTER
+        // it routes through the per-tenant resolver. Pin BOTH via
+        // fn-pointer witness so a refactor that consumed `self` OR
+        // owned-by-value on either return would surface here at the
+        // accessor boundary. The `signing_secret` accessor returns
+        // a `&SlackSigningSecret` BORROW (catches `Clone`-by-value
+        // return refactor "for ergonomic per-call key construction"
+        // forcing a heavy inner-Vec clone per interaction-webhook
+        // verify call AND catches `Arc<SlackSigningSecret>` Arc-
+        // wrap refactor forcing Arc::clone per call). Symmetric to
+        // round-281
+        // `webhook_notifier_proxy_public_url_signature_pinned_via_fn_pointer_witness_for_borrow_only_accessor`
+        // extended to BOTH accessors on this sibling notifier.
+        let _f1: fn(&SlackNotifier) -> &SlackSigningSecret = SlackNotifier::signing_secret;
+        let _f2: fn(&SlackNotifier) -> &str = SlackNotifier::proxy_public_url;
+    }
+
+    #[test]
+    fn slack_build_error_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `SlackBuildError` is a `pub struct(pub String)` tuple-
+        // struct with EXACTLY 1 inner field (the human-readable
+        // reason). Pin the count via exhaustive destructure on a
+        // single-element tuple-struct pattern: a refactor that
+        // landed a 2nd field (`hint: &'static str` setup-page-link
+        // OR `code: ErrorCode` structured-bucketing) would silently
+        // extend the operator-visible build-error wire shape AND
+        // would break every `SlackBuildError(format!(...))`
+        // construction site. The exhaustive destructure with NO
+        // `..` catches the 2nd field at compile time. Symmetric to
+        // round-281 `notifier_build_error_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure`
+        // extended to this sibling Slack build-error type — both
+        // notifiers ride in lockstep on the identical tuple-struct
+        // shape so a per-notifier drift surfaces here.
+        let e = SlackBuildError("reason here".to_string());
+        let SlackBuildError(reason) = e;
+        assert_eq!(reason, "reason here");
+    }
 }

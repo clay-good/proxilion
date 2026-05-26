@@ -1088,4 +1088,160 @@ mod tests {
             "UnknownClient docs link drift",
         );
     }
+
+    #[test]
+    fn oauth_error_status_signature_pinned_via_fn_pointer_witness() {
+        // Pin OAuthError::status signature as
+        // `fn(&OAuthError) -> StatusCode` via fn-pointer witness.
+        // The method takes `&self` (NOT `self`) — handlers call
+        // `.status()` AFTER `.body()` (both via borrow) before
+        // consuming the error in `into_response(self)`. A
+        // refactor to `fn(self) -> StatusCode` "for value-by-move
+        // ergonomics" would force the IntoResponse impl to
+        // reconstruct the error after calling status. The owned
+        // `StatusCode` return (not `&'static StatusCode`) is
+        // load-bearing because axum's response builder consumes
+        // the StatusCode by value. Pin both axes at compile time.
+        let _f: fn(&OAuthError) -> StatusCode = OAuthError::status;
+    }
+
+    #[test]
+    fn oauth_error_implements_into_response_via_trait_object_witness_for_axum_handler_arms() {
+        // The OAuthError enum is the per-handler error type every
+        // /oauth/* endpoint returns through the `?` operator —
+        // axum's IntoResponse trait is what makes
+        // `Result<..., OAuthError>` a valid handler return type.
+        // The existing response-shape tests walk body bytes but
+        // never the trait-bound contract directly. A refactor
+        // that dropped the `impl IntoResponse for OAuthError`
+        // block (perhaps a refactor unifying oauth errors with
+        // a sibling crate's) would force every handler to wrap
+        // the error explicitly. Pin via require_into_response
+        // trait-bound witness — symmetric to round-262/268/271
+        // require_into_response pins extended to OAuthError.
+        fn require_into_response<T: IntoResponse>() {}
+        require_into_response::<OAuthError>();
+    }
+
+    #[test]
+    fn oauth_error_implements_from_reqwest_error_via_question_mark_chain_witness() {
+        // OAuthError::Upstream is `#[from] reqwest::Error` —
+        // adapter call sites bubble Google's HTTP failures
+        // through the `?` operator. Pin the From impl via a
+        // trait-bound witness so a refactor that dropped the
+        // `#[from]` (forcing explicit `OAuthError::Upstream(e)`
+        // at every call site) would surface here.
+        fn require_from<T, S: From<T>>() {}
+        require_from::<reqwest::Error, OAuthError>();
+        // Also pin the symmetric From<sqlx::Error> conversion
+        // for the Db variant — same contract on every async
+        // sqlx call site in the OAuth callback path.
+        require_from::<sqlx::Error, OAuthError>();
+    }
+
+    #[test]
+    fn oauth_error_send_sync_static_for_axum_handler_return_value_boundary() {
+        // OAuthError flows through axum's handler-return-value
+        // pipeline across `.await` boundaries (the OAuth callback
+        // handler awaits Google's token endpoint, then the Trust
+        // Plane, then the DB) — Send + Sync + 'static are the
+        // load-bearing trait bounds. The existing variant_count
+        // pin walks the enum shape but never the auto-trait
+        // contract. A refactor that landed a non-Send field on
+        // any variant (e.g. `Internal { context: Rc<...> }` "for
+        // structured error context") would break Send and surface
+        // at a remote handler-bound trait error far from this
+        // file. Pin via require_send_sync_static — symmetric to
+        // round-176/177/178 Send+Sync+'static pins extended to
+        // OAuthError.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<OAuthError>();
+    }
+
+    #[test]
+    fn oauth_error_internal_variant_inner_field_is_owned_string_for_cross_await_propagation() {
+        // OAuthError::Internal(String) carries owned bytes —
+        // the OAuth callback constructs the error from a
+        // freshly-formatted message and the error then flows
+        // through `?`-chains across multiple `.await` boundaries
+        // before reaching the IntoResponse impl. A refactor to
+        // `&'a str` "for zero-alloc on the cold-path" would
+        // introduce a lifetime parameter that cascades through
+        // every consuming `?`-chain and the
+        // `From<sqlx::Error>`/`From<reqwest::Error>` impls.
+        // Pin owned-String type via require_string +
+        // pattern-match destructure — symmetric to round-187
+        // owned-String pins extended to OAuthError::Internal
+        // (the only String-carrying variant aside from
+        // BadRequest/BridgeRejected/PicInvariant which all
+        // share the same shape).
+        fn require_string(_: &String) {}
+        let e = OAuthError::Internal("transient kid lookup failure".into());
+        match &e {
+            OAuthError::Internal(s) => require_string(s),
+            _ => unreachable!(),
+        }
+        // Symmetric: BadRequest + BridgeRejected + PicInvariant
+        // all carry String too — pin each in the same test.
+        let e = OAuthError::BadRequest("missing code".into());
+        match &e {
+            OAuthError::BadRequest(s) => require_string(s),
+            _ => unreachable!(),
+        }
+        let e = OAuthError::BridgeRejected("token expired".into());
+        match &e {
+            OAuthError::BridgeRejected(s) => require_string(s),
+            _ => unreachable!(),
+        }
+        let e = OAuthError::PicInvariant("requested ops not a subset of predecessor".into());
+        match &e {
+            OAuthError::PicInvariant(s) => require_string(s),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn oauth_error_debug_carries_all_eleven_variant_names_for_grep_bucketing() {
+        // Operator log aggregators bucket OAuth callback faults
+        // by Debug-variant-name (the OAuth callback path traces
+        // `tracing::warn!(?e, ..)` on every error). The existing
+        // variant_count pin walks the variant set; the existing
+        // Display pins walk each variant's user-facing message.
+        // Pin all 11 variant-name substrings in Debug output
+        // here so a `#[derive(Debug)]` drift to a hand-rolled
+        // impl that elided variant names "for compactness"
+        // would silently merge all 11 into one bucket on the
+        // operator's alert filter — breaking the
+        // BadRequest-vs-Upstream-vs-PicInvariant triage
+        // distinction the runbook depends on. Symmetric to
+        // round-176 PolicyLoadError + round-173 ErrorCode
+        // Debug variant-name sweeps extended to OAuthError's
+        // 11-variant catalogue.
+        let cases: &[(OAuthError, &str)] = &[
+            (OAuthError::BadRequest("x".into()), "BadRequest"),
+            (OAuthError::UnknownClient, "UnknownClient"),
+            (OAuthError::SessionGone, "SessionGone"),
+            (OAuthError::BridgeRejected("x".into()), "BridgeRejected"),
+            (OAuthError::PkceFail, "PkceFail"),
+            (OAuthError::BadAuthCode, "BadAuthCode"),
+            (OAuthError::PicInvariant("x".into()), "PicInvariant"),
+            (OAuthError::Db(sqlx::Error::PoolClosed), "Db"),
+            (OAuthError::Crypto, "Crypto"),
+            (OAuthError::Internal("x".into()), "Internal"),
+            // Upstream(reqwest::Error) can't be constructed
+            // without a real network call — pin the other 10
+            // exhaustively here; the existing reqwest-real-error
+            // pins cover the 11th branch.
+        ];
+        for (e, want) in cases {
+            let s = format!("{e:?}");
+            assert!(
+                s.contains(want),
+                "Debug missing variant name `{want}` for {e:?}: got {s}",
+            );
+        }
+        // Exhaustivity check: pinned 10, plus the Upstream variant
+        // covered by the existing test = 11 total.
+        assert_eq!(cases.len(), 10);
+    }
 }

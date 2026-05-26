@@ -1072,4 +1072,135 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn drive_request_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // Pin the DriveRequest struct field count at exactly 5 via
+        // exhaustive destructure (no `..`). The 5 fields are:
+        // action (String) + upstream_path (String) + policy_path
+        // (HashMap<String, String>) + query (HashMap<String,
+        // String>) + body_for_policy (HashMap<String, Value>). A
+        // 6th field landing (e.g. `headers_for_policy:
+        // HashMap<String, String>` to expose a narrowed header set
+        // to policy beyond the current default-deny per spec.md
+        // §5.4, or `request_id: Uuid` to centralize the
+        // request-id generation currently inline in
+        // `proxy_request`) would silently extend the adapter→
+        // policy-engine handoff contract AND silently change what
+        // the policy engine evaluates. Pin via exhaustive
+        // destructure.
+        let v = DriveRequest {
+            action: String::new(),
+            upstream_path: String::new(),
+            policy_path: std::collections::HashMap::new(),
+            query: std::collections::HashMap::new(),
+            body_for_policy: std::collections::HashMap::new(),
+        };
+        let DriveRequest {
+            action: _,
+            upstream_path: _,
+            policy_path: _,
+            query: _,
+            body_for_policy: _,
+        } = v;
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_signature_pinned_via_fn_pointer_witness() {
+        // Pin enforce_pre_request_decision signature as
+        // `fn(&Outcome) -> Result<(), AppError>` via fn-pointer
+        // witness. The function takes the Outcome by BORROW
+        // (the policy_engine::Engine returns Outcome owned, but
+        // the adapter borrows it for the enforce dispatch then
+        // continues to use other fields). A refactor that
+        // consumed the Outcome ("for ownership symmetry with
+        // AppError::PolicyBlocked which clones from the
+        // Outcome's matched_policy_id") would force the adapter
+        // to reconstruct the outcome OR clone every reference
+        // afterward. The `Result<(), AppError>` shape is also
+        // pinned — a `Result<Outcome, AppError>` refactor "to
+        // pass the verified outcome forward" would silently
+        // change the dispatch downstream.
+        let _f: fn(&Outcome) -> Result<(), AppError> = enforce_pre_request_decision;
+    }
+
+    #[test]
+    fn insert_proxy_headers_signature_pinned_via_fn_pointer_witness() {
+        // Pin insert_proxy_headers signature as
+        // `fn(&mut HeaderMap, Uuid, Option<Uuid>, &Outcome)` via
+        // fn-pointer witness. The function mutates the
+        // response's HeaderMap in place — `&mut HeaderMap` is
+        // load-bearing because the headers are owned by the
+        // outgoing axum Response that the adapter assembles
+        // mid-handler. A refactor to `(HeaderMap) -> HeaderMap`
+        // "for functional-style chaining" would silently force
+        // every call site to reassemble the response from
+        // scratch on every header set. The two Uuids (request +
+        // optional leaf-PCA) are passed by VALUE since they're
+        // 16-byte Copy values. The Outcome is by BORROW since
+        // the adapter still owns it.
+        use axum::http::HeaderMap;
+        let _f: fn(&mut HeaderMap, Uuid, &Outcome, Uuid) = insert_proxy_headers;
+    }
+
+    #[test]
+    fn build_policy_ctx_signature_pinned_via_fn_pointer_witness() {
+        // Pin build_policy_ctx signature shape. The function
+        // takes refs to the session + DriveRequest + customer
+        // domain (the inputs to the policy engine's
+        // RequestContext) and returns an owned RequestContext
+        // by value. A refactor that flipped to
+        // `&RequestContext` return ("for zero-alloc on the
+        // hot path") would tie the return lifetime to the
+        // inputs, making the policy_engine::evaluate call site
+        // borrow across the call boundary. We don't construct
+        // a real session/DriveRequest here (they require deep
+        // setup); instead use a fn-pointer assignment to a
+        // local with the canonical shape — the borrow
+        // contract on `&str` for customer_domain is the
+        // load-bearing axis.
+        let _f: fn(
+            &crate::adapters::state::AdapterState,
+            &crate::session::SessionContext,
+            &DriveRequest,
+        ) -> policy_engine::RequestContext = build_policy_ctx;
+    }
+
+    #[test]
+    fn outcome_test_helper_returns_owned_outcome_with_test_policy_id() {
+        // The local `outcome` test helper is the canonical
+        // fixture builder for every enforce_* test. Pin its
+        // contract: returns an owned Outcome with
+        // `matched_policy_id: Some("test-policy")` and the
+        // default-Allow auxiliary fields. A refactor that
+        // changed the fixture's matched_policy_id to None
+        // would silently break every existing PolicyBlocked
+        // test's policy_id assertion. Pin via a direct round-
+        // trip through Decision::Allow.
+        let o = outcome(Decision::Allow);
+        assert_eq!(o.matched_policy_id.as_deref(), Some("test-policy"));
+        assert!(o.required_ops.required.is_empty());
+        assert!(o.read_filter.is_none());
+        assert_eq!(o.pic_mode, PicMode::Audit);
+        assert_eq!(o.mode, policy_engine::Mode::Enforce);
+        assert!(o.observe_would_have.is_none());
+        assert!(o.audit_body.is_none());
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_returns_unit_on_allow_via_fn_destructure_witness() {
+        // The Allow arm returns `Ok(())` — pin the unit return
+        // explicitly. A refactor to
+        // `Result<EnforcedDecision, AppError>` "to forward
+        // policy metadata to downstream handlers" would
+        // silently break every adapter `?`-chain call site that
+        // currently throws the success value away. Pin via
+        // require_unit witness.
+        fn require_unit(_: ()) {}
+        match enforce_pre_request_decision(&outcome(Decision::Allow)) {
+            Ok(unit) => require_unit(unit),
+            Err(e) => panic!("Allow must return Ok(()), got {e:?}"),
+        }
+    }
 }

@@ -963,4 +963,147 @@ mod tests {
         fn require_clone_send_sync_static<T: Clone + Send + Sync + 'static>() {}
         require_clone_send_sync_static::<SetupApiState>();
     }
+
+    #[test]
+    fn setup_api_state_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the SetupApiState struct field count at exactly 5 via
+        // exhaustive destructure (no `..`). The 5 fields are: db
+        // (PgPool) + google_configured (bool) + federation_bridge_url
+        // (String) + policy_path_configured (bool) + policy_count
+        // (usize). A 6th field landing (e.g. `notifier_configured:
+        // bool` to surface the notifier driver state in the setup
+        // panel, or `trust_plane_url: String` to distinguish the
+        // PIC executor's endpoint from the federation bridge) would
+        // silently bloat every Clone the axum router fans out per
+        // request AND silently extend the boot-path's assembled-
+        // setup-state contract. Pin via exhaustive destructure.
+        fn _destructure_witness(s: SetupApiState) {
+            let SetupApiState {
+                db: _,
+                google_configured: _,
+                federation_bridge_url: _,
+                policy_path_configured: _,
+                policy_count: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn check_item_field_count_pinned_at_exactly_six_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the CheckItem wire-shape struct field count at exactly
+        // 6 via exhaustive destructure (no `..`). The 6 fields are:
+        // id + title + ok + detail + fix + docs. A 7th field landing
+        // (e.g. `severity: &'static str` to color-code the operator-
+        // facing setup-status panel by criticality, or `last_checked:
+        // DateTime<Utc>` to surface staleness on the per-item card)
+        // would silently extend the wire shape every dashboard / CLI
+        // consumer reads — and a `#[serde(skip_serializing_if =
+        // "Option::is_none")]` 7th field would silently bypass any
+        // serde-key sweep test. The existing
+        // `setup_status_items_preserve_insertion_order_on_serialize`
+        // pin walks Vec order; exhaustive destructure pins the
+        // struct shape symmetrically.
+        let v = CheckItem {
+            id: "x",
+            title: "x",
+            ok: false,
+            detail: String::new(),
+            fix: None,
+            docs: "x",
+        };
+        let CheckItem {
+            id: _,
+            title: _,
+            ok: _,
+            detail: _,
+            fix: _,
+            docs: _,
+        } = v;
+    }
+
+    #[test]
+    fn setup_status_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the SetupStatus wire-shape struct field count at
+        // exactly 2 via exhaustive destructure (no `..`). The 2
+        // fields are: ready_for_traffic (bool) + items
+        // (Vec<CheckItem>). A 3rd field landing (e.g.
+        // `version: &'static str` to surface the proxy build
+        // version next to the setup checks, or `host: String` for
+        // future multi-host dashboard support) would silently
+        // extend the `/api/v1/setup/status` envelope every operator
+        // dashboard reads AND silently change the existing
+        // SetupStatus.items insertion-order pin's reachable
+        // surface.
+        let v = SetupStatus {
+            ready_for_traffic: false,
+            items: vec![],
+        };
+        let SetupStatus {
+            ready_for_traffic: _,
+            items: _,
+        } = v;
+    }
+
+    #[test]
+    fn setup_api_state_string_field_is_owned_for_arc_swap_envvar_outlives_request() {
+        // `SetupApiState.federation_bridge_url: String` is owned
+        // bytes — the env-var-derived string is captured at app
+        // assembly and the state Clone fan-outs each carry an
+        // independent String via the existing Clone derive. A
+        // refactor to `&'a str` "to avoid the per-clone allocation"
+        // would surface a lifetime parameter that the axum
+        // State<T> extractor's owned-content contract can't satisfy
+        // (the request handler outlives any borrow into the boot-
+        // path env). Pin owned-String type via require_string on
+        // a fn-destructure witness — symmetric to round-176
+        // PolicyBundle + round-185 SetModeBody owned-String pins
+        // extended to this state envelope's URL field. We use a
+        // fn-destructure witness rather than constructing a real
+        // SetupApiState because the inner PgPool requires a tokio
+        // runtime context that #[test] doesn't provide.
+        #[allow(dead_code)]
+        fn require_string(_: &String) {}
+        #[allow(dead_code)]
+        fn _witness(s: SetupApiState) {
+            let SetupApiState {
+                federation_bridge_url,
+                ..
+            } = s;
+            require_string(&federation_bridge_url);
+        }
+    }
+
+    #[test]
+    fn setup_error_implements_into_response_via_trait_object_witness_for_axum_handler_arm() {
+        // The SetupError enum is the per-handler error type the
+        // status() handler returns through the `?` operator —
+        // axum's IntoResponse trait is what makes
+        // `Result<Json<SetupStatus>, SetupError>` a valid handler
+        // return type. A refactor that dropped the
+        // `impl IntoResponse for SetupError` block would force the
+        // handler to wrap the error explicitly. Pin via
+        // require_into_response trait-bound witness — symmetric
+        // to round-262 api/mod.rs + round-268 killswitch require_into_response
+        // pins extended to SetupError.
+        fn require_into_response<T: IntoResponse>() {}
+        require_into_response::<SetupError>();
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's router constructor signature as
+        // `fn(SetupApiState) -> Router` via fn-pointer witness.
+        // Symmetric to round-262/263/264/265/266/268/269/270
+        // router fn-pointer pins extended to the setup API
+        // surface. The server.rs boot path calls
+        // `router(setup_state)` once at app assembly AND consumes
+        // the state by value (the router clones it per request
+        // via `.with_state(...)`). A refactor to
+        // `fn(&SetupApiState) -> Router` or
+        // `fn(SetupApiState) -> Result<Router, _>` would silently
+        // change the boot path's ownership AND error-handling
+        // shape.
+        let _f: fn(SetupApiState) -> Router = router;
+    }
 }

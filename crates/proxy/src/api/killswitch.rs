@@ -871,4 +871,137 @@ mod tests {
         require_send_sync_static::<KillBody>();
         require_send_sync_static::<KillResponse>();
     }
+
+    #[test]
+    fn killswitch_api_state_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the KillswitchApiState struct field count at exactly 2
+        // via exhaustive destructure (no `..`). The 2 fields are: db
+        // (PgPool) + kill_cache (KillCache). A 3rd field landing
+        // (e.g. `audit_sink: Arc<dyn ActionStream>` to tee a
+        // per-revoke audit row into the SIEM pipeline distinct from
+        // the existing kill_records insertion, or `metrics_bucket:
+        // &'static str` to split per-tenant operator metrics for
+        // the future multi-tenant operator path) would silently
+        // bloat every Clone the axum router fans out per request
+        // AND silently change what the kill_* handlers see. Pin
+        // via exhaustive destructure.
+        fn _destructure_witness(s: KillswitchApiState) {
+            let KillswitchApiState {
+                db: _,
+                kill_cache: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn kill_body_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the KillBody request-body struct field count at
+        // exactly 3 via exhaustive destructure. The 3 fields are:
+        // reason (Option<String>) + operator_subject (Option<String>)
+        // + confirm (Option<String>). A 4th field landing (e.g.
+        // `slack_channel: Option<String>` for a future fan-out to
+        // notify a specific channel on revoke, or `cascade:
+        // Option<bool>` for "also revoke child sessions" on the
+        // user/all scopes) would silently extend the CLI's
+        // expected request body shape AND change the deserialize
+        // contract on every `/api/v1/killswitch/*` POST endpoint.
+        // The existing forward-compat test pins permissive serde
+        // default; this pins the field-count ceiling explicitly.
+        let v = KillBody {
+            reason: None,
+            operator_subject: None,
+            confirm: None,
+        };
+        let KillBody {
+            reason: _,
+            operator_subject: _,
+            confirm: _,
+        } = v;
+    }
+
+    #[test]
+    fn kill_response_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // Pin the KillResponse wire-shape field count at exactly 5
+        // via exhaustive destructure. The 5 fields are: record_id +
+        // scope + target + bearers_revoked + at. A 6th field
+        // landing (e.g. `sessions_revoked: i64` to distinguish
+        // session-count from bearer-count on the `/killswitch/user`
+        // path, or `cache_marked_count: i64` for operator-facing
+        // visibility into the in-process kill_cache size delta)
+        // would silently extend the wire shape every CLI / dashboard
+        // consumer reads AND silently change the existing
+        // `kill_response_serializes_with_stable_field_names` JSON
+        // pin via `#[serde(skip_serializing_if)]` runtime-only
+        // field bypass.
+        let v = KillResponse {
+            record_id: Uuid::nil(),
+            scope: "session",
+            target: String::new(),
+            bearers_revoked: 0,
+            at: Utc::now(),
+        };
+        let KillResponse {
+            record_id: _,
+            scope: _,
+            target: _,
+            bearers_revoked: _,
+            at: _,
+        } = v;
+    }
+
+    #[test]
+    fn api_error_implements_into_response_via_trait_object_witness_for_axum_handler_arms() {
+        // The `ApiError` enum is the per-handler error type the
+        // three kill_* handlers return through the `?` operator —
+        // axum's IntoResponse trait is what makes
+        // `Result<Json<...>, ApiError>` a valid handler return
+        // type. The existing arm-level response shape tests walk
+        // the body bytes but never the trait-bound contract
+        // directly. A refactor that dropped the
+        // `impl IntoResponse for ApiError` block (perhaps a
+        // refactor unifying the API error type with a sibling
+        // crate's) would force every handler to wrap the error
+        // explicitly. Pin via require_into_response trait-bound
+        // witness — symmetric to round-262 api/mod.rs ApiError
+        // require_into_response pin extended to killswitch
+        // ApiError.
+        fn require_into_response<T: IntoResponse>() {}
+        require_into_response::<ApiError>();
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's router constructor signature as
+        // `fn(KillswitchApiState) -> Router` via fn-pointer witness.
+        // Symmetric to round-262/263/264/265/266 router fn-pointer
+        // pins extended to the killswitch API surface. The
+        // server.rs boot path calls `router(killswitch_state)` once
+        // at app assembly time AND consumes the state by value
+        // (the router internally wraps it in Arc before fan-out via
+        // `.with_state(Arc::new(state))`). A refactor to
+        // `fn(&KillswitchApiState) -> Router` or
+        // `fn(KillswitchApiState) -> Result<Router, _>` would
+        // silently change the boot path's ownership AND
+        // error-handling shape.
+        let _f: fn(KillswitchApiState) -> Router = router;
+    }
+
+    #[test]
+    fn killswitch_api_state_is_clone_for_axum_router_state_fan_out() {
+        // The axum `with_state(Arc::new(state))` indirection still
+        // requires the inner KillswitchApiState to be Clone (the
+        // router constructor itself takes the state by value and
+        // Arc-wraps it, but operator-tooling that builds the state
+        // outside the boot path may clone it for testing /
+        // dashboard fan-out). The existing `#[derive(Clone)]` is
+        // what makes this work; a refactor that dropped the derive
+        // would surface at hundreds of test-fixture sites rather
+        // than at this single trait-bound assertion. Pin Clone via
+        // require_clone — symmetric to round-264/265 trait-bound
+        // pins extended to KillswitchApiState.
+        fn require_clone<T: Clone>() {}
+        require_clone::<KillswitchApiState>();
+    }
 }

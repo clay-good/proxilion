@@ -1204,4 +1204,128 @@ mod tests {
         let p = parse_mime(raw.as_bytes()).unwrap();
         assert_eq!(p.attachment_count, 1);
     }
+
+    #[test]
+    fn gmail_request_field_count_pinned_at_exactly_eight_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the GmailRequest struct field count at exactly 8 via
+        // exhaustive destructure (no `..`). The 8 fields are:
+        // action (String) + upstream_path (String) + method
+        // (Method) + policy_path (HashMap) + query (HashMap) +
+        // body_for_policy (HashMap) + upstream_body
+        // (Option<Vec<u8>>) + upstream_content_type
+        // (Option<String>). A 9th field landing (e.g.
+        // `headers_for_policy: HashMap<String, String>` to narrow
+        // the header set the policy engine sees beyond default-deny,
+        // or `attachment_summary: Option<AttachmentSummary>` to
+        // pass parsed-attachment metadata into the policy engine)
+        // would silently extend the adapter→policy-engine handoff
+        // contract AND silently change what every Gmail handler
+        // assembles per request. Pin via exhaustive destructure
+        // (the struct is private — pinned inside the module's
+        // tests block).
+        let v = GmailRequest {
+            action: String::new(),
+            upstream_path: String::new(),
+            method: Method::GET,
+            policy_path: std::collections::HashMap::new(),
+            query: std::collections::HashMap::new(),
+            body_for_policy: std::collections::HashMap::new(),
+            upstream_body: None,
+            upstream_content_type: None,
+        };
+        let GmailRequest {
+            action: _,
+            upstream_path: _,
+            method: _,
+            policy_path: _,
+            query: _,
+            body_for_policy: _,
+            upstream_body: _,
+            upstream_content_type: _,
+        } = v;
+    }
+
+    #[test]
+    fn send_body_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the SendBody POST body field count at exactly 1 via
+        // exhaustive destructure. The 1 field is: raw (String) —
+        // the base64url-encoded RFC 2822 message. A 2nd field
+        // landing (e.g. `thread_id: Option<String>` to thread a
+        // reply, or `labels: Vec<String>` for post-send label
+        // application) would silently extend the
+        // `users.messages.send` POST body shape every Gmail-using
+        // agent must conform to AND silently change the
+        // deserialize contract. Pin via exhaustive destructure.
+        let v = SendBody { raw: String::new() };
+        let SendBody { raw: _ } = v;
+    }
+
+    #[test]
+    fn parsed_send_field_count_pinned_at_exactly_six_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the ParsedSend struct field count at exactly 6 via
+        // exhaustive destructure. The 6 fields are: to + cc + bcc
+        // + subject + attachment_count + body_text_preview. A 7th
+        // field landing (e.g. `reply_to: Vec<String>` for a future
+        // anti-spoofing policy authoring path, or `headers_seen:
+        // Vec<String>` for richer policy-author visibility into the
+        // MIME header set) would silently extend the parsed-MIME
+        // envelope every build_send_body_ctx call site reads
+        // AND silently change what fields the policy engine can
+        // match on. Pin via exhaustive destructure on the Default-
+        // built fixture (ParsedSend derives Default).
+        let v = ParsedSend::default();
+        let ParsedSend {
+            to: _,
+            cc: _,
+            bcc: _,
+            subject: _,
+            attachment_count: _,
+            body_text_preview: _,
+        } = v;
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_signature_pinned_via_fn_pointer_witness() {
+        // Pin enforce_pre_request_decision signature as
+        // `fn(&Outcome) -> Result<(), AppError>` via fn-pointer
+        // witness. Symmetric to round-273 google_drive pin
+        // extended to the gmail adapter — the 3 Google adapters
+        // (drive, gmail, calendar) currently carry IDENTICAL
+        // signature for this dispatch function; pinning each
+        // adapter's signature symmetrically catches a per-adapter
+        // drift refactor in lockstep.
+        let _f: fn(&Outcome) -> Result<(), AppError> = enforce_pre_request_decision;
+    }
+
+    #[test]
+    fn insert_proxy_headers_signature_pinned_via_fn_pointer_witness() {
+        // Pin insert_proxy_headers signature symmetric to round-273
+        // google_drive pin. The 3 Google adapters share the same
+        // header-insertion helper signature — a drift in one
+        // would silently introduce a per-adapter header contract
+        // mismatch on the response, breaking dashboard's "per-
+        // request inspector" panel which displays the headers
+        // identically across all 3 vendors.
+        use axum::http::HeaderMap;
+        let _f: fn(&mut HeaderMap, Uuid, &Outcome, Uuid) = insert_proxy_headers;
+    }
+
+    #[test]
+    fn parse_mime_signature_pinned_via_fn_pointer_witness() {
+        // Pin parse_mime signature as `fn(&[u8]) ->
+        // Result<ParsedSend, mailparse::MailParseError>` via
+        // fn-pointer witness. The function takes the decoded
+        // MIME bytes by BORROW (the b64url-decoded buffer is
+        // owned by the caller — `send_message` holds it across
+        // the `.await` boundary) and returns an owned
+        // ParsedSend with the `mailparse::MailParseError` error
+        // type. A refactor to `fn(Vec<u8>) -> ...` "for
+        // consume-and-cache" would silently force every call
+        // site to clone the decoded buffer. A refactor to a
+        // wrapping error type "to unify mail-parse + policy-
+        // engine errors" would silently change the call-site
+        // `?`-chain conversion.
+        let _f: fn(&[u8]) -> Result<ParsedSend, mailparse::MailParseError> = parse_mime;
+    }
 }

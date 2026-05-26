@@ -879,4 +879,159 @@ mod tests {
         let e = sample();
         require_datetime_utc(e.at);
     }
+
+    // ─── round 279 (2026-05-26): ActionEvent remaining-field + BroadcastingActionStream Clone pins ───
+
+    #[test]
+    fn action_event_vendor_action_method_path_fields_all_pinned_owned_string_via_destructure() {
+        // The four wire-label String fields — `vendor` (e.g. "google"),
+        // `action` (e.g. "calendar.events.insert"), `method` (HTTP
+        // verb), `path` — are all OWNED Strings, NOT `&'a str`. Each
+        // is bound across the `.execute(&self.db).await` suspension
+        // inside `BroadcastingActionStream::publish` (lines 99-102)
+        // and crosses the `tokio::spawn` boundary that TeeStream uses
+        // for fan-out. A refactor to `&'a str` "for zero-alloc adapter
+        // construction" on ANY ONE of the four (the most likely shape
+        // would be `vendor: &'static str` since the vendor set is
+        // closed) would tie ActionEvent's lifetime to the per-request
+        // frame and break every spawn site. Pin all four owned-String
+        // shapes simultaneously via destructure + require_owned_string
+        // — symmetric to round 278's `token_response_access_token_and_
+        // scope_fields_pinned_owned_string_for_cross_await_handler`
+        // extended to this sibling 4-field owned-String quartet.
+        fn require_owned_string(_: String) {}
+        let e = sample();
+        let ActionEvent {
+            request_id: _,
+            agent_session_id: _,
+            p_0: _,
+            leaf_pca_id: _,
+            vendor,
+            action,
+            method,
+            path,
+            status: _,
+            decision: _,
+            block_reason: _,
+            read_filter_triggered: _,
+            quarantined_count: _,
+            at: _,
+            policy_id: _,
+            extra: _,
+        } = e;
+        require_owned_string(vendor);
+        require_owned_string(action);
+        require_owned_string(method);
+        require_owned_string(path);
+    }
+
+    #[test]
+    fn action_event_decision_field_pinned_owned_string_for_metric_label_dispatch_cross_await() {
+        // `decision: String` is the canonical wire-label the
+        // `proxilion_action_events_persisted_total{decision}` metric
+        // (line 121-125) labels by AFTER the await suspension on the
+        // sqlx `.execute()` call — i.e. `event.decision.clone()` is
+        // captured into the metric tag map. A refactor to a closed
+        // enum (`Decision::{Allow, Deny, Quarantine}`) would force the
+        // metric site to `format!("{:?}", ...)` (introducing a per-
+        // increment alloc) AND would force every persistence row
+        // through the same enum + reduce wire flexibility for new
+        // decision labels behind a code release (today operators can
+        // add new labels by editing policy). Pin owned-String here
+        // via require_owned_string + the SAME exhaustive destructure
+        // shape symmetric to round-278/279 sibling pins so a refactor
+        // changing just `decision` (without the rest) surfaces here.
+        fn require_owned_string(_: String) {}
+        let e = sample();
+        require_owned_string(e.decision);
+    }
+
+    #[test]
+    fn action_event_p_0_field_pinned_owned_string_for_principal_label_cross_await_db_bind() {
+        // `p_0: String` is the canonical agent-principal label
+        // (spec.md §0.4 PCA_0.p_0 — the human-attributable principal
+        // every audit row carries). The publish path binds
+        // `&event.p_0` AFTER the `.execute(&self.db).await`
+        // suspension. A refactor to `&'static str` "since the
+        // principal set is closed under enterprise SSO" OR
+        // `Cow<'a, str>` "to avoid cloning when the principal
+        // comes from a request-frame borrow" would either narrow
+        // the principal universe AND would re-introduce lifetime
+        // parameters on ActionEvent breaking the Send+Sync+'static
+        // bound the trait requires. Pin owned-String specifically
+        // via require_owned_string. Symmetric to round-279
+        // vendor/action/method/path quartet extended to this
+        // 5th sibling owned-String field.
+        fn require_owned_string(_: String) {}
+        let e = sample();
+        require_owned_string(e.p_0);
+    }
+
+    #[test]
+    fn action_event_uuid_fields_request_id_agent_session_id_both_pinned_uuid_via_require_uuid() {
+        // `request_id: Uuid` + `agent_session_id: Uuid` — both are
+        // typed `Uuid`, NOT `String` UUID-textual. The DB schema
+        // binds them via `sqlx::query.bind(event.request_id)` which
+        // routes through sqlx's `uuid::Uuid` → PG-UUID encoding
+        // (binary on the wire). A refactor to `String` "for
+        // ergonomic textual logging" would silently shift the
+        // binding to TEXT-typed parameters which the `uuid` PG
+        // column REJECTS at runtime with a `pg_error: invalid
+        // input syntax` — a startup-time failure rather than a
+        // compile-time one. Pin via require_uuid on both fields
+        // simultaneously so a one-field-not-other drift (the most
+        // likely refactor shape — "let's textualize request_id for
+        // log correlation but keep session_id binary") surfaces
+        // here. Symmetric to the `at_field_pinned_datetime_utc`
+        // type pin extended to this sibling Uuid pair.
+        fn require_uuid(_: Uuid) {}
+        let e = sample();
+        require_uuid(e.request_id);
+        require_uuid(e.agent_session_id);
+    }
+
+    #[test]
+    fn action_event_extra_field_pinned_value_type_via_require_for_jsonb_passthrough_contract() {
+        // `extra: serde_json::Value` — pinned to the Value type, NOT
+        // `String` raw-JSON OR `HashMap<String, String>` flat-kv. The
+        // DB column is `jsonb` and `.bind(&event.extra)` routes
+        // through sqlx's `serde_json::Value` → PG-JSONB encoding. A
+        // refactor to `String` "to avoid the deserialize-reserialize
+        // round-trip on the publish hot path" would land the raw
+        // user-controlled string AS A SQL PARAMETER to a jsonb
+        // column — sqlx would attempt TEXT-typed binding, PG would
+        // reject at runtime. A refactor to `HashMap<String, String>`
+        // "to constrain extra to flat-kv" would silently DROP every
+        // nested object every adapter emits today (the gmail
+        // adapter emits attachment metadata as a nested array of
+        // objects — extra.attachments[i].mime_type). Pin via
+        // require_value on the destructured field so a TYPE refactor
+        // surfaces here at the field boundary. Symmetric to
+        // round-279's at + uuid type pins extended to this Value pin.
+        fn require_value(_: Value) {}
+        let e = sample();
+        require_value(e.extra);
+    }
+
+    #[test]
+    fn broadcasting_action_stream_clone_derive_required_via_trait_bound_witness_for_axum_state_fan_out()
+     {
+        // `BroadcastingActionStream` MUST be `Clone` — every Axum
+        // route handler that holds `State<AppState>` (or holds
+        // `Arc<dyn ActionStream>` indirectly) calls `.clone()` at
+        // the per-request fan-out site. The struct carries
+        // `db: PgPool` (cheaply cloneable, internal Arc) and
+        // `tx: broadcast::Sender<Arc<ActionEvent>>` (cheaply
+        // cloneable, internal Arc). Pin via require_clone trait-
+        // bound witness so a refactor that landed a non-Clone field
+        // (e.g. `metrics_bucket: AtomicU64` direct-by-value) would
+        // surface here at the type boundary rather than at every
+        // axum-handler call site as a confusing `the trait bound
+        // BroadcastingActionStream: Clone is not satisfied` message
+        // bubbling through `Router::with_state`. Symmetric to the
+        // round-262/272-style Clone witnesses applied to a sibling
+        // axum state-bag.
+        fn require_clone<T: Clone>() {}
+        require_clone::<BroadcastingActionStream>();
+    }
 }

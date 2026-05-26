@@ -1324,4 +1324,153 @@ mod tests {
         require_owned_string(access_token);
         require_owned_string(scope);
     }
+
+    #[test]
+    fn authorize_params_field_count_pinned_at_exactly_seven_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // `AuthorizeParams` is the `Query<T>`-extracted shape for
+        // `GET /oauth/google/authorize` — the public wire contract every
+        // agent SDK constructs by hand. Pin the field count at EXACTLY 7
+        // via exhaustive destructure with NO `..` rest pattern: a refactor
+        // that landed an 8th field (`nonce: Option<String>` OIDC-replay
+        // defense per RFC 6749 §10.12 OR `audience: Option<String>`
+        // RFC 8707 resource-indicator) would silently extend the
+        // accepted-query-string surface — without a coordinated agent
+        // SDK release, the new field would deserialize-silent-drop for
+        // every existing in-flight agent. The struct is private but the
+        // test sits in the same module so direct construction works.
+        let p = AuthorizeParams {
+            response_type: String::new(),
+            client_id: String::new(),
+            redirect_uri: String::new(),
+            state: String::new(),
+            code_challenge: String::new(),
+            code_challenge_method: String::new(),
+            scope: String::new(),
+        };
+        let AuthorizeParams {
+            response_type: _,
+            client_id: _,
+            redirect_uri: _,
+            state: _,
+            code_challenge: _,
+            code_challenge_method: _,
+            scope: _,
+        } = p;
+    }
+
+    #[test]
+    fn bridge_callback_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // `BridgeCallback` is the `Query<T>` for `/oauth/bridge/callback`
+        // — the federation-bridge → proxy hop the proxy reads only TWO
+        // fields from: the opaque session `state` (a Uuid the proxy
+        // minted in `/authorize`) and a `federation_token` JWT. Pin the
+        // field count at EXACTLY 2 via exhaustive destructure with NO
+        // `..` rest pattern. A regression that landed a 3rd field
+        // (`pca_0_cbor_b64: Option<String>` lifting it out of the JWT
+        // claims for raw-CBOR-out-of-band-injection OR
+        // `error: Option<String>` federation-bridge-returns-error pass-
+        // through) would silently extend the wire contract every
+        // federation-bridge implementation must conform to, and the
+        // new field would deserialize-silent-drop until the bridge
+        // implementer rebuilt against the new struct.
+        let p = BridgeCallback {
+            state: Uuid::nil(),
+            federation_token: String::new(),
+        };
+        let BridgeCallback {
+            state: _,
+            federation_token: _,
+        } = p;
+    }
+
+    #[test]
+    fn google_callback_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // `GoogleCallback` is the `Query<T>` for `/oauth/google/callback`
+        // — the Google → proxy authorization-code redirect. Pin EXACTLY
+        // 2 fields (state + code) via exhaustive destructure with NO
+        // `..` rest pattern. A regression that landed a 3rd field
+        // (`error: Option<String>` Google-returns-error-instead-of-code
+        // per RFC 6749 §4.1.2.1 OR `scope: Option<String>` Google-
+        // narrowed-the-granted-scope-on-consent) would extend the
+        // adapter→Google-OAuth handoff shape — and the proxy currently
+        // re-reads scope from the token exchange response, NOT the
+        // callback, so any new `scope` query param would silently
+        // drift away from the token-exchange truth.
+        let p = GoogleCallback {
+            state: Uuid::nil(),
+            code: String::new(),
+        };
+        let GoogleCallback { state: _, code: _ } = p;
+    }
+
+    #[test]
+    fn google_token_response_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // `GoogleTokenResponse` is the `Deserialize` shape the proxy
+        // pulls from Google's `https://oauth2.googleapis.com/token`
+        // endpoint after the authorization-code exchange. Pin EXACTLY
+        // 4 fields via exhaustive destructure (no `..` rest pattern)
+        // catching 5th `id_token: Option<String>` OIDC-userinfo OR
+        // `token_type: String` (Google docs say always "Bearer" — the
+        // proxy currently doesn't read it — landing it would silently
+        // extend the deserialize surface AND would mask a future Google
+        // change that returned a non-Bearer token type). The 4 fields
+        // are access_token + refresh_token (Option) + expires_in (i64)
+        // + scope — matching Google's documented response shape.
+        let resp = GoogleTokenResponse {
+            access_token: String::new(),
+            refresh_token: None,
+            expires_in: 0,
+            scope: String::new(),
+        };
+        let GoogleTokenResponse {
+            access_token: _,
+            refresh_token: _,
+            expires_in: _,
+            scope: _,
+        } = resp;
+    }
+
+    #[test]
+    fn router_signature_pinned_via_fn_pointer_witness_fn_of_oauth_state_returns_router() {
+        // `router(state: OAuthState) -> Router` is the public entry
+        // point `server.rs` calls to mount the OAuth handlers under
+        // axum. Pin the signature via fn-pointer witness symmetric to
+        // round-262/263/264/265/266/268/269/270/271 router pins on the
+        // api/* modules — a refactor that landed `fn(&OAuthState) ->
+        // Router` (borrow-by-reference "to avoid a Clone of the
+        // PgPool") would break the server.rs `.merge(routes::router(
+        // state.clone()))` call site every other router pin in the
+        // workspace conforms to AND would tie the Router's lifetime to
+        // the borrow, breaking axum's `Router: 'static`-ish bound. AND
+        // `fn(OAuthState) -> Result<Router, _>` fallible-construction
+        // refactor breaking the inline `.merge` chain at server.rs.
+        let _: fn(OAuthState) -> Router = router;
+    }
+
+    #[test]
+    fn narrowed_ops_for_pca1_signature_pinned_via_fn_pointer_witness_for_pca_minting_callsite() {
+        // `narrowed_ops_for_pca1(pca0_ops: &[String], granted_scope:
+        // &str) -> Vec<String>` is the helper that intersects the
+        // PCA_0 op-list with the actual Google-granted scope on the
+        // `/oauth/google/callback` hop, producing the op-list for
+        // PCA_1 minting. Pin the signature via fn-pointer witness:
+        // both inputs are BORROWED (pca0_ops as `&[String]` slice
+        // view over the deserialized session row, granted_scope as
+        // `&str` slice into the GoogleTokenResponse.scope String) and
+        // the return is OWNED `Vec<String>` because the callers
+        // (`pic.mint_successor` + `cache.insert`) consume by move.
+        // A refactor to `fn(Vec<String>, String) -> Vec<String>`
+        // consume-and-shrink would force the callback handler to
+        // clone the session ops vector twice (once for the
+        // PicInvariant error path that re-reads the original list).
+        // AND `fn(&[String], &str) -> &[String]` borrow-return
+        // refactor would tie the return lifetime to pca0_ops,
+        // making `mint_successor(pca0.cbor.clone(), pca1_ops, ...)`
+        // borrow-across-await-boundary impossible.
+        let _: fn(&[String], &str) -> Vec<String> = narrowed_ops_for_pca1;
+    }
 }

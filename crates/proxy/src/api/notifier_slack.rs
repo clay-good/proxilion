@@ -906,4 +906,110 @@ mod tests {
         // a refactor that conflated them surfaces in this one test.
         assert_eq!(header_str(&h, "x-other"), None);
     }
+
+    #[test]
+    fn slack_interact_state_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the SlackInteractState struct field count at exactly 3
+        // via exhaustive destructure (no `..`). The 3 fields are:
+        // slack (SlackHandle) + blocked (Arc<BlockedApiState>) + db
+        // (PgPool). A 4th field landing (e.g. `audit_sink: Arc<dyn
+        // ActionStream>` to tee Slack interactions distinct from the
+        // approve_inner audit chain, or `notifier: Notifiers` to
+        // fan out a post-approve notification to email when an
+        // operator approves through Slack) would silently bloat
+        // every Clone of SlackInteractState the axum router fans
+        // out per request AND silently change what the interact
+        // handler sees. The existing `#[derive(Clone)]` walks the
+        // trait; exhaustive destructure catches a runtime-only 4th
+        // field that doesn't surface through Clone derivation.
+        fn _destructure_witness(s: SlackInteractState) {
+            let SlackInteractState {
+                slack: _,
+                blocked: _,
+                db: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn slack_interact_state_is_clone_for_axum_router_state_fan_out() {
+        // The axum `with_state(...)` extractor relies on the
+        // State<T> type being Clone (the router clones per request
+        // to construct the handler arg). The existing
+        // `#[derive(Clone)]` is what makes this work; a refactor
+        // that dropped the derive (perhaps a refactor unifying
+        // SlackInteractState with a sibling crate's state that's
+        // !Clone) would surface at the route-build site in
+        // server.rs rather than at this single trait-bound
+        // assertion. Pin Clone via require_clone — symmetric to
+        // round-264/265/268 trait-bound pins extended to
+        // SlackInteractState.
+        fn require_clone<T: Clone>() {}
+        require_clone::<SlackInteractState>();
+    }
+
+    #[test]
+    fn slack_ok_message_signature_pinned_via_fn_pointer_witness() {
+        // Pin slack_ok_message signature as `fn(&str) -> Response`
+        // via fn-pointer witness. A refactor to `fn(String) ->
+        // Response` ("for consume-and-format clarity") would
+        // silently force every interact handler arm to box the
+        // borrowed dispatch-arm string before passing through to
+        // the helper. The borrow shape lets call sites pass
+        // literal `&'static str` arms directly. The owned Response
+        // return is also pinned — a refactor to
+        // `fn(&str) -> Result<Response, _>` would silently change
+        // the no-error contract every handler relies on for the
+        // success-path response shape.
+        let _f: fn(&str) -> Response = slack_ok_message;
+    }
+
+    #[test]
+    fn slack_err_signature_pinned_via_fn_pointer_witness() {
+        // Pin slack_err signature as `fn(StatusCode, &str) ->
+        // Response` via fn-pointer witness. A refactor to
+        // `fn(u16, &str) -> Response` ("for direct numeric status
+        // construction") would silently bypass StatusCode
+        // validation (StatusCode::from_u16 returns Result; raw u16
+        // doesn't), letting a future caller construct an invalid
+        // status. A refactor to `fn(StatusCode, String) ->
+        // Response` would force every dispatch arm to box the
+        // error message. The two-arg shape (status + message) is
+        // load-bearing.
+        let _f: fn(StatusCode, &str) -> Response = slack_err;
+    }
+
+    #[test]
+    fn header_str_signature_pinned_via_fn_pointer_witness() {
+        // Pin header_str signature as `fn(&HeaderMap, &str) ->
+        // Option<&str>` via fn-pointer witness. BOTH arguments are
+        // borrows (the HeaderMap from the axum request, the name
+        // from a literal `&'static str`), AND the return is a
+        // BORROW into the HeaderMap's owned bytes. A refactor to
+        // `fn(&HeaderMap, &str) -> Option<String>` "to avoid the
+        // lifetime parameter" would silently allocate one String
+        // per header lookup on the signature-verification hot
+        // path. Pin the for<'a> lifetime relationship so a refactor
+        // that returned a `&'static str` (impossibly) or an owned
+        // `String` (allocating) would surface here.
+        let _f: for<'a> fn(&'a HeaderMap, &str) -> Option<&'a str> = header_str;
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's router constructor signature as
+        // `fn(SlackInteractState) -> Router` via fn-pointer witness.
+        // Symmetric to round-262/263/264/265/266/268 router
+        // fn-pointer pins extended to the slack-interact API
+        // surface. The server.rs boot path calls
+        // `router(slack_state)` once at app assembly time AND
+        // consumes the state by value (the router clones it per
+        // request via `.with_state(...)`). A refactor to
+        // `fn(&SlackInteractState) -> Router` or
+        // `fn(SlackInteractState) -> Result<Router, _>` would
+        // silently change the boot path's ownership AND
+        // error-handling shape.
+        let _f: fn(SlackInteractState) -> Router = router;
+    }
 }

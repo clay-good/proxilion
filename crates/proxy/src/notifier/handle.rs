@@ -868,4 +868,123 @@ mod tests {
         assert!(slack.current().is_none());
         assert!(email.current().is_none());
     }
+
+    #[test]
+    fn handle_struct_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // Pin the Handle<T> struct field count at exactly 1 via
+        // exhaustive destructure (no `..`). The 1 field is: inner
+        // (Arc<ArcSwap<Option<Arc<T>>>>). A 2nd field landing (e.g.
+        // `swap_count: Arc<AtomicU64>` for per-handle observability
+        // counting hot-swaps, or `last_swapped_at:
+        // Arc<ArcSwap<DateTime<Utc>>>` for "this notifier was last
+        // configured at" surfacing on the setup-status panel) would
+        // silently bloat every Handle Clone the Notifiers bundle
+        // fan-out path uses AND silently change what observers see.
+        // The hand-rolled Clone impl wires `inner.clone()` only;
+        // a 2nd field landing without matching the Clone impl would
+        // surface as a non-cloning regression too.
+        let h: NotifierHandle = Handle::new(None);
+        let Handle { inner: _ } = h;
+    }
+
+    #[test]
+    fn notifiers_bundle_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the Notifiers bundle struct field count at exactly 5
+        // via exhaustive destructure (no `..`). The 5 fields are:
+        // webhook + slack + email + webhook_burst + slack_burst.
+        // A 6th field landing (e.g. `pagerduty: PagerDutyHandle`
+        // for the future incident-routing driver per
+        // ui-less-surfaces.md §5.3 future-work, or
+        // `email_burst: Option<BurstSuppressor>` symmetric to the
+        // webhook/slack pair for per-driver email burst suppression)
+        // would silently bloat every Notifiers Clone on the adapter
+        // hot path AND silently change which drivers fan out at
+        // notify time. The existing `empty()` constructor + the
+        // existing `any_configured()` predicate would each need
+        // updates in lockstep — exhaustive destructure catches a
+        // landed field without matching every site.
+        let n = Notifiers::empty();
+        let Notifiers {
+            webhook: _,
+            slack: _,
+            email: _,
+            webhook_burst: _,
+            slack_burst: _,
+        } = n;
+    }
+
+    #[test]
+    fn handle_new_signature_pinned_via_fn_pointer_witness() {
+        // Pin Handle<WebhookNotifier>::new signature as
+        // `fn(Option<Arc<WebhookNotifier>>) -> Handle<WebhookNotifier>`
+        // via fn-pointer witness. The constructor takes the initial
+        // notifier by VALUE (consuming the Option<Arc<_>>) and
+        // returns the owned Handle. A refactor to
+        // `fn(&Option<Arc<T>>) -> Self` ("for borrow-on-build
+        // clarity") would tie the Handle's ArcSwap-from-pointee
+        // step to a borrow lifetime that ArcSwap can't satisfy
+        // without an extra clone. Pin the by-value owned-Arc shape
+        // at compile time via fn-pointer witness on the most-used
+        // concrete instantiation.
+        let _f: fn(Option<Arc<WebhookNotifier>>) -> Handle<WebhookNotifier> = Handle::new;
+    }
+
+    #[test]
+    fn handle_replace_signature_pinned_via_fn_pointer_witness() {
+        // Pin Handle<WebhookNotifier>::replace signature as
+        // `fn(&Handle<WebhookNotifier>, Option<Arc<WebhookNotifier>>)`
+        // via fn-pointer witness. The replace method takes `&self`
+        // (NOT `&mut self`) — interior mutability via the inner
+        // ArcSwap is the canonical Rust shape for hot-swap APIs.
+        // A refactor to `&mut self` ("for clarity") would silently
+        // break every call site in `/api/v1/notifier/config` that
+        // holds the Handle through an `Arc<dyn ...>`-style
+        // shared-borrow chain. The new-notifier arg is by VALUE
+        // (consuming the Option<Arc<_>>) — symmetric to the new()
+        // pin above. The return type is unit `()` — pin via
+        // explicit signature shape so a future `Result<(), _>`
+        // refactor "for error-on-failed-swap" surfaces here.
+        let _f: fn(&Handle<WebhookNotifier>, Option<Arc<WebhookNotifier>>) = Handle::replace;
+    }
+
+    #[test]
+    fn handle_current_signature_pinned_via_fn_pointer_witness() {
+        // Pin Handle<WebhookNotifier>::current signature as
+        // `fn(&Handle<WebhookNotifier>) -> Option<Arc<WebhookNotifier>>`
+        // via fn-pointer witness. The accessor takes `&self` and
+        // returns an OWNED `Option<Arc<T>>` (the Arc is incref'd by
+        // the underlying ArcSwap::load, the Option is built fresh
+        // on each call). A refactor to
+        // `fn(&self) -> &Option<Arc<T>>` "to avoid the
+        // Option-cloning on the hot path" would tie the return
+        // lifetime to &self, breaking call sites that drop the
+        // Handle clone before consuming the inner Arc (the adapter
+        // pattern: `state.notifiers.webhook.current().map(|n| ...)`).
+        // The owned-return shape is load-bearing.
+        let _f: fn(&Handle<WebhookNotifier>) -> Option<Arc<WebhookNotifier>> = Handle::current;
+    }
+
+    #[test]
+    fn notifiers_bundle_is_send_sync_static_for_axum_router_state_propagation() {
+        // The Notifiers bundle flows through axum's State<T>
+        // extractor + survives across `.await` boundaries in the
+        // approve_inner / reject_inner paths. All Send + Sync +
+        // 'static MUST be satisfied. The existing Clone derive
+        // walks the trait; this walks the auto-trait combo
+        // directly. A refactor adding an Rc<...> field "for cheap
+        // shared metadata" on any of the 5 fields would break
+        // Sync and surface at a remote `tower::Service` trait-bound
+        // rather than at this module. Pin via require_send_sync_static
+        // — symmetric to round-176/177/178 Send+Sync+'static pins
+        // extended to the notifier bundle. Also pin Handle<T> via
+        // a concrete generic instantiation so a refactor that broke
+        // either the generic or the bundle surfaces here.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<Notifiers>();
+        require_send_sync_static::<NotifierHandle>();
+        require_send_sync_static::<SlackHandle>();
+        require_send_sync_static::<EmailHandle>();
+    }
 }

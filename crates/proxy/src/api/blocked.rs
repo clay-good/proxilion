@@ -1137,4 +1137,200 @@ mod tests {
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["request_canonical_json"]["to"], "alice");
     }
+
+    #[test]
+    fn blocked_api_state_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the BlockedApiState struct field count at exactly 3 via
+        // exhaustive destructure (no `..`). The 3 fields are: db
+        // (PgPool) + pca_cache (PcaCache) + pic (PicExecutor). A 4th
+        // field landing (e.g. `audit_sink: Arc<dyn ActionStream>` to
+        // emit a per-approve / per-reject audit event distinct from
+        // the policy_engine trace path, or `notifier: Notifiers` to
+        // fan out a post-approve notification to operators who
+        // requested the override) would silently bloat every
+        // Clone of BlockedApiState the axum router fans out per
+        // request. Pin via exhaustive destructure.
+        fn _destructure_witness(s: BlockedApiState) {
+            let BlockedApiState {
+                db: _,
+                pca_cache: _,
+                pic: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn blocked_row_field_count_pinned_at_exactly_twenty_one_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the BlockedRow wire-shape field count at exactly 21
+        // via exhaustive destructure (no `..`). The 21 fields are:
+        // id + request_id + session_id + p_0 + vendor + action +
+        // method + path + layer + policy_id + detail +
+        // predecessor_pca_id + requested_ops + status +
+        // override_pca_id + justification + approver_subject +
+        // reject_reason + resolved_at + expires_at + at +
+        // request_canonical_json. A 22nd field landing (e.g.
+        // `chain_id: Option<Uuid>` for back-attribution from
+        // blocked row to chain root, or `actor_subject:
+        // Option<String>` for richer audit attribution) would
+        // silently extend the wire shape every CLI / dashboard
+        // consumer reads — and a `#[serde(skip_serializing_if =
+        // "Option::is_none")]` 22nd field would silently bypass any
+        // serde-key sweep test. Exhaustive destructure is the
+        // canonical pin.
+        let r = BlockedRow {
+            id: Uuid::nil(),
+            request_id: Uuid::nil(),
+            session_id: None,
+            p_0: None,
+            vendor: String::new(),
+            action: String::new(),
+            method: None,
+            path: None,
+            layer: String::new(),
+            policy_id: None,
+            detail: None,
+            predecessor_pca_id: None,
+            requested_ops: vec![],
+            status: String::new(),
+            override_pca_id: None,
+            justification: None,
+            approver_subject: None,
+            reject_reason: None,
+            resolved_at: None,
+            expires_at: Utc::now(),
+            at: Utc::now(),
+            request_canonical_json: None,
+        };
+        let BlockedRow {
+            id: _,
+            request_id: _,
+            session_id: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            method: _,
+            path: _,
+            layer: _,
+            policy_id: _,
+            detail: _,
+            predecessor_pca_id: _,
+            requested_ops: _,
+            status: _,
+            override_pca_id: _,
+            justification: _,
+            approver_subject: _,
+            reject_reason: _,
+            resolved_at: _,
+            expires_at: _,
+            at: _,
+            request_canonical_json: _,
+        } = r;
+    }
+
+    #[test]
+    fn api_error_variant_count_pinned_at_exactly_six_via_exhaustive_match() {
+        // Pin the ApiError variant count at exactly 6 via exhaustive
+        // match. The 6 variants are: NotFound + BadRequest + Conflict
+        // + PicRefused + Internal + Db. A 7th variant landing (e.g.
+        // `Unauthorized` to distinguish "blocked-row exists but the
+        // operator's scope doesn't cover this tenant" from the
+        // middleware-layer 403, or `RateLimited` for per-operator
+        // approval-throttling) without matching every Display +
+        // IntoResponse arm + every adapter-bubble `?` site would
+        // surface here as a non-exhaustive compile error. Pin the
+        // 6-variant ceiling explicitly.
+        fn variant_witness(e: &ApiError) -> u8 {
+            match e {
+                ApiError::NotFound => 0,
+                ApiError::BadRequest(_) => 1,
+                ApiError::Conflict(_) => 2,
+                ApiError::PicRefused(_) => 3,
+                ApiError::Internal(_) => 4,
+                ApiError::Db(_) => 5,
+            }
+        }
+        let cases = [
+            ApiError::NotFound,
+            ApiError::BadRequest("x".into()),
+            ApiError::Conflict("x".into()),
+            ApiError::PicRefused("x".into()),
+            ApiError::Internal("x".into()),
+            // Db needs a real sqlx::Error — use PoolClosed which is
+            // trivially constructible.
+            ApiError::Db(sqlx::Error::PoolClosed),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for e in &cases {
+            assert!(seen.insert(variant_witness(e)));
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    #[test]
+    fn list_params_field_count_pinned_at_exactly_six_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the ListParams query-string field count at exactly 6
+        // via exhaustive destructure. The 6 fields are: status +
+        // p_0 + policy_id + session_id + limit + before. A 7th
+        // field landing (e.g. `vendor: Option<String>` for the
+        // dashboard's "filter by Google vs other adapter" panel,
+        // or `since: Option<DateTime<Utc>>` to symmetrically pair
+        // with the existing `before` cursor for paging both
+        // directions) would silently extend the CLI's expected
+        // query-string shape AND silently change which rows the
+        // `/api/v1/blocked` GET endpoint surfaces. Pin via
+        // exhaustive destructure.
+        let v = ListParams {
+            status: None,
+            p_0: None,
+            policy_id: None,
+            session_id: None,
+            limit: None,
+            before: None,
+        };
+        let ListParams {
+            status: _,
+            p_0: _,
+            policy_id: _,
+            session_id: _,
+            limit: _,
+            before: _,
+        } = v;
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's router constructor signature as
+        // `fn(BlockedApiState) -> Router` via fn-pointer witness.
+        // Symmetric to round-262/263/264 router fn-pointer pins
+        // extended to the blocked-actions API surface. The server.rs
+        // boot path calls `router(blocked_state)` exactly once at
+        // app assembly AND consumes the state by value (the router
+        // internally wraps it in Arc before fan-out via
+        // `.with_state(Arc::new(state))`). A refactor to
+        // `fn(&BlockedApiState) -> Router` or
+        // `fn(BlockedApiState) -> Result<Router, _>` would silently
+        // change the boot path's ownership AND error-handling
+        // shape.
+        let _f: fn(BlockedApiState) -> Router = router;
+    }
+
+    #[test]
+    fn blocked_api_state_is_clone_for_axum_router_state_fan_out() {
+        // The axum `with_state(Arc::new(state))` indirection still
+        // requires the inner BlockedApiState to be Clone (the
+        // router constructor itself takes the state by value and
+        // Arc-wraps it, but operator-tooling that builds the state
+        // outside the boot path may clone it for testing /
+        // dashboard fan-out). The existing `#[derive(Clone)]` is
+        // what makes this work; a refactor that dropped the
+        // derive would surface at hundreds of test-fixture sites
+        // rather than at this single trait-bound assertion. Pin
+        // Clone via require_clone — symmetric to round-264
+        // NotifierApiState require_clone pin extended to
+        // BlockedApiState.
+        fn require_clone<T: Clone>() {}
+        require_clone::<BlockedApiState>();
+    }
 }

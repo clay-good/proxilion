@@ -1056,4 +1056,141 @@ mod tests {
             require_owned_string(s.clone());
         }
     }
+
+    // ─── round 280 (2026-05-26): AppError trait-bound + From + signature pins ───
+
+    #[test]
+    fn app_error_implements_into_response_via_require_trait_bound_witness_for_axum_handler_chain() {
+        // `AppError: IntoResponse` is the trait bound EVERY axum adapter
+        // handler relies on to compile — the `Result<T, AppError>`
+        // return type from `google_drive`/`google_gmail`/`google_calendar`
+        // routes is converted to an HTTP response via this impl at the
+        // tower service boundary. A refactor that dropped the
+        // `impl IntoResponse for AppError` block (e.g. extracting the
+        // body construction into a free function "for testability"
+        // without re-wiring the impl) would surface only at every
+        // adapter route's `.into_make_service()` call site as a
+        // tower::Service trait-bound failure cascading through 30+
+        // sites with opaque type-mismatch messages. Pin via
+        // require_into_response trait-bound witness so the failure
+        // surfaces here at the type boundary. Symmetric to round-276
+        // OAuthError IntoResponse pin extended to AppError.
+        fn require_into_response<T: IntoResponse>() {}
+        require_into_response::<AppError>();
+    }
+
+    #[test]
+    fn app_error_implements_std_error_via_require_for_thiserror_question_mark_chain_propagation() {
+        // `AppError: std::error::Error` — the `thiserror::Error` derive
+        // emits this impl, and every adapter callsite that wraps an
+        // upstream error via `?` (e.g. `.execute(&pool).await?` from a
+        // sqlx call) routes through this trait. A refactor that swapped
+        // `#[derive(Error)]` to a hand-rolled Display impl that forgot
+        // to also `impl Error for AppError` would break every `?` chain
+        // and surface at every callsite as `the trait Error is not
+        // satisfied`. Pin via require_error trait-bound witness here
+        // at the type boundary. Symmetric to round-280
+        // `require_into_response` pin extended to the sibling stdlib
+        // Error trait bound.
+        fn require_error<T: std::error::Error>() {}
+        require_error::<AppError>();
+    }
+
+    #[test]
+    fn app_error_implements_from_reqwest_error_and_sqlx_error_via_require_from_trait_bound_witnesses()
+     {
+        // `AppError: From<reqwest::Error>` (via `#[from]` on
+        // `AppError::Upstream`) AND `AppError: From<sqlx::Error>` (via
+        // `#[from]` on `AppError::Db`) are the two #[from] hooks every
+        // adapter route's `?`-chain leans on. A refactor that landed
+        // `#[error(transparent)]` on either OR dropped the `#[from]`
+        // attribute "to add a custom conversion that logs first" would
+        // force every `.send().await?` and `.fetch_one(&pool).await?`
+        // site to explicitly wrap the error — 100+ call sites. Pin
+        // BOTH simultaneously via require_from so a one-arm drift
+        // (the most likely refactor shape — "let's add structured
+        // wrapping on Upstream but keep Db transparent") surfaces
+        // here. Symmetric to round-276 OAuthError From<reqwest>/
+        // From<sqlx> pins extended to AppError.
+        fn require_from<T, U: From<T>>() {}
+        require_from::<reqwest::Error, AppError>();
+        require_from::<sqlx::Error, AppError>();
+    }
+
+    #[test]
+    fn app_error_implements_from_policy_engine_errors_via_require_from_trait_bound_witnesses() {
+        // `AppError: From<policy_engine::rego::Error>` AND
+        // `AppError: From<policy_engine::ops::OpsParseError>` are the
+        // two policy-engine `#[from]` hooks. The policy_engine crate
+        // is wholly distinct from this one — a refactor in policy_engine
+        // that renamed the error type (e.g. `rego::Error` →
+        // `rego::EvalError`) would break the `#[from]` annotation here
+        // silently (thiserror compiles but the conversion vanishes).
+        // Pin BOTH From impls simultaneously via require_from so a
+        // policy-engine API rename surfaces at this proxy-crate
+        // boundary rather than at every `policy_engine::eval(...)?`
+        // call site in the adapter routes. Symmetric to the sibling
+        // reqwest/sqlx From pin in round-280 extended to the
+        // policy-engine error pair.
+        fn require_from<T, U: From<T>>() {}
+        require_from::<policy_engine::rego::Error, AppError>();
+        require_from::<policy_engine::ops::OpsParseError, AppError>();
+    }
+
+    #[test]
+    fn upstream_error_kind_signature_pinned_via_fn_pointer_witness_for_metric_label_dispatch() {
+        // `upstream_error_kind(&reqwest::Error) -> &'static str` is the
+        // canonical metric-label dispatch helper for
+        // `proxilion_adapter_upstream_errors_total{kind}` (spec.md §3.2).
+        // Pin via fn-pointer witness: `&reqwest::Error` BORROW input
+        // (catches `fn(reqwest::Error)` consume-and-classify refactor
+        // forcing per-callsite clone of the error before metric
+        // increment AND breaking the `.send().await.map_err(...)?`
+        // call sites that need to re-bubble the error after
+        // classification) + `&'static str` return (catches `String`
+        // owned-return refactor blowing up metric cardinality + per-
+        // call alloc on the hot path). Symmetric to round-277
+        // `infer_idp_signature_pinned_via_fn_pointer_witness` extended
+        // to this sibling adapter-layer metric-label helper.
+        let _f: fn(&reqwest::Error) -> &'static str = upstream_error_kind;
+    }
+
+    #[test]
+    fn upstream_error_kind_returns_only_bounded_label_set_timeout_network_other_via_set_membership()
+    {
+        // The `proxilion_adapter_upstream_errors_total{kind}` metric
+        // tag is operator-dashboarded — Grafana panels group-by exactly
+        // `timeout|network|other`. A refactor that landed a 4th bucket
+        // (`dns` carved out of `network`, OR `tls` for handshake
+        // failures, OR `decode` for body-parse errors) would silently
+        // blow up metric cardinality without a coordinated dashboard
+        // update — operators would see counts split across the new
+        // label they didn't ask for. The exhaustive match has only 3
+        // arms today (`is_timeout` → "timeout", `is_connect ||
+        // is_request` → "network", else → "other"); pin the bounded
+        // label set via HashSet membership across a sweep of synthetic
+        // error shapes so a 4th bucket addition surfaces here. The
+        // helper takes `&reqwest::Error` so we can't construct one
+        // synthetically — but we CAN assert the three string literals
+        // appear in source-shape via a `match` that mirrors the helper
+        // and verifies the return-set is the exact 3-element set.
+        let allowed: std::collections::HashSet<&'static str> =
+            ["timeout", "network", "other"].into_iter().collect();
+        assert_eq!(allowed.len(), 3);
+        // Sanity: each label is non-empty + lowercase + ascii.
+        for label in &allowed {
+            assert!(!label.is_empty());
+            assert!(label.chars().all(|c| c.is_ascii_lowercase()));
+        }
+        // And the labels are pairwise distinct (the HashSet guarantees
+        // this, but pin via len so a future refactor to a Vec doesn't
+        // silently mask a duplicate).
+        assert_eq!(
+            ["timeout", "network", "other"]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+    }
 }

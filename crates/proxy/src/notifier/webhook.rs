@@ -1066,4 +1066,145 @@ mod tests {
         // 32 hex chars).
         assert_eq!(orig_bytes.len(), 16);
     }
+
+    // ─── round 281 (2026-05-26): WebhookNotifier accessor + NotifierBuildError + max_retries pins ───
+
+    #[test]
+    fn webhook_secret_clone_required_via_trait_bound_witness_for_axum_state_fan_out() {
+        // `WebhookSecret: Clone` is REQUIRED — the `WebhookNotifier`
+        // constructor takes `WebhookSecret` by value, and the
+        // notifier bundle is cloned across every per-request axum
+        // handler invocation. The existing
+        // `secret_clone_yields_same_signature_as_original` test pins
+        // the BEHAVIOR; pin the TRAIT BOUND here at the type
+        // boundary via require_clone witness so a refactor that
+        // dropped `#[derive(Clone)]` "for explicit Arc-sharing of the
+        // inner key bytes" would surface here as a single
+        // type-boundary failure rather than at every notifier-bundle
+        // Clone call site as a confusing tower::Service trait
+        // cascade. Symmetric to round-279's
+        // `broadcasting_action_stream_clone_derive_required_via_trait_bound_witness_for_axum_state_fan_out`
+        // extended to this sibling notifier-state type.
+        fn require_clone<T: Clone>() {}
+        require_clone::<WebhookSecret>();
+    }
+
+    #[test]
+    fn notifier_build_error_implements_display_via_require_for_format_substitution_at_setup_logs() {
+        // `NotifierBuildError: Display` — the boot path emits the
+        // structured error via `tracing::error!(error = %e, ...)`
+        // which routes through the `{}` (`Display`) substitution
+        // path, NOT `{:?}` (`Debug`). The existing
+        // `notifier_build_error_display_contains_inner_reason` pin
+        // checks the RUNTIME string; pin the TRAIT BOUND here via
+        // require_display so a refactor that dropped the
+        // `#[error("notifier build: {0}")]` attribute "to hand-roll
+        // a richer Display impl in a separate file" would surface at
+        // this trait-bound boundary rather than at every
+        // `tracing::error!(error = %e, ...)` call site as a generic
+        // `the trait Display is not satisfied` message. Symmetric to
+        // round-280 `app_error_implements_into_response_via_require_trait_bound_witness`
+        // extended to this sibling notifier-build trait bound.
+        fn require_display<T: std::fmt::Display>() {}
+        require_display::<NotifierBuildError>();
+    }
+
+    #[test]
+    fn webhook_notifier_with_burst_signature_pinned_via_fn_pointer_witness_for_builder_chain() {
+        // `WebhookNotifier::with_burst(self, BurstSuppressor) -> Self`
+        // is the chainable builder that attaches a burst-suppressor
+        // (ui-less-surfaces.md §5.6) to a freshly-constructed
+        // notifier. The signature MUST consume `self` by VALUE
+        // (the fluent builder pattern) and return `Self` by VALUE so
+        // the `.with_burst(...)` call site can chain `.into()` or
+        // bind directly to a `let n =` site without an intermediate
+        // mutable binding. A refactor to `fn with_burst(&mut self,
+        // suppressor: BurstSuppressor) -> &mut Self` "for ergonomic
+        // mid-construction mutation" would break every `let n =
+        // WebhookNotifier::new(...)?.with_burst(...)?` chain at the
+        // server.rs boot site. Pin via fn-pointer witness symmetric
+        // to round-275's `urlencoding_signature_pinned_via_fn_pointer_witness`
+        // extended to this sibling builder method.
+        let _f: fn(WebhookNotifier, BurstSuppressor) -> WebhookNotifier =
+            WebhookNotifier::with_burst;
+    }
+
+    #[test]
+    fn webhook_notifier_proxy_public_url_signature_pinned_via_fn_pointer_witness_for_borrow_only_accessor()
+     {
+        // `WebhookNotifier::proxy_public_url(&self) -> &str` is the
+        // accessor for the configured proxy-public URL used in
+        // signature-bound link assembly. Pin via fn-pointer witness:
+        // `&self` borrow (catches `self`-consuming refactor breaking
+        // the accessor's idempotency every notifier-config endpoint
+        // relies on) + `&str` return BORROWED (catches `String`
+        // owned-return refactor forcing a per-call alloc on the
+        // hot path AND breaking the call-site `.to_owned()` chain
+        // already wired at the `/api/v1/notifier/config` GET route).
+        // Symmetric to the BroadcastingActionStream::subscribe
+        // fn-pointer-accessor pin in action_stream.rs (round 240)
+        // extended to this sibling notifier accessor.
+        let _f: fn(&WebhookNotifier) -> &str = WebhookNotifier::proxy_public_url;
+    }
+
+    #[test]
+    fn notifier_build_error_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure() {
+        // `NotifierBuildError` is a `pub struct(pub String)` tuple-
+        // struct with EXACTLY 1 inner field (the human-readable
+        // reason). Pin the count via exhaustive destructure on a
+        // single-element tuple-struct pattern: a refactor that
+        // landed a 2nd field (`hint: &'static str` setup-page-link OR
+        // `code: ErrorCode` structured-bucketing) would silently
+        // extend the operator-visible build-error wire shape AND
+        // would break every `NotifierBuildError(format!(...))`
+        // construction site (the cli setup helpers + the
+        // `from_hex`/`new` paths in this file). The exhaustive
+        // destructure with NO `..` catches the 2nd field at
+        // compile time. Symmetric to round-272 OAuthState +
+        // round-274 ParsedSend struct field-count pins extended to
+        // this sibling tuple-struct error type.
+        let e = NotifierBuildError("reason here".to_string());
+        let NotifierBuildError(reason) = e;
+        assert_eq!(reason, "reason here");
+    }
+
+    #[test]
+    fn webhook_notifier_max_retries_default_pinned_at_exactly_three_for_siem_forwarder_parity() {
+        // `WebhookNotifier::new` sets `max_retries: 3` per the file
+        // header doc ("Reliability mirrors the SIEM forwarder (§3.3):
+        // up to 3 retries"). The default is operator-load-bearing —
+        // a refactor that bumped it to 5 "for ergonomic flakiness
+        // tolerance" would silently extend P99 notify latency to up
+        // to 5×backoff seconds AND would diverge from the documented
+        // SIEM forwarder retry budget (operators who read both docs
+        // expect parity). The `with_max_retries` cfg(test) helper
+        // lets the test pin the value via destructure on a freshly-
+        // constructed notifier WITHOUT explicitly setting the field.
+        // The struct is private so destructure-by-pattern works only
+        // inside this module — pin the exact value `3` here. Symmetric
+        // to round-241 BroadcastingActionStream channel-size pin
+        // extended to this sibling notifier-reliability default.
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(
+            "https://hook.example.test/wh".into(),
+            secret,
+            "https://proxy.local".into(),
+        )
+        .unwrap();
+        // Destructure to read the private field directly — a refactor
+        // changing the default would surface here at the literal
+        // value comparison.
+        let WebhookNotifier {
+            url: _,
+            secret: _,
+            http: _,
+            max_retries,
+            proxy_public_url: _,
+            burst: _,
+        } = n;
+        assert_eq!(
+            max_retries, 3,
+            "default max_retries must be 3 per SIEM-forwarder parity (file header)"
+        );
+    }
 }

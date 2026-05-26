@@ -985,4 +985,136 @@ mod tests {
             html.len()
         );
     }
+
+    #[test]
+    fn notifier_public_state_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the NotifierPublicState struct field count at exactly
+        // 2 via exhaustive destructure (no `..`). The 2 fields are:
+        // db (PgPool) + blocked (Arc<BlockedApiState>). A 3rd field
+        // landing (e.g. `audit_sink: Arc<dyn ActionStream>` to log
+        // every public approve / reject click into the audit
+        // pipeline, or `rate_limiter: Arc<RateLimiter>` for
+        // per-IP throttling on the signed-URL landing page) would
+        // silently bloat every Clone of NotifierPublicState the
+        // axum router fans out per request. The existing Clone
+        // derive is what supports the fan-out; exhaustive
+        // destructure catches a runtime-only 3rd field.
+        fn _destructure_witness(s: NotifierPublicState) {
+            let NotifierPublicState { db: _, blocked: _ } = s;
+        }
+    }
+
+    #[test]
+    fn token_q_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the TokenQ query-string struct field count at exactly
+        // 1 via exhaustive destructure. The 1 field is: t (Uuid).
+        // A 2nd field landing (e.g. `approver: Option<String>` to
+        // distinguish the actual click-through user from the
+        // approver_hint set at link-mint time, or `redirect_url:
+        // Option<String>` for a future SSO landing-page integration)
+        // would silently extend the query-string shape every email
+        // link must use AND silently change the deserialize
+        // contract on `GET /notifier/approve`.
+        let v = TokenQ { t: Uuid::nil() };
+        let TokenQ { t: _ } = v;
+    }
+
+    #[test]
+    fn submit_form_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // Pin the SubmitForm POST body struct field count at exactly
+        // 3 via exhaustive destructure. The 3 fields are: t (Uuid)
+        // + justification (Option<String>) + reason (Option<String>).
+        // A 4th field landing (e.g. `csrf_token: String` for a
+        // future CSRF protection layer on the signed-URL landing
+        // page, or `acknowledged_risk: Option<bool>` for an
+        // operator-facing acknowledge-this-is-destructive checkbox)
+        // would silently extend the form fields the approve.html
+        // template emits AND silently change the deserialize
+        // contract on `POST /notifier/approve`. The existing
+        // approve.html template references all 3 fields by name; a
+        // 4th field landing without matching template-side updates
+        // would silently produce a deserialize error for every
+        // legitimate click-through.
+        let v = SubmitForm {
+            t: Uuid::nil(),
+            justification: None,
+            reason: None,
+        };
+        let SubmitForm {
+            t: _,
+            justification: _,
+            reason: _,
+        } = v;
+    }
+
+    #[test]
+    fn blocked_summary_field_count_pinned_at_exactly_eight_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the BlockedSummary struct field count at exactly 8 via
+        // exhaustive destructure. The 8 fields are: p_0 + vendor +
+        // action + path + policy_id + detail + created_at +
+        // requested_ops. A 9th field landing (e.g. `chain_id:
+        // Option<Uuid>` to render the chain-walker link on the
+        // landing page, or `severity: Option<String>` to color-code
+        // the approve form by risk level) would silently bloat
+        // every BlockedSummary Clone on the form-render path AND
+        // silently change what the approve.html template can
+        // substitute via the fill_template placeholders.
+        let v = BlockedSummary {
+            p_0: None,
+            vendor: String::new(),
+            action: String::new(),
+            path: String::new(),
+            policy_id: None,
+            detail: None,
+            created_at: Utc::now(),
+            requested_ops: vec![],
+        };
+        let BlockedSummary {
+            p_0: _,
+            vendor: _,
+            action: _,
+            path: _,
+            policy_id: _,
+            detail: _,
+            created_at: _,
+            requested_ops: _,
+        } = v;
+    }
+
+    #[test]
+    fn html_escape_signature_pinned_via_fn_pointer_witness() {
+        // Pin html_escape signature as `fn(&str) -> String` via
+        // fn-pointer witness. A refactor that flipped to
+        // `fn(String) -> String` ("for consume-and-format") would
+        // silently force every render call site to box every
+        // user-supplied field — the approve.html template path
+        // calls html_escape on borrowed slices into the
+        // BlockedSummary struct without cloning. The owned String
+        // return is also pinned — a refactor to `Cow<'_, str>`
+        // for the no-escape-needed fast path would tie the return
+        // lifetime to the input slice and force lifetime
+        // parameters on the response shape that the axum Html()
+        // wrapper can't satisfy without owning the body.
+        let _f: fn(&str) -> String = html_escape;
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's router constructor signature as
+        // `fn(NotifierPublicState) -> Router` via fn-pointer
+        // witness. Symmetric to round-262/263/264/265 router
+        // fn-pointer pins extended to the public notifier API
+        // surface. The server.rs boot path calls
+        // `router(public_state)` once at app assembly time AND
+        // consumes the state by value (the router clones it per
+        // request via `.with_state(...)`). A refactor to
+        // `fn(&NotifierPublicState) -> Router` or
+        // `fn(NotifierPublicState) -> Result<Router, _>` would
+        // silently change the boot path's ownership AND
+        // error-handling shape.
+        let _f: fn(NotifierPublicState) -> Router = router;
+    }
 }

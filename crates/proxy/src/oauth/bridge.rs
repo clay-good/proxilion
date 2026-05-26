@@ -1184,4 +1184,170 @@ mod tests {
         assert_eq!(c.p_0, "user:alice@demo.local");
         assert_eq!(c.ops, vec!["drive:read:engineering/*".to_string()]);
     }
+
+    #[test]
+    fn federation_claims_field_count_pinned_at_exactly_eight_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the FederationClaims struct field count at exactly 8
+        // via exhaustive destructure (no `..`). The 8 fields are:
+        // pca_0_id (Uuid) + p_0 (String) + ops (Vec<String>) +
+        // pca_0_cbor_b64 (Option<String>) + state (String) + iat
+        // (i64) + exp (i64) + iss (Option<String>). A 9th field
+        // landing (e.g. `nbf: Option<i64>` for a future not-before
+        // clock-skew check, or `jti: Option<String>` for
+        // anti-replay nonce tracking) would silently extend the
+        // federation-bridge wire contract the proxy must
+        // round-trip per spec.md §0.4 AND silently change what the
+        // OAuth callback handler can extract from the JWT. Pin via
+        // exhaustive destructure.
+        let v = FederationClaims {
+            pca_0_id: Uuid::nil(),
+            p_0: String::new(),
+            ops: vec![],
+            pca_0_cbor_b64: None,
+            state: String::new(),
+            iat: 0,
+            exp: 0,
+            iss: None,
+        };
+        let FederationClaims {
+            pca_0_id: _,
+            p_0: _,
+            ops: _,
+            pca_0_cbor_b64: _,
+            state: _,
+            iat: _,
+            exp: _,
+            iss: _,
+        } = v;
+    }
+
+    #[test]
+    fn validate_federation_token_signature_pinned_via_fn_pointer_witness() {
+        // Pin validate_federation_token signature as
+        // `fn(&str) -> Result<FederationClaims, OAuthError>` via
+        // fn-pointer witness. The JWT input is by BORROW (the
+        // OAuth callback holds the raw token in a String field on
+        // the request struct and passes a slice through). A
+        // refactor to `fn(String) -> ...` "for consume-and-decode
+        // clarity" would silently force every call site to box
+        // the borrowed JWT. The owned `Result<FederationClaims,
+        // OAuthError>` return is also pinned — the error variant
+        // funnels through the OAuthError envelope downstream.
+        let _f: fn(&str) -> Result<FederationClaims, OAuthError> = validate_federation_token;
+    }
+
+    #[test]
+    fn infer_idp_signature_pinned_via_fn_pointer_witness() {
+        // Pin infer_idp signature as `fn(Option<&str>) ->
+        // &'static str` via fn-pointer witness. The arg is
+        // `Option<&str>` (NOT `&str` and NOT `&Option<String>`) —
+        // the None arm is wire-distinct from `Some("")` (per the
+        // documented contract) and a refactor to either alternate
+        // shape would silently change which inputs return
+        // "unknown". The `&'static str` return is load-bearing
+        // because the OAuth callback labels the
+        // `proxilion_oauth_callback_total{idp}` metric with the
+        // returned value — `&'static str` lets the metrics SDK
+        // intern the label without per-call allocation. A
+        // refactor to `String` "for dynamic per-tenant labels"
+        // would silently force allocation per OAuth callback
+        // AND blow up metric cardinality.
+        let _f: fn(Option<&str>) -> &'static str = infer_idp;
+    }
+
+    #[test]
+    fn infer_idp_returns_only_bounded_label_set_per_spec_md_section_3_2() {
+        // The spec.md §3.2 contract is that infer_idp returns
+        // exactly one of the bounded set `okta|azure|google|oidc|
+        // unknown`. The existing `infer_idp_classifies_known_issuers`
+        // pin walks the 5 known mappings via individual asserts;
+        // pin the closed-set invariant directly so a refactor
+        // adding a 6th bucket (e.g. `auth0` or `keycloak`) would
+        // silently extend the metric cardinality without an
+        // operator-dashboard update. Sweep a representative
+        // sample of inputs and assert every result lands in the
+        // 5-label set.
+        let probes = [
+            None,
+            Some(""),
+            Some("https://acme.okta.com"),
+            Some("https://acme.oktapreview.com"),
+            Some("https://login.microsoftonline.com/x"),
+            Some("https://login.windows.net/x"),
+            Some("https://accounts.google.com"),
+            Some("https://googleapis.com"),
+            Some("https://id.example.org"),
+            Some("https://keycloak.example.com"),
+            Some("https://login.auth0.com"),
+        ];
+        let allowed: std::collections::HashSet<&'static str> =
+            ["okta", "azure", "google", "oidc", "unknown"]
+                .iter()
+                .copied()
+                .collect();
+        for p in &probes {
+            let label = infer_idp(*p);
+            assert!(
+                allowed.contains(label),
+                "infer_idp({p:?}) returned `{label}` not in bounded set",
+            );
+        }
+    }
+
+    #[test]
+    fn federation_claims_is_send_sync_static_for_axum_extension_propagation() {
+        // FederationClaims flows through the OAuth callback's
+        // request-extension store across `.await` boundaries —
+        // Send + Sync + 'static are load-bearing. The existing
+        // Clone pin walks Clone; this walks the auto-trait combo
+        // directly. A refactor adding an Rc<...> field "for
+        // shared metadata across the callback chain" would
+        // surface here. Pin via require_send_sync_static —
+        // symmetric to round-176/177 trait-bound pins extended
+        // to FederationClaims.
+        fn require_send_sync_static<T: Send + Sync + 'static>() {}
+        require_send_sync_static::<FederationClaims>();
+    }
+
+    #[test]
+    fn federation_claims_string_fields_are_owned_for_jwt_decode_outlives_request() {
+        // FederationClaims.p_0 + state fields are owned String —
+        // captured fresh from the JWT decode and consumed
+        // downstream after `.await` boundaries (the OAuth
+        // callback awaits Trust Plane + DB writes before
+        // persisting the claims). A refactor to `&'a str` "to
+        // avoid the decode-time allocation" would tie the
+        // lifetime to the JWT payload buffer that's dropped
+        // mid-handler. Pin owned-String type on all three
+        // String-shaped fields via require_string +
+        // pattern-match. Symmetric to round-176/185/272
+        // owned-String pins extended to FederationClaims.
+        fn require_string(_: &String) {}
+        let v = FederationClaims {
+            pca_0_id: Uuid::nil(),
+            p_0: "alice".into(),
+            ops: vec![],
+            pca_0_cbor_b64: Some("base64".into()),
+            state: "corr-id".into(),
+            iat: 0,
+            exp: 0,
+            iss: Some("https://acme.okta.com".into()),
+        };
+        require_string(&v.p_0);
+        require_string(&v.state);
+        // ops is Vec<String> — pin each element is String via
+        // require_string on a sample element when present.
+        let v_ops = FederationClaims {
+            pca_0_id: Uuid::nil(),
+            p_0: "x".into(),
+            ops: vec!["drive:read:*".into()],
+            pca_0_cbor_b64: None,
+            state: "x".into(),
+            iat: 0,
+            exp: 0,
+            iss: None,
+        };
+        require_string(&v_ops.ops[0]);
+    }
 }

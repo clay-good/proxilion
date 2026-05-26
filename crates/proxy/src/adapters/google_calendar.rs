@@ -1418,4 +1418,114 @@ mod tests {
             other => panic!("expected PolicyBlocked, got {other:?}"),
         }
     }
+
+    #[test]
+    fn calendar_request_field_count_pinned_at_exactly_seven_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the CalendarRequest struct field count at exactly 7
+        // via exhaustive destructure (no `..`). The 7 fields are:
+        // action (String) + upstream_path (String) + method
+        // (Method) + policy_path (HashMap) + query (HashMap) +
+        // body_for_policy (HashMap) + upstream_body
+        // (Option<Vec<u8>>). A 8th field landing (e.g.
+        // `upstream_content_type: Option<String>` symmetric with
+        // the gmail adapter — currently calendar hardcodes
+        // application/json at every call site, which is the
+        // intentional simplification; lifting it would silently
+        // change the adapter contract) would extend the
+        // adapter→policy-engine handoff AND silently change what
+        // every calendar handler assembles per request. Pin via
+        // exhaustive destructure.
+        let v = CalendarRequest {
+            action: String::new(),
+            upstream_path: String::new(),
+            method: Method::GET,
+            policy_path: std::collections::HashMap::new(),
+            query: std::collections::HashMap::new(),
+            body_for_policy: std::collections::HashMap::new(),
+            upstream_body: None,
+        };
+        let CalendarRequest {
+            action: _,
+            upstream_path: _,
+            method: _,
+            policy_path: _,
+            query: _,
+            body_for_policy: _,
+            upstream_body: _,
+        } = v;
+    }
+
+    #[test]
+    fn enforce_pre_request_decision_signature_pinned_via_fn_pointer_witness() {
+        // Pin enforce_pre_request_decision signature as
+        // `fn(&Outcome) -> Result<(), AppError>` via fn-pointer
+        // witness. Symmetric to round-273 drive + round-274
+        // gmail pins extended to the calendar adapter — the 3
+        // Google adapters carry IDENTICAL dispatch signatures;
+        // pinning each catches per-adapter drift refactor in
+        // lockstep across the 3 sibling files.
+        let _f: fn(&Outcome) -> Result<(), AppError> = enforce_pre_request_decision;
+    }
+
+    #[test]
+    fn insert_proxy_headers_signature_pinned_via_fn_pointer_witness() {
+        // Pin insert_proxy_headers signature symmetric to round-273
+        // drive + round-274 gmail pins. The 3 Google adapters
+        // share the same header-insertion helper signature — a
+        // drift in one would silently introduce a per-adapter
+        // header contract mismatch breaking the dashboard's
+        // per-request inspector panel which displays headers
+        // identically across all 3 vendors.
+        use axum::http::HeaderMap;
+        let _f: fn(&mut HeaderMap, Uuid, &Outcome, Uuid) = insert_proxy_headers;
+    }
+
+    #[test]
+    fn urlencoding_signature_pinned_via_fn_pointer_witness() {
+        // Pin urlencoding signature as `fn(&str) -> String` via
+        // fn-pointer witness. The helper takes the input by
+        // BORROW (callers pass borrowed slices into the calendar
+        // event-id / calendar-id path params) and returns owned
+        // bytes. A refactor to `fn(String) -> String` "for
+        // consume-and-format clarity" would force every call site
+        // to box the borrowed path-param string. A refactor to
+        // `Cow<'_, str>` return "to avoid the per-call allocation
+        // on the no-encoding-needed fast path" would tie the
+        // return lifetime to the input slice and force lifetime
+        // parameters on the upstream-path assembly site.
+        let _f: fn(&str) -> String = urlencoding;
+    }
+
+    #[test]
+    fn build_event_body_ctx_signature_pinned_via_fn_pointer_witness() {
+        // Pin build_event_body_ctx signature as
+        // `fn(&Value, &str) -> HashMap<String, Value>` via
+        // fn-pointer witness. The function takes the event JSON
+        // BORROW + customer_domain BORROW and returns an OWNED
+        // HashMap (the policy-engine RequestContext.body field
+        // owns its map per-request). A refactor to
+        // `fn(Value, &str)` consuming the event "for ownership
+        // symmetry" would silently force every call site to
+        // clone the parsed JSON. A refactor to a borrowed-Value
+        // map return would tie lifetimes to the inputs in a way
+        // the policy_engine handoff can't satisfy.
+        let _f: fn(&Value, &str) -> std::collections::HashMap<String, Value> = build_event_body_ctx;
+    }
+
+    #[test]
+    fn domain_of_signature_pinned_via_fn_pointer_witness() {
+        // Pin domain_of signature as `fn(&str) -> Option<String>`
+        // via fn-pointer witness. The 3 Google adapters all carry
+        // a `domain_of` helper but calendar's variant has the
+        // load-bearing `.filter(!is_empty)` divergence (the gmail
+        // sibling does NOT filter empty domains, per the
+        // round-38 pin). Pin the calendar shape directly so a
+        // unification refactor that aligned the two helpers
+        // would surface here as well as at the gmail-side
+        // divergence pin. The owned `Option<String>` return is
+        // load-bearing — a `Option<&str>` refactor would tie
+        // the return lifetime to the input email slice.
+        let _f: fn(&str) -> Option<String> = domain_of;
+    }
 }

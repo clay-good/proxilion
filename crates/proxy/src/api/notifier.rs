@@ -1126,4 +1126,122 @@ mod tests {
         assert_eq!(clone_a.proxy_base_url, "https://proxy.local");
         assert_eq!(clone_b.proxy_base_url, "https://proxy.local");
     }
+
+    #[test]
+    fn notifier_api_state_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the NotifierApiState struct field count at exactly 3 via
+        // exhaustive destructure pattern (no `..` rest). The 3 fields
+        // are: notifiers (Notifiers) + db (PgPool) + proxy_base_url
+        // (String). A 4th field landing (e.g. `metrics: MetricsHandle`
+        // for the notifier API to report send-success / send-failure
+        // counters live, or `audit_sink: Arc<dyn ActionStream>` to
+        // tee a per-config-change event into the audit pipeline)
+        // would silently bloat every Clone of NotifierApiState the
+        // axum router fans out per request AND silently change what
+        // every notifier API handler sees. The existing
+        // Notifiers-shared-across-Clone test walks Arc semantics on
+        // ONE field (notifiers); exhaustive destructure pins the
+        // catch-all-fields contract symmetrically.
+        fn _destructure_witness(s: NotifierApiState) {
+            let NotifierApiState {
+                notifiers: _,
+                db: _,
+                proxy_base_url: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn test_request_field_count_pinned_at_exactly_one_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the TestRequest body struct field count at exactly 1
+        // via exhaustive destructure pattern. The 1 field is: driver
+        // (Option<String>). A 2nd field landing (e.g.
+        // `target_user: Option<String>` to send the synthetic
+        // BlockedNotification to a specific operator instead of the
+        // configured-default channel, or `dry_run: Option<bool>`
+        // for "validate config without emitting") would silently
+        // extend the CLI's expected request body shape AND silently
+        // change the deserialize contract for the
+        // `/api/v1/notifier/test` endpoint. Pin via exhaustive
+        // destructure.
+        let v = TestRequest { driver: None };
+        let TestRequest { driver: _ } = v;
+    }
+
+    #[test]
+    fn set_config_body_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the SetConfigBody request-body field count at exactly
+        // 3 via exhaustive destructure. The 3 fields are: driver
+        // (String) + enabled (Option<bool>) + config (Value). A 4th
+        // field landing (e.g. `actor: Option<String>` for
+        // operator-attribution into the audit log of config
+        // changes, or `effective_at: Option<DateTime<Utc>>` for a
+        // future scheduled-config-change feature) would silently
+        // extend the CLI's expected request body shape AND silently
+        // change the handler's deserialize contract for the
+        // `/api/v1/notifier/config` POST endpoint.
+        let v = SetConfigBody {
+            driver: String::new(),
+            enabled: None,
+            config: serde_json::Value::Null,
+        };
+        let SetConfigBody {
+            driver: _,
+            enabled: _,
+            config: _,
+        } = v;
+    }
+
+    #[test]
+    fn redact_url_signature_pinned_via_fn_pointer_witness() {
+        // Pin redact_url signature as `fn(&str) -> String` via
+        // fn-pointer witness. A refactor that flipped to
+        // `fn(String) -> String` ("for consume-and-format
+        // clarity") would silently force every call site to
+        // allocate a String from the borrowed config-field URL.
+        // The borrow shape lets the show / get_config handlers call
+        // `redact_url(url)` on a borrowed &str slice into the
+        // serde_json Value tree without cloning. The owned String
+        // return is also pinned — a refactor to `Cow<'_, str>` for
+        // the "passthrough already-redacted" path would tie the
+        // return lifetime to the input slice and force lifetime
+        // parameters on the response shape.
+        let _f: fn(&str) -> String = redact_url;
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's router constructor signature as
+        // `fn(NotifierApiState) -> Router` via fn-pointer witness.
+        // Symmetric to round-262 api/mod.rs + round-263 api/policy.rs
+        // router fn-pointer pins extended to the notifier API. The
+        // server.rs boot path calls `router(notifier_state)` once
+        // at app assembly AND consumes the state by value (the
+        // router internally clones it per request via
+        // `.with_state(...)`). A refactor to
+        // `fn(&NotifierApiState) -> Router` or
+        // `fn(NotifierApiState) -> Result<Router, _>` would silently
+        // change the boot path's ownership AND error-handling
+        // shape.
+        let _f: fn(NotifierApiState) -> Router = router;
+    }
+
+    #[test]
+    fn notifier_api_state_is_clone_for_axum_router_state_fan_out() {
+        // The axum `with_state` extractor relies on the State<T>
+        // type being Clone (the router clones per request to
+        // construct the handler arg). The existing
+        // `#[derive(Clone)]` is what makes this work; a refactor
+        // that dropped the derive (perhaps a refactor unifying
+        // notifier state with a sibling crate's that's !Clone)
+        // would surface at hundreds of router-build sites in
+        // server.rs rather than at this single trait-bound
+        // assertion. Pin Clone via require_clone — symmetric to
+        // round-76 OperatorAuthState Clone trait-bound pin
+        // extended to NotifierApiState.
+        fn require_clone<T: Clone>() {}
+        require_clone::<NotifierApiState>();
+    }
 }

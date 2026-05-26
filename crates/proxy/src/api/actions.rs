@@ -1280,4 +1280,164 @@ mod tests {
         require_send_sync_static::<ListResponse>();
         require_send_sync_static::<ListRow>();
     }
+
+    #[test]
+    fn actions_api_state_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the ActionsApiState struct field count at exactly 3
+        // via exhaustive destructure (no `..`). The 3 fields are:
+        // db (PgPool) + stream (BroadcastingActionStream) +
+        // pca_cache (PcaCache). A 4th field landing (e.g.
+        // `audit_sink: Arc<dyn ActionStream>` to distinguish the
+        // broadcaster used for live SSE consumers from a separate
+        // persistence sink, or `metrics_bucket: &'static str` for
+        // future multi-tenant operator label splits) would
+        // silently bloat every Clone the axum router fans out per
+        // request AND silently change what every actions API
+        // handler sees. Pin via exhaustive destructure.
+        fn _destructure_witness(s: ActionsApiState) {
+            let ActionsApiState {
+                db: _,
+                stream: _,
+                pca_cache: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn list_params_field_count_pinned_at_exactly_seven_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // Pin the ListParams query-string struct field count at
+        // exactly 7 via exhaustive destructure. The 7 fields are:
+        // limit + before + decision + p_0 + vendor + action +
+        // session_id. An 8th field landing (e.g. `since:
+        // Option<DateTime<Utc>>` symmetric with `before` for
+        // bidirectional paging, or `request_id: Option<Uuid>` to
+        // narrow a query to a single transaction) would silently
+        // extend the CLI's expected query-string shape AND change
+        // which rows the `/api/v1/actions` GET endpoint surfaces.
+        // The existing
+        // `list_params_filters_default_to_none_when_query_string_empty`
+        // test walks individual fields; exhaustive destructure
+        // pins the catch-all-fields contract symmetrically.
+        let v = ListParams {
+            limit: None,
+            before: None,
+            decision: None,
+            p_0: None,
+            vendor: None,
+            action: None,
+            session_id: None,
+        };
+        let ListParams {
+            limit: _,
+            before: _,
+            decision: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            session_id: _,
+        } = v;
+    }
+
+    #[test]
+    fn export_params_field_count_pinned_at_exactly_eight_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the ExportParams query-string struct field count at
+        // exactly 8 via exhaustive destructure. The 8 fields are:
+        // format + decision + p_0 + vendor + action + session_id +
+        // since + until. A 9th field landing (e.g.
+        // `request_id: Option<Uuid>` to narrow a SIEM export to a
+        // single transaction's audit trail, or `chain_id:
+        // Option<Uuid>` for a future per-PCA-chain export shape)
+        // would silently extend the CLI's expected query-string
+        // shape AND change which rows the
+        // `/api/v1/actions/export` GET endpoint streams. Pin via
+        // exhaustive destructure.
+        let v = ExportParams {
+            format: None,
+            decision: None,
+            p_0: None,
+            vendor: None,
+            action: None,
+            session_id: None,
+            since: None,
+            until: None,
+        };
+        let ExportParams {
+            format: _,
+            decision: _,
+            p_0: _,
+            vendor: _,
+            action: _,
+            session_id: _,
+            since: _,
+            until: _,
+        } = v;
+    }
+
+    #[test]
+    fn purge_request_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // Pin the PurgeRequest body struct field count at exactly 2
+        // via exhaustive destructure. The 2 fields are: older_than
+        // (DateTime<Utc>) + dry_run (bool). A 3rd field landing
+        // (e.g. `actor: Option<String>` for operator-attribution
+        // into the audit log of destructive purges, or
+        // `confirm: Option<String>` symmetric to the killswitch
+        // /all `confirm: "yes"` guard for the most-destructive
+        // arm) would silently extend the CLI's expected request
+        // body shape AND change the deserialize contract on
+        // `/api/v1/actions/purge`. Pin via exhaustive destructure.
+        let v = PurgeRequest {
+            older_than: Utc::now(),
+            dry_run: false,
+        };
+        let PurgeRequest {
+            older_than: _,
+            dry_run: _,
+        } = v;
+    }
+
+    #[test]
+    fn purge_response_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // Pin the PurgeResponse wire-shape field count at exactly
+        // 3 via exhaustive destructure. The 3 fields are:
+        // older_than + dry_run + deleted. A 4th field landing
+        // (e.g. `actor: Option<String>` for surfacing who
+        // initiated the purge in the response, or `tables_purged:
+        // Vec<String>` to enumerate which joined tables had rows
+        // affected) would silently extend the wire shape every
+        // CLI consumer reads AND silently change the existing
+        // `purge_response_serializes_with_stable_field_names`
+        // JSON pin via `#[serde(skip_serializing_if)]` bypass.
+        // Pin via exhaustive destructure.
+        let v = PurgeResponse {
+            older_than: Utc::now(),
+            dry_run: false,
+            deleted: 0,
+        };
+        let PurgeResponse {
+            older_than: _,
+            dry_run: _,
+            deleted: _,
+        } = v;
+    }
+
+    #[test]
+    fn router_function_signature_pinned_via_fn_pointer_witness() {
+        // Pin the module's router constructor signature as
+        // `fn(ActionsApiState) -> Router` via fn-pointer witness.
+        // Symmetric to round-262/263/264/265/266/268/269 router
+        // fn-pointer pins extended to the actions API surface. The
+        // server.rs boot path calls `router(actions_state)` once
+        // at app assembly AND consumes the state by value (the
+        // router clones it per request via `.with_state(...)`).
+        // A refactor to `fn(&ActionsApiState) -> Router` or
+        // `fn(ActionsApiState) -> Result<Router, _>` would
+        // silently change the boot path's ownership AND
+        // error-handling shape.
+        let _f: fn(ActionsApiState) -> Router = router;
+    }
 }

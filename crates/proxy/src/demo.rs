@@ -1043,4 +1043,200 @@ mod tests {
             "extra.demo must NOT be the string \"true\"",
         );
     }
+
+    // ─── round 282 (2026-05-26): SCENARIOS/USERS const sizing + synth_event invariant pins ───
+
+    #[test]
+    fn scenarios_const_length_pinned_at_exactly_four_for_decision_variety_coverage_contract() {
+        // The dashboard's first-time-render screenshot in
+        // `docs/install/email.md` shows EXACTLY 4 distinct scenario
+        // rows (allow + allow-with-read-filter + block +
+        // require_confirmation). The existing
+        // `scenarios_const_has_at_least_three_entries` pin admits a
+        // ≥3 lower bound but allows silent growth — a 5th scenario
+        // landing without a coordinated screenshot refresh would
+        // surface as a layout drift in the first-impression of the
+        // product. Pin EXACTLY 4 via direct len comparison so a
+        // 5th-scenario landing OR a 3rd-scenario deletion BOTH
+        // surface here. Symmetric to round-282 USERS-const sizing
+        // pin and to the spec.md §§ scenario-table contract.
+        assert_eq!(
+            SCENARIOS.len(),
+            4,
+            "SCENARIOS const length is the operator-visible first-render variety contract"
+        );
+        // Defensive: ensure the 4 entries cover the 3 documented
+        // decision labels — refactoring the set to 4 entries all
+        // returning the same decision would pass the len pin but
+        // would still break the dashboard variety contract.
+        let decisions: std::collections::HashSet<&'static str> =
+            SCENARIOS.iter().map(|s| s.decision).collect();
+        assert!(
+            decisions.contains("allow"),
+            "scenarios must include `allow`"
+        );
+        assert!(
+            decisions.contains("block"),
+            "scenarios must include `block`"
+        );
+        assert!(
+            decisions.contains("require_confirmation"),
+            "scenarios must include `require_confirmation`"
+        );
+    }
+
+    #[test]
+    fn users_const_length_pinned_at_exactly_three_for_demo_principal_diversity() {
+        // The `USERS` slice carries EXACTLY 3 demo principals — the
+        // dashboard's "Top principals by activity" panel sorts and
+        // displays the top N (currently N=3) so the demo set must
+        // populate every slot WITHOUT a 4th principal that would
+        // never render. The existing `users_const_all_carry_user_colon_prefix`
+        // pin walks the prefix shape; pin the LENGTH here so a
+        // 4th-user landing "for ergonomic 'and N others' rendering"
+        // would surface here as a count mismatch rather than as a
+        // silent crowded-state in the panel. Symmetric to the
+        // SCENARIOS-const sizing pin in this same round.
+        assert_eq!(
+            USERS.len(),
+            3,
+            "USERS const length is the operator-visible top-principals-panel population contract"
+        );
+        // And the 3 entries are pairwise distinct (a refactor that
+        // duplicated a user in the slice would degrade the panel's
+        // sort-by-count + group-by-principal aggregation).
+        let unique: std::collections::HashSet<&'static str> = USERS.iter().copied().collect();
+        assert_eq!(unique.len(), 3, "USERS entries must be pairwise distinct");
+    }
+
+    #[test]
+    fn synth_event_extra_field_is_single_key_demo_object_no_second_key_for_jsonb_filter_purity() {
+        // `extra: { "demo": true }` — the JSON object MUST have
+        // EXACTLY 1 key. The `@> '{"demo": true}'` JSONB containment
+        // filter every operator dashboard uses to exclude demo rows
+        // RELIES on this — a refactor that landed a 2nd key (e.g.
+        // `"synthetic": true` or `"source": "demo"`) wouldn't break
+        // the containment filter directly but WOULD silently extend
+        // the wire shape of `extra` for every demo row, which
+        // operator-visible side panels render verbatim. The
+        // existing `synth_event_extra_field_is_demo_true_jsonb_marker`
+        // pin walks the VALUE; pin the KEY-COUNT here so a 2nd-key
+        // landing surfaces. Symmetric to round-241 ActionEvent.extra
+        // 1-key-object contract extended to demo synthetic rows.
+        for scenario in SCENARIOS.iter() {
+            let ev = synth_event(scenario, Utc::now());
+            let obj = ev
+                .extra
+                .as_object()
+                .expect("extra must be a JSON object, not array/scalar");
+            assert_eq!(
+                obj.len(),
+                1,
+                "extra must have exactly 1 key (`demo`), got: {obj:?}"
+            );
+            assert!(obj.contains_key("demo"));
+        }
+    }
+
+    #[test]
+    fn synth_event_leaf_pca_id_is_always_some_never_none_across_all_scenarios() {
+        // `leaf_pca_id: Option<Uuid>` — the demo seeder ALWAYS sets
+        // it to `Some(Uuid::new_v4())` (line 153) regardless of
+        // scenario. The dashboard's "session → PCA chain" inspector
+        // renders a "(no PCA)" placeholder when leaf_pca_id is None,
+        // which on a fresh demo install would surface as a confusing
+        // missing-PCA state for rows that DID go through the proxy
+        // (synthetic or not). Pin Some-ness across all 4 scenarios
+        // so a refactor that landed `leaf_pca_id: None` "for the
+        // require_confirmation arm since the chain doesn't extend"
+        // would surface here. Symmetric to the
+        // `synth_event_p_0_field_always_drawn_from_users_const_set`
+        // pin extended to this sibling Option-Uuid contract.
+        for scenario in SCENARIOS.iter() {
+            let ev = synth_event(scenario, Utc::now());
+            assert!(
+                ev.leaf_pca_id.is_some(),
+                "leaf_pca_id must be Some on demo synthetic events, got None for scenario {:?}",
+                scenario.policy
+            );
+        }
+    }
+
+    #[test]
+    fn synth_event_request_id_and_agent_session_id_distinct_and_fresh_per_invocation() {
+        // Every `synth_event` call mints FRESH `request_id` AND
+        // `agent_session_id` via `Uuid::new_v4()` (lines 150-151).
+        // The dashboard's per-request inspector uses `request_id`
+        // as the primary key and groups by `agent_session_id`; a
+        // refactor that landed a constant (`Uuid::nil()` or a per-
+        // scenario constant "for ergonomic test fixture diffing")
+        // would silently collapse every demo row into a single
+        // request OR session bucket, breaking the panel's render.
+        // Pin via two-call comparison: two invocations of
+        // `synth_event` on the SAME scenario must produce distinct
+        // request_id AND distinct agent_session_id. Symmetric to
+        // round-241 ActionEvent Uuid fresh-per-clone pin extended
+        // to this synthetic event seeder.
+        let s = drive_scenario();
+        let a = synth_event(&s, Utc::now());
+        let b = synth_event(&s, Utc::now());
+        assert_ne!(
+            a.request_id, b.request_id,
+            "request_id must be fresh per synth_event call"
+        );
+        assert_ne!(
+            a.agent_session_id, b.agent_session_id,
+            "agent_session_id must be fresh per synth_event call"
+        );
+        // And request_id != agent_session_id within a SINGLE event
+        // (Uuid::new_v4 collision probability is negligible).
+        assert_ne!(
+            a.request_id, a.agent_session_id,
+            "request_id and agent_session_id must be distinct within one event"
+        );
+    }
+
+    #[test]
+    fn synth_event_path_suffix_is_exactly_six_lowercase_alphanumeric_chars_for_non_s_templates() {
+        // For path templates that do NOT end in `s` or `/` (e.g.
+        // `/drive/v3/files/demo-file-` and `/drive/v3/files/finance-`),
+        // `synth_event` appends EXACTLY 6 random lowercase
+        // alphanumeric (base-36) chars (lines 134-148). This is the
+        // operator-visible URL shape the dashboard's "path" column
+        // renders verbatim — a refactor that bumped the suffix to 8
+        // chars OR shrank it to 4 OR shifted the alphabet to include
+        // uppercase would silently extend column widths and break
+        // the byte-exact regex `^/drive/v3/files/demo-file-[0-9a-z]{6}$`
+        // some operator dashboards anchor on. Pin via two probes
+        // on the drive scenario: the path matches the template
+        // prefix verbatim AND the trailing 6 chars are all in
+        // [0-9a-z]. Symmetric to round-235 sanitize_token alphabet
+        // boundary pins extended to this sibling random-suffix
+        // helper.
+        let s = drive_scenario();
+        // The drive scenario template is "/drive/v3/files/demo-file-"
+        // — ends in `-`, not `s` or `/`, so suffix IS appended.
+        let prefix = s.path_template;
+        for _ in 0..20 {
+            let ev = synth_event(&s, Utc::now());
+            assert!(
+                ev.path.starts_with(prefix),
+                "path must start with template prefix: got {}",
+                ev.path
+            );
+            let suffix = &ev.path[prefix.len()..];
+            assert_eq!(
+                suffix.chars().count(),
+                6,
+                "suffix must be exactly 6 chars, got {suffix:?} ({} chars)",
+                suffix.chars().count()
+            );
+            for c in suffix.chars() {
+                assert!(
+                    c.is_ascii_digit() || c.is_ascii_lowercase(),
+                    "suffix char must be [0-9a-z], got {c:?} in {suffix:?}"
+                );
+            }
+        }
+    }
 }

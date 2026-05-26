@@ -880,4 +880,142 @@ mod tests {
         fn require_into_response<T: IntoResponse>() {}
         require_into_response::<ApiError>();
     }
+
+    // ─── round 283 (2026-05-26): ApiError trait bounds + PcaView typed field pins ───
+
+    #[test]
+    fn api_error_implements_from_cache_error_via_require_from_trait_bound_witness_for_handler_chain()
+     {
+        // `ApiError: From<crate::pic::cache::CacheError>` (via
+        // `#[from]` on the `ApiError::Db` variant) is the conversion
+        // every `state.pca_cache.get(id).await?` call site relies on
+        // in the API handlers (`get_pca` line 70, etc.). A refactor
+        // that swapped to `#[error(transparent)]` "to remove the
+        // intermediate variant" OR dropped the `#[from]` attribute
+        // "to add structured wrapping that logs first" would force
+        // every `?`-chain through an explicit `.map_err(ApiError::Db)`
+        // — and there are 10+ such sites in the api/ tree. Pin via
+        // require_from trait-bound witness so a one-arm refactor
+        // surfaces at the type boundary rather than at every
+        // cache-call site as `the trait From<CacheError> is not
+        // implemented`. Symmetric to round-280
+        // `app_error_implements_from_reqwest_error_and_sqlx_error`
+        // extended to this sibling API-layer error type.
+        fn require_from<T, U: From<T>>() {}
+        require_from::<crate::pic::cache::CacheError, ApiError>();
+    }
+
+    #[test]
+    fn api_error_implements_std_error_via_require_trait_bound_witness_for_anyhow_question_mark_chain()
+     {
+        // `ApiError: std::error::Error` — the `#[derive(thiserror::Error)]`
+        // emits this impl, and the API-route `?` chains lean on it
+        // implicitly for `anyhow`-style error logging (`tracing::error!(
+        // error = %e, ...)`). A refactor that swapped to a hand-rolled
+        // Display impl forgetting to also `impl Error` would compile
+        // here but break every downstream `anyhow::Result<...>`
+        // wrapping. Pin via require_error trait-bound witness here
+        // at the type boundary — symmetric to round-280
+        // `app_error_implements_std_error_via_require_for_thiserror_question_mark_chain_propagation`
+        // extended to this sibling API error.
+        fn require_error<T: std::error::Error>() {}
+        require_error::<ApiError>();
+    }
+
+    #[test]
+    fn api_error_not_found_is_unit_variant_layout_pinned_via_match_arm_no_inner_pattern() {
+        // `ApiError::NotFound` is a UNIT variant (no inner field).
+        // The existing `api_error_variant_count_pinned_at_exactly_three`
+        // pin walks all 3 variants but doesn't pin the unit-layout
+        // shape of NotFound specifically. A refactor that landed
+        // `ApiError::NotFound(String)` "for ergonomic ID-in-error-
+        // message threading" would break every `Err(ApiError::NotFound)`
+        // construction in the codebase (10+ sites) AND would shift
+        // the wire shape of the NotFound response body. Pin the
+        // unit-variant layout via a match arm with NO inner pattern
+        // — a refactor to a tuple-variant would require the `(_)`
+        // pattern and fail to compile here. Symmetric to round-251
+        // SessionExtractError unit-struct layout pin extended to
+        // this sibling unit variant.
+        let e = ApiError::NotFound;
+        match e {
+            ApiError::NotFound => {}
+            ApiError::Db(_) | ApiError::Verifier(_) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn pca_view_hop_field_is_i32_type_via_require_i32_for_postgres_int4_column_compat() {
+        // `PcaView.hop: i32` is the postgres `int4` column type from
+        // pca_cache — the response value is binary-encoded as a
+        // 4-byte big-endian integer. A refactor to `u32` "for
+        // ergonomic 'hop count is non-negative' typing" would shift
+        // the wire shape on serde's JSON path (i32 → integer, u32 →
+        // also integer, BUT the postgres binding rejects u32 for
+        // int4 columns at runtime since u32::MAX > i32::MAX). Pin
+        // i32 explicitly via require_i32 at the typed-field boundary.
+        // Symmetric to round-279 ActionEvent.status u16 pin extended
+        // to this sibling typed-integer field.
+        fn require_i32(_: i32) {}
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: String::new(),
+            ops: vec![],
+            hop: 0,
+            predecessor_id: None,
+            pic_profile: String::new(),
+            cbor_hex: String::new(),
+        };
+        require_i32(v.hop);
+    }
+
+    #[test]
+    fn pca_view_pca_id_field_is_uuid_type_via_require_uuid_for_postgres_uuid_column_compat() {
+        // `PcaView.pca_id: Uuid` is binary-encoded on the postgres
+        // wire as a 16-byte big-endian UUID. A refactor to `String`
+        // "for ergonomic textual logging" would shift sqlx's binding
+        // to TEXT-typed parameters which the `uuid` PG column
+        // REJECTS at runtime with `invalid input syntax`. Pin via
+        // require_uuid at the typed-field boundary. Symmetric to
+        // round-279 ActionEvent.request_id/agent_session_id Uuid
+        // pin extended to this sibling typed-uuid field.
+        fn require_uuid(_: Uuid) {}
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: String::new(),
+            ops: vec![],
+            hop: 0,
+            predecessor_id: None,
+            pic_profile: String::new(),
+            cbor_hex: String::new(),
+        };
+        require_uuid(v.pca_id);
+    }
+
+    #[test]
+    fn pca_view_predecessor_id_field_is_option_uuid_type_via_require_for_root_chain_some_polarity()
+    {
+        // `PcaView.predecessor_id: Option<Uuid>` — `Some(Uuid)` for
+        // every non-root chain hop, `None` ONLY for the root PCA_0.
+        // The dashboard's chain-walker reads this field and follows
+        // the predecessor link until it hits None. A refactor to
+        // `Uuid` (using `Uuid::nil()` for the root) would silently
+        // shift the dashboard's chain-walker into an infinite loop
+        // OR a misleading "predecessor 00000000-0000-0000-0000-
+        // 000000000000" render. Pin via require_option_uuid at the
+        // typed-field boundary. Symmetric to round-241
+        // ActionEvent.leaf_pca_id Option<Uuid> pin extended to this
+        // sibling typed-Option-Uuid field.
+        fn require_option_uuid(_: Option<Uuid>) {}
+        let v = PcaView {
+            pca_id: Uuid::nil(),
+            p_0: String::new(),
+            ops: vec![],
+            hop: 0,
+            predecessor_id: None,
+            pic_profile: String::new(),
+            cbor_hex: String::new(),
+        };
+        require_option_uuid(v.predecessor_id);
+    }
 }

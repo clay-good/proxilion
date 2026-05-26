@@ -661,4 +661,160 @@ mod tests {
             assert_eq!(c.token_url, "https://example.test/token");
         });
     }
+
+    #[test]
+    fn oauth_state_field_count_pinned_at_exactly_six_via_exhaustive_destructure_no_rest_pattern() {
+        // Pin the OAuthState struct field count at exactly 6 via
+        // exhaustive destructure (no `..`). The 6 fields are: db
+        // (PgPool) + cipher (Arc<TokenCipher>) + pic (PicExecutor)
+        // + google (GoogleClient) + federation_bridge_authorize_url
+        // (String) + proxy_base_url (String). A 7th field landing
+        // (e.g. `audit_sink: Arc<dyn ActionStream>` to tee a
+        // per-OAuth-callback audit event distinct from the
+        // adapter-layer pipeline, or `cat_key_registry:
+        // CatKeyRegistry` to surface the CAT-key cache on the
+        // OAuth state for federation-bridge verification) would
+        // silently bloat every Clone of OAuthState the axum router
+        // fans out per request AND silently change what the OAuth
+        // callback handlers see. The existing `#[derive(Clone)]`
+        // walks the trait; exhaustive destructure catches a
+        // runtime-only 7th field that doesn't surface through Clone
+        // derivation. Use a fn-destructure witness since OAuthState
+        // contains PgPool which requires a tokio runtime context
+        // that #[test] doesn't provide.
+        #[allow(dead_code)]
+        fn _destructure_witness(s: OAuthState) {
+            let OAuthState {
+                db: _,
+                cipher: _,
+                pic: _,
+                google: _,
+                federation_bridge_authorize_url: _,
+                proxy_base_url: _,
+            } = s;
+        }
+    }
+
+    #[test]
+    fn google_client_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // Pin the GoogleClient struct field count at exactly 4 via
+        // exhaustive destructure (no `..`). The 4 fields are:
+        // client_id (String) + client_secret (String) + auth_url
+        // (String) + token_url (String). A 5th field landing (e.g.
+        // `userinfo_url: String` for a future Google profile
+        // endpoint override that some tests need, or `scopes:
+        // Vec<String>` to centralize the Google-scope set
+        // currently hardcoded at the callsite) would silently
+        // extend the GoogleClient envelope every OAuth route uses
+        // AND silently change the existing from_env contract beyond
+        // the 4 env-var pin set. Pin via exhaustive destructure.
+        let g = GoogleClient {
+            client_id: String::new(),
+            client_secret: String::new(),
+            auth_url: String::new(),
+            token_url: String::new(),
+        };
+        let GoogleClient {
+            client_id: _,
+            client_secret: _,
+            auth_url: _,
+            token_url: _,
+        } = g;
+    }
+
+    #[test]
+    fn google_client_from_env_signature_pinned_via_fn_pointer_witness() {
+        // Pin GoogleClient::from_env signature as
+        // `fn() -> Result<GoogleClient, String>` via fn-pointer
+        // witness. The constructor takes ZERO args (reads from
+        // std::env directly) and returns a Result with `String`
+        // error (NOT a structured error type). A refactor to
+        // `fn(&Env) -> Result<Self, _>` "for testability via
+        // dependency injection" would silently force every call
+        // site to thread an Env handle through. A refactor to
+        // `Result<Self, ConfigError>` "for structured error
+        // surfacing" would silently change the call-site error
+        // handling at server.rs and break the inline `.map_err`
+        // chain that translates the String into the boot-path's
+        // friendly stderr message. Pin the zero-arg + Result<Self,
+        // String> shape at compile time.
+        let _f: fn() -> Result<GoogleClient, String> = GoogleClient::from_env;
+    }
+
+    #[test]
+    fn oauth_state_is_clone_for_axum_router_state_fan_out() {
+        // The axum `with_state` extractor relies on the State<T>
+        // type being Clone (the router clones per request to
+        // construct the handler arg). The existing
+        // `#[derive(Clone)]` is what makes this work; a refactor
+        // that dropped the derive (perhaps a refactor unifying
+        // OAuthState with a sibling crate's state that's !Clone
+        // because it holds a Mutex) would surface at hundreds of
+        // route-build sites in server.rs rather than at this
+        // single trait-bound assertion. Pin Clone via
+        // require_clone — symmetric to round-264/265/268
+        // trait-bound pins extended to OAuthState.
+        fn require_clone<T: Clone>() {}
+        require_clone::<OAuthState>();
+    }
+
+    #[test]
+    fn google_client_clone_is_independent_across_every_field_after_mutation() {
+        // GoogleClient derives Clone — every OAuthState clone fans
+        // a fresh GoogleClient out to the per-request handler. Pin
+        // that the Clone is a DEEP copy across all 4 fields by
+        // mutating each on the clone and asserting the original is
+        // unchanged. A refactor to `Arc<...>` inner field "for
+        // cheap-clone sharing across handlers" would silently alias
+        // the original back to mutations performed on the clone,
+        // breaking per-request snapshot semantics. The existing
+        // `from_env_respects_url_overrides` test exercises field
+        // VALUES but doesn't catch a shared-Arc Clone semantic.
+        let original = GoogleClient {
+            client_id: "id-original".into(),
+            client_secret: "secret-original".into(),
+            auth_url: "https://auth-original".into(),
+            token_url: "https://token-original".into(),
+        };
+        let mut cloned = original.clone();
+        cloned.client_id.push_str("-modified");
+        cloned.client_secret.push_str("-modified");
+        cloned.auth_url.push_str("/v2/modified");
+        cloned.token_url.push_str("/v2/modified");
+        // Original unchanged across all 4 fields.
+        assert_eq!(original.client_id, "id-original");
+        assert_eq!(original.client_secret, "secret-original");
+        assert_eq!(original.auth_url, "https://auth-original");
+        assert_eq!(original.token_url, "https://token-original");
+    }
+
+    #[test]
+    fn oauth_state_string_fields_are_owned_for_arc_swap_envvar_outlives_request() {
+        // OAuthState.federation_bridge_authorize_url AND
+        // proxy_base_url are owned String — captured at boot from
+        // env vars and cloned into every per-request handler via
+        // the OAuthState derive(Clone). A refactor to `&'a str`
+        // "to avoid per-clone allocation" would surface a
+        // lifetime parameter that the axum State<T> extractor's
+        // owned-content contract can't satisfy across `.await`
+        // boundaries. Pin owned-String type on both URL fields
+        // via require_string + fn-destructure witness (because
+        // OAuthState contains PgPool which requires tokio runtime).
+        // Symmetric to round-271 SetupApiState
+        // federation_bridge_url owned-String pin extended to this
+        // OAuth state envelope.
+        #[allow(dead_code)]
+        fn require_string(_: &String) {}
+        #[allow(dead_code)]
+        fn _witness(s: OAuthState) {
+            let OAuthState {
+                federation_bridge_authorize_url,
+                proxy_base_url,
+                ..
+            } = s;
+            require_string(&federation_bridge_authorize_url);
+            require_string(&proxy_base_url);
+        }
+    }
 }

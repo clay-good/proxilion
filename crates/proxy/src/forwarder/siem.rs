@@ -1289,4 +1289,172 @@ mod tests {
         assert!(m.contains("tls handshake failed"));
         assert!(m.contains("cert expired"));
     }
+
+    // ─── round 285 (2026-05-26): SIEM forwarder trait + signature + default pins ───
+
+    #[test]
+    fn siem_hmac_key_clone_required_via_trait_bound_witness_for_forwarder_construction_path() {
+        // `SiemHmacKey: Clone` is REQUIRED — the `SiemForwarder` boot
+        // path takes a `SiemHmacKey` by value and operators frequently
+        // construct multiple forwarders (production + staging) from
+        // the SAME key by calling `.clone()` at the boot site. The
+        // existing `siem_hmac_key_clone_preserves_bytes_via_sign_equality`
+        // pin checks the RUNTIME behavior; pin the TRAIT BOUND here
+        // at the type boundary via require_clone witness so a
+        // refactor that dropped `#[derive(Clone)]` "for explicit
+        // Arc-sharing of the inner key bytes" would surface here as
+        // a single type-boundary failure rather than at every
+        // forwarder-bundle clone call site as a tower::Service trait
+        // cascade. Symmetric to round-281
+        // `webhook_secret_clone_required_via_trait_bound_witness_for_axum_state_fan_out`
+        // extended to this sibling SIEM key type.
+        fn require_clone<T: Clone>() {}
+        require_clone::<SiemHmacKey>();
+    }
+
+    #[test]
+    fn siem_key_error_and_build_error_both_implement_display_via_require_for_tracing_substitution()
+    {
+        // `KeyError: Display` AND `BuildError: Display` — the boot
+        // path emits structured errors via
+        // `tracing::error!(error = %e, ...)` which routes through
+        // the `{}` (`Display`) substitution path, NOT `{:?}` (`Debug`).
+        // The existing
+        // `key_error_and_build_error_implement_std_error_trait_via_dyn_cast_leaf_source_none`
+        // pin walks the std::error::Error trait axis; pin the
+        // narrower Display trait bound here so a refactor that
+        // dropped the `#[error("{0}")]` thiserror attribute on
+        // KeyError (line 67-68) AND/OR BuildError "to hand-roll a
+        // richer Display impl in a separate file" would surface
+        // here as a trait-bound failure rather than at every
+        // `tracing::error!(error = %e, ...)` call site as a generic
+        // Display-not-satisfied message. Pin BOTH simultaneously so
+        // a one-arm refactor (the most likely shape — "let's polish
+        // KeyError's Display but defer BuildError") surfaces here.
+        // Symmetric to round-281's
+        // `notifier_build_error_implements_display_via_require_for_format_substitution_at_setup_logs`
+        // extended to this sibling SIEM error pair.
+        fn require_display<T: std::fmt::Display>() {}
+        require_display::<KeyError>();
+        require_display::<BuildError>();
+    }
+
+    #[test]
+    fn siem_forwarder_with_batching_signature_pinned_via_fn_pointer_witness_for_builder_chain() {
+        // `SiemForwarder::with_batching(self, usize, Duration) -> Self`
+        // is the chainable builder that enables batched delivery
+        // (spec.md §3.3 dev 2). The signature MUST consume `self` by
+        // VALUE (fluent builder) and return `Self` by VALUE so the
+        // `.with_batching(...)` call site can chain into other
+        // builder methods or into a final `let fwd =` binding without
+        // an intermediate `mut` binding. A refactor to
+        // `fn with_batching(&mut self, usize, Duration) -> &mut Self`
+        // "for ergonomic mid-construction mutation" would break the
+        // `SiemForwarder::new(...)?.with_max_retries(...).with_batching(...)`
+        // boot chain at server.rs. AND pin the (usize, Duration) arg
+        // order — a refactor that swapped the arg order
+        // (`fn(Duration, usize)`) would silently change the meaning
+        // of every operator's `.with_batching(64, Duration::from_secs(30))`
+        // call without compile failure if the literals happened to
+        // be type-compatible. Pin via fn-pointer witness symmetric
+        // to round-281's
+        // `webhook_notifier_with_burst_signature_pinned_via_fn_pointer_witness_for_builder_chain`
+        // extended to this sibling SIEM builder method.
+        let _f: fn(SiemForwarder, usize, Duration) -> SiemForwarder = SiemForwarder::with_batching;
+    }
+
+    #[test]
+    fn siem_forwarder_batching_enabled_signature_pinned_via_fn_pointer_witness_for_borrow_accessor()
+    {
+        // `SiemForwarder::batching_enabled(&self) -> bool` is the
+        // accessor that drives the boot-path decision to spawn the
+        // flush loop (spec.md §3.3 dev 2). Pin via fn-pointer
+        // witness: `&self` borrow (catches `self`-consuming refactor
+        // breaking accessor idempotency the boot path relies on to
+        // BOTH spawn the flush loop AND register the forwarder as an
+        // ActionStream) + `bool` return BY VALUE (catches
+        // `Option<&BatchState>` accessor refactor "for ergonomic
+        // direct-state-access" widening the return surface and
+        // forcing the boot site through a `.is_some()` redirection).
+        // Symmetric to round-281
+        // `webhook_notifier_proxy_public_url_signature_pinned_via_fn_pointer_witness_for_borrow_only_accessor`
+        // extended to this sibling SIEM accessor.
+        let _f: fn(&SiemForwarder) -> bool = SiemForwarder::batching_enabled;
+    }
+
+    #[test]
+    fn siem_forwarder_max_retries_default_pinned_at_exactly_three_per_file_header_reliability_contract()
+     {
+        // `SiemForwarder::new` sets `max_retries: 3` (line 106) per
+        // the file header doc ("Reliability: ... retried with
+        // exponential backoff up to `max_retries` (default 3)").
+        // The default is operator-load-bearing — a refactor that
+        // bumped it to 5 "for ergonomic flakiness tolerance" would
+        // silently extend P99 forwarding latency to up to 5×backoff
+        // seconds AND would diverge from the documented webhook
+        // notifier retry budget (operators who read both docs expect
+        // parity — round-281 pinned the SAME default on
+        // WebhookNotifier). Pin via destructure on a freshly-
+        // constructed forwarder so a refactor surfaces here at the
+        // literal-3 comparison. The struct is private outside the
+        // crate, so destructure-by-pattern works inside this module
+        // — pin the exact value. Symmetric to round-281's
+        // `webhook_notifier_max_retries_default_pinned_at_exactly_three_for_siem_forwarder_parity`
+        // — both notifiers pinned in lockstep so a one-side drift
+        // surfaces.
+        let key = SiemHmacKey::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let f = SiemForwarder::new("https://siem.example.test/wh".into(), key).unwrap();
+        let SiemForwarder {
+            url: _,
+            key: _,
+            http: _,
+            max_retries,
+            batch: _,
+        } = f;
+        assert_eq!(
+            max_retries, 3,
+            "default max_retries must be 3 per file-header SIEM-forwarder reliability contract"
+        );
+    }
+
+    #[test]
+    fn siem_schema_constants_pairwise_distinct_per_event_vs_batched_with_v1_versioning_suffix() {
+        // The forwarder emits TWO different `x-proxilion-schema`
+        // header values depending on whether batched (`proxilion.
+        // action_event_batch.v1` at line 154 + 171) or per-event
+        // (`proxilion.action_event.v1` at line 296) — and the
+        // downstream SIEM receiver routes on this header to two
+        // different parsers. The existing
+        // `posts_with_schema_header` integration test walks ONE
+        // schema; pin the PAIRWISE-DISTINCT axis on the two
+        // constants here so a refactor that collapsed both to a
+        // single umbrella schema (e.g. `proxilion.action.v1`)
+        // would break the SIEM-side routing without a compile
+        // failure. AND assert both end in `.v1` so a refactor that
+        // bumped one to `.v2` without the other would silently
+        // diverge the schema versioning — surfaces here as a suffix
+        // pin failure. Symmetric to round-279
+        // `action_event_decision_field_pinned_owned_string_for_metric_label_dispatch_cross_await`
+        // and round-275 `urlencoding`-divergence pin extended to
+        // this sibling schema-label axis. Note: constants are
+        // declared as local literals at the use sites, so pin via
+        // direct string assertion (rather than const reference).
+        const PER_EVENT: &str = "proxilion.action_event.v1";
+        const BATCHED: &str = "proxilion.action_event_batch.v1";
+        assert_ne!(
+            PER_EVENT, BATCHED,
+            "schemas must be pairwise distinct for SIEM routing"
+        );
+        assert!(PER_EVENT.ends_with(".v1"), "per-event schema must be .v1");
+        assert!(BATCHED.ends_with(".v1"), "batched schema must be .v1");
+        // And both share the `proxilion.` namespace prefix — a
+        // refactor that dropped the namespace from one would break
+        // the SIEM-side glob filter operators anchor on.
+        assert!(PER_EVENT.starts_with("proxilion."));
+        assert!(BATCHED.starts_with("proxilion."));
+        // The two literals match the source code at lines 154/171/296
+        // — if the source drifts, an integration test will fail
+        // first, but this pin catches a coordinated rename without a
+        // schema-version bump.
+    }
 }

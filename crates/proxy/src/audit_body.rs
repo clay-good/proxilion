@@ -1052,4 +1052,163 @@ mod tests {
         assert_eq!(out, clean);
         assert_eq!(out.as_bytes(), clean.as_bytes());
     }
+
+    // ─── round 284 (2026-05-26): audit_body fn-pointer + Send+Sync + order pins ───
+
+    #[test]
+    fn sha256_hex_signature_pinned_via_fn_pointer_witness_for_persist_bind_hot_path() {
+        // `sha256_hex(&[u8]) -> String` is invoked TWICE per
+        // `persist()` call (one each for request_body + response_body)
+        // on the hot path BEFORE the sqlx `.execute(db).await`
+        // suspension — so the digest bytes are captured into the
+        // request-frame and bound by reference at the suspension
+        // boundary. The signature MUST take a `&[u8]` BORROW (catches
+        // `fn(Vec<u8>)` consume-and-hash refactor forcing every
+        // caller to clone the body before hashing) AND return owned
+        // `String` (catches `&'a str` borrow-return refactor tying
+        // the digest lifetime to the input slice, breaking the
+        // cross-await sqlx bind). Pin via fn-pointer witness so a
+        // signature drift surfaces here at the boundary rather than
+        // at the persist call site as opaque type-mismatch. The
+        // existing `sha256_hex_return_type_is_owned_string_for_cross_await_sqlx_bind_through_persist`
+        // pin walks the return-type axis; pin the full fn-pointer
+        // shape here. Symmetric to round-283 hex_encode signature pin
+        // extended to this sibling digest helper.
+        let _f: fn(&[u8]) -> String = sha256_hex;
+    }
+
+    #[test]
+    fn redact_pii_text_signature_pinned_via_fn_pointer_witness_for_bytes_to_text_chain() {
+        // `redact_pii_text(&str) -> String` is invoked by
+        // `redact_pii_bytes` AFTER the utf8 decode succeeds — the
+        // returned `String` is then `.into_bytes()`-ed for the sqlx
+        // bind. The signature MUST take `&str` BORROW (catches
+        // `fn(String)` consume-and-redact refactor forcing
+        // redact_pii_bytes to clone the decoded text before passing,
+        // doubling the alloc on the persist path) AND return owned
+        // `String` (catches `Cow<'a, str>` borrow-return refactor
+        // tying lifetime to input and breaking the
+        // `.into_bytes()` consumption downstream). Pin via fn-pointer
+        // witness symmetric to the `redact_pii_bytes_signature_takes_bytes_borrow_via_fn_pointer_witness_for_persist_path`
+        // pin (round 237) extended to this sibling text-API helper.
+        let _f: fn(&str) -> String = redact_pii_text;
+    }
+
+    #[test]
+    fn redactors_signature_pinned_via_fn_pointer_witness_for_oncelock_singleton_accessor() {
+        // `redactors() -> &'static Redactors` is the OnceLock-cached
+        // singleton accessor invoked once per `redact_pii_text` call.
+        // The signature MUST take zero arguments AND return a
+        // `&'static` borrow (catches `fn() -> Redactors` clone-by-
+        // value refactor "for ergonomic Redactors-owned ownership" —
+        // would cost a heavy regex-set deep clone per call AND
+        // would dissolve the OnceLock singleton contract — AND
+        // catches `fn() -> Arc<Redactors>` Arc-wrap refactor forcing
+        // an Arc::clone per call AND a heap alloc per process boot).
+        // Pin via fn-pointer witness so a refactor at the singleton
+        // boundary surfaces here. Symmetric to the
+        // `redactors_returns_same_static_pointer_across_two_calls`
+        // pointer-identity pin extended to the type axis.
+        let _f: fn() -> &'static Redactors = redactors;
+    }
+
+    #[test]
+    fn redactors_is_sync_and_send_for_oncelock_static_storage_contract() {
+        // `static REDACTORS: OnceLock<Redactors>` requires `Redactors:
+        // Sync` (the `OnceLock<T>` API stores `T` and provides
+        // `&'static T` from a `&'static OnceLock<T>` — the contained
+        // value must be `Sync` so concurrent readers can share the
+        // reference safely). All 6 fields are `regex::Regex` which is
+        // documented `Send + Sync`, but a refactor that landed a
+        // 7th field carrying `Rc<...>` (NOT Sync) "for cheap clone
+        // of a parsed schema" would break OnceLock storage at the
+        // `static` declaration site with an opaque
+        // `OnceLock<Redactors> is not Send/Sync` message bubbling up
+        // through the static-binding line. Pin via require_send_sync
+        // trait-bound witness here at the type boundary so the
+        // failure surfaces in this file. Symmetric to round-279
+        // `action_event_is_send_sync_static` extended to the
+        // OnceLock-resident type.
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<Redactors>();
+        // And the symmetric pin on the OnceLock-wrapped type — the
+        // outer `OnceLock<Redactors>` must ALSO be Send+Sync for the
+        // `static` storage to compile (OnceLock<T>: Sync iff T:
+        // Send+Sync per std docs).
+        require_send_sync::<OnceLock<Redactors>>();
+    }
+
+    #[test]
+    fn redact_pii_text_applies_api_key_before_bearer_before_phone_per_documented_order() {
+        // Lines 176-189 of redact_pii_text commit to a SPECIFIC
+        // application order: api_key → bearer → email → ssn →
+        // credit_card → phone. The comment at line 175 documents
+        // WHY ("known token shapes before generic digit-pattern
+        // redactors so e.g. a Slack token's leading 10-digit workspace
+        // id isn't pre-redacted by the phone-number regex"). The
+        // existing `redact_pii_text_api_key_runs_before_phone_so_slack_token_is_not_split`
+        // pin walks ONE pairwise ordering; pin the full
+        // api_key < bearer < phone TRANSITIVE chain here so a
+        // refactor that swapped just bearer/email order (silently
+        // breaking the documented Bearer-with-email-shape token
+        // boundary case) would surface here as a marker drift. Use
+        // a fixture that contains BOTH a Slack-shaped api key AND
+        // a bearer token AND a phone-shaped digit run.
+        let s = redact_pii_text(
+            "key xoxb-1234567890-12345-abcdef123456 then Bearer abcdef1234567890 then 555-867-5309",
+        );
+        // All three markers present in pairwise order in the output:
+        // <REDACTED_API_KEY> appears BEFORE <REDACTED_TOKEN> appears
+        // BEFORE <REDACTED_PHONE>.
+        let api_pos = s
+            .find("<REDACTED_API_KEY>")
+            .expect("api_key marker missing");
+        let bearer_pos = s.find("<REDACTED_TOKEN>").expect("bearer marker missing");
+        let phone_pos = s.find("<REDACTED_PHONE>").expect("phone marker missing");
+        assert!(
+            api_pos < bearer_pos,
+            "api_key marker must precede bearer marker positionally"
+        );
+        assert!(
+            bearer_pos < phone_pos,
+            "bearer marker must precede phone marker positionally"
+        );
+        // And NONE of the original shapes survive in the output —
+        // each was successfully redacted (sanity check).
+        assert!(!s.contains("xoxb-1234567890"));
+        assert!(!s.contains("abcdef1234567890"));
+        assert!(!s.contains("555-867-5309"));
+    }
+
+    #[test]
+    fn sha256_hex_output_has_no_0x_prefix_no_trailing_whitespace_for_db_text_column_contract() {
+        // The digest is stored in a `text` postgres column at line
+        // 49 (`request_hash`, `response_hash`). Downstream tooling
+        // (the action-event dashboard's "diff bodies" feature) does
+        // EQUALITY comparison on the hash string — `0x`-prefixed,
+        // whitespace-padded, or uppercase outputs would all silently
+        // break the equality match without a clear failure message.
+        // The existing `sha256_hex_output_width_pinned_at_sixty_four_lowercase_hex_chars`
+        // pin walks the width AND lowercase axes; pin the
+        // NO-0x-PREFIX axis AND the NO-TRAILING-WHITESPACE axis here
+        // so a `format!("0x{:02x}{...}")`-style refactor "to be
+        // explicit about the encoding" would surface here. Cover both
+        // empty + non-empty + binary-byte inputs to make the pin
+        // robust against any input-dependent refactor.
+        for input in [&[][..], b"hello", b"\xff\x00\x80\x7f"].iter() {
+            let h = sha256_hex(input);
+            assert!(!h.starts_with("0x"), "must NOT have 0x prefix: {h}");
+            assert!(!h.starts_with("0X"), "must NOT have 0X prefix: {h}");
+            assert_eq!(
+                h.trim(),
+                h,
+                "must NOT have leading/trailing whitespace: {h:?}"
+            );
+            assert!(
+                !h.contains(' '),
+                "must NOT contain internal whitespace: {h:?}"
+            );
+            assert!(!h.contains('\n'), "must NOT contain newline: {h:?}");
+        }
+    }
 }

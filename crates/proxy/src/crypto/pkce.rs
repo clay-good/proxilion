@@ -549,4 +549,175 @@ mod tests {
                 .contains("length must be 43..=128"),
         );
     }
+
+    // ─── round 293 (2026-05-26): PkceError trait-bound + verify_pkce_s256 contract pins ───
+
+    #[test]
+    fn pkce_error_implements_display_via_require_trait_bound_witness_for_tracing_substitution() {
+        // `PkceError: Display` — the OAuth callback handler emits the
+        // structured error via `tracing::warn!(error = %e, ...)` which
+        // routes through the `{}` (`Display`) substitution path. The
+        // existing `error_display_strings_are_stable_for_log_filters`
+        // pin walks the RUNTIME string shape; pin the TRAIT BOUND
+        // here so a refactor that dropped the `#[error("...")]`
+        // thiserror attributes on EITHER variant "to hand-roll a
+        // richer Display impl in a separate file" would surface at
+        // the trait-bound boundary rather than at every
+        // `tracing::warn!(error = %e, ...)` call site. Symmetric to
+        // round-281/285/287/288/290 build-error Display pins
+        // extended to this sibling PKCE error type.
+        fn require_display<T: std::fmt::Display>() {}
+        require_display::<PkceError>();
+    }
+
+    #[test]
+    fn pkce_error_variants_both_unit_layout_pinned_via_match_arm_no_inner_pattern_for_zero_alloc_err()
+     {
+        // `PkceError::Mismatch` AND `PkceError::VerifierLength` are
+        // BOTH unit variants (no inner fields). The error envelope
+        // serialization at the OAuth callback site benefits from
+        // this — every PkceError instance is zero-byte beyond the
+        // tag discriminant, AND error construction sites just write
+        // `Err(PkceError::Mismatch)` without any inner-detail
+        // ceremony. A refactor that landed `PkceError::Mismatch {
+        // computed: String, expected: String }` "for richer audit-
+        // log triage" would silently expand the error wire shape AND
+        // would force every `Err(PkceError::Mismatch)` site to update
+        // (10+ call sites across OAuth callback + the verifier). Pin
+        // BOTH variants via match-arm with NO inner pattern — a
+        // refactor to a struct/tuple variant would force `{ .. }` or
+        // `(_)` syntax and fail to compile here. Symmetric to
+        // round-283
+        // `api_error_not_found_is_unit_variant_layout_pinned_via_match_arm_no_inner_pattern`
+        // extended to this sibling PKCE error variant pair.
+        let e1 = PkceError::Mismatch;
+        let e2 = PkceError::VerifierLength;
+        match e1 {
+            PkceError::Mismatch => {}
+            PkceError::VerifierLength => {}
+        }
+        match e2 {
+            PkceError::Mismatch => {}
+            PkceError::VerifierLength => {}
+        }
+    }
+
+    #[test]
+    fn verify_pkce_s256_length_check_uses_byte_length_not_char_count_for_multibyte_utf8_verifier() {
+        // `verifier.len()` on `&str` returns BYTE count, NOT char
+        // count (RFC 7636 §4.1 specifies length in UNRESERVED
+        // characters but the implementation pragmatically checks
+        // BYTE length — every char in the unreserved set is single-
+        // byte ASCII so byte == char count in valid PKCE input).
+        // A refactor that swapped to `verifier.chars().count()` "to
+        // be more semantically correct" would silently ACCEPT
+        // multibyte-padded verifiers below the 43-byte minimum (a
+        // 14-char `é`-only string is 28 bytes but 14 chars — the
+        // refactor would let it pass length, then fail compare with
+        // SHA-256 cycle waste). Pin via a multibyte fixture: 14 chars
+        // each 3 bytes = 42 bytes total but 14 chars; the byte check
+        // rejects (VerifierLength), the char check would let it
+        // through (then Mismatch). Asserting VerifierLength catches
+        // the refactor.
+        let multibyte = "❤".repeat(14); // 14 chars × 3 bytes = 42 bytes
+        assert_eq!(multibyte.chars().count(), 14);
+        assert_eq!(multibyte.len(), 42);
+        let err = verify_pkce_s256(&multibyte, "bogus").unwrap_err();
+        assert!(
+            matches!(err, PkceError::VerifierLength),
+            "byte-length 42 must trip VerifierLength even when char count is 14, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pkce_url_safe_no_pad_encoder_produces_no_equals_padding_for_sha256_digest_43_byte_output() {
+        // RFC 7636 §4.2 mandates the code_challenge be base64url WITH
+        // NO padding (BASE64URL-NO-PAD). A SHA-256 digest is 32 bytes;
+        // base64-encoding 32 bytes yields 43 chars + 1 `=` pad in
+        // STANDARD/URL_SAFE; URL_SAFE_NO_PAD strips the padding for
+        // exactly 43 chars. The existing
+        // `computed_challenge_is_exactly_43_bytes_for_any_input_length`
+        // pin walks the length axis; pin the NO-EQUALS-PADDING
+        // contract here so a refactor that swapped to
+        // `URL_SAFE` (WITH padding) "for consistency with RFC 4648"
+        // would silently break every existing challenge anchor (the
+        // OAuth callback compares byte-equal — a `=`-suffixed
+        // challenge would mismatch every legitimate verifier).
+        // Symmetric to round-285 SIEM-schema `.v1` byte-exact
+        // pin extended to this base64url wire-format axis.
+        let verifier = "a".repeat(43);
+        let digest = Sha256::digest(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(digest);
+        assert_eq!(
+            challenge.len(),
+            43,
+            "SHA-256 → base64url-no-pad must be 43 chars"
+        );
+        assert!(
+            !challenge.contains('='),
+            "URL_SAFE_NO_PAD must produce NO equals padding, got: {challenge:?}"
+        );
+        // And the base64url alphabet excludes '+' and '/' (which
+        // URL_SAFE uses '-' and '_' for). Defensive sweep.
+        for c in challenge.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '-' || c == '_',
+                "URL_SAFE_NO_PAD output must use base64url alphabet only, got: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_pkce_s256_challenge_exactly_42_chars_yields_mismatch_not_length_error_for_verifier() {
+        // The length check is ONLY on the verifier (line 22); the
+        // challenge length is NOT validated at this layer — a
+        // mis-shaped challenge falls through to the constant-time
+        // compare and yields Mismatch. Pin this asymmetric contract:
+        // for a VALID-length verifier (43 chars) and an INVALID-length
+        // challenge (42 chars, one byte short), the result MUST be
+        // Mismatch, not VerifierLength. A refactor that "tightened"
+        // the validation to also length-check the challenge "for
+        // symmetry" would silently shift the error envelope from
+        // Mismatch to a new variant (or to VerifierLength which is
+        // misleading — the verifier IS valid). Symmetric to round-283
+        // `api_error_not_found_is_unit_variant_layout` pin extended
+        // to this verifier-vs-challenge asymmetric-validation
+        // contract.
+        let verifier = "a".repeat(43);
+        let short_challenge = "x".repeat(42);
+        let err = verify_pkce_s256(&verifier, &short_challenge).unwrap_err();
+        assert!(
+            matches!(err, PkceError::Mismatch),
+            "short-but-valid-length verifier + short challenge must yield Mismatch, not VerifierLength: got {err:?}"
+        );
+        // And symmetrically, an OVER-LONG challenge (44 chars) also
+        // yields Mismatch — the only Length error path is the
+        // verifier length, not the challenge length.
+        let long_challenge = "x".repeat(44);
+        let err = verify_pkce_s256(&verifier, &long_challenge).unwrap_err();
+        assert!(matches!(err, PkceError::Mismatch));
+    }
+
+    #[test]
+    fn pkce_error_is_sync_directly_not_just_via_static_for_async_oauth_callback_middleware() {
+        // `PkceError: Sync` directly — the OAuth callback handler at
+        // [crates/proxy/src/oauth/routes.rs](../oauth/routes.rs)
+        // line 593 calls `verify_pkce_s256(...).map_err(|_| OAuthError::PkceFail)?`
+        // INSIDE an async fn, which means the PkceError instance
+        // crosses an `.await` boundary potentially (if the
+        // `map_err` closure ever borrowed across an await in a
+        // refactor). The existing `pkce_error_is_send_sync_static_for_anyhow_chain_boundary`
+        // pin walks the Send+Sync+'static composite; pin Sync
+        // directly here at the type boundary so a refactor that
+        // landed a `RefCell<...>` inner (NOT Sync) "for lazy-init
+        // of an inner error context" would surface here at the
+        // type-bound boundary rather than at the axum-handler
+        // tower::Service trait cascade. Symmetric to round-292
+        // `tee_stream_is_send_and_sync_directly_for_arc_dyn_action_stream_object_safety`
+        // extended to this sibling PKCE error type.
+        fn require_sync<T: Sync>() {}
+        fn require_send<T: Send>() {}
+        require_sync::<PkceError>();
+        require_send::<PkceError>();
+    }
 }

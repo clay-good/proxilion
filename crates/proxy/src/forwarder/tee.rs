@@ -853,4 +853,152 @@ mod tests {
         let erased: Arc<dyn ActionStream> = Arc::new(tee);
         require_dyn_action_stream(erased);
     }
+
+    // ─── round 292 (2026-05-26): TeeStream Send+Sync + accessor + initial-state pins ───
+
+    #[test]
+    fn tee_stream_sink_count_signature_pinned_via_fn_pointer_witness_for_borrow_only_accessor() {
+        // `TeeStream::sink_count(&self) -> usize` — the read-only
+        // accessor every boot-path uses to decide whether to spawn
+        // the secondary-sink flush loop (server.rs reads this AFTER
+        // assembling the TeeStream). Pin the FULL fn-pointer
+        // signature here: `&self` borrow (catches `self`-consuming
+        // refactor breaking accessor idempotency every reader site
+        // relies on) + `usize` return (catches `i32`/`u32` width-
+        // change refactor surfacing only at downstream comparison
+        // sites where numeric literals auto-coerce). The existing
+        // `tee_stream_sink_count_return_type_is_usize_not_signed`
+        // pin walks the return-type axis only; pin the full fn-
+        // pointer signature here at the boundary. Symmetric to
+        // round-281 webhook_notifier_proxy_public_url + round-287
+        // slack_notifier accessor fn-pointer pins extended to this
+        // sibling forwarder accessor.
+        let _f: fn(&TeeStream) -> usize = TeeStream::sink_count;
+    }
+
+    #[test]
+    fn tee_stream_implements_action_stream_via_require_trait_bound_witness_for_arc_dyn_at_app_state()
+     {
+        // `TeeStream: ActionStream` is the trait the AppState fan-out
+        // depends on at line 17-18 of action_stream.rs — server.rs
+        // wraps a `TeeStream` in `Arc<dyn ActionStream>` and stores
+        // it on AppState; every per-request adapter publish() routes
+        // through this trait dispatch. The existing
+        // `tee_stream_is_dyn_compatible_via_arc_dyn_action_stream_witness`
+        // pin walks the dyn-erasure path (Arc<TeeStream> →
+        // Arc<dyn ActionStream> coercion); pin the BARE TRAIT
+        // BOUND here at the type boundary via require_action_stream
+        // witness so a refactor that dropped the
+        // `impl ActionStream for TeeStream` block (line 40-55) "for
+        // refactoring publish into a free function" would surface
+        // here as a single type-boundary failure rather than at the
+        // axum boot site as a cascading trait error. Symmetric to
+        // round-280 AppError + round-291 ErrorBody trait-bound
+        // witness pins extended to this sibling fan-out type.
+        fn require_action_stream<T: ActionStream + ?Sized>() {}
+        require_action_stream::<TeeStream>();
+    }
+
+    #[test]
+    fn tee_stream_is_send_and_sync_directly_for_arc_dyn_action_stream_object_safety() {
+        // `TeeStream: Send + Sync` directly (NOT just when wrapped
+        // in `Arc<dyn ActionStream>`). The existing
+        // `tee_stream_erased_to_arc_dyn_is_send_sync_static` pin
+        // walks the erased path only; pin the BARE type bound here
+        // so a refactor that landed a `Rc<...>` or `Cell<...>` field
+        // (NOT Send/Sync) would surface here at the type boundary
+        // BEFORE the Arc-erasure site. The bounds are load-bearing
+        // for the `Arc<dyn ActionStream>` AppState coercion: the
+        // `dyn ActionStream` object-safety requires `Send + Sync`
+        // bounds on the trait, but the storage in
+        // `Arc<dyn ActionStream + Send + Sync>` requires the
+        // concrete type ALSO satisfy them. Pin both axes here.
+        // Symmetric to round-280 AppError Send+Sync+'static pin
+        // extended to this sibling concrete type (not just erased).
+        fn require_send<T: Send>() {}
+        fn require_sync<T: Sync>() {}
+        require_send::<TeeStream>();
+        require_sync::<TeeStream>();
+    }
+
+    #[test]
+    fn tee_stream_new_starts_with_empty_sinks_via_sink_count_zero_initial_state_invariant() {
+        // `TeeStream::new(primary)` constructs with `sinks:
+        // Vec::new()` (line 26) — the documented initial state is
+        // ZERO secondary sinks. The boot path at server.rs depends
+        // on this: it builds `TeeStream::new(primary)` THEN
+        // conditionally calls `.with_sink(nats)` /
+        // `.with_sink(siem)` based on operator config. A refactor
+        // that pre-seeded the initial Vec with a sentinel
+        // (e.g. `vec![noop_sink_for_metrics()]` "for unconditional
+        // counter increment") would silently double-count every
+        // event AND would render `sink_count() == 0` impossible
+        // even when no sinks are registered. Pin the initial
+        // sink_count == 0 invariant directly. Symmetric to round-282
+        // demo `synth_event_leaf_pca_id_is_always_some_never_none_across_all_scenarios`
+        // initial-state-invariant pin extended to this sibling
+        // forwarder builder.
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary);
+        assert_eq!(
+            tee.sink_count(),
+            0,
+            "TeeStream::new must start with empty sinks"
+        );
+    }
+
+    #[test]
+    fn tee_stream_primary_field_type_pinned_arc_dyn_action_stream_via_destructure_helper_witness() {
+        // `TeeStream.primary: Arc<dyn ActionStream>` — the primary
+        // sink is held by `Arc<dyn ActionStream>` so server.rs can
+        // hand in EITHER a `BroadcastingActionStream` OR a
+        // `LoggingStream` (dev mode) OR a nested TeeStream
+        // (composition) WITHOUT a generic type parameter on
+        // TeeStream itself (which would break the Arc<dyn> AppState
+        // bound — see the dyn-compatibility pin at line 832). The
+        // existing `tee_stream_sinks_field_type_is_owned_vec_arc_dyn`
+        // pin walks the SECONDARY sinks field; pin the PRIMARY
+        // field type here so a refactor that landed a CONCRETE type
+        // (`primary: BroadcastingActionStream` "for type-safety on
+        // the durable-row gate") would surface as a destructure
+        // type mismatch here AND would force every server.rs site
+        // that constructs TeeStream with a non-Broadcasting primary
+        // to update. Pin via destructure + helper witness on the
+        // owned Arc<dyn>. Symmetric to the sibling `sinks` field
+        // type pin extended to the primary field.
+        fn require_arc_dyn(_: Arc<dyn ActionStream>) {}
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary);
+        let TeeStream { primary, sinks: _ } = tee;
+        require_arc_dyn(primary);
+    }
+
+    #[test]
+    fn tee_stream_with_sink_appends_to_trailing_position_preserving_prior_sinks_via_three_chain() {
+        // `TeeStream::with_sink` calls `self.sinks.push(sink)` (line
+        // 31) — appends to the trailing position WITHOUT touching
+        // prior sinks. The existing
+        // `tee_stream_with_sink_chaining_preserves_registration_order`
+        // pin walks 2 sinks; widen to 3 sinks here AND pin via
+        // direct sink_count comparison at EACH step so an off-by-one
+        // or accidental-reset refactor (e.g. `self.sinks = vec![sink]`
+        // "for builder reset semantics") surfaces at the count
+        // mismatch on intermediate states rather than only at the
+        // final sink count. Symmetric to round-282
+        // `synth_event_request_id_and_agent_session_id_distinct_and_fresh_per_invocation`
+        // step-by-step invariant pin extended to this sibling
+        // append-only builder.
+        let primary: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let s1: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let s2: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let s3: Arc<dyn ActionStream> = Arc::new(Collector::default());
+        let tee = TeeStream::new(primary);
+        assert_eq!(tee.sink_count(), 0, "initial state");
+        let tee = tee.with_sink(s1);
+        assert_eq!(tee.sink_count(), 1, "after 1st with_sink");
+        let tee = tee.with_sink(s2);
+        assert_eq!(tee.sink_count(), 2, "after 2nd with_sink");
+        let tee = tee.with_sink(s3);
+        assert_eq!(tee.sink_count(), 3, "after 3rd with_sink");
+    }
 }

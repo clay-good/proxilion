@@ -1164,4 +1164,218 @@ operator_auth_enforced = false
         assert!(c.nats_url.is_none());
         assert!(c.siem_webhook_url.is_none());
     }
+
+    // ─── round 289 (2026-05-26): Config/ConfigBuilder/ConfigError variant + Clone pins ───
+
+    #[test]
+    fn config_field_count_pinned_at_exactly_twenty_three_via_exhaustive_destructure_no_rest_pattern()
+     {
+        // `Config` carries EXACTLY 23 fields — every one of them is
+        // operator-load-bearing (env-var-driven, surfaced in the
+        // `/api/v1/setup/status` panel, OR consumed at boot by the
+        // server.rs wiring). Pin the field count via exhaustive
+        // destructure with NO `..` rest pattern: a refactor that
+        // landed a 24th field (e.g. `pub kill_switch_path:
+        // Option<PathBuf>` OR `pub admin_email: Option<String>`)
+        // without matching `ConfigBuilder` AND the from_env_layer
+        // mapping would silently leave the new field at its
+        // `Default` value despite an operator setting the
+        // corresponding env var. The exhaustive destructure with no
+        // rest pattern forces a new field to update this site in
+        // lockstep with the loader. Symmetric to round-271 SetMode
+        // + round-272 OAuthState + round-274 ParsedSend field-count
+        // pins extended to this sibling operator-config struct.
+        let c = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .build()
+            .unwrap();
+        let Config {
+            bind_addr: _,
+            tls_cert_path: _,
+            tls_key_path: _,
+            database_url: _,
+            trust_plane_url: _,
+            federation_bridge_url: _,
+            log_format: _,
+            token_encryption_key_hex: _,
+            google_client_id: _,
+            google_client_secret: _,
+            proxy_base_url: _,
+            policy_path: _,
+            customer_domain: _,
+            dev_mode: _,
+            nats_url: _,
+            nats_subject_prefix: _,
+            siem_webhook_url: _,
+            siem_hmac_key_hex: _,
+            siem_batch_size: _,
+            siem_batch_max_age_secs: _,
+            blocked_webhook_url: _,
+            blocked_webhook_hmac_key_hex: _,
+            operator_auth_enforced: _,
+        } = c;
+    }
+
+    #[test]
+    fn config_builder_field_count_pinned_at_exactly_twenty_three_via_exhaustive_destructure_no_rest()
+     {
+        // `ConfigBuilder` MUST carry the SAME 23 fields as `Config`
+        // — the builder→config conversion in `ConfigBuilder::build`
+        // does a 1:1 field move, so an asymmetric refactor that
+        // added a field to one side and not the other would either
+        // (a) compile-fail at the build site if added to Config, OR
+        // (b) silently strip the new builder-side field at build
+        // time if added to ConfigBuilder. Pin EXACTLY 23 via
+        // exhaustive destructure to anchor BOTH sides in lockstep
+        // with the sibling `Config` field-count pin. A refactor that
+        // extended ConfigBuilder without matching Config (the more
+        // dangerous direction — silently drops the operator's value)
+        // surfaces here at compile time. Symmetric to the Config
+        // 23-field pin in this same round.
+        let b = ConfigBuilder::defaults();
+        let ConfigBuilder {
+            bind_addr: _,
+            tls_cert_path: _,
+            tls_key_path: _,
+            database_url: _,
+            trust_plane_url: _,
+            federation_bridge_url: _,
+            log_format: _,
+            token_encryption_key_hex: _,
+            google_client_id: _,
+            google_client_secret: _,
+            proxy_base_url: _,
+            policy_path: _,
+            customer_domain: _,
+            dev_mode: _,
+            nats_url: _,
+            nats_subject_prefix: _,
+            siem_webhook_url: _,
+            siem_hmac_key_hex: _,
+            siem_batch_size: _,
+            siem_batch_max_age_secs: _,
+            blocked_webhook_url: _,
+            blocked_webhook_hmac_key_hex: _,
+            operator_auth_enforced: _,
+        } = b;
+    }
+
+    #[test]
+    fn config_error_variant_count_pinned_at_exactly_five_via_exhaustive_match_no_underscore_fallback()
+     {
+        // `ConfigError` has EXACTLY 5 variants: BindAddr +
+        // MissingCert + MissingKey + InvalidValue + FileLoad. The
+        // existing `config_error_debug_carries_all_five_variant_names`
+        // pin walks the Debug surface; pin the VARIANT COUNT here
+        // via exhaustive match WITHOUT the `_` underscore fallback
+        // — a 6th-variant landing (e.g.
+        // `ConfigError::EnvAccessDenied { var: String }` for read-
+        // only-fs probes OR `ConfigError::TlsKeyMismatch {…}` for
+        // cert/key key-pair validation) would surface here as a
+        // non-exhaustive-match compile error rather than at the
+        // setup dashboard's classify-by-variant logic. Symmetric to
+        // round-280 AppError 11-variant exhaustive-match pin
+        // extended to this sibling boot-error type.
+        fn classify(e: &ConfigError) -> &'static str {
+            match e {
+                ConfigError::BindAddr(_, _) => "bind_addr",
+                ConfigError::MissingCert(_) => "missing_cert",
+                ConfigError::MissingKey(_) => "missing_key",
+                ConfigError::InvalidValue { .. } => "invalid_value",
+                ConfigError::FileLoad { .. } => "file_load",
+            }
+        }
+        let samples = [
+            ConfigError::BindAddr("x".into(), "x".parse::<std::net::SocketAddr>().unwrap_err()),
+            ConfigError::MissingCert(PathBuf::from("/dev/null")),
+            ConfigError::MissingKey(PathBuf::from("/dev/null")),
+            ConfigError::InvalidValue {
+                field: "x",
+                reason: "y".into(),
+            },
+            ConfigError::FileLoad {
+                path: PathBuf::from("/dev/null"),
+                reason: "y".into(),
+            },
+        ];
+        let labels: std::collections::HashSet<&'static str> =
+            samples.iter().map(classify).collect();
+        assert_eq!(
+            labels.len(),
+            5,
+            "ConfigError variant count must be exactly 5: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn log_format_variant_count_pinned_at_exactly_two_pretty_and_json_via_exhaustive_match() {
+        // `LogFormat` carries EXACTLY 2 variants: `Pretty` + `Json`.
+        // The existing `from_file_log_format_pretty_value_selects_pretty_variant`
+        // + `from_file_log_format_unknown_value_falls_back_to_json_no_error`
+        // pins walk the env/from-file string→variant dispatch; pin
+        // the VARIANT COUNT via exhaustive match with NO `_`
+        // fallback here. A 3rd-variant landing (e.g. `LogFormat::Tracing`
+        // for OTLP exporters OR `LogFormat::Compact` for verbose-
+        // grep-style logging) would surface here as a non-exhaustive
+        // match — AND would force the from_file/from_env_layer
+        // string→variant tables to update in lockstep with the new
+        // operator-visible label. Symmetric to round-286 SuccessorOutcome
+        // 2-variant exhaustive-match pin extended to this sibling
+        // boot-config enum.
+        fn classify(lf: LogFormat) -> &'static str {
+            match lf {
+                LogFormat::Pretty => "pretty",
+                LogFormat::Json => "json",
+            }
+        }
+        let a = classify(LogFormat::Pretty);
+        let b = classify(LogFormat::Json);
+        assert_ne!(a, b);
+        let labels: std::collections::HashSet<&'static str> = [a, b].into_iter().collect();
+        assert_eq!(labels.len(), 2, "LogFormat must carry exactly 2 variants");
+    }
+
+    #[test]
+    fn config_and_config_builder_both_implement_clone_via_require_for_axum_state_and_embed_path() {
+        // `Config: Clone` is REQUIRED for the axum-handler State<T>
+        // fan-out — the boot path constructs a Config once and clones
+        // it at the per-request boundary (or holds it in Arc; either
+        // way the Clone derive is the operator-visible contract).
+        // `ConfigBuilder: Clone` is REQUIRED for the embed-test
+        // pattern where a base builder is cloned before each
+        // `.with_*(...)` override variant — the existing test
+        // `programmatic_overrides_compose` constructs multiple
+        // configs from a single base builder, which lean on Clone.
+        // The existing `config_and_config_builder_and_log_format_and_config_error_send_sync_static`
+        // pin walks Send+Sync+'static only; pin the Clone trait-bound
+        // axis here so a refactor that dropped `#[derive(Clone)]`
+        // from EITHER struct "for explicit Arc-management of the
+        // 23-field shape" surfaces here at the type boundary rather
+        // than as a confusing tower::Service trait cascade. Pin
+        // BOTH simultaneously so a one-side drift surfaces. Symmetric
+        // to round-279/281/285/286/287 Clone witnesses extended to
+        // this config-pair.
+        fn require_clone<T: Clone>() {}
+        require_clone::<Config>();
+        require_clone::<ConfigBuilder>();
+    }
+
+    #[test]
+    fn config_load_signature_pinned_via_fn_pointer_witness_fn_returns_result_config_config_error() {
+        // `Config::load() -> Result<Config, ConfigError>` is the
+        // documented production entry point (see file header §
+        // "Loading"). Pin via fn-pointer witness: zero-arg + owned-
+        // Config + ConfigError-typed error. A refactor that widened
+        // the error type to `Result<Config, anyhow::Error>` "for
+        // ergonomic boot-path bubbling" would lose the structured
+        // ConfigError variant the setup dashboard splits on at the
+        // wire AND would break the documented production-entry-point
+        // contract. A refactor to `fn load(&Env) -> Result<...>`
+        // dependency-injection refactor (passing in env explicitly
+        // instead of reading from std::env) would silently change
+        // the call site at main.rs. Symmetric to round-272
+        // GoogleClient::from_env signature pin extended to this
+        // sibling boot-entry-point constructor.
+        let _f: fn() -> Result<Config, ConfigError> = Config::load;
+    }
 }

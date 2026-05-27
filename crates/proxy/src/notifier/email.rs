@@ -1415,4 +1415,143 @@ mod tests {
         );
         assert!(result.is_ok());
     }
+
+    // ─── round 288 (2026-05-26): EmailBuildError Display + EmailNotifier accessor/builder pins ───
+
+    #[test]
+    fn email_build_error_implements_display_via_require_for_tracing_format_substitution_at_boot() {
+        // `EmailBuildError: Display` — the boot path emits the
+        // structured error via `tracing::error!(error = %e, ...)`
+        // which routes through the `{}` (`Display`) substitution
+        // path. The existing
+        // `email_build_error_display_carries_byte_exact_email_build_prefix_with_inner`
+        // pin walks the RUNTIME string; pin the TRAIT BOUND here so
+        // a refactor that dropped the `#[error("email build: {0}")]`
+        // thiserror attribute "to hand-roll a richer Display impl in
+        // a separate file" would surface at the trait-bound boundary
+        // rather than at every `tracing::error!(error = %e, ...)`
+        // call site as a generic Display-not-satisfied message.
+        // Symmetric to round-281
+        // `notifier_build_error_implements_display_via_require_for_format_substitution_at_setup_logs`
+        // + round-285
+        // `siem_key_error_and_build_error_both_implement_display_via_require_for_tracing_substitution`
+        // + round-287
+        // `slack_build_error_implements_display_via_require_for_tracing_format_substitution_at_boot`
+        // — all four notifier-family build-error types pinned in
+        // lockstep.
+        fn require_display<T: std::fmt::Display>() {}
+        require_display::<EmailBuildError>();
+    }
+
+    #[test]
+    fn email_notifier_with_recipients_resolver_signature_pinned_via_fn_pointer_witness_for_builder_chain()
+     {
+        // `EmailNotifier::with_recipients_resolver(self,
+        // EmailRecipientsResolver) -> Self` is the chainable builder
+        // that attaches a per-policy recipient resolver (ui-less-
+        // surfaces.md §5.4 dev 3). Pin via fn-pointer witness: self-
+        // by-value + resolver-by-value (Arc<dyn Fn(...) -> ...>) +
+        // Self-return for the fluent builder. A refactor to
+        // `fn with_recipients_resolver(&mut self, &EmailRecipientsResolver)
+        // -> &mut Self` "for ergonomic mid-construction mutation"
+        // would break the `EmailNotifier::new_with_recipients(...)?.with_recipients_resolver(...).with_max_retries(...)`
+        // boot chain at server.rs. AND tying the resolver lifetime
+        // by borrow would break the `Send + Sync + 'static` axum
+        // State<T> bound. Symmetric to round-287
+        // `slack_notifier_with_user_map_signature_pinned_via_fn_pointer_witness_for_builder_chain`
+        // extended to this sibling email-notifier builder.
+        let _f: fn(EmailNotifier, EmailRecipientsResolver) -> EmailNotifier =
+            EmailNotifier::with_recipients_resolver;
+    }
+
+    #[test]
+    fn email_notifier_proxy_public_url_signature_pinned_via_fn_pointer_witness_for_borrow_accessor()
+    {
+        // `EmailNotifier::proxy_public_url(&self) -> &str` is the
+        // accessor for the configured proxy-public URL used in
+        // signed-link assembly. Pin via fn-pointer witness: `&self`
+        // borrow (catches `self`-consuming refactor breaking the
+        // accessor's idempotency every notifier-config endpoint
+        // relies on) + `&str` return BORROWED (catches `String`
+        // owned-return refactor forcing a per-call alloc on the
+        // hot path AND breaking the `/api/v1/notifier/config` GET
+        // route's `.to_owned()` chain). Symmetric to round-281
+        // `webhook_notifier_proxy_public_url_signature_pinned_via_fn_pointer_witness_for_borrow_only_accessor`
+        // + round-287
+        // `slack_notifier_signing_secret_and_proxy_public_url_accessors_pinned_via_fn_pointer_witnesses`
+        // — all three notifier-family proxy_public_url accessors
+        // pinned in lockstep on the identical `fn(&Self) -> &str`
+        // shape.
+        let _f: fn(&EmailNotifier) -> &str = EmailNotifier::proxy_public_url;
+    }
+
+    #[test]
+    fn email_notifier_new_back_compat_alias_signature_pinned_via_fn_pointer_witness_for_callers() {
+        // `EmailNotifier::new(&str, &str, &[String], String, PgPool)
+        // -> Result<Self, EmailBuildError>` is the back-compat alias
+        // for the older 5-arg constructor (line 73 marks it as
+        // `#[allow(dead_code)]` because new callers use
+        // `new_with_recipients` but the alias is preserved for
+        // older boot sites that haven't migrated). Pin via fn-pointer
+        // witness so a refactor that REMOVED the alias "to drop dead
+        // code" would surface here AND a refactor that widened the
+        // return type to `Result<Self, anyhow::Error>` would also
+        // surface. The 5-arg shape is the operator-visible API on
+        // the README and the back-compat preservation matters for
+        // every external integration that pinned to the older
+        // signature. Symmetric to round-287
+        // `slack_notifier_new_return_type_is_result_self_slack_build_error_via_fn_pointer_witness`
+        // extended to this back-compat alias.
+        let _f: fn(
+            &str,
+            &str,
+            &[String],
+            String,
+            PgPool,
+        ) -> Result<EmailNotifier, EmailBuildError> = EmailNotifier::new;
+    }
+
+    #[test]
+    fn html_escape_signature_pinned_via_fn_pointer_witness_for_message_body_assembly_hot_path() {
+        // `html_escape(&str) -> String` is invoked once per
+        // `notify()` call to escape user-controlled fields (the
+        // matched policy reason, principal, etc.) before they land
+        // in the HTML body of the email. The existing
+        // `html_escape_return_type_is_owned_string_for_cross_await_lettre_message_body`
+        // pin walks the return-type axis only; pin the FULL fn-
+        // pointer signature here. A refactor to `fn(String) -> String`
+        // consume-and-escape would force every call site to clone
+        // the input first; `fn(&str) -> Cow<'_, str>` zero-alloc-
+        // fast-path refactor would tie return lifetime to input
+        // breaking the cross-await lettre `.body(text)` consumption
+        // boundary. Symmetric to round-284
+        // `sha256_hex_signature_pinned_via_fn_pointer_witness_for_persist_bind_hot_path`
+        // extended to this sibling text-encoder helper.
+        let _f: fn(&str) -> String = html_escape;
+    }
+
+    #[test]
+    fn parse_or_fallback_signature_pinned_via_fn_pointer_witness_for_per_policy_recipient_resolution()
+     {
+        // `parse_or_fallback(list: &[String], fallback: &[Mailbox],
+        // field: &str) -> Vec<Mailbox>` is the helper that resolves
+        // the per-policy recipient override (ui-less-surfaces.md
+        // §5.4 dev 3) — when the resolver returns a Some list, it
+        // parses each address; on parse failure it logs the error
+        // and falls back to the global default. Pin the FULL
+        // signature via fn-pointer witness: all 3 args BORROWED
+        // (catches `Vec<String>`-by-value consume-and-parse refactor
+        // forcing per-callsite clone of the resolver's returned
+        // list AND breaking the cross-`Some(...)`-match borrow
+        // chain) + `Vec<Mailbox>` OWNED return (catches `&[Mailbox]`
+        // borrow-return refactor tying return lifetime to the
+        // fallback slice making the lettre `Message::builder()`
+        // chain borrow-across-await impossible). The existing
+        // `parse_or_fallback_return_type_is_owned_vec_mailbox_for_cross_await_smtp_send`
+        // pin walks the return type only; pin the full fn-pointer
+        // signature here at the boundary. Symmetric to round-284
+        // `redact_pii_text_signature_pinned_via_fn_pointer_witness_for_bytes_to_text_chain`
+        // extended to this sibling per-policy resolver helper.
+        let _f: fn(&[String], &[Mailbox], &str) -> Vec<Mailbox> = parse_or_fallback;
+    }
 }

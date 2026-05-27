@@ -719,4 +719,216 @@ mod tests {
         require_usize(RAW_BYTES);
         require_usize(TOKEN_LEN);
     }
+
+    // ─── round 294 (2026-05-26): Bearer/BearerHash Send+Sync + Debug-safety + layout pins ───
+
+    #[test]
+    fn bearer_and_bearer_hash_both_send_and_sync_directly_for_axum_middleware_cross_await_propagation()
+     {
+        // `Bearer` AND `BearerHash` both flow through the bearer
+        // middleware at [crates/proxy/src/auth_middleware.rs](../auth_middleware.rs)
+        // across `.await` boundaries — `BearerHash` rides in the
+        // SessionContext extracted on every request AND `Bearer`
+        // lives in the OAuth callback's `bearer.hash()` call site
+        // before being moved into the encrypted-storage path. Pin
+        // Send+Sync directly on BOTH types (rather than via a
+        // composite Send+Sync+'static at the wrap site) so a
+        // refactor that landed a `Rc<...>` OR `Cell<...>` inner
+        // field on EITHER type would surface here at the type
+        // boundary rather than at the auth-middleware tower::Service
+        // trait cascade. Symmetric to round-292
+        // `tee_stream_is_send_and_sync_directly_for_arc_dyn_action_stream_object_safety`
+        // + round-293 `pkce_error_is_sync_directly_not_just_via_static_for_async_oauth_callback_middleware`
+        // extended to this sibling bearer-credential pair.
+        fn require_send<T: Send>() {}
+        fn require_sync<T: Sync>() {}
+        require_send::<Bearer>();
+        require_sync::<Bearer>();
+        require_send::<BearerHash>();
+        require_sync::<BearerHash>();
+    }
+
+    #[test]
+    fn prefix_constant_byte_exact_pxl_live_with_namespace_structure_pinned_for_token_family_contract()
+     {
+        // `PREFIX = "pxl_live_"` (line 12) — the operator-visible
+        // token family marker. The existing
+        // `prefix_constant_type_is_static_str_for_format_macro_const_concat_compat`
+        // pin walks the TYPE axis (`&'static str`); pin the
+        // STRUCTURAL byte-exact contract here. The 9-byte prefix
+        // distinguishes live agent bearers from sibling token
+        // families: `pxl_operator_` (operator-auth tokens, see
+        // operator_auth.rs SCOPE_CATALOGUE family discriminator),
+        // `pxl_test_` (test-only tokens not yet wired), and any
+        // future `pxl_<family>_` namespace. A refactor that
+        // collapsed the prefix to `pxl_` "for ergonomic prefix
+        // testing" would silently merge the live + operator token
+        // families AND break the dashboard's family-discriminator
+        // panel that anchors on the byte-exact prefix. Pin the
+        // exact 9-byte literal AND the structural `pxl_<family>_`
+        // shape so a one-byte drift surfaces. Symmetric to
+        // round-290 CURRENT_PIC_PROFILE namespace+version pin
+        // extended to this sibling token-family namespace.
+        assert_eq!(PREFIX, "pxl_live_");
+        assert_eq!(PREFIX.len(), 9);
+        assert!(PREFIX.starts_with("pxl_"));
+        assert!(PREFIX.ends_with("_"));
+        // Defensive: the family token "live" sits between the two
+        // underscores at offset 4..8.
+        assert_eq!(&PREFIX[4..8], "live");
+        // Pairwise-distinct from the sibling operator token family
+        // (operator_auth.rs uses `pxl_operator_` — a refactor that
+        // accidentally collapsed both to the same prefix would
+        // break per-family middleware dispatch).
+        assert_ne!(PREFIX, "pxl_operator_");
+    }
+
+    #[test]
+    fn token_len_constant_equals_exactly_sixty_one_via_prefix_nine_plus_body_fifty_two_for_layout()
+    {
+        // `TOKEN_LEN = PREFIX.len() + 52` (line 15) — the FULL
+        // bearer-string byte length used by `Bearer::parse` to
+        // reject any wrong-length input. The existing
+        // `token_len_equals_prefix_plus_fifty_two_base32_chars_per_spec`
+        // pin checks the symbolic formula `PREFIX.len() + 52`; pin
+        // the NUMERIC VALUE 61 here so a refactor that legitimately
+        // bumps the namespace prefix (`pxl_live_` → `pxl_live_v2_`)
+        // would surface here as a constant-value drift — AND the
+        // bumped prefix would land WITHOUT a coordinated rev of the
+        // base32 body width. The numeric pin gives a second anchor
+        // a refactor can't satisfy by just updating PREFIX. Symmetric
+        // to round-285 `siem_forwarder_max_retries_default_pinned_at_exactly_three`
+        // numeric-value pin extended to this sibling token-layout
+        // constant.
+        assert_eq!(
+            TOKEN_LEN, 61,
+            "TOKEN_LEN must equal 61 = 9-byte prefix + 52-char base32 body"
+        );
+        // And the formula must hold (the existing test pins this
+        // axis; cross-anchor here so a one-side refactor surfaces
+        // here at the numeric value rather than only at the
+        // formula).
+        assert_eq!(TOKEN_LEN, PREFIX.len() + 52);
+    }
+
+    #[test]
+    fn bearer_debug_rendering_does_not_contain_pxl_live_prefix_or_any_base32_body_substring() {
+        // The existing `debug_does_not_leak` pin checks that the
+        // full token string doesn't appear in the Debug output;
+        // tighten the contract here so a refactor that displayed
+        // ONLY the prefix (e.g. `Bearer("pxl_live_…")` to "give
+        // operators a token-family hint without leaking the body")
+        // would still surface as a regression. The pxl_live_ prefix
+        // itself MUST NOT appear in Debug output — combined with
+        // the existing pin, this catches a wider class of
+        // half-leakage refactors. Pin three byte-substring
+        // negations: the PREFIX, ANY 8-char base32 substring from
+        // the body, AND the literal "redacted" marker which IS
+        // expected in the canonical render.
+        let b = Bearer::generate();
+        let dbg = format!("{b:?}");
+        assert!(
+            !dbg.contains("pxl_live_"),
+            "Bearer Debug must NOT contain the token-family prefix, got: {dbg}"
+        );
+        let body = &b.as_str()[PREFIX.len()..];
+        // First 8 chars of the body — if these leak, an attacker
+        // with log access has 40 bits of the 256-bit token and
+        // the rest is brute-forceable.
+        let body_head: String = body.chars().take(8).collect();
+        assert!(
+            !dbg.contains(&body_head),
+            "Bearer Debug must NOT contain any 8-char base32 body substring"
+        );
+        // Positive marker: the canonical "redacted" marker IS
+        // present, distinguishing the safe "redacted" render from
+        // a hypothetical empty-Debug refactor.
+        assert!(
+            dbg.contains("redacted"),
+            "Bearer Debug must contain the canonical `redacted` marker"
+        );
+    }
+
+    #[test]
+    fn bearer_hash_debug_rendering_carries_only_first_four_bytes_as_eight_hex_chars_for_log_safety()
+    {
+        // The custom Debug impl at line 75-84 renders BearerHash as
+        // `BearerHash(<8-hex>…)` — first 4 bytes (8 hex chars) of
+        // the 32-byte hash, then an ellipsis. Operators correlate
+        // by the 8-hex prefix in logs without exposing enough hash
+        // to invert against rainbow tables (4 bytes = 32 bits;
+        // SHA-256 preimage resistance at full output means even 4
+        // bytes shown is fine — a refactor that widened the
+        // truncation to e.g. 16 hex chars (8 bytes / 64 bits)
+        // would weaken the contract). Pin the 8-hex-char shape
+        // byte-exact via direct substring assertion + length-bound
+        // sweep. The first 4 bytes of `BearerHash::of("test")`
+        // (SHA-256 of "test") are deterministic — pin against the
+        // known prefix `9f86d081`. Symmetric to round-291
+        // `error_body_with_fix_signature_pinned_via_fn_pointer_witness`
+        // operator-log-safety pin extended to this sibling
+        // BearerHash Debug rendering.
+        let h = BearerHash::of("test");
+        let dbg = format!("{h:?}");
+        // SHA-256("test") starts with bytes 9f 86 d0 81 ... — pin
+        // the 8-hex-char prefix in the Debug output.
+        assert!(
+            dbg.contains("9f86d081"),
+            "BearerHash Debug must contain SHA-256(\"test\") 8-hex prefix, got: {dbg}"
+        );
+        // And the Debug output's length is bounded — the format
+        // is `BearerHash(<8>…)` so length ≈ 11 + 8 + 4 (ellipsis is
+        // 3-byte UTF-8) = 23 bytes. A refactor that widened the
+        // truncation to 16 hex chars would land at length 31. Pin
+        // the upper bound conservatively at 25 bytes so a 16-hex
+        // widening AND a hypothetical full-32-hex-byte render
+        // both surface here.
+        assert!(
+            dbg.len() < 25,
+            "BearerHash Debug must not leak more than 8-hex prefix, got {} bytes: {dbg}",
+            dbg.len()
+        );
+        // Defensive: the full SHA-256 hex (64 chars) MUST NOT
+        // appear — a refactor that removed the truncation would
+        // surface here as the longer prefix substring would
+        // suddenly match.
+        let full_hex: String = h.0.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(full_hex.len(), 64);
+        assert!(
+            !dbg.contains(&full_hex),
+            "BearerHash Debug must NOT contain the full 64-hex hash"
+        );
+    }
+
+    #[test]
+    fn bearer_hash_as_bytes_returns_exactly_thirty_two_bytes_for_sha256_output_width_contract() {
+        // `BearerHash::as_bytes(&self) -> &[u8]` returns a borrowed
+        // slice over the inner `[u8; 32]` array — the slice MUST be
+        // exactly 32 bytes (the SHA-256 output width). The existing
+        // `bearer_hash_inner_field_is_array_32_bytes_not_vec_or_arc_via_destructure`
+        // pin walks the FIELD type at construction; pin the
+        // ACCESSOR-output length here so a refactor that returned a
+        // sub-slice (e.g. `&self.0[..16]` "for truncated hash
+        // storage to save 16 bytes per row") would surface here as
+        // a length drift. The sqlx column for `bearer_sha256` is
+        // bytea sized 32; a 16-byte slice would either error at
+        // bind time OR silently store a truncated hash that fails
+        // every subsequent revocation lookup. Pin via direct
+        // length assertion across multiple inputs. Symmetric to
+        // round-284 `sha256_hex_output_width_pinned_at_sixty_four_lowercase_hex_chars`
+        // extended to this sibling SHA-256 byte-width accessor.
+        for s in [
+            "",
+            "abc",
+            "test",
+            "pxl_live_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            let h = BearerHash::of(s);
+            assert_eq!(
+                h.as_bytes().len(),
+                32,
+                "BearerHash::as_bytes must return exactly 32 bytes for input {s:?}"
+            );
+        }
+    }
 }

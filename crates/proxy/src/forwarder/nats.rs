@@ -805,4 +805,131 @@ mod tests {
             assert_eq!(r, &baseline, "worker {i}: cross-thread sanitize drift");
         }
     }
+
+    // ─── round 295 (2026-05-26): ConnectError trait + NatsBridge Send+Sync + signature pins ───
+
+    #[test]
+    fn connect_error_implements_display_via_require_trait_bound_witness_for_tracing_substitution() {
+        // `ConnectError: Display` — the boot path emits the
+        // structured error via `tracing::error!(error = %e, ...)`
+        // (server.rs) which routes through the `{}` (`Display`)
+        // substitution path. The existing
+        // `connect_error_display_and_debug_strings_are_byte_distinct`
+        // pin walks the RUNTIME string shapes; pin the TRAIT BOUND
+        // here so a refactor that dropped the `#[error("nats
+        // connect failed: {0}")]` thiserror attribute "to hand-roll
+        // a richer Display impl in a separate file" would surface
+        // at the trait-bound boundary. Symmetric to round-281/285/287/288/290/293
+        // build-error Display pins extended to this sibling NATS
+        // connect-error type.
+        fn require_display<T: std::fmt::Display>() {}
+        require_display::<ConnectError>();
+    }
+
+    #[test]
+    fn connect_error_implements_std_error_via_require_trait_bound_witness_for_anyhow_question_mark()
+    {
+        // `ConnectError: std::error::Error` — emitted by
+        // `#[derive(thiserror::Error)]` and load-bearing for any
+        // `?`-chain in main.rs that wraps NATS connection failures
+        // into an outer anyhow::Error for the boot-path log render.
+        // The existing `connect_error_debug_includes_struct_name_for_grep`
+        // pin walks the Debug; pin the std::error::Error trait
+        // bound here via require_error witness symmetric to
+        // round-280 AppError + round-283 ApiError + round-290
+        // CacheError pins extended to this sibling NATS connect
+        // error type.
+        fn require_error<T: std::error::Error>() {}
+        require_error::<ConnectError>();
+    }
+
+    #[test]
+    fn connect_error_inner_field_count_pinned_at_exactly_one_via_exhaustive_destructure_tuple_struct()
+     {
+        // `ConnectError` is a `pub struct(pub String)` tuple-struct
+        // with EXACTLY 1 inner field (the human-readable reason).
+        // Pin via exhaustive destructure on a single-element tuple-
+        // struct pattern: a refactor that landed a 2nd field
+        // (`url: String` for "echo the failing URL back to the
+        // operator" OR `kind: ConnectErrorKind` structured-bucketing
+        // refactor) would silently extend the operator-visible
+        // wire shape AND would break every `ConnectError(format!(...))`
+        // construction site in the connect path (line 33). Symmetric
+        // to round-281 NotifierBuildError + round-285 KeyError/BuildError
+        // + round-287 SlackBuildError + round-288 EmailBuildError
+        // 1-field tuple-struct pins extended to this sibling
+        // forwarder connect-error type — completing the 5-error
+        // family lockstep on identical tuple-struct shape.
+        let e = ConnectError("connection refused".to_string());
+        let ConnectError(reason) = e;
+        assert_eq!(reason, "connection refused");
+    }
+
+    #[test]
+    fn sanitize_token_signature_pinned_via_fn_pointer_witness_for_subject_assembly_hot_path() {
+        // `sanitize_token(&str) -> String` is invoked TWICE per
+        // `subject_for()` call (once for vendor, once for action)
+        // on the publish hot path BEFORE the `client.publish(...).await`
+        // suspension. Pin via fn-pointer witness: `&str` BORROW
+        // input (catches `fn(String)` consume-and-sanitize refactor
+        // forcing per-callsite clone of the event's vendor + action
+        // fields before sanitization) + owned `String` return
+        // (catches `Cow<'a, str>` borrow-return refactor tying
+        // sanitized lifetime to input slice, breaking the
+        // `format!("{}.{}.{}", prefix, vendor, action)` subject
+        // assembly that consumes the strings by value). Symmetric
+        // to round-284 redact_pii_text + round-288 html_escape
+        // signature pins extended to this sibling subject-sanitizer.
+        let _f: fn(&str) -> String = sanitize_token;
+    }
+
+    #[test]
+    fn nats_bridge_is_send_and_sync_directly_for_arc_dyn_action_stream_at_app_state() {
+        // `NatsBridge: Send + Sync` directly (NOT just via
+        // `Arc<dyn ActionStream>` erasure). The existing
+        // `nats_bridge_implements_action_stream_trait_via_dyn_compat_witness`
+        // pin walks the dyn-erasure axis only; pin the BARE type
+        // bounds here at the type boundary so a refactor that
+        // landed a `Rc<...>` field (NOT Send/Sync) OR a `Cell<...>`
+        // field (NOT Sync) "for in-process subject-buffer caching"
+        // would surface here at the type boundary BEFORE the Arc-
+        // erasure site. The bounds are load-bearing for the
+        // `Arc<dyn ActionStream>` AppState coercion. Symmetric to
+        // round-292
+        // `tee_stream_is_send_and_sync_directly_for_arc_dyn_action_stream_object_safety`
+        // extended to this sibling concrete forwarder type.
+        fn require_send<T: Send>() {}
+        fn require_sync<T: Sync>() {}
+        require_send::<NatsBridge>();
+        require_sync::<NatsBridge>();
+    }
+
+    #[test]
+    fn sanitize_token_rejected_chars_include_nats_reserved_star_gt_space_per_nats_subject_spec() {
+        // NATS subject spec (docs.nats.io/nats-concepts/subjects)
+        // reserves `*` (single-token wildcard), `>` (multi-token
+        // wildcard), and space (subject separator at the wire
+        // protocol level). All three MUST be sanitized to `_` by
+        // `sanitize_token` so an adversary-controlled (or
+        // accidentally-named) action/vendor enum doesn't smuggle a
+        // wildcard subscription past the proxy's published subject.
+        // The existing `sanitize_replaces_invalid_chars` pin walks
+        // ONE input fixture covering some of these; pin the THREE
+        // reserved-char invariants directly so a refactor that
+        // narrowed the rejected-set (e.g. `match c { '.' | space =>
+        // '_', _ => c }` "for performance on the hot path") would
+        // surface here as a subject-injection vulnerability AT
+        // TEST TIME rather than at a SOC review post-incident. Pin
+        // each reserved char independently across three minimal
+        // fixtures.
+        assert_eq!(sanitize_token("a*b"), "a_b", "`*` must be sanitized");
+        assert_eq!(sanitize_token("a>b"), "a_b", "`>` must be sanitized");
+        assert_eq!(sanitize_token("a b"), "a_b", "space must be sanitized");
+        // And combined: all three reserved chars in one input must
+        // all collapse to `_` independently (NOT collapse to a
+        // single `_` run — `sanitize_token_replaces_each_rejected_char_byte_by_byte_not_collapsed_runs`
+        // pins the by-byte axis; pin the by-NATS-reserved-char
+        // axis here in lockstep).
+        assert_eq!(sanitize_token("*> "), "___");
+    }
 }

@@ -820,4 +820,132 @@ mod tests {
             );
         }
     }
+
+    // ─── round 291 (2026-05-26): ErrorBody trait + builder signature + static-str pins ───
+
+    #[test]
+    fn error_body_implements_into_response_via_require_trait_bound_witness_for_axum_handler_chain()
+    {
+        // `ErrorBody: IntoResponse` (the impl at line 86) is the
+        // axum trait bound EVERY API/adapter handler relies on
+        // when returning `ErrorBody` directly (e.g. ad-hoc test
+        // fixtures) — the production path goes through
+        // `ErrorBody::into_response(self, status: StatusCode)` but
+        // the bare `IntoResponse` impl is preserved per the
+        // implementation comment ("we only implement IntoResponse
+        // so the type can be used in test fixtures and helpers").
+        // The existing `error_body_is_send_sync_for_axum_into_response_boundary`
+        // pin walks the Send+Sync axis only; pin the IntoResponse
+        // TRAIT BOUND here at the type boundary via require_into_response
+        // witness so a refactor that dropped the impl block "as
+        // dead code" (the documented `#[allow(dead_code)]` is on
+        // DOCS_BASE, not the impl) would surface here at the type
+        // boundary rather than at the test-fixture call sites as a
+        // confusing trait-cascade. Symmetric to round-280 AppError
+        // + round-283 ApiError + round-276 OAuthError IntoResponse
+        // pins extended to this base envelope type.
+        fn require_into_response<T: IntoResponse>() {}
+        require_into_response::<ErrorBody>();
+    }
+
+    #[test]
+    fn error_body_with_fix_signature_pinned_via_fn_pointer_witness_for_builder_chain() {
+        // `ErrorBody::with_fix(ErrorBody, &'static str) -> ErrorBody`
+        // is the chainable builder for the operator-facing "fix"
+        // hint. Pin via fn-pointer witness: self-by-value (fluent
+        // builder) + `&'static str` arg (catches `String` owned-by-
+        // value refactor forcing a per-call alloc to satisfy the
+        // const &'static str inputs every adapter chain passes —
+        // the field is `Option<&'static str>` so the arg type must
+        // match the field type) + Self-return for chaining. A
+        // refactor to `fn with_fix(&mut self, &'static str) -> &mut Self`
+        // "for ergonomic mid-construction mutation" would break the
+        // `ErrorBody::new(...).with_fix(...).with_docs(...)` chain
+        // in EVERY adapter error-body construction site (50+
+        // call sites). Symmetric to round-281
+        // `webhook_notifier_with_burst_signature_pinned_via_fn_pointer_witness_for_builder_chain`
+        // extended to this sibling envelope builder.
+        let _f: fn(ErrorBody, &'static str) -> ErrorBody = ErrorBody::with_fix;
+    }
+
+    #[test]
+    fn error_body_with_docs_signature_pinned_via_fn_pointer_witness_for_builder_chain() {
+        // `ErrorBody::with_docs(ErrorBody, &'static str) -> ErrorBody`
+        // — the chainable builder for the operator-facing docs link.
+        // Pin via fn-pointer witness symmetric to the `with_fix`
+        // pin in this same round. Both `fix` and `docs` are
+        // `Option<&'static str>` fields and their builders share
+        // the identical signature shape — pinning BOTH separately
+        // catches a one-arm drift (the most likely refactor shape
+        // — "let's widen with_fix to accept owned String for
+        // dynamic fix messages but keep with_docs static" — would
+        // make the field types diverge, breaking the existing
+        // round-198 fix+docs symmetric pin). Symmetric to the
+        // with_fix pin extended to this sibling builder.
+        let _f: fn(ErrorBody, &'static str) -> ErrorBody = ErrorBody::with_docs;
+    }
+
+    #[test]
+    fn error_body_with_extras_signature_pinned_via_fn_pointer_witness_for_jsonb_passthrough_builder()
+     {
+        // `ErrorBody::with_extras(ErrorBody, serde_json::Value) ->
+        // ErrorBody` — the chainable builder for the structured
+        // extras field (policy_id, override_allowed, etc. from
+        // AppError::PolicyBlocked at line 82-85 of adapters/error.rs).
+        // Pin via fn-pointer witness: self-by-value + Value-by-value
+        // consumption (catches `&Value` borrow refactor tying
+        // extras lifetime to the call site frame breaking the
+        // axum-handler return-self chain) + Self-return. The
+        // existing `error_body_extras_field_type_is_value_not_option_value_via_destructure`
+        // pin walks the field-type axis; pin the BUILDER fn-pointer
+        // signature here. Symmetric to the with_fix + with_docs
+        // pins in this same round.
+        let _f: fn(ErrorBody, serde_json::Value) -> ErrorBody = ErrorBody::with_extras;
+    }
+
+    #[test]
+    fn error_body_into_response_with_status_signature_pinned_via_fn_pointer_witness_for_handler_chain()
+     {
+        // `ErrorBody::into_response(self, status: StatusCode) ->
+        // Response` is the production path every handler routes
+        // through to set the correct status code on the envelope.
+        // This is a SEPARATE method from the IntoResponse trait
+        // impl (which defaults to 500) — the inherent method takes
+        // an explicit StatusCode and is the documented production
+        // entry point. Pin via fn-pointer witness so a refactor
+        // that swapped to `fn(self, u16)` "to avoid the StatusCode
+        // import at call sites" would surface here AND a refactor
+        // that consumed `&self` (yielding an owned-self->owned-resp
+        // shape) would surface. The 2-arg shape (self + status) is
+        // load-bearing for every AppError + OAuthError + ApiError
+        // into_response impl that calls `body.into_response(status)`.
+        // Symmetric to round-283 `router_function_signature_pinned_via_fn_pointer_witness`
+        // extended to this sibling envelope assembler.
+        let _f: fn(ErrorBody, StatusCode) -> Response = ErrorBody::into_response;
+    }
+
+    #[test]
+    fn error_body_error_and_code_fields_pinned_static_str_lifetime_via_require_for_zero_alloc_envelope()
+     {
+        // `ErrorBody.error: &'static str` AND `ErrorBody.code:
+        // &'static str` (lines 32+34) — both required fields are
+        // `&'static str`, NOT `String`. Every adapter / API
+        // construction site passes string LITERALS for these two
+        // (e.g. `ErrorBody::new("blocked by policy", code)` at
+        // adapters/error.rs line 78). A refactor to `String` "for
+        // dynamic error messages" would force per-call alloc at
+        // every construction site (50+) AND would expand the
+        // ErrorBody Clone cost on the axum-handler boundary.
+        // The existing `error_body_fix_and_docs_fields_are_option_of_static_str`
+        // pin walks the sibling optional fields; pin BOTH required
+        // fields here so a one-field-not-other drift surfaces.
+        // Symmetric to the round-289 ConfigError InvalidValue.field
+        // &'static str pin extended to this sibling envelope field
+        // pair. Use require_static_str + destructure on a stack-
+        // built ErrorBody.
+        fn require_static_str(_: &'static str) {}
+        let body = ErrorBody::new("test error", "test_code");
+        require_static_str(body.error);
+        require_static_str(body.code);
+    }
 }

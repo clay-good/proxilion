@@ -893,4 +893,151 @@ mod tests {
             CacheError::Db(_inner) => {}
         }
     }
+
+    // ─── round 290 (2026-05-26): CacheError trait bounds + CachedPca Clone + version contract ───
+
+    #[test]
+    fn cache_error_implements_display_via_require_trait_bound_witness_for_tracing_substitution() {
+        // `CacheError: Display` — the persist + get paths emit
+        // structured errors via `tracing::warn!(error = %e, …)` which
+        // routes through the `{}` (`Display`) substitution path, NOT
+        // `{:?}` (`Debug`). The existing
+        // `cache_error_from_sqlx_via_question_mark` pin walks the
+        // `?` conversion; pin the Display TRAIT BOUND here at the
+        // type boundary via require_display witness so a refactor
+        // that dropped the `#[error("postgres: {0}")]` thiserror
+        // attribute "to hand-roll a richer Display impl in a
+        // separate file" would surface at the trait-bound boundary
+        // rather than at every `tracing::warn!` call site as a
+        // generic Display-not-satisfied message. Symmetric to
+        // round-281/285/287/288 build-error Display pins extended
+        // to this sibling cache-error type.
+        fn require_display<T: std::fmt::Display>() {}
+        require_display::<CacheError>();
+    }
+
+    #[test]
+    fn cache_error_implements_std_error_via_require_trait_bound_witness_for_anyhow_question_mark() {
+        // `CacheError: std::error::Error` — emitted by the
+        // `#[derive(thiserror::Error)]` and load-bearing for the
+        // `?` chains in adapter paths that wrap `sqlx::Error` into
+        // `ApiError` / `AppError` via `#[from]`. The existing
+        // `cache_error_from_sqlx_via_question_mark` pin checks the
+        // conversion path runtime behavior; pin the trait-bound axis
+        // here so a refactor that swapped to a hand-rolled Display
+        // impl forgetting to also `impl Error for CacheError` would
+        // surface here. Symmetric to round-280
+        // `app_error_implements_std_error_via_require_for_thiserror_question_mark_chain_propagation`
+        // extended to this sibling cache error type.
+        fn require_error<T: std::error::Error>() {}
+        require_error::<CacheError>();
+    }
+
+    #[test]
+    fn cached_pca_clone_required_via_trait_bound_witness_for_arc_share_at_oauth_callback_path() {
+        // `CachedPca: Clone` is REQUIRED — the OAuth callback handler
+        // at [crates/proxy/src/oauth/routes.rs](../oauth/routes.rs)
+        // clones the cached PCA's cbor + p_0 + ops at line 203-204
+        // for the `cache.insert(&CachedPca { ... })` call AFTER
+        // reading the predecessor PCA via `cache.get(...)`. The
+        // existing Send+Sync+'static pin at line 431 walks the dyn-
+        // share axis only; pin the Clone TRAIT BOUND here at the
+        // type boundary via require_clone witness so a refactor
+        // that dropped `#[derive(Clone)]` from line 23 "for
+        // explicit Arc-management of the inner Vec<u8> cbor +
+        // signature" would surface here as a single type-boundary
+        // failure rather than at every `cached_pca.clone()` call
+        // site in the OAuth callback path. Symmetric to round-279
+        // BroadcastingActionStream + round-281/285/286/287 Clone
+        // witnesses extended to this sibling PCA-cache row type.
+        fn require_clone<T: Clone>() {}
+        require_clone::<CachedPca>();
+    }
+
+    #[test]
+    fn pca_cache_field_count_pinned_at_exactly_one_pool_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // `PcaCache` carries EXACTLY 1 field — `pool: PgPool`. The
+        // existing `pca_cache_new_constructor_type_signature_takes_pg_pool_by_value`
+        // pin walks the constructor; pin the FIELD COUNT here via
+        // exhaustive destructure with NO `..` rest pattern. A
+        // refactor that landed a 2nd field (e.g. `lru: Arc<Mutex<LruCache<Uuid, CachedPca>>>`
+        // "for in-process LRU on top of postgres" OR
+        // `metrics_label: &'static str` for per-tenant metric
+        // splitting) would silently bloat every `PcaCache.clone()`
+        // call at the per-request axum-handler fan-out — AND would
+        // force every test-fixture site that constructs PcaCache by
+        // struct literal to update. Pin via exhaustive destructure
+        // on a real `PcaCache` instance — we can't construct a
+        // PgPool synchronously here, so use an `#[allow(dead_code)]`
+        // fn-destructure witness that the compiler still type-
+        // checks. Symmetric to round-281 NotifierBuildError 1-field
+        // destructure extended to this sibling 1-field type.
+        #[allow(dead_code)]
+        fn destructure_witness(c: PcaCache) {
+            let PcaCache { pool: _ } = c;
+        }
+    }
+
+    #[test]
+    fn cached_pca_p_0_field_pinned_owned_string_and_ops_field_pinned_owned_vec_string_via_require()
+    {
+        // `CachedPca.p_0: String` AND `CachedPca.ops: Vec<String>`
+        // — both OWNED, NOT borrowed. The cached PCA crosses the
+        // `.execute(&self.pool).await` suspension in `PcaCache::insert`
+        // AND the `.fetch_optional(&self.pool).await` suspension in
+        // `PcaCache::get`. A refactor to `&'a str` on p_0 OR
+        // `&'a [String]` on ops "for zero-alloc adapter-side cache
+        // hits" would tie CachedPca's lifetime to the request frame
+        // and break the cross-await sqlx bind path. The existing
+        // `cached_pca_pic_profile_field_pinned_owned_string_via_require`
+        // pin walks the sibling pic_profile field; pin BOTH p_0 +
+        // ops here so a one-field-not-other drift surfaces. Symmetric
+        // to round-279 ActionEvent quartet owned-String pin extended
+        // to this sibling CachedPca pair.
+        fn require_owned_string(_: String) {}
+        fn require_owned_vec_string(_: Vec<String>) {}
+        let pca = CachedPca::new(
+            Uuid::nil(),
+            vec![],
+            "alice@example.com".to_string(),
+            vec!["drive:read:file/x".to_string()],
+            0,
+            None,
+        );
+        require_owned_string(pca.p_0);
+        require_owned_vec_string(pca.ops);
+    }
+
+    #[test]
+    fn current_pic_profile_starts_with_proxilion_dot_and_ends_with_dot_v1_for_version_contract() {
+        // `CURRENT_PIC_PROFILE = "proxilion.v1"` (line 21) — the
+        // verifier mismatch detection (`pic_profile_mismatch_at`
+        // surface in api/mod.rs line 100) anchors on this byte-exact
+        // string. The existing `current_pic_profile_is_stable_v1_string`
+        // pin walks the full literal; pin the STRUCTURAL contract
+        // here so a refactor that legitimately bumped the version
+        // (`proxilion.v2`) would surface here at the version-suffix
+        // axis — AND would force the migration story (spec.md §15
+        // #11) the byte-exact pin alone doesn't anchor. Pin both
+        // the namespace prefix `proxilion.` AND the `.v1` version
+        // suffix so a refactor that legitimately bumps to v2 OR
+        // accidentally renames the namespace surfaces here. Symmetric
+        // to round-285 SIEM-schema `.v1` versioning suffix pin
+        // extended to this sibling PIC-profile versioning constant.
+        assert!(
+            CURRENT_PIC_PROFILE.starts_with("proxilion."),
+            "PIC profile must carry the proxilion. namespace prefix, got: {CURRENT_PIC_PROFILE:?}"
+        );
+        assert!(
+            CURRENT_PIC_PROFILE.ends_with(".v1"),
+            "PIC profile must end with .v1 version suffix, got: {CURRENT_PIC_PROFILE:?}"
+        );
+        // Defensive: no internal whitespace, no leading/trailing
+        // dots, no double-dot.
+        assert!(!CURRENT_PIC_PROFILE.contains(' '));
+        assert!(!CURRENT_PIC_PROFILE.starts_with('.'));
+        assert!(!CURRENT_PIC_PROFILE.ends_with('.'));
+        assert!(!CURRENT_PIC_PROFILE.contains(".."));
+    }
 }

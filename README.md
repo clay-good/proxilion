@@ -314,9 +314,11 @@ properties end-to-end:
 | email approval landing | the single-use token is consumed only on **POST**, never on a prefetch GET; a re-GET shows "already used" |
 | `killswitch --dry-run` | the preview `count(*)` equals the real revoke exactly, changes no state, and writes no `kill_records` row |
 | blocked-queue `list` / `show` | status/policy filters, the auto-expire-on-list of past-due pending rows, and unknown-id → 404 |
+| Drive adapter `proxy_request` (full path) | policy eval → PIC mint vs a **wiremock'd Trust Plane** (422 → audit fallback) → upstream GET to a **wiremock'd Google** → read-filter quarantines an injection pattern (replaced by `[redacted by proxilion read-filter]`) while surrounding text passes through |
 
-The next slice is the wiremock'd Google / Trust-Plane adapter scenarios (which
-also need a seeded `pca_cache` + a successor PoC).
+These run in the CI `integration` job (postgres service) on every push. The
+next slice is the runtime-gate "forced ops mismatch → 403" and the Gmail
+external-send 403, which build on this same wiremock'd harness.
 
 ## License
 

@@ -16,6 +16,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **End-to-end Drive adapter integration test** (spec.md §1.3 "read filter
+  triggers → marker present", the long-deferred wiremock'd-Google scenario) —
+  [google_drive.rs](crates/proxy/src/adapters/google_drive.rs)
+  `db_backed_drive_get_audit_mode_read_filter_quarantines_injection` drives the
+  whole `proxy_request` path: policy eval → PIC mint against a **wiremock'd
+  Trust Plane** (422 → `audit` fallback, no real crypto) → upstream GET to a
+  **wiremock'd Google** (via the `google_api_base` override) → read-filter
+  quarantine. Asserts the injection pattern is replaced by `read_filter::MARKER`
+  while surrounding text passes through. Runs in the CI `integration` job
+  (postgres service); skips locally without `PROXILION_TEST_DATABASE_URL`.
 - **CI now runs the DB-backed integration tests** — a new `integration` job in
   [.github/workflows/ci.yml](.github/workflows/ci.yml) provisions a
   `postgres:16-alpine` service and sets `PROXILION_TEST_DATABASE_URL`, so the

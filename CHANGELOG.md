@@ -14,6 +14,30 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ## [Unreleased]
 
+### Added
+
+- **CLI: shell completion** (surface-delight-and-correctness.md §3.4) —
+  `proxilion-cli completion bash|zsh|fish|powershell|elvish` emits a completion
+  script via `clap_complete` (offline; handled before any HTTP client is
+  built). Documented in the README install section. New dependency:
+  `clap_complete` (MIT/Apache-2.0, reuses clap's existing transitive deps).
+- **CLI: `clients list` table** (§3.1) — `clients list` gains `--format
+  pretty|json` and renders an aligned `client_id · name · created_at · revoked`
+  table instead of raw JSON (`blocked list` / `policy list` already had
+  tables).
+- **Approval messages: absolute expiry + inline matched detail** (§4.3, §4.4) —
+  Slack and email now show an absolute UTC `expires_at` (computed at send so it
+  doesn't drift as the message sits unread) instead of "expires in 30m"; the
+  shared window is `notifier::OVERRIDE_TOKEN_TTL_MINUTES`. Slack inlines the
+  matched rule id + a full-width detail excerpt (section block, ~2900 chars)
+  rather than truncating to 140; email already showed full detail.
+
+### Changed
+
+- **CLI: actionable parse errors** (§3.6) — `--since`, `--older-than`, and
+  `--against` parse failures now name the accepted forms (RFC3339 timestamp or
+  a duration like `30m` / `24h` / `7d`).
+
 ### Security
 
 - **Path / SSRF injection closed in the Drive & Gmail adapters**

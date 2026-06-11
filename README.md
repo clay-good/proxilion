@@ -255,6 +255,18 @@ defaults to an aligned `pretty` table; `--format json|ndjson` for machines.
 | `killswitch session\|user\|all` | revoke an agent/user's authority; rejected on the next request |
 | `clients list\|add\|revoke` / `tokens …` | OAuth client + operator-token registry |
 | `metrics sample` / `trust-plane …` / `notifier …` | Prometheus, Trust Plane, and notifier diagnostics |
+| `completion bash\|zsh\|fish` | emit a shell completion script (offline) |
+
+**Shell completion** (subcommand discovery without memorization):
+
+```bash
+# bash
+proxilion-cli completion bash | sudo tee /etc/bash_completion.d/proxilion-cli
+# zsh — write to a directory on your $fpath, e.g.
+proxilion-cli completion zsh > "${fpath[1]}/_proxilion-cli"
+# fish
+proxilion-cli completion fish > ~/.config/fish/completions/proxilion-cli.fish
+```
 
 ## Design decisions
 

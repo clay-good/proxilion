@@ -195,6 +195,14 @@ impl EmailNotifier {
             self.proxy_public_url, reject_token
         );
 
+        // §4.3 — absolute expiry (UTC) computed at send so it doesn't drift as
+        // the message sits unread. Matches the `now() + interval '30 minutes'`
+        // window the tokens were minted with above (`OVERRIDE_TOKEN_TTL_MINUTES`).
+        let expires = (chrono::Utc::now()
+            + chrono::Duration::minutes(super::OVERRIDE_TOKEN_TTL_MINUTES))
+        .format("%Y-%m-%d %H:%M")
+        .to_string();
+
         let subject = if is_escalation {
             format!(
                 "[Proxilion] REMINDER: Blocked: {} by {}",
@@ -219,7 +227,7 @@ impl EmailNotifier {
              blocked_id:    {blocked_id}\n\n\
              Approve:  {approve_url}\n\
              Reject:   {reject_url}\n\n\
-             Both links are single-use and expire in 30 minutes.\n",
+             Both links are single-use and expire at {expires} UTC.\n",
             p_0 = n.p_0.unwrap_or("(unknown)"),
             vendor = n.vendor,
             action = n.action,
@@ -245,7 +253,7 @@ impl EmailNotifier {
   <a href="{approve_url}" style="display:inline-block;padding:10px 18px;background:#00b386;color:white;text-decoration:none;border-radius:4px;font-weight:600;margin-right:8px">Approve</a>
   <a href="{reject_url}" style="display:inline-block;padding:10px 18px;background:#f85149;color:white;text-decoration:none;border-radius:4px;font-weight:600">Reject</a>
 </p>
-<p style="font-size:12px;color:#6a737d;margin-top:24px">Both links are single-use and expire in 30 minutes.</p>
+<p style="font-size:12px;color:#6a737d;margin-top:24px">Both links are single-use and expire at {expires} UTC.</p>
 </body></html>"#,
             p_0 = html_escape(n.p_0.unwrap_or("(unknown)")),
             vendor = html_escape(n.vendor),

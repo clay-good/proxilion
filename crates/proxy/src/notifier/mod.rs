@@ -34,6 +34,13 @@ pub use webhook::{NotifierBuildError, WebhookNotifier, WebhookSecret};
 use serde::Serialize;
 use uuid::Uuid;
 
+/// TTL of a single-use approve/reject token, in minutes. The email notifier
+/// mints `notifier_tokens` with `now() + interval '30 minutes'` and the
+/// Slack/email messages display the corresponding absolute `expires_at`
+/// (surface-delight-and-correctness.md §4.3). Kept here so the displayed
+/// window and the minted window stay in lockstep.
+pub const OVERRIDE_TOKEN_TTL_MINUTES: i64 = 30;
+
 /// The envelope every notifier driver receives. Mirrors the
 /// `ui-less-surfaces.md §5.2` shape — fields a human approver needs to
 /// decide. PCA chain bytes / requested_ops are kept light here; deeper

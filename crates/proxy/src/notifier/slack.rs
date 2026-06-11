@@ -178,7 +178,11 @@ impl SlackNotifier {
                 return;
             }
         }
-        let payload = block_kit_payload(n);
+        // §4.3 — absolute expiry computed at send so it doesn't drift as the
+        // message sits unread.
+        let expires_at =
+            chrono::Utc::now() + chrono::Duration::minutes(super::OVERRIDE_TOKEN_TTL_MINUTES);
+        let payload = block_kit_payload(n, expires_at);
         match self
             .http
             .post(&self.incoming_webhook_url)
@@ -312,7 +316,10 @@ fn plural(n: u64, word: &str) -> String {
 /// Buttons carry `value: "approve:<blocked_id>"` / `"reject:<blocked_id>"`
 /// — the interaction webhook parses these to route to approve_inner /
 /// reject_inner.
-fn block_kit_payload(n: &BlockedNotification<'_>) -> serde_json::Value {
+fn block_kit_payload(
+    n: &BlockedNotification<'_>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
     let header = format!("🛑 Blocked: {}", n.action);
     let p_0 = n.p_0.unwrap_or("(unknown)");
     let policy = n.policy_id.unwrap_or("—");
@@ -326,16 +333,24 @@ fn block_kit_payload(n: &BlockedNotification<'_>) -> serde_json::Value {
     let reject_value = format!("reject:{}", n.blocked_id);
     let why_value = format!("why:{}", n.blocked_id);
 
+    // §4.4 — inline the matched rule + a full-width detail excerpt so a
+    // confident approve needs zero clicks. A Slack section `mrkdwn` field
+    // tolerates ~3000 chars; we cap at 2900 to leave room for the label.
+    // Empty detail falls back to a neutral marker rather than blank italics.
+    let detail_block_text = if detail.is_empty() {
+        format!("*Matched rule:* `{policy}`\n_no detail provided_")
+    } else {
+        format!("*Matched rule:* `{policy}`\n{}", truncate(detail, 2900))
+    };
+
     serde_json::json!({
         "blocks": [
             { "type": "header",
               "text": { "type": "plain_text", "text": header } },
             { "type": "section",
               "text": { "type": "mrkdwn", "text": context } },
-            { "type": "context",
-              "elements": [
-                  { "type": "mrkdwn", "text": format!("_{}_", truncate(detail, 140)) }
-              ] },
+            { "type": "section",
+              "text": { "type": "mrkdwn", "text": detail_block_text } },
             { "type": "actions",
               "elements": [
                   { "type": "button",
@@ -353,7 +368,11 @@ fn block_kit_payload(n: &BlockedNotification<'_>) -> serde_json::Value {
             { "type": "context",
               "elements": [
                   { "type": "mrkdwn",
-                    "text": format!("blocked_id `{}` · expires in 30m", n.blocked_id) }
+                    "text": format!(
+                        "blocked_id `{}` · approval window expires {} UTC",
+                        n.blocked_id,
+                        expires_at.format("%Y-%m-%d %H:%M")
+                    ) }
               ] }
         ],
     })
@@ -419,7 +438,8 @@ mod tests {
 
     #[test]
     fn block_kit_payload_has_header_and_buttons() {
-        let p = block_kit_payload(&n());
+        let exp: chrono::DateTime<chrono::Utc> = "2026-06-11T14:35:00Z".parse().unwrap();
+        let p = block_kit_payload(&n(), exp);
         assert_eq!(p["blocks"][0]["type"], "header");
         let actions = &p["blocks"][3]["elements"];
         assert_eq!(actions[0]["value"], format!("approve:{}", Uuid::nil()));
@@ -429,6 +449,50 @@ mod tests {
         assert_eq!(actions[1]["style"], "danger");
         // Why button is neutral (no `style` attribute).
         assert!(actions[2].get("style").is_none());
+    }
+
+    #[test]
+    fn block_kit_detail_section_inlines_matched_rule_and_full_detail() {
+        // §4.4 — the matched rule id and a full-width detail excerpt are
+        // inlined as a section block (block index 2), not truncated to 140 in
+        // a context block, so a confident approve needs zero clicks.
+        let exp: chrono::DateTime<chrono::Utc> = "2026-06-11T14:35:00Z".parse().unwrap();
+        let p = block_kit_payload(&n(), exp);
+        let detail_block = &p["blocks"][2];
+        assert_eq!(detail_block["type"], "section");
+        let text = detail_block["text"]["text"].as_str().unwrap();
+        // n() sets policy_id = "gmail-external", detail = "external recipient".
+        assert!(text.contains("gmail-external"), "missing rule: {text}");
+        assert!(
+            text.contains("external recipient"),
+            "missing detail: {text}"
+        );
+    }
+
+    #[test]
+    fn block_kit_detail_section_tolerates_a_long_excerpt_beyond_140_chars() {
+        // §4.4 — a >140-char detail must survive (it used to be cut to 140).
+        let long = "x".repeat(800);
+        let mut note = n();
+        note.detail = Some(&long);
+        let exp: chrono::DateTime<chrono::Utc> = "2026-06-11T14:35:00Z".parse().unwrap();
+        let p = block_kit_payload(&note, exp);
+        let text = p["blocks"][2]["text"]["text"].as_str().unwrap();
+        assert!(text.contains(&"x".repeat(800)), "long detail was truncated");
+    }
+
+    #[test]
+    fn block_kit_footer_shows_absolute_expiry_not_relative_phrasing() {
+        // §4.3 — the footer must carry an absolute UTC `expires_at`, not the
+        // drift-prone "expires in 30m" relative phrasing.
+        let exp: chrono::DateTime<chrono::Utc> = "2026-06-11T14:35:00Z".parse().unwrap();
+        let p = block_kit_payload(&n(), exp);
+        let footer = p["blocks"][4]["elements"][0]["text"].as_str().unwrap();
+        assert!(footer.contains("2026-06-11 14:35 UTC"), "footer: {footer}");
+        assert!(
+            !footer.contains("expires in 30m"),
+            "still relative: {footer}"
+        );
     }
 
     #[test]
@@ -1039,7 +1103,8 @@ mod tests {
         // via require_value AND that block_kit_payload + summary_block_kit_payload
         // both share the contract.
         fn require_value(_: serde_json::Value) {}
-        require_value(block_kit_payload(&n()));
+        let exp: chrono::DateTime<chrono::Utc> = "2026-06-11T14:35:00Z".parse().unwrap();
+        require_value(block_kit_payload(&n(), exp));
         // summary_block_kit_payload symmetric.
         let s = BurstSummary {
             schema: BurstSummary::SCHEMA,

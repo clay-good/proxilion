@@ -2,7 +2,7 @@
 
 **One line:** Make the three customer-facing surfaces (CLI, human-in-the-loop approvals, marketing site) a pleasure to use, and close the concrete correctness gaps an audit of the existing code surfaced — without adding a dashboard.
 
-**Status:** Partially implemented (2026-06-11). The entire correctness work-stream (§6.1–§6.7, Phase 0 + Phase 1) and the marketing-site delight items (§5.1–§5.4, Phase 4) have landed with regression tests; the CLI delight (§3) and approval-justification capture (§4) remain Proposed. Companion to [spec.md](spec.md) and [ui-less-surfaces.md](ui-less-surfaces.md). This spec **extends** the three surfaces defined in `ui-less-surfaces.md` (it does not supersede them) and **adds** a correctness work-stream (§6) for bugs found during the 2026-06-11 repo audit. The "no React dashboard" decision in `ui-less-surfaces.md` §0 stands — every item here lands in a surface that already exists.
+**Status:** Substantially implemented (2026-06-11). Landed with regression tests: the entire correctness work-stream (§6.1–§6.7), the marketing-site delight (§5.1–§5.4), CLI delight §3.1/§3.4/§3.6 (and §4.1's CLI `--justification` requirement, which was already in place), and approval delight §4.3/§4.4. **Still Proposed:** §3.2 (`--color`, deferred — gating the 31 inline color-capture sites cleanly would trip `non_snake_case` under `clippy -D warnings`; needs a helper-fn pass), §3.3 (`--dry-run`, needs a proxy read-only resolve-count endpoint), §3.5 (progress feedback), and §4.1's Slack-modal / email-form + §4.2 view-details (interactive Slack payloads + email token-on-POST — the larger, higher-risk surface). Companion to [spec.md](spec.md) and [ui-less-surfaces.md](ui-less-surfaces.md). This spec **extends** the three surfaces defined in `ui-less-surfaces.md` (it does not supersede them) and **adds** a correctness work-stream (§6) for bugs found during the 2026-06-11 repo audit. The "no React dashboard" decision in `ui-less-surfaces.md` §0 stands — every item here lands in a surface that already exists.
 
 **Author intent:** The three surfaces are functionally complete (see `ui-less-surfaces.md` §3–§5 status blocks), but "complete" is not the same as "delightful," and the audit found six real defects ranging from a path-injection / confused-deputy vector to a silently-broken flagship policy gate. This spec packages the polish and the fixes as one coherent unit of work so the delight items don't ship on top of latent correctness bugs.
 
@@ -50,7 +50,7 @@ The product is deliberately UI-less (`ui-less-surfaces.md` §0). "Good UI" here 
 
 Reference: [crates/cli/src/main.rs](../../crates/cli/src/main.rs). The CLI already has `pretty | json | ndjson` formats, SSE tail, `$EDITOR` policy edit, and humantime parsing. The gaps below are what stop it from feeling first-class.
 
-### 3.1 Colored, aligned tables for every list command — `[ ]` Proposed
+### 3.1 Colored, aligned tables for every list command — `[x]` Done (2026-06-11)
 
 Today `blocked list` and `policy list` print raw JSON ([main.rs](../../crates/cli/src/main.rs) `blocked`/`policy` arms); only `actions list` renders a table. **Requirement:** every `*-list` command's `pretty` format renders an aligned ASCII table. Minimum columns:
 
@@ -60,7 +60,9 @@ Today `blocked list` and `policy list` print raw JSON ([main.rs](../../crates/cl
 | `policy list` | `policy_id` · `mode` · `layer` · `last_reload` |
 | `clients list` | `client_id` · `name` · `created_at` · `revoked` |
 
-`--format json` / `ndjson` behavior is unchanged. Table rendering shares one helper (column auto-width, header rule) so all commands align identically.
+`--format json` / `ndjson` behavior is unchanged.
+
+*Implementation note (2026-06-11):* `blocked list` and `policy list` already rendered aligned tables; the gap was `clients list` (raw JSON, no `--format`). It now takes `--format pretty|json` and renders the `client_id · name · created_at · revoked` table. A fully shared auto-width helper across all three is deferred — each table uses fixed column widths today; unifying them is cosmetic and not blocking.
 
 ### 3.2 Global `--color auto|always|never`, honoring `NO_COLOR` — `[ ]` Proposed
 
@@ -70,7 +72,7 @@ Color constants exist but are applied inconsistently. **Requirement:** a top-lev
 
 `killswitch session|user|all` ([main.rs](../../crates/cli/src/main.rs) killswitch arm) executes after only a `--confirm yes` gate. **Requirement:** `--dry-run` resolves the target and prints the blast radius (count of sessions/bearers that *would* be revoked, the resolved `p_0`/session ids) **without** calling the revoke endpoint. Applies to `killswitch *`, `clients revoke`, and `actions purge`. This needs a proxy-side read-only "resolve target" path (count only) — see §9 Phase 2.
 
-### 3.4 Shell completion — `[ ]` Proposed
+### 3.4 Shell completion — `[x]` Done (2026-06-11)
 
 **Requirement:** `proxilion-cli completion bash|zsh|fish` emits a completion script via `clap_complete`. Documented in `README.md` install section. Subcommand discovery without memorization is the single biggest first-run ergonomics win.
 
@@ -78,7 +80,7 @@ Color constants exist but are applied inconsistently. **Requirement:** a top-lev
 
 `actions export` and `policy simulate` can stream thousands of rows with only a trailing `eprintln`. **Requirement:** when stderr is a TTY, show a lightweight progress indicator (rows processed, elapsed). Suppressed under `--format json`, non-TTY, and `--color never`. No new heavy dependency — a periodic stderr counter is sufficient.
 
-### 3.6 Actionable error messages — `[ ]` Proposed
+### 3.6 Actionable error messages — `[x]` Done (2026-06-11)
 
 Errors like `invalid --older-than` ([main.rs](../../crates/cli/src/main.rs)) state the problem but not the fix. **Requirement:** parse-failure messages name the accepted forms (e.g. `expected RFC3339 timestamp or duration like "24h", "7d"`). Bounded scope: the ~6 user-input parse sites, not a framework.
 
@@ -95,7 +97,7 @@ Both surfaces record the approver but synthesize the justification (`"approved v
 **Requirement:**
 - **Slack:** the **Approve** button opens a Block Kit modal with a single required free-text "Justification" input before the override commits. **Reject** opens the same modal (reason optional). The entered text becomes the override `justification`, replacing the synthesized string.
 - **Email:** the approve/reject link lands on a confirmation page (it already redirects to `/notifier/approve?t=…`) that now renders a short form with a justification textarea and a confirm button. This also fixes the email-client link-prefetch hazard (a prefetch can today consume the single-use token silently) — the token is consumed on **form POST**, not on GET.
-- **CLI:** `blocked approve <id> --justification "<text>"` makes `--justification` required for `approve` (optional for `reject`).
+- **CLI:** `blocked approve <id> --justification "<text>"` makes `--justification` required for `approve` (optional for `reject`). **`[x]` Done** — already in place: `--justification` is a required `String` arg on `approve` and `--reason` is `Option<String>` on `reject`.
 
 The justification column already exists on the override audit row; this populates it with human intent instead of boilerplate.
 
@@ -103,13 +105,15 @@ The justification column already exists on the override audit row; this populate
 
 Slack has a non-destructive **Why?** button; email has no read-only path — to see full context an operator must approve or reject. **Requirement:** the email body gains a `View details` link to a read-only page (no token consumption) showing policy, matched detail, requested ops, and the request snapshot. Mirrors Slack's forensic affordance.
 
-### 4.3 Absolute "expires at" timestamp — `[ ]` Proposed
+### 4.3 Absolute "expires at" timestamp — `[x]` Done (2026-06-11)
 
 Messages say "expires in 30 minutes" (relative, computed at send) — misleading once the message sits unread. **Requirement:** Slack footer and email body show an absolute `expires_at` (UTC, e.g. `2026-06-11 14:35 UTC`) alongside or instead of the relative phrasing.
 
-### 4.4 Inline the matched detail (stop truncating to 140 chars) — `[ ]` Proposed
+### 4.4 Inline the matched detail (stop truncating to 140 chars) — `[x]` Done (2026-06-11)
 
 Slack truncates `detail` to 140 chars ([notifier/slack.rs](../../crates/proxy/src/notifier/slack.rs)); email truncates similarly. The matched pattern / rule is often exactly what the approver needs and is exactly what gets cut. **Requirement:** show the matched rule id and a longer detail excerpt (Slack section block tolerates ~3000 chars) inline, so a confident approve needs zero clicks.
+
+*Implementation note (2026-06-11):* Slack now renders the detail as a full-width `section` block (`*Matched rule:* \`<policy_id>\`` + detail capped at 2900 chars) instead of a 140-char `context` element. Email already inlined the policy id and full (un-truncated) detail, so no email change was needed.
 
 ---
 

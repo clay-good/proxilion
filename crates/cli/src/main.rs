@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -42,6 +43,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Emit a shell completion script for `proxilion-cli`.
+    ///
+    /// surface-delight-and-correctness.md §3.4. Offline — talks to no proxy.
+    /// Install (bash): `proxilion-cli completion bash > /etc/bash_completion.d/proxilion-cli`.
+    /// zsh: write to a dir on `$fpath`; fish: `~/.config/fish/completions/`.
+    Completion {
+        /// Target shell: bash | zsh | fish | powershell | elvish.
+        shell: Shell,
+    },
     /// Probe the proxy's /healthz.
     Health,
     /// Fetch a single PCA by id.
@@ -124,6 +134,9 @@ enum ClientsCmd {
     List {
         #[arg(long)]
         all: bool,
+        /// Output: pretty (default) | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
     },
     /// Register a new OAuth client.
     Add {
@@ -565,6 +578,16 @@ enum ActionsCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Offline, network-free commands handled before the HTTP client is built.
+    if let Cmd::Completion { shell } = &cli.cmd {
+        let shell = *shell;
+        let mut cmd = Cli::command();
+        let bin = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
+        return Ok(());
+    }
+
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .danger_accept_invalid_certs(cli.insecure)
@@ -572,6 +595,7 @@ async fn main() -> Result<()> {
         .context("building reqwest client")?;
 
     match cli.cmd {
+        Cmd::Completion { .. } => unreachable!("handled before the HTTP client is built"),
         Cmd::Health => cmd_health(&http, &cli.url).await,
         Cmd::Pca { id } => cmd_pca(&http, &cli.url, &cli.token, &id).await,
         Cmd::Verify { id } => cmd_verify(&http, &cli.url, &cli.token, &id).await,
@@ -597,7 +621,7 @@ async fn cmd_clients(sub: ClientsCmd) -> Result<()> {
         .await
         .context("connecting to postgres")?;
     match sub {
-        ClientsCmd::List { all } => {
+        ClientsCmd::List { all, format } => {
             let rows: Vec<(
                 String,
                 String,
@@ -616,7 +640,7 @@ async fn cmd_clients(sub: ClientsCmd) -> Result<()> {
             .await
             .context("selecting oauth_clients")?;
             let arr: Vec<_> = rows
-                .into_iter()
+                .iter()
                 .map(|(id, name, redirects, created, revoked, reason)| {
                     json!({
                         "id": id,
@@ -628,7 +652,31 @@ async fn cmd_clients(sub: ClientsCmd) -> Result<()> {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&arr)?);
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                // §3.1 — aligned table: client_id · name · created_at · revoked.
+                println!(
+                    "{:<28} {:<24} {:<22} revoked",
+                    "client_id", "name", "created_at"
+                );
+                println!("{}", "─".repeat(86));
+                for (id, name, _redirects, created, revoked, reason) in &rows {
+                    let revoked_cell = match (revoked, reason) {
+                        (Some(t), Some(r)) => format!("yes ({}) — {}", t.format("%Y-%m-%d"), r),
+                        (Some(t), None) => format!("yes ({})", t.format("%Y-%m-%d")),
+                        (None, _) => "no".to_string(),
+                    };
+                    println!(
+                        "{:<28} {:<24} {:<22} {}",
+                        truncate(id, 28),
+                        truncate(name, 24),
+                        created.format("%Y-%m-%d %H:%M UTC"),
+                        revoked_cell,
+                    );
+                }
+                println!("\n{} client(s)", rows.len());
+            }
             Ok(())
         }
         ClientsCmd::Add {
@@ -1030,8 +1078,12 @@ async fn actions_purge(
     dry_run: bool,
     format: &str,
 ) -> Result<()> {
-    let cutoff =
-        parse_since(older_than).with_context(|| format!("invalid --older-than {older_than:?}"))?;
+    let cutoff = parse_since(older_than).with_context(|| {
+        format!(
+            "invalid --older-than {older_than:?} — expected an RFC3339 timestamp \
+             or a duration like \"24h\", \"7d\""
+        )
+    })?;
     let body = serde_json::json!({
         "older_than": cutoff.to_rfc3339(),
         "dry_run": dry_run,
@@ -1063,8 +1115,12 @@ fn parse_since(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&chrono::Utc));
     }
-    let dur = humantime::parse_duration(s)
-        .with_context(|| format!("--since {s:?} is not a duration or RFC3339 date"))?;
+    let dur = humantime::parse_duration(s).with_context(|| {
+        format!(
+            "--since {s:?} is not a valid value — expected an RFC3339 timestamp \
+             (e.g. 2026-06-11T14:00:00Z) or a duration like \"30m\", \"24h\", \"7d\""
+        )
+    })?;
     let chrono_dur =
         chrono::Duration::from_std(dur).map_err(|_| anyhow!("--since duration overflows"))?;
     Ok(chrono::Utc::now() - chrono_dur)
@@ -2746,7 +2802,12 @@ fn parse_window(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     // Try as RFC 3339.
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|e| anyhow!("invalid --against value `{s}`: {e}"))
+        .map_err(|e| {
+            anyhow!(
+                "invalid --against value `{s}` — expected an RFC3339 timestamp \
+                 (e.g. 2026-06-11T14:00:00Z) or a window like \"7d\", \"24h\", \"30m\", \"45s\": {e}"
+            )
+        })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3092,6 +3153,38 @@ async fn cmd_notifier(
 #[cfg(test)]
 mod pure_helper_tests {
     use super::*;
+
+    #[test]
+    fn cli_command_tree_is_internally_consistent() {
+        // clap's debug_assert validates the whole derive tree (no
+        // duplicate args, valid value-parsers, etc). Catches a malformed
+        // subcommand/arg at test time rather than at first invocation —
+        // including the new `completion` arm.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completion_generates_a_nonempty_script_for_every_supported_shell() {
+        // §3.4 — `proxilion-cli completion <shell>` must emit a script for
+        // each clap_complete shell. Generate into a buffer and assert it
+        // references the binary name, so a broken command tree surfaces here.
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let mut cmd = Cli::command();
+            let mut buf: Vec<u8> = Vec::new();
+            clap_complete::generate(shell, &mut cmd, "proxilion-cli", &mut buf);
+            let script = String::from_utf8(buf).expect("completion script is utf8");
+            assert!(
+                !script.is_empty() && script.contains("proxilion-cli"),
+                "{shell:?} completion script missing binary name",
+            );
+        }
+    }
 
     #[test]
     fn format_metric_value_integers_drop_decimal() {

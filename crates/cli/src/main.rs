@@ -6,11 +6,13 @@
 //! `/v1/pca/issue`). For deeper SQL audit (action stream, blocked actions,
 //! quarantine), connect to postgres — see `docs/specs/spec.md` §5.4.
 
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,8 +39,22 @@ struct Cli {
     #[arg(long, env = "PROXILION_OPERATOR_TOKEN", default_value = "")]
     token: String,
 
+    /// When to colorize output: auto (color iff stdout is a TTY and
+    /// `NO_COLOR` is unset), always, or never.
+    /// surface-delight-and-correctness.md §3.2.
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// `--color` policy. `auto` honors `NO_COLOR` and the TTY-ness of stdout.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ColorChoice {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Subcommand, Debug)]
@@ -156,6 +172,10 @@ enum ClientsCmd {
         id: String,
         #[arg(long, default_value = "operator-initiated")]
         reason: String,
+        /// Preview whether the client would be revoked (and that it exists and
+        /// is not already revoked) without writing. §3.3.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -210,6 +230,10 @@ enum KillswitchCmd {
         /// Operator-visible reason; stored on `kill_records.reason`.
         #[arg(long, default_value = "operator-initiated")]
         reason: String,
+        /// Preview the blast radius (count of bearers that WOULD be revoked)
+        /// without revoking anything. surface-delight-and-correctness.md §3.3.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Revoke every active session for a user (`p_0`). Use for full-user
     /// kill — e.g., suspended account, compromised credentials.
@@ -219,16 +243,22 @@ enum KillswitchCmd {
         p_0: String,
         #[arg(long, default_value = "operator-initiated")]
         reason: String,
+        /// Preview without revoking. §3.3.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Revoke EVERY active session globally. Requires explicit confirmation
     /// to guard against fat-fingered fleet-wide kills.
     All {
-        /// Must be `yes` (case-sensitive) for the kill to fire. Anything
-        /// else exits 2 with a "did you mean it?" message.
-        #[arg(long)]
+        /// Must be `yes` (case-sensitive) for the kill to fire. Not required
+        /// with `--dry-run` (a preview revokes nothing).
+        #[arg(long, default_value = "")]
         confirm: String,
         #[arg(long, default_value = "operator-initiated")]
         reason: String,
+        /// Preview the fleet-wide blast radius without revoking. §3.3.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -578,6 +608,7 @@ enum ActionsCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    set_color_mode(cli.color);
 
     // Offline, network-free commands handled before the HTTP client is built.
     if let Cmd::Completion { shell } = &cli.cmd {
@@ -722,7 +753,33 @@ async fn cmd_clients(sub: ClientsCmd) -> Result<()> {
             );
             Ok(())
         }
-        ClientsCmd::Revoke { id, reason } => {
+        ClientsCmd::Revoke {
+            id,
+            reason,
+            dry_run,
+        } => {
+            if dry_run {
+                // §3.3 — resolve the target (would it be revoked?) without
+                // writing. Counts the rows the real UPDATE's WHERE matches.
+                let active: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM oauth_clients WHERE id = $1 AND revoked_at IS NULL",
+                )
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .context("previewing oauth_clients revoke")?;
+                if active == 0 {
+                    return Err(anyhow!(
+                        "no active client with id `{id}` (already revoked, or never existed)"
+                    ));
+                }
+                #[allow(non_snake_case)]
+                let (GREEN, _, DIM, RESET, _) = colors();
+                println!(
+                    "{GREEN}dry-run{RESET}: would revoke client {DIM}{id}{RESET} (reason: {reason}) — nothing was changed."
+                );
+                return Ok(());
+            }
             let res = sqlx::query(
                 "UPDATE oauth_clients
                     SET revoked_at = now(), revoked_reason = $2
@@ -871,6 +928,8 @@ async fn cmd_trust_plane(
 }
 
 async fn cmd_status(http: &reqwest::Client, url: &str, token: &str, format: &str) -> Result<()> {
+    #[allow(non_snake_case)]
+    let (GREEN, RED, _, RESET, _) = colors();
     let healthz: Value = http
         .get(format!("{url}/healthz"))
         .send()
@@ -969,27 +1028,62 @@ async fn cmd_killswitch(
     token: &str,
     sub: KillswitchCmd,
 ) -> Result<()> {
-    let (path, reason) = match sub {
-        KillswitchCmd::Session { id, reason } => (
+    #[allow(non_snake_case)]
+    let (GREEN, RED, DIM, RESET, _) = colors();
+    // (path, reason, dry_run, confirm) — `confirm` is forwarded only for the
+    // `all` scope (the server gates a real fleet-wide kill on it).
+    let (path, reason, dry_run, confirm) = match sub {
+        KillswitchCmd::Session {
+            id,
+            reason,
+            dry_run,
+        } => (
             format!("/api/v1/killswitch/session/{}", urlencode(&id)),
             reason,
+            dry_run,
+            None,
         ),
-        KillswitchCmd::User { p_0, reason } => (
+        KillswitchCmd::User {
+            p_0,
+            reason,
+            dry_run,
+        } => (
             format!("/api/v1/killswitch/user/{}", urlencode(&p_0)),
             reason,
+            dry_run,
+            None,
         ),
-        KillswitchCmd::All { confirm, reason } => {
-            if confirm != "yes" {
+        KillswitchCmd::All {
+            confirm,
+            reason,
+            dry_run,
+        } => {
+            // A real (non-dry-run) fleet kill requires the explicit gate.
+            if !dry_run && confirm != "yes" {
                 eprintln!(
                     "{RED}refused{RESET}: `killswitch all` requires --confirm yes (case-sensitive). Got: {confirm:?}"
                 );
                 std::process::exit(2);
             }
-            ("/api/v1/killswitch/all".to_string(), reason)
+            (
+                "/api/v1/killswitch/all".to_string(),
+                reason,
+                dry_run,
+                Some(confirm),
+            )
         }
     };
+    // Build the request body: reason always, dry_run when previewing, and
+    // confirm forwarded for the `all` scope's server-side gate.
+    let mut payload = serde_json::json!({ "reason": reason });
+    if dry_run {
+        payload["dry_run"] = serde_json::json!(true);
+    }
+    if let Some(c) = &confirm {
+        payload["confirm"] = serde_json::json!(c);
+    }
     let resp = auth_header(http.post(format!("{url}{path}")), token)
-        .json(&serde_json::json!({ "reason": reason }))
+        .json(&payload)
         .send()
         .await?;
     let status = resp.status();
@@ -1001,7 +1095,19 @@ async fn cmd_killswitch(
         );
         std::process::exit(1);
     }
-    println!("{}", serde_json::to_string_pretty(&body)?);
+    if dry_run {
+        let n = body
+            .get("bearers_revoked")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let target = body.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+        let scope = body.get("scope").and_then(|v| v.as_str()).unwrap_or("?");
+        println!(
+            "{GREEN}dry-run{RESET}: would revoke {n} bearer(s) for {scope} {DIM}{target}{RESET} — nothing was changed."
+        );
+    } else {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    }
     Ok(())
 }
 
@@ -1215,6 +1321,8 @@ fn matches_tail_filter(
 }
 
 fn print_pretty_event(json: &str) {
+    #[allow(non_snake_case)]
+    let (GREEN, RED, DIM, RESET, _) = colors();
     let v: Value = serde_json::from_str(json).unwrap_or(Value::Null);
     let at = v.get("at").and_then(|x| x.as_str()).unwrap_or("");
     let vendor = v.get("vendor").and_then(|x| x.as_str()).unwrap_or("?");
@@ -1247,6 +1355,8 @@ async fn actions_list(
     all: bool,
     format: &str,
 ) -> Result<()> {
+    #[allow(non_snake_case)]
+    let (_, _, DIM, RESET, _) = colors();
     let since_dt = since.as_deref().map(parse_since).transpose()?;
     let mut before: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut total = 0usize;
@@ -1390,6 +1500,8 @@ async fn actions_show(
     id: &str,
     format: &str,
 ) -> Result<()> {
+    #[allow(non_snake_case)]
+    let (GREEN, RED, DIM, RESET, _) = colors();
     let v: Value = auth_header(
         http.get(format!("{url}/api/v1/actions/{}", urlencode(id))),
         token,
@@ -1524,6 +1636,8 @@ async fn actions_export(
     p_0: Option<String>,
     output: Option<String>,
 ) -> Result<()> {
+    #[allow(non_snake_case)]
+    let (_, _, DIM, RESET, _) = colors();
     let mut q = vec![format!("format={}", urlencode(format))];
     if let Some(s) = since {
         let dt = parse_since(&s)?;
@@ -1559,12 +1673,15 @@ async fn actions_export(
         None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
     };
     let mut bytes_written: u64 = 0;
+    let mut progress = Progress::new("exporting", "bytes", format);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("read export chunk")?;
         sink.write_all(&chunk)?;
         bytes_written += chunk.len() as u64;
+        progress.tick(bytes_written);
     }
     sink.flush()?;
+    progress.finish(bytes_written);
     eprintln!("{DIM}exported {bytes_written} bytes ({format}){RESET}");
     Ok(())
 }
@@ -1612,20 +1729,137 @@ async fn cmd_verify(http: &reqwest::Client, url: &str, token: &str, id: &str) ->
     Ok(())
 }
 
+// ============ color (§3.2) ============
+
+/// Global ANSI-color gate, set once in `main` from `--color` + `NO_COLOR` +
+/// TTY-ness. Default `false` so any code path that runs before `main` sets it
+/// (and tests) emits no escape codes.
+static COLOR: AtomicBool = AtomicBool::new(false);
+
+/// Whether `--color never` was passed. Tracked separately from [`COLOR`]
+/// because the §3.5 stderr progress indicator keys on stderr TTY-ness (not
+/// stdout's), so it must stay independent of the stdout-driven color gate —
+/// but it should still honor an explicit `--color never`.
+static COLOR_NEVER: AtomicBool = AtomicBool::new(false);
+
+/// Whether ANSI color should be emitted. One predicate, consulted by every
+/// styled write-site via [`colors`].
+fn should_color() -> bool {
+    COLOR.load(Ordering::Relaxed)
+}
+
+/// Resolve `--color` (+ `NO_COLOR` + stdout TTY-ness) into the on/off decision
+/// and store it. `auto` → color iff stdout is a terminal and `NO_COLOR` is
+/// unset (or empty, per no-color.org). Called once at startup.
+fn set_color_mode(choice: ColorChoice) {
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    let enabled = resolve_color(choice, no_color, std::io::stdout().is_terminal());
+    COLOR.store(enabled, Ordering::Relaxed);
+    COLOR_NEVER.store(choice == ColorChoice::Never, Ordering::Relaxed);
+}
+
+/// Pure color decision (extracted for testing): `always`/`never` are absolute;
+/// `auto` enables color iff `NO_COLOR` is unset/empty **and** stdout is a TTY.
+fn resolve_color(choice: ColorChoice, no_color: bool, stdout_is_tty: bool) -> bool {
+    match choice {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => !no_color && stdout_is_tty,
+    }
+}
+
+/// The `(GREEN, RED, DIM, RESET, YELLOW)` SGR tuple — the actual escape codes
+/// when color is enabled, or empty strings when it isn't. Every styled site
+/// binds the subset it needs from this, so a single `should_color()` decision
+/// gates all output.
+fn colors() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    if should_color() {
+        ("\x1b[32m", "\x1b[31m", "\x1b[2m", "\x1b[0m", "\x1b[33m")
+    } else {
+        ("", "", "", "", "")
+    }
+}
+
+/// `\x1b[1m…\x1b[0m` bold wrapper, gated by `should_color()`.
+fn bold(s: &str) -> String {
+    if should_color() {
+        format!("\x1b[1m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// A throttled single-line stderr progress indicator for long streaming
+/// operations (surface-delight-and-correctness.md §3.5). Active only when
+/// stderr is a TTY, `--color never` was not passed, and the output format
+/// isn't `json` (so machine-readable stdout pipelines stay clean and a piped
+/// stderr emits nothing). Renders `\r<label>: <n> <unit> · <elapsed>s` at most
+/// ~8×/second; `finish` clears the line with a final count. A no-op otherwise.
+struct Progress {
+    active: bool,
+    started: Instant,
+    last: Instant,
+    label: &'static str,
+    unit: &'static str,
+}
+
+impl Progress {
+    fn new(label: &'static str, unit: &'static str, format: &str) -> Self {
+        let active = format != "json"
+            && !COLOR_NEVER.load(Ordering::Relaxed)
+            && std::io::stderr().is_terminal();
+        let now = Instant::now();
+        Progress {
+            active,
+            started: now,
+            last: now,
+            label,
+            unit,
+        }
+    }
+
+    fn tick(&mut self, n: u64) {
+        if !self.active {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last) < Duration::from_millis(120) {
+            return;
+        }
+        self.last = now;
+        let secs = self.started.elapsed().as_secs_f64();
+        eprint!("\r{}: {n} {} · {secs:.1}s   ", self.label, self.unit);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+
+    fn finish(&self, n: u64) {
+        if !self.active {
+            return;
+        }
+        let secs = self.started.elapsed().as_secs_f64();
+        eprintln!("\r{}: {n} {} · {secs:.1}s        ", self.label, self.unit);
+    }
+}
+
 // ============ selftest ============
 
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
-
 fn ok(name: &str, latency_ms: u128, detail: &str) {
+    #[allow(non_snake_case)]
+    let (GREEN, _, DIM, RESET, _) = colors();
     println!(
         "  {GREEN}✓{RESET} {name:<28}{DIM}{:>6}ms{RESET}   {detail}",
         latency_ms
     );
 }
 fn fail(name: &str, latency_ms: u128, detail: &str) {
+    #[allow(non_snake_case)]
+    let (_, RED, DIM, RESET, _) = colors();
     println!(
         "  {RED}✗{RESET} {name:<28}{DIM}{:>6}ms{RESET}   {RED}{detail}{RESET}",
         latency_ms
@@ -1637,6 +1871,8 @@ async fn cmd_selftest(
     proxy_url: &str,
     trust_plane_url: &str,
 ) -> Result<()> {
+    #[allow(non_snake_case)]
+    let (GREEN, RED, _, RESET, _) = colors();
     println!("proxilion selftest");
     println!("  proxy:       {proxy_url}");
     println!("  trust-plane: {trust_plane_url}\n");
@@ -2061,6 +2297,8 @@ fn cmd_tokens_scopes(format: &str) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────
 
 async fn cmd_policy(http: &reqwest::Client, url: &str, token: &str, sub: PolicyCmd) -> Result<()> {
+    #[allow(non_snake_case)]
+    let (GREEN, RED, _, RESET, _) = colors();
     match sub {
         PolicyCmd::List { mode, format } => {
             let resp = auth_header(http.get(format!("{url}/api/v1/policy")), token)
@@ -2313,6 +2551,8 @@ async fn cmd_policy_edit(
     explicit_editor: Option<&str>,
     no_reload: bool,
 ) -> Result<()> {
+    #[allow(non_snake_case)]
+    let (GREEN, RED, _, RESET, _) = colors();
     // 1. Resolve the policy file path.
     let path = match explicit_file {
         Some(p) => p.to_string(),
@@ -2485,6 +2725,7 @@ async fn cmd_policy_simulate(
     let mut was_blocked_total: HashMap<String, usize> = HashMap::new();
     let mut now_blocked_total: HashMap<String, usize> = HashMap::new();
     let mut unreplayable: usize = 0;
+    let mut progress = Progress::new("simulating", "rows", format);
 
     let since_str = since.to_rfc3339();
 
@@ -2509,6 +2750,7 @@ async fn cmd_policy_simulate(
         }
         for row in &rows {
             total += 1;
+            progress.tick(total as u64);
             let vendor = row["vendor"].as_str().unwrap_or("").to_string();
             let action = row["action"].as_str().unwrap_or("").to_string();
             let p_0 = row["p_0"].as_str().unwrap_or("").to_string();
@@ -2605,6 +2847,7 @@ async fn cmd_policy_simulate(
             break;
         }
     }
+    progress.finish(total as u64);
 
     // 4. Render report + compute max delta percentage.
     let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -2949,7 +3192,6 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 fn pretty_blocked_record(v: &Value) {
-    let bold = |s: &str| format!("\x1b[1m{s}\x1b[0m");
     println!("{}", bold("blocked action"));
     for k in [
         "id",
@@ -3014,14 +3256,16 @@ async fn cmd_notifier(
             } else {
                 let webhook = &body["webhook"];
                 let configured = webhook["configured"].as_bool().unwrap_or(false);
+                #[allow(non_snake_case)]
+                let (GREEN, _, _, RESET, YELLOW) = colors();
                 if !configured {
-                    println!("webhook: \x1b[33mnot configured\x1b[0m");
+                    println!("webhook: {YELLOW}not configured{RESET}");
                     println!(
                         "  set PROXILION_BLOCKED_WEBHOOK_URL + PROXILION_BLOCKED_WEBHOOK_HMAC_KEY to enable"
                     );
                 } else {
                     println!(
-                        "webhook: \x1b[32mconfigured\x1b[0m  ({})",
+                        "webhook: {GREEN}configured{RESET}  ({})",
                         webhook["proxy_public_url_redacted"]
                             .as_str()
                             .unwrap_or("unknown")
@@ -3153,6 +3397,54 @@ async fn cmd_notifier(
 #[cfg(test)]
 mod pure_helper_tests {
     use super::*;
+
+    #[test]
+    fn resolve_color_honors_never_always_and_auto_matrix() {
+        // §3.2 — `always`/`never` are absolute regardless of TTY/NO_COLOR.
+        assert!(resolve_color(ColorChoice::Always, true, false));
+        assert!(resolve_color(ColorChoice::Always, false, false));
+        assert!(!resolve_color(ColorChoice::Never, false, true));
+        assert!(!resolve_color(ColorChoice::Never, true, true));
+        // `auto`: color iff NO_COLOR unset AND stdout is a TTY.
+        assert!(resolve_color(ColorChoice::Auto, false, true));
+        assert!(!resolve_color(ColorChoice::Auto, true, true)); // NO_COLOR set
+        assert!(!resolve_color(ColorChoice::Auto, false, false)); // piped / non-TTY
+        assert!(!resolve_color(ColorChoice::Auto, true, false));
+    }
+
+    #[test]
+    fn colors_returns_empty_strings_when_disabled_and_codes_when_enabled() {
+        // The `colors()` tuple is the single gate every styled site reads.
+        // Default global is disabled → all empty (the test-process default).
+        let (g, r, d, rs, y) = colors();
+        if should_color() {
+            assert_eq!(
+                (g, r, d, rs, y),
+                ("\x1b[32m", "\x1b[31m", "\x1b[2m", "\x1b[0m", "\x1b[33m")
+            );
+        } else {
+            assert_eq!((g, r, d, rs, y), ("", "", "", "", ""));
+            // bold() is gated by the same predicate.
+            assert_eq!(bold("x"), "x");
+        }
+    }
+
+    #[test]
+    fn progress_is_inert_for_json_format_and_under_test_non_tty() {
+        // §3.5 — a `--format json` run never animates progress (machine
+        // output stays clean), and under the test harness (stderr is not a
+        // TTY) the indicator is inert regardless of format. `tick`/`finish`
+        // must be safe no-ops in the inert state.
+        let mut p = Progress::new("simulating", "rows", "json");
+        assert!(!p.active, "json format must disable progress");
+        p.tick(100);
+        p.finish(100);
+        // Non-json under the (non-TTY) test harness is also inert.
+        let mut p2 = Progress::new("exporting", "bytes", "pretty");
+        assert!(!p2.active, "non-TTY stderr must disable progress in tests");
+        p2.tick(1);
+        p2.finish(1);
+    }
 
     #[test]
     fn cli_command_tree_is_internally_consistent() {

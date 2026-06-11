@@ -16,6 +16,33 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **CLI: `--color auto|always|never`** (surface-delight-and-correctness.md
+  §3.2) — a global flag gating all ANSI output, honoring `NO_COLOR` and
+  non-TTY pipes. The four `const` SGR codes were replaced with a runtime-gated
+  `colors()` tuple resolved once from a pure, unit-tested `resolve_color`
+  decision; every styled site binds the subset it needs so format strings are
+  untouched.
+- **CLI: `--dry-run` on destructive commands** (§3.3) — `killswitch
+  session|user|all` and `clients revoke` preview the blast radius (count of
+  bearers/clients that *would* be revoked) without changing anything
+  (`actions purge --dry-run` already existed). Killswitch previews use a
+  **server count** (`SELECT count(*)` against the same predicate as the real
+  revoke) so the preview matches execution with no TOCTOU gap — no UPDATE, no
+  `kill_records` row, no cache write.
+- **CLI: progress feedback** (§3.5) — `actions export` and `policy simulate`
+  show a throttled single-line stderr progress indicator (bytes/rows +
+  elapsed), suppressed under `--format json`, a piped stderr, or
+  `--color never`. No new dependency.
+
+### Fixed
+
+- **CLI: `killswitch all` now forwards `--confirm` to the server** — it
+  validated `--confirm yes` locally but never sent `confirm` in the request
+  body, so a real fleet-wide kill would have been rejected by the server's
+  `confirm` gate. Surfaced while wiring §3.3 dry-run.
+
+### Added — earlier this cycle
+
 - **CLI: shell completion** (surface-delight-and-correctness.md §3.4) —
   `proxilion-cli completion bash|zsh|fish|powershell|elvish` emits a completion
   script via `clap_complete` (offline; handled before any HTTP client is

@@ -242,6 +242,9 @@ fires when every recipient is external.
 
 `proxilion-cli` is the operator surface — there is no web dashboard. Output
 defaults to an aligned `pretty` table; `--format json|ndjson` for machines.
+Global `--color auto|always|never` gates ANSI (honors `NO_COLOR` and non-TTY
+pipes). Destructive commands take `--dry-run` to preview the blast radius
+(count of bearers/clients that *would* be revoked) without changing anything.
 
 | Command | What it does |
 |---|---|
@@ -252,7 +255,7 @@ defaults to an aligned `pretty` table; `--format json|ndjson` for machines.
 | `policy set-mode <id> …` / `policy edit` / `policy reload` | flip observe↔enforce, `$EDITOR` the live YAML, hot-reload |
 | `policy simulate` | replay traffic and report would-have-blocked deltas per policy |
 | `blocked list` / `blocked show <id>` / `blocked approve <id>` / `blocked reject <id>` | the human-in-the-loop queue |
-| `killswitch session\|user\|all` | revoke an agent/user's authority; rejected on the next request |
+| `killswitch session\|user\|all [--dry-run]` | revoke an agent/user's authority (or preview the blast radius); rejected on the next request |
 | `clients list\|add\|revoke` / `tokens …` | OAuth client + operator-token registry |
 | `metrics sample` / `trust-plane …` / `notifier …` | Prometheus, Trust Plane, and notifier diagnostics |
 | `completion bash\|zsh\|fish` | emit a shell completion script (offline) |

@@ -62,6 +62,12 @@ struct KillBody {
     operator_subject: Option<String>,
     /// Required only by `/killswitch/all`; must equal "yes".
     confirm: Option<String>,
+    /// surface-delight-and-correctness.md §3.3 — when true, resolve the blast
+    /// radius (count of bearers that WOULD be revoked) without revoking
+    /// anything: no UPDATE, no kill_record, no cache write. Lets the CLI
+    /// `--dry-run` preview a killswitch with no TOCTOU gap (the count is
+    /// computed server-side against the same predicate the real revoke uses).
+    dry_run: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,6 +77,10 @@ struct KillResponse {
     target: String,
     bearers_revoked: i64,
     at: DateTime<Utc>,
+    /// True when this was a §3.3 dry-run preview — `bearers_revoked` is the
+    /// count that *would* be revoked and `record_id` is nil (nothing was
+    /// persisted).
+    dry_run: bool,
 }
 
 async fn kill_session(
@@ -80,6 +90,16 @@ async fn kill_session(
 ) -> Result<Json<KillResponse>, ApiError> {
     let body = body.map(|j| j.0).unwrap_or_default();
     let reason = body.reason.clone().unwrap_or_else(|| "killswitch".into());
+    if body.dry_run.unwrap_or(false) {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_bearers WHERE session_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(ApiError::Db)?;
+        return Ok(Json(dry_run_response("session", &id.to_string(), n)));
+    }
     let hashes: Vec<(Vec<u8>,)> = sqlx::query_as(
         "UPDATE agent_bearers
             SET revoked_at      = now(),
@@ -115,6 +135,18 @@ async fn kill_user(
 ) -> Result<Json<KillResponse>, ApiError> {
     let body = body.map(|j| j.0).unwrap_or_default();
     let reason = body.reason.clone().unwrap_or_else(|| "killswitch".into());
+    if body.dry_run.unwrap_or(false) {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_bearers ab
+               JOIN oauth_sessions os ON ab.session_id = os.id
+              WHERE os.p_0 = $1 AND ab.revoked_at IS NULL",
+        )
+        .bind(&p0)
+        .fetch_one(&state.db)
+        .await
+        .map_err(ApiError::Db)?;
+        return Ok(Json(dry_run_response("user", &p0, n)));
+    }
     let hashes: Vec<(Vec<u8>,)> = sqlx::query_as(
         "UPDATE agent_bearers ab
             SET revoked_at      = now(),
@@ -150,6 +182,17 @@ async fn kill_all(
     body: Option<Json<KillBody>>,
 ) -> Result<Json<KillResponse>, ApiError> {
     let body = body.map(|j| j.0).unwrap_or_default();
+    // A dry-run preview is read-only, so it does NOT require the `confirm`
+    // gate — the operator is asking "how big is the blast radius?" before
+    // deciding to confirm.
+    if body.dry_run.unwrap_or(false) {
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM agent_bearers WHERE revoked_at IS NULL")
+                .fetch_one(&state.db)
+                .await
+                .map_err(ApiError::Db)?;
+        return Ok(Json(dry_run_response("all", "*", n)));
+    }
     if body.confirm.as_deref() != Some("yes") {
         return Err(ApiError::BadRequest(
             "/killswitch/all requires { confirm: \"yes\" } in the body".into(),
@@ -239,7 +282,21 @@ async fn persist(
         target: target.to_string(),
         bearers_revoked,
         at,
+        dry_run: false,
     })
+}
+
+/// Build a §3.3 dry-run preview response: `record_id` nil (nothing persisted),
+/// `bearers_revoked` the count that *would* be revoked, `dry_run: true`.
+fn dry_run_response(scope: &'static str, target: &str, bearers_revoked: i64) -> KillResponse {
+    KillResponse {
+        record_id: Uuid::nil(),
+        scope,
+        target: target.to_string(),
+        bearers_revoked,
+        at: Utc::now(),
+        dry_run: true,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -339,6 +396,7 @@ mod tests {
             target: "abc".into(),
             bearers_revoked: 3,
             at: Utc::now(),
+            dry_run: false,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert!(v.get("record_id").is_some());
@@ -375,6 +433,7 @@ mod tests {
             target: "alice@demo.local".into(),
             bearers_revoked: 0,
             at: Utc::now(),
+            dry_run: false,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["bearers_revoked"], 0);
@@ -499,6 +558,7 @@ mod tests {
             target: "*".into(),
             bearers_revoked: 42,
             at: Utc::now(),
+            dry_run: false,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert!(v["scope"].is_string(), "scope must be string: {v}");
@@ -553,17 +613,18 @@ mod tests {
     }
 
     #[test]
-    fn kill_response_serialized_json_object_carries_exactly_five_known_keys() {
-        // The struct has 5 fields (record_id, scope, target,
-        // bearers_revoked, at). When serialized the JSON object MUST
-        // carry EXACTLY those 5 keys — not 4 (an elided field would
+    fn kill_response_serialized_json_object_carries_exactly_six_known_keys() {
+        // The struct has 6 fields (record_id, scope, target,
+        // bearers_revoked, at, dry_run — the last added for §3.3
+        // `--dry-run` previews). When serialized the JSON object MUST
+        // carry EXACTLY those 6 keys — not 5 (an elided field would
         // silently drop operator-visible state from the killswitch
-        // confirmation toast) and not 6 (a refactor that surfaced an
-        // internal correlation-id "for telemetry" would widen the
-        // wire shape and potentially leak request-internal state to
-        // the operator UI). The existing
-        // `kill_response_serializes_with_stable_field_names` pin
-        // checks individual key presence but NOT exact count. Pin
+        // confirmation toast, or hide whether a result was a preview)
+        // and not 7 (a refactor that surfaced an internal
+        // correlation-id "for telemetry" would widen the wire shape
+        // and potentially leak request-internal state to the operator
+        // UI). The existing `kill_response_serializes_with_stable_field_names`
+        // pin checks individual key presence but NOT exact count. Pin
         // both axes.
         let r = KillResponse {
             record_id: Uuid::nil(),
@@ -571,40 +632,63 @@ mod tests {
             target: "abc".into(),
             bearers_revoked: 3,
             at: Utc::now(),
+            dry_run: false,
         };
         let v = serde_json::to_value(&r).unwrap();
         let obj = v.as_object().expect("must serialize to JSON object");
-        assert_eq!(obj.len(), 5, "field count drift: {obj:?}");
-        for k in ["record_id", "scope", "target", "bearers_revoked", "at"] {
+        assert_eq!(obj.len(), 6, "field count drift: {obj:?}");
+        for k in [
+            "record_id",
+            "scope",
+            "target",
+            "bearers_revoked",
+            "at",
+            "dry_run",
+        ] {
             assert!(obj.contains_key(k), "missing key {k}: {obj:?}");
         }
     }
 
     #[test]
-    fn kill_body_serialized_json_object_carries_exactly_three_known_optional_keys_when_all_set() {
-        // Symmetric to the KillResponse count pin. KillBody has 3
-        // optional fields (reason, operator_subject, confirm). When
-        // all are set, the round-trip via serialize-then-deserialize
-        // recovers exactly 3 keys. A refactor that elided a field
-        // "for backwards compat with CLI v1" would silently drop the
-        // killswitch authorization audit-trail. Pin via a fresh
-        // KillBody serialized from a hand-built JSON with all three
+    fn kill_body_serialized_json_object_carries_exactly_four_known_optional_keys_when_all_set() {
+        // Symmetric to the KillResponse count pin. KillBody has 4
+        // optional fields (reason, operator_subject, confirm, dry_run —
+        // the last added for §3.3 `--dry-run`). When all are set, the
+        // round-trip via deserialize recovers exactly 4 fields. A
+        // refactor that elided a field "for backwards compat with CLI
+        // v1" would silently drop the killswitch authorization
+        // audit-trail (or the dry-run preview flag). Pin via a fresh
+        // KillBody deserialized from a hand-built JSON with all four
         // fields populated.
         let body: KillBody = serde_json::from_str(
-            r#"{"reason":"drill","operator_subject":"alice","confirm":"yes"}"#,
+            r#"{"reason":"drill","operator_subject":"alice","confirm":"yes","dry_run":true}"#,
         )
         .unwrap();
-        // All three fields populated from the input.
+        // All four fields populated from the input.
         assert_eq!(body.reason.as_deref(), Some("drill"));
         assert_eq!(body.operator_subject.as_deref(), Some("alice"));
         assert_eq!(body.confirm.as_deref(), Some("yes"));
-        // Symmetric inspection via Debug to pin all three field names
+        assert_eq!(body.dry_run, Some(true));
+        // Symmetric inspection via Debug to pin all four field names
         // are rendered (a refactor that hid a field from Debug would
         // surface here as a missing name).
         let dbg = format!("{:?}", body);
-        for f in ["reason", "operator_subject", "confirm"] {
+        for f in ["reason", "operator_subject", "confirm", "dry_run"] {
             assert!(dbg.contains(f), "missing {f} in Debug: {dbg}");
         }
+    }
+
+    #[test]
+    fn dry_run_response_is_nil_record_preview_with_dry_run_flag_set() {
+        // §3.3 — a dry-run preview must carry record_id = nil (nothing
+        // persisted), the count it would revoke, and dry_run = true so the
+        // CLI can label it a preview and assert no state changed.
+        let r = dry_run_response("user", "alice@acme.com", 7);
+        assert_eq!(r.record_id, Uuid::nil());
+        assert_eq!(r.scope, "user");
+        assert_eq!(r.target, "alice@acme.com");
+        assert_eq!(r.bearers_revoked, 7);
+        assert!(r.dry_run);
     }
 
     #[tokio::test]
@@ -658,6 +742,7 @@ mod tests {
             target: "abc".into(),
             bearers_revoked: 0,
             at: Utc::now(),
+            dry_run: false,
         };
         require_static_str(r.scope);
         // And the target field is owned String (the inverse pin —
@@ -783,6 +868,7 @@ mod tests {
             target: "abc".into(),
             bearers_revoked: 42,
             at: Utc::now(),
+            dry_run: false,
         };
         require_i64(r.bearers_revoked);
         assert_eq!(r.bearers_revoked, 42);
@@ -810,6 +896,7 @@ mod tests {
             target: "alice@demo.local".into(),
             bearers_revoked: 1,
             at: Utc::now(),
+            dry_run: false,
         };
         require_string(&r.target);
         assert_eq!(r.target, "alice@demo.local");
@@ -835,6 +922,7 @@ mod tests {
             reason: Some("drill".into()),
             operator_subject: Some("alice".into()),
             confirm: Some("yes".into()),
+            dry_run: None,
         };
         require_opt_string(&body.reason);
         require_opt_string(&body.operator_subject);
@@ -895,11 +983,12 @@ mod tests {
     }
 
     #[test]
-    fn kill_body_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern() {
+    fn kill_body_field_count_pinned_at_exactly_four_via_exhaustive_destructure_no_rest_pattern() {
         // Pin the KillBody request-body struct field count at
-        // exactly 3 via exhaustive destructure. The 3 fields are:
+        // exactly 4 via exhaustive destructure. The 4 fields are:
         // reason (Option<String>) + operator_subject (Option<String>)
-        // + confirm (Option<String>). A 4th field landing (e.g.
+        // + confirm (Option<String>) + dry_run (Option<bool>, added
+        // for §3.3 `--dry-run`). A 5th field landing (e.g.
         // `slack_channel: Option<String>` for a future fan-out to
         // notify a specific channel on revoke, or `cascade:
         // Option<bool>` for "also revoke child sessions" on the
@@ -912,20 +1001,23 @@ mod tests {
             reason: None,
             operator_subject: None,
             confirm: None,
+            dry_run: None,
         };
         let KillBody {
             reason: _,
             operator_subject: _,
             confirm: _,
+            dry_run: _,
         } = v;
     }
 
     #[test]
-    fn kill_response_field_count_pinned_at_exactly_five_via_exhaustive_destructure_no_rest_pattern()
+    fn kill_response_field_count_pinned_at_exactly_six_via_exhaustive_destructure_no_rest_pattern()
     {
-        // Pin the KillResponse wire-shape field count at exactly 5
-        // via exhaustive destructure. The 5 fields are: record_id +
-        // scope + target + bearers_revoked + at. A 6th field
+        // Pin the KillResponse wire-shape field count at exactly 6
+        // via exhaustive destructure. The 6 fields are: record_id +
+        // scope + target + bearers_revoked + at + dry_run (the last
+        // added for §3.3 `--dry-run` previews). A 7th field
         // landing (e.g. `sessions_revoked: i64` to distinguish
         // session-count from bearer-count on the `/killswitch/user`
         // path, or `cache_marked_count: i64` for operator-facing
@@ -941,6 +1033,7 @@ mod tests {
             target: String::new(),
             bearers_revoked: 0,
             at: Utc::now(),
+            dry_run: false,
         };
         let KillResponse {
             record_id: _,
@@ -948,6 +1041,7 @@ mod tests {
             target: _,
             bearers_revoked: _,
             at: _,
+            dry_run: _,
         } = v;
     }
 

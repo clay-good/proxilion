@@ -2,7 +2,7 @@
 
 **One line:** Make the three customer-facing surfaces (CLI, human-in-the-loop approvals, marketing site) a pleasure to use, and close the concrete correctness gaps an audit of the existing code surfaced — without adding a dashboard.
 
-**Status:** Substantially implemented (2026-06-11). Landed with regression tests: the entire correctness work-stream (§6.1–§6.7), the marketing-site delight (§5.1–§5.4), CLI delight §3.1/§3.4/§3.6 (and §4.1's CLI `--justification` requirement, which was already in place), and approval delight §4.3/§4.4. **Still Proposed:** §3.2 (`--color`, deferred — gating the 31 inline color-capture sites cleanly would trip `non_snake_case` under `clippy -D warnings`; needs a helper-fn pass), §3.3 (`--dry-run`, needs a proxy read-only resolve-count endpoint), §3.5 (progress feedback), and §4.1's Slack-modal / email-form + §4.2 view-details (interactive Slack payloads + email token-on-POST — the larger, higher-risk surface). Companion to [spec.md](spec.md) and [ui-less-surfaces.md](ui-less-surfaces.md). This spec **extends** the three surfaces defined in `ui-less-surfaces.md` (it does not supersede them) and **adds** a correctness work-stream (§6) for bugs found during the 2026-06-11 repo audit. The "no React dashboard" decision in `ui-less-surfaces.md` §0 stands — every item here lands in a surface that already exists.
+**Status:** Substantially implemented (2026-06-11). Landed with regression tests: the entire correctness work-stream (§6.1–§6.7), the marketing-site delight (§5.1–§5.4), **all of CLI delight §3** (§3.1 tables, §3.2 `--color`, §3.3 `--dry-run`, §3.4 completion, §3.5 progress, §3.6 errors), and approval delight §4.3/§4.4. §4.1's CLI `--justification` requirement and **email form (token-on-POST + justification capture)** were already in place — the email landing already renders a form on GET and consumes the token only on POST ([api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs)), which also covers §4.2's read-only context. **Still Proposed:** only §4.1's **Slack modal** (a Block Kit `views.open` justification modal — needs a Slack *bot* token + interactivity `view_submission` handling, beyond the current incoming-webhook + signing-secret setup) and a dedicated §4.2 "View details" link distinct from the GET landing. Companion to [spec.md](spec.md) and [ui-less-surfaces.md](ui-less-surfaces.md). This spec **extends** the three surfaces defined in `ui-less-surfaces.md` (it does not supersede them) and **adds** a correctness work-stream (§6) for bugs found during the 2026-06-11 repo audit. The "no React dashboard" decision in `ui-less-surfaces.md` §0 stands — every item here lands in a surface that already exists.
 
 **Author intent:** The three surfaces are functionally complete (see `ui-less-surfaces.md` §3–§5 status blocks), but "complete" is not the same as "delightful," and the audit found six real defects ranging from a path-injection / confused-deputy vector to a silently-broken flagship policy gate. This spec packages the polish and the fixes as one coherent unit of work so the delight items don't ship on top of latent correctness bugs.
 
@@ -64,21 +64,27 @@ Today `blocked list` and `policy list` print raw JSON ([main.rs](../../crates/cl
 
 *Implementation note (2026-06-11):* `blocked list` and `policy list` already rendered aligned tables; the gap was `clients list` (raw JSON, no `--format`). It now takes `--format pretty|json` and renders the `client_id · name · created_at · revoked` table. A fully shared auto-width helper across all three is deferred — each table uses fixed column widths today; unifying them is cosmetic and not blocking.
 
-### 3.2 Global `--color auto|always|never`, honoring `NO_COLOR` — `[ ]` Proposed
+### 3.2 Global `--color auto|always|never`, honoring `NO_COLOR` — `[x]` Done (2026-06-11)
 
 Color constants exist but are applied inconsistently. **Requirement:** a top-level `--color` flag (default `auto`) gates all ANSI output. `auto` = color iff stdout is a TTY. `never`, the `NO_COLOR` env var, and a non-TTY pipe all disable color. One `should_color()` predicate, checked at every styled write-site.
 
-### 3.3 `--dry-run` on every destructive command — `[ ]` Proposed
+*Implementation note (2026-06-11):* The four `const` SGR codes were replaced with a runtime-gated `colors()` tuple resolved once in `main` via `set_color_mode` (`--color` + `NO_COLOR` + `stdout().is_terminal()`); the decision logic is the pure, unit-tested `resolve_color`. Each styled write-site binds the subset it needs (`let (GREEN, RED, ..) = colors();`), so the format strings are untouched and a single predicate gates everything.
+
+### 3.3 `--dry-run` on every destructive command — `[x]` Done (2026-06-11)
 
 `killswitch session|user|all` ([main.rs](../../crates/cli/src/main.rs) killswitch arm) executes after only a `--confirm yes` gate. **Requirement:** `--dry-run` resolves the target and prints the blast radius (count of sessions/bearers that *would* be revoked, the resolved `p_0`/session ids) **without** calling the revoke endpoint. Applies to `killswitch *`, `clients revoke`, and `actions purge`. This needs a proxy-side read-only "resolve target" path (count only) — see §9 Phase 2.
+
+*Implementation note (2026-06-11):* Resolved per open question #2 with a **server count** (no TOCTOU gap). `KillBody` gained `dry_run: bool`; each killswitch handler ([api/killswitch.rs](../../crates/proxy/src/api/killswitch.rs)) runs `SELECT count(*)` against the same predicate as the real UPDATE and returns a `KillResponse { record_id: nil, bearers_revoked: <count>, dry_run: true }` with no UPDATE, no `kill_records` row, and no cache write (the `all` dry-run skips the `confirm` gate since a preview is read-only). `clients revoke --dry-run` previews client-side (the CLI owns the postgres connection for `clients`); `actions purge --dry-run` already existed server-side. **Bug fixed alongside:** the CLI's `killswitch all` validated `--confirm yes` locally but never forwarded `confirm` in the request body, so a real fleet kill would have been rejected by the server's `confirm` gate — the CLI now forwards it.
 
 ### 3.4 Shell completion — `[x]` Done (2026-06-11)
 
 **Requirement:** `proxilion-cli completion bash|zsh|fish` emits a completion script via `clap_complete`. Documented in `README.md` install section. Subcommand discovery without memorization is the single biggest first-run ergonomics win.
 
-### 3.5 Progress feedback on long operations — `[ ]` Proposed
+### 3.5 Progress feedback on long operations — `[x]` Done (2026-06-11)
 
 `actions export` and `policy simulate` can stream thousands of rows with only a trailing `eprintln`. **Requirement:** when stderr is a TTY, show a lightweight progress indicator (rows processed, elapsed). Suppressed under `--format json`, non-TTY, and `--color never`. No new heavy dependency — a periodic stderr counter is sufficient.
+
+*Implementation note (2026-06-11):* A small `Progress` helper renders a throttled (~8×/s) single-line `\r<label>: <n> <unit> · <elapsed>s` to stderr. Active only when `format != "json"`, `--color never` is unset, and `stderr().is_terminal()` — so machine pipelines and piped stderr stay clean. Wired into `actions export` (bytes) and `policy simulate` (rows). No new dependency.
 
 ### 3.6 Actionable error messages — `[x]` Done (2026-06-11)
 
@@ -90,20 +96,22 @@ Errors like `invalid --older-than` ([main.rs](../../crates/cli/src/main.rs)) sta
 
 References: [notifier/slack.rs](../../crates/proxy/src/notifier/slack.rs), [notifier/email.rs](../../crates/proxy/src/notifier/email.rs), [api/notifier_slack.rs](../../crates/proxy/src/api/notifier_slack.rs), the email approve/reject landing handler in [api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs).
 
-### 4.1 Capture justification on approve — `[ ]` Proposed (audit-critical)
+### 4.1 Capture justification on approve — `[~]` Partially done (email + CLI done; Slack modal Proposed) (audit-critical)
 
 Both surfaces record the approver but synthesize the justification (`"approved via Slack by {approver}"`). The reviewer-supplied *reason* — the field that matters six months later — is never captured.
 
 **Requirement:**
-- **Slack:** the **Approve** button opens a Block Kit modal with a single required free-text "Justification" input before the override commits. **Reject** opens the same modal (reason optional). The entered text becomes the override `justification`, replacing the synthesized string.
-- **Email:** the approve/reject link lands on a confirmation page (it already redirects to `/notifier/approve?t=…`) that now renders a short form with a justification textarea and a confirm button. This also fixes the email-client link-prefetch hazard (a prefetch can today consume the single-use token silently) — the token is consumed on **form POST**, not on GET.
+- **Slack:** the **Approve** button opens a Block Kit modal with a single required free-text "Justification" input before the override commits. **Reject** opens the same modal (reason optional). The entered text becomes the override `justification`, replacing the synthesized string. **`[ ]` Proposed** — the remaining open item: a Block Kit `views.open` modal needs a Slack *bot* token + `view_submission` interactivity handling, beyond the current incoming-webhook + signing-secret setup.
+- **Email:** the approve/reject link lands on a confirmation page (it already redirects to `/notifier/approve?t=…`) that now renders a short form with a justification textarea and a confirm button. This also fixes the email-client link-prefetch hazard (a prefetch can today consume the single-use token silently) — the token is consumed on **form POST**, not on GET. **`[x]` Done** — already in place: [api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs) renders a form on `GET /notifier/approve` (no consumption) and consumes the token + commits the override only on `POST`, with a ≥ 20-char justification required on approve and a reason required on reject.
 - **CLI:** `blocked approve <id> --justification "<text>"` makes `--justification` required for `approve` (optional for `reject`). **`[x]` Done** — already in place: `--justification` is a required `String` arg on `approve` and `--reason` is `Option<String>` on `reject`.
 
 The justification column already exists on the override audit row; this populates it with human intent instead of boilerplate.
 
-### 4.2 Email "View details (no action)" link — `[ ]` Proposed
+### 4.2 Email "View details (no action)" link — `[~]` Largely covered
 
 Slack has a non-destructive **Why?** button; email has no read-only path — to see full context an operator must approve or reject. **Requirement:** the email body gains a `View details` link to a read-only page (no token consumption) showing policy, matched detail, requested ops, and the request snapshot. Mirrors Slack's forensic affordance.
+
+*Note (2026-06-11):* The `GET /notifier/approve?t=…` landing already **is** a read-only page (it renders the form without consuming the token) showing policy, matched detail, requested ops, and the request snapshot. A *dedicated* "View details" link distinct from the approve/reject CTA is the only remaining nicety and is low value given the landing is already non-destructive.
 
 ### 4.3 Absolute "expires at" timestamp — `[x]` Done (2026-06-11)
 
@@ -301,6 +309,6 @@ Ordered so correctness blockers land first. Each step is independently shippable
 ## 10. Open questions
 
 1. ~~**List-match set semantics (§6.2):** is `in` over an array "any element matches" or "all elements match"?~~ **Resolved 2026-06-11:** `in` = any-element-in-set, `not_in` = no-element-in-set, `equals` = single-value membership, `not_equals` = non-membership. Implemented in [match_expr.rs](../../crates/policy-engine/src/match_expr.rs) `apply_op` and pinned by the end-to-end `list_match_blocks_fully_external_recipient_set` test in [gmail_external_send.rs](../../crates/policy-engine/tests/gmail_external_send.rs).
-2. **Dry-run count endpoint (§3.3):** does the proxy expose a cheap "how many sessions/bearers match this target" count, or must `--dry-run` resolve client-side from a `list` call? Prefer a server count to avoid a TOCTOU gap between preview and execution.
+2. ~~**Dry-run count endpoint (§3.3):** server count or client-side resolve?~~ **Resolved 2026-06-11:** server count. The killswitch handlers accept `dry_run` and run a `SELECT count(*)` against the same predicate as the real revoke, so the preview matches execution with no TOCTOU gap (no separate route, just a read-only branch on the existing endpoints). `clients revoke` previews client-side because the CLI already owns the `clients` postgres connection.
 3. **Justification requiredness (§4.1):** required on **approve** is settled (audit value); is it also required on **reject**, or optional? Default proposed: required on approve, optional on reject.
 4. **Email confirmation page hosting (§4.1, §4.2):** the approve/reject/view pages are served by the proxy itself ([api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs)). Confirm this stays in-proxy and is not pushed to the static site (it needs request state and token validation).

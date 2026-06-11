@@ -130,6 +130,38 @@ enum AuthFail {
     Other(String),
 }
 
+/// What to do with a session's Google access token given its expiry, the
+/// current time, and whether a refresh token is on file.
+///
+/// surface-delight-and-correctness.md §6.6 — the subtlety is the no-refresh
+/// case inside the 60s pre-expiry window: the access token is still valid, so
+/// we `Use` it and let Google 401 naturally at true expiry rather than
+/// rejecting up to 60s early. Only an *actually expired* token with no refresh
+/// token is rejected.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenAction {
+    /// Forward the current access token as-is.
+    Use,
+    /// Within the refresh window and a refresh token exists — renew first.
+    Refresh,
+    /// Token has expired and there is no refresh token — reject.
+    RejectExpired,
+}
+
+fn token_action(expires_at: DateTime<Utc>, now: DateTime<Utc>, has_refresh: bool) -> TokenAction {
+    let needs_refresh = expires_at <= now + chrono::Duration::seconds(60);
+    if !needs_refresh {
+        return TokenAction::Use;
+    }
+    if has_refresh {
+        TokenAction::Refresh
+    } else if expires_at <= now {
+        TokenAction::RejectExpired
+    } else {
+        TokenAction::Use
+    }
+}
+
 async fn build_session(state: &AuthState, token: &str) -> Result<SessionContext, AuthFail> {
     // 1+2. Format check.
     Bearer::parse(token).ok_or(AuthFail::BadFormat)?;
@@ -203,25 +235,33 @@ async fn build_session(state: &AuthState, token: &str) -> Result<SessionContext,
         })
         .map_err(|_| AuthFail::Decrypt)?;
 
-    // 5. Refresh if within 60s of expiry (and we have a refresh token).
-    let needs_refresh = expires_at <= Utc::now() + chrono::Duration::seconds(60);
-    if needs_refresh {
-        let (Some(refresh_ct_b), Some(refresh_nonce_b)) = (refresh_ct, refresh_nonce) else {
-            // No refresh token — let upstream Google return 401 naturally.
-            debug!("token near expiry but no refresh token available");
+    // 5. Refresh if within 60s of expiry (and we have a refresh token). §6.6 —
+    // a still-valid token with no refresh token is forwarded, not rejected.
+    let now = Utc::now();
+    let has_refresh = refresh_ct.is_some() && refresh_nonce.is_some();
+    match token_action(expires_at, now, has_refresh) {
+        TokenAction::Use => {}
+        TokenAction::Refresh => {
+            // `has_refresh` guarantees both halves are present.
+            let (Some(refresh_ct_b), Some(refresh_nonce_b)) = (refresh_ct, refresh_nonce) else {
+                unreachable!("token_action returned Refresh only when both halves present");
+            };
+            let new_plain = refresh_with_coalescing(
+                state,
+                hash.0,
+                google_tokens_id,
+                &Ciphertext {
+                    nonce: refresh_nonce_b,
+                    bytes: refresh_ct_b,
+                },
+            )
+            .await?;
+            access_plain = new_plain;
+        }
+        TokenAction::RejectExpired => {
+            debug!("access token expired and no refresh token available");
             return Err(AuthFail::Refresh("no refresh_token on file".into()));
-        };
-        let new_plain = refresh_with_coalescing(
-            state,
-            hash.0,
-            google_tokens_id,
-            &Ciphertext {
-                nonce: refresh_nonce_b,
-                bytes: refresh_ct_b,
-            },
-        )
-        .await?;
-        access_plain = new_plain;
+        }
     }
 
     let access_token = String::from_utf8(access_plain).map_err(|_| AuthFail::Decrypt)?;
@@ -421,6 +461,45 @@ async fn refresh_with_coalescing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_action_near_expiry_no_refresh_token_forwards_still_valid_token() {
+        // §6.6 regression — a session with 30s of validity left and no refresh
+        // token must FORWARD (let Google 401 at true expiry), not reject 60s
+        // early.
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(30);
+        assert_eq!(
+            token_action(expires_at, now, false),
+            TokenAction::Use,
+            "still-valid token with no refresh token must be forwarded",
+        );
+    }
+
+    #[test]
+    fn token_action_expired_no_refresh_token_rejects() {
+        let now = Utc::now();
+        let expires_at = now - chrono::Duration::seconds(1);
+        assert_eq!(
+            token_action(expires_at, now, false),
+            TokenAction::RejectExpired
+        );
+    }
+
+    #[test]
+    fn token_action_near_expiry_with_refresh_token_refreshes() {
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(30);
+        assert_eq!(token_action(expires_at, now, true), TokenAction::Refresh);
+    }
+
+    #[test]
+    fn token_action_well_before_expiry_uses_token_regardless_of_refresh() {
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(3600);
+        assert_eq!(token_action(expires_at, now, false), TokenAction::Use);
+        assert_eq!(token_action(expires_at, now, true), TokenAction::Use);
+    }
 
     #[tokio::test]
     async fn refresh_coordinator_returns_same_mutex_for_same_hash() {

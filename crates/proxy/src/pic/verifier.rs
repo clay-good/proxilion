@@ -51,7 +51,18 @@ pub enum VerifierError {
     Decode(String),
     #[error("CAT key fetch: {0}")]
     CatKey(String),
+    #[error("chain exceeds max hops cap {cap}")]
+    ChainTooLong { cap: u32 },
 }
+
+/// Hard ceiling on chain length during verification
+/// (surface-delight-and-correctness.md §6.7). The walk follows
+/// `predecessor_id` cold from the cache; without a cap a crafted deep chain
+/// forces unbounded DB round-trips (DoS-of-degree). The monotonic hop invariant
+/// already bounds depth in principle, but an explicit cap turns a pathological
+/// chain into a fast, bounded rejection. 64 hops is far beyond any legitimate
+/// delegation depth (production chains are 2–3 links: PCA_0 → PCA_1 → leaf).
+const MAX_CHAIN_HOPS: u32 = 64;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VerificationResult {
@@ -163,6 +174,13 @@ impl PicVerifier {
             key.verify_pca(&signed_current)
                 .map_err(|_| VerifierError::BadCatSignature(current_id))?;
             links_verified += 1;
+            // §6.7 — bound the walk so a crafted deep chain can't force
+            // unbounded cold-cache DB round-trips.
+            if links_verified > MAX_CHAIN_HOPS as usize {
+                return Err(VerifierError::ChainTooLong {
+                    cap: MAX_CHAIN_HOPS,
+                });
+            }
             p_0.get_or_insert_with(|| pca_current.p_0.value.clone());
             // Track the chain's PIC profile. First link sets it; subsequent
             // links that disagree get recorded as a mismatch (not yet a
@@ -242,7 +260,10 @@ fn check_invariants(
             parent: parent_id,
         });
     }
-    if child.hop != parent.hop + 1 {
+    // §6.7 — `checked_add` so a crafted `hop == u32::MAX` parent yields a
+    // verification error rather than a debug panic / release wrap. Overflow
+    // (None) and an ordinary off-by-one both fail the same HopOrder check.
+    if parent.hop.checked_add(1) != Some(child.hop) {
         return Err(VerifierError::HopOrder {
             child: child.hop,
             parent: parent.hop,
@@ -288,6 +309,7 @@ fn invariant_kind(e: &VerifierError) -> &'static str {
         VerifierError::Missing(_) => "missing",
         VerifierError::Decode(_) => "decode",
         VerifierError::CatKey(_) => "cat_key",
+        VerifierError::ChainTooLong { .. } => "chain_too_long",
     }
 }
 
@@ -536,6 +558,47 @@ mod tests {
             matches!(err, VerifierError::ContinuityBroken { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn check_invariants_hop_overflow_yields_error_not_panic() {
+        // §6.7 — a crafted parent at the u32 hop ceiling must not panic
+        // (debug) or wrap (release) on `parent.hop + 1`. `checked_add` turns
+        // it into an ordinary HopOrder verification error.
+        let (_cat, chain) = build_three_deep();
+        let (_signed0, mut pca0) = decode(&chain[0], chain[0].pca_id).unwrap();
+        let (_signed1, pca1) = decode(&chain[1], chain[1].pca_id).unwrap();
+        pca0.hop = u32::MAX;
+        let err = check_invariants(
+            &pca1,
+            &pca0,
+            chain[1].pca_id,
+            chain[0].pca_id,
+            &SignedPca::from_bytes(&chain[0].cbor).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, VerifierError::HopOrder { parent, .. } if parent == u32::MAX),
+            "u32::MAX parent hop must yield HopOrder, not panic; got {err:?}",
+        );
+    }
+
+    #[test]
+    fn max_chain_hops_is_a_sane_bound_and_chain_too_long_displays() {
+        // §6.7 — the cap exists and is bounded well above legitimate
+        // delegation depth (2–3 links) but far below a DoS-amplifying walk.
+        assert!(
+            (8..=256).contains(&MAX_CHAIN_HOPS),
+            "MAX_CHAIN_HOPS={MAX_CHAIN_HOPS} should be a sane mid-range cap",
+        );
+        let e = VerifierError::ChainTooLong {
+            cap: MAX_CHAIN_HOPS,
+        };
+        assert_eq!(
+            e.to_string(),
+            format!("chain exceeds max hops cap {MAX_CHAIN_HOPS}")
+        );
+        assert_eq!(invariant_kind(&e), "chain_too_long");
     }
 
     #[test]
@@ -1062,14 +1125,14 @@ mod tests {
     }
 
     #[test]
-    fn verifier_error_display_prefix_sweep_distinguishes_all_eight_variants() {
+    fn verifier_error_display_prefix_sweep_distinguishes_all_nine_variants() {
         // Each VerifierError variant has a distinct `#[error("...")]`
         // attribute — the prefix is what the chain-walker's tracing
         // log filter buckets violations on. Pin that every variant's
         // Display string starts with a distinct, recognizable
         // substring AND that no two prefixes collide. The existing
         // tests pin individual variants' full Display shapes (Decode,
-        // CatKey) — this pin walks ALL EIGHT for completeness,
+        // CatKey) — this pin walks ALL NINE for completeness,
         // confirming the prefix-distinct contract holds across the
         // whole enum. A refactor that "harmonized" any two variants
         // to a shared prefix "for shorter messages" would silently
@@ -1099,9 +1162,13 @@ mod tests {
             .to_string(),
             VerifierError::Decode("x".into()).to_string(),
             VerifierError::CatKey("x".into()).to_string(),
+            VerifierError::ChainTooLong {
+                cap: MAX_CHAIN_HOPS,
+            }
+            .to_string(),
         ];
         // No two Display strings begin with the same first 5 bytes —
-        // sufficient to distinguish all eight in operator log filters.
+        // sufficient to distinguish all nine in operator log filters.
         for (i, a) in displays.iter().enumerate() {
             for (j, b) in displays.iter().enumerate() {
                 if i == j {
@@ -1127,7 +1194,7 @@ mod tests {
         // second call with a freshly-constructed equal variant.
         // Symmetric to rounds 199/200/204/205/206/207 referentially-
         // transparent pins.
-        let cases: [VerifierError; 8] = [
+        let cases: [VerifierError; 9] = [
             VerifierError::Missing(Uuid::nil()),
             VerifierError::BadCatSignature(Uuid::nil()),
             VerifierError::ContinuityBroken {
@@ -1147,6 +1214,9 @@ mod tests {
             },
             VerifierError::Decode("x".into()),
             VerifierError::CatKey("x".into()),
+            VerifierError::ChainTooLong {
+                cap: MAX_CHAIN_HOPS,
+            },
         ];
         for e in &cases {
             let first = invariant_kind(e);
@@ -1161,18 +1231,18 @@ mod tests {
     }
 
     #[test]
-    fn invariant_kind_returns_static_str_from_canonical_eight_label_set() {
+    fn invariant_kind_returns_static_str_from_canonical_nine_label_set() {
         // `invariant_kind` returns `&'static str` for bounded metric
         // label cardinality. Pin the lifetime contract via require_static_str
         // — a refactor to `String` "for ergonomic dynamic labels"
         // would silently heap-allocate per verification AND blow up
         // Prometheus cardinality on label drift. Pin the canonical
-        // 8-label set is closed: `continuity | monotonicity | p0 | hop
-        // | signature | missing | decode | cat_key`. A future variant
-        // landing without a label arm would fall to the compiler's
-        // exhaustive-match check.
+        // 9-label set is closed: `continuity | monotonicity | p0 | hop
+        // | signature | missing | decode | cat_key | chain_too_long`. A
+        // future variant landing without a label arm would fall to the
+        // compiler's exhaustive-match check.
         fn require_static_str(_: &'static str) {}
-        let cases: [VerifierError; 8] = [
+        let cases: [VerifierError; 9] = [
             VerifierError::ContinuityBroken {
                 child: Uuid::nil(),
                 parent: Uuid::nil(),
@@ -1192,6 +1262,9 @@ mod tests {
             VerifierError::Missing(Uuid::nil()),
             VerifierError::Decode("x".into()),
             VerifierError::CatKey("x".into()),
+            VerifierError::ChainTooLong {
+                cap: MAX_CHAIN_HOPS,
+            },
         ];
         for e in &cases {
             let label = invariant_kind(e);
@@ -1207,6 +1280,7 @@ mod tests {
                         | "missing"
                         | "decode"
                         | "cat_key"
+                        | "chain_too_long"
                 ),
                 "non-canonical label `{label}` on {e:?}",
             );
@@ -1214,15 +1288,16 @@ mod tests {
     }
 
     #[test]
-    fn verifier_error_variant_count_pinned_at_exactly_eight_via_exhaustive_match() {
-        // The `VerifierError` enum has EIGHT variants — pinned here
+    fn verifier_error_variant_count_pinned_at_exactly_nine_via_exhaustive_match() {
+        // The `VerifierError` enum has NINE variants — pinned here
         // via an exhaustive match arm with no `_` fallback. A refactor
-        // that added a ninth variant (e.g. `RateLimited` for a future
+        // that added a tenth variant (e.g. `RateLimited` for a future
         // CAT-key registry rate-gate) would surface here, not as a
         // silent dispatch-table gap in `invariant_kind` (whose own
         // exhaustive match would also catch — pin BOTH so the failure
-        // surfaces at TWO sites for double coverage).
-        let all: [VerifierError; 8] = [
+        // surfaces at TWO sites for double coverage). `ChainTooLong` is
+        // the §6.7 chain-depth-cap variant.
+        let all: [VerifierError; 9] = [
             VerifierError::Missing(Uuid::nil()),
             VerifierError::BadCatSignature(Uuid::nil()),
             VerifierError::ContinuityBroken {
@@ -1242,6 +1317,9 @@ mod tests {
             },
             VerifierError::Decode("x".into()),
             VerifierError::CatKey("x".into()),
+            VerifierError::ChainTooLong {
+                cap: MAX_CHAIN_HOPS,
+            },
         ];
         for e in &all {
             // Exhaustive without `_` — a future variant breaks compile.
@@ -1254,9 +1332,10 @@ mod tests {
                 VerifierError::HopOrder { .. } => 5,
                 VerifierError::Decode(_) => 6,
                 VerifierError::CatKey(_) => 7,
+                VerifierError::ChainTooLong { .. } => 8,
             };
         }
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
     }
 
     #[test]
@@ -1413,8 +1492,9 @@ mod tests {
     #[test]
     fn verifier_error_struct_variants_continuity_p0_hop_all_pinned_two_named_fields_via_destructure()
      {
-        // Three of VerifierError's eight variants are STRUCT variants
-        // with exactly 2 named fields each:
+        // Three of VerifierError's nine variants are STRUCT variants
+        // with exactly 2 named fields each (a fourth, `ChainTooLong
+        // { cap: u32 }`, has one):
         //   * `ContinuityBroken { child: Uuid, parent: Uuid }`
         //   * `P0Mismatch { child_p0: String, parent_p0: String }`
         //   * `HopOrder { child: u32, parent: u32 }`
@@ -1423,7 +1503,7 @@ mod tests {
         // delta-reporting on multi-hop skips") without matching the
         // thiserror Display format string OR the operator log-grep
         // contract would silently break the byte-exact Display
-        // pinned by `verifier_error_display_prefix_sweep_distinguishes_all_eight_variants`.
+        // pinned by `verifier_error_display_prefix_sweep_distinguishes_all_nine_variants`.
         // The exhaustive destructure with no `..` rest pattern on each
         // struct variant forces a 3rd field to update this site in
         // lockstep with the Display attribute. Symmetric to round-230's
@@ -1538,7 +1618,7 @@ mod tests {
         // would foreclose the bubble-and-label dual-use pattern. A
         // refactor returning `String` "for runtime-formatted labels"
         // would silently break the existing
-        // `invariant_kind_returns_static_str_from_canonical_eight_label_set`
+        // `invariant_kind_returns_static_str_from_canonical_nine_label_set`
         // pin (which checks &'static str-ness implicitly via
         // require_static_str). Pin via fn-pointer witness with
         // explicit `for<'a>` lifetime so a signature drift surfaces.

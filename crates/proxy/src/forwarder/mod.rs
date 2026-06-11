@@ -14,3 +14,16 @@ pub mod tee;
 pub use nats::NatsBridge;
 pub use siem::{SiemForwarder, SiemHmacKey};
 pub use tee::TeeStream;
+
+/// Whether a 4xx upstream status is *retryable* rather than permanent
+/// (surface-delight-and-correctness.md §6.5). Most 4xx are permanent — the
+/// request is malformed or unauthorized and replaying won't help. But
+/// `429 Too Many Requests` (Slack, PagerDuty, Datadog, Splunk HEC all
+/// rate-limit with it) and `408 Request Timeout` are transient: under load,
+/// treating them as permanent silently drops deliverable audit / notification
+/// events exactly when volume is highest. Callers fold a `true` here into their
+/// 5xx retry branch. Shared by the SIEM forwarder and the webhook notifier so
+/// both honor the same retry contract.
+pub(crate) fn is_retryable_4xx(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429)
+}

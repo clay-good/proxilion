@@ -239,6 +239,21 @@ impl BurstSuppressor {
             b.suppressed = 0;
             b.first_suppressed = None;
         }
+        // surface-delight-and-correctness.md §6.3 — bound the map. `p_0` is
+        // high-cardinality, partly attacker-influenced principal identity, so
+        // without a sweep the bucket map grows for the process lifetime. After
+        // draining, prune each bucket's expired timestamps and drop any bucket
+        // with no live timestamps and nothing pending. A bucket survives only
+        // as long as it has in-window traffic; an idle `p_0` is collected once
+        // its window lapses.
+        let now = Instant::now();
+        buckets.retain(|(policy_id, _), b| {
+            let window = self.config_for(policy_id).window;
+            b.prune(now, window);
+            !b.timestamps.is_empty() || b.suppressed > 0
+        });
+        // §7 — `proxilion_burst_buckets` gauge proves the map stays bounded.
+        metrics::gauge!("proxilion_burst_buckets").set(buckets.len() as f64);
         out
     }
 
@@ -344,6 +359,40 @@ mod tests {
         // Drain clears state.
         let again = s.drain_summaries().await;
         assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_collects_idle_buckets_so_map_stays_bounded() {
+        // §6.3 regression — a stream of blocks across many distinct `p_0`
+        // values must not grow the bucket map for the process lifetime. After
+        // the window lapses with no further traffic, `drain_summaries` GCs the
+        // idle buckets and the map returns to empty.
+        let s = BurstSuppressor::new(BurstConfig {
+            threshold: 5,
+            window: Duration::from_millis(20),
+            flush_interval: Duration::from_secs(30),
+        });
+        let now = Instant::now();
+        let ops: Vec<String> = vec![];
+        for i in 0..50 {
+            let p0 = format!("user{i}@acme.com");
+            let n = notification("gmail-ext", &p0, &ops);
+            assert!(s.admit(&n, now).await);
+        }
+        assert_eq!(
+            s.buckets.lock().await.len(),
+            50,
+            "all distinct p_0 keys present before the sweep",
+        );
+        // Let the window lapse so every timestamp prunes out.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let summaries = s.drain_summaries().await;
+        assert!(summaries.is_empty(), "no events were suppressed");
+        assert_eq!(
+            s.buckets.lock().await.len(),
+            0,
+            "idle buckets must be collected — map is bounded",
+        );
     }
 
     #[tokio::test]

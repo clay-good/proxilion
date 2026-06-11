@@ -921,15 +921,11 @@ fn domain_of(email: &str) -> Option<String> {
 /// shaped (`primary`, `alice@org.com`, hex strings); we percent-encode
 /// `/` `#` and other reserved chars defensively.
 fn urlencoding(s: &str) -> String {
-    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-    const PATH: &AsciiSet = &CONTROLS
-        .add(b' ')
-        .add(b'/')
-        .add(b'?')
-        .add(b'#')
-        .add(b'&')
-        .add(b'%');
-    utf8_percent_encode(s, PATH).to_string()
+    // Promoted to the shared `adapters::path_segment` helper so Drive and
+    // Gmail encode identically (surface-delight-and-correctness.md §6.1).
+    // This thin wrapper is retained for the adapter's existing call sites
+    // and tests.
+    super::path_segment(s)
 }
 
 // Silence unused-import lints for re-exports kept symmetrical with the

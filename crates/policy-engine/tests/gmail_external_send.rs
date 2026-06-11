@@ -11,6 +11,76 @@ fn engine() -> Engine {
     Engine::new(&yaml).expect("policy parses")
 }
 
+/// surface-delight-and-correctness.md §6.2 regression — a Layer-B gate that
+/// matches directly on the list-valued `body.to_domains` field (rather than the
+/// adapter-computed `body.external_recipient` boolean) must actually fire. This
+/// is the recipient-domain gate from spec.md §9 expressed over the array. Before
+/// the §6.2 fix the matcher stringified the array to its JSON literal and the
+/// `not_in` set comparison never matched, silently disabling the gate.
+fn list_match_engine() -> Engine {
+    let yaml = r#"
+- id: gmail-list-recipient-gate
+  vendor: google
+  action: gmail.messages.send
+  match:
+    body.to_domains:
+      not_in: ["${customer_domain}"]
+  decision: block
+  override: requires_justification
+  pic_mode: runtime-gate
+"#;
+    Engine::new(yaml).expect("inline list-match policy parses")
+}
+
+fn ctx_with_domains(domains: &[&str]) -> RequestContext {
+    let mut body = HashMap::new();
+    body.insert(
+        "to_domains".into(),
+        Value::Array(domains.iter().map(|d| Value::String((*d).into())).collect()),
+    );
+    RequestContext {
+        vendor: "google".into(),
+        action: "gmail.messages.send".into(),
+        user: UserCtx {
+            email: "alice@acme.com".into(),
+            groups: vec![],
+        },
+        path: HashMap::new(),
+        body,
+        headers: HashMap::new(),
+        customer_domain: "acme.com".into(),
+    }
+}
+
+#[test]
+fn list_match_blocks_fully_external_recipient_set() {
+    // None of the recipient domains is the customer domain → `not_in`
+    // (no-element-in-set) fires → block.
+    let e = list_match_engine();
+    let outcome = e
+        .evaluate(&ctx_with_domains(&["evilcorp.example", "spamcorp.example"]))
+        .unwrap();
+    assert_eq!(
+        outcome.matched_policy_id.as_deref(),
+        Some("gmail-list-recipient-gate"),
+        "list-valued not_in gate must match a fully-external send",
+    );
+    assert!(matches!(outcome.decision, Decision::Block { .. }));
+}
+
+#[test]
+fn list_match_allows_when_an_internal_recipient_present() {
+    // acme.com is among the recipients → `not_in` is false (an element is in
+    // the set) → no match → default Allow.
+    let e = list_match_engine();
+    let outcome = e.evaluate(&ctx_with_domains(&["acme.com"])).unwrap();
+    assert!(
+        outcome.matched_policy_id.is_none(),
+        "an internal recipient must not trip the external gate",
+    );
+    assert!(matches!(outcome.decision, Decision::Allow));
+}
+
 fn ctx_with_external(external: bool, to_domain: &str) -> RequestContext {
     let mut body = HashMap::new();
     body.insert("external_recipient".into(), Value::Bool(external));

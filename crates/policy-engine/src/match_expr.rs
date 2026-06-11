@@ -115,7 +115,7 @@ fn eval_field(field: &str, val: &Yaml, ctx: &RequestContext) -> Result<bool, Mat
             expected: "string",
             got: type_name(k),
         })?;
-        if !apply_op(op, lhs.as_deref(), v, ctx)? {
+        if !apply_op(op, field, lhs.as_deref(), v, ctx)? {
             return Ok(false);
         }
     }
@@ -124,10 +124,41 @@ fn eval_field(field: &str, val: &Yaml, ctx: &RequestContext) -> Result<bool, Mat
 
 fn apply_op(
     op: &str,
+    field: &str,
     lhs: Option<&str>,
     rhs: &Yaml,
     ctx: &RequestContext,
 ) -> Result<bool, MatchError> {
+    // List-valued LHS (surface-delight-and-correctness.md §6.2). When the bound
+    // field is a genuine JSON array of strings (only `body.*` can be), apply
+    // element-wise *set* semantics rather than comparing against the array's
+    // JSON-literal stringification (which never matches anything). Open
+    // question #1 resolved as: `in` = any-element-in-set, `not_in` =
+    // no-element-in-set, with `equals`/`not_equals` as the single-value
+    // membership / non-membership forms. `matches` / `greater_than` /
+    // `less_than` have no defined list semantics and fall through to the
+    // scalar path below (regex/number against the array's string form).
+    if let Some(elems) = ctx.lookup_list(field) {
+        match op {
+            "in" => {
+                let xs = as_str_seq(rhs, "in", ctx)?;
+                return Ok(elems.iter().any(|e| xs.iter().any(|x| x == e)));
+            }
+            "not_in" => {
+                let xs = as_str_seq(rhs, "not_in", ctx)?;
+                return Ok(!elems.iter().any(|e| xs.iter().any(|x| x == e)));
+            }
+            "equals" => {
+                let r = as_str_subst(rhs, ctx)?;
+                return Ok(r.map(|r| elems.iter().any(|e| e == &r)).unwrap_or(false));
+            }
+            "not_equals" => {
+                let r = as_str_subst(rhs, ctx)?;
+                return Ok(r.map(|r| !elems.iter().any(|e| e == &r)).unwrap_or(true));
+            }
+            _ => {}
+        }
+    }
     match op {
         "equals" => Ok(lhs == as_str_subst(rhs, ctx)?.as_deref()),
         "not_equals" => Ok(lhs != as_str_subst(rhs, ctx)?.as_deref()),
@@ -340,6 +371,63 @@ mod tests {
     #[test]
     fn missing_field_not_in_returns_true() {
         let y = parse("body.nonexistent: { not_in: [x, y] }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    // --- list-valued LHS set semantics (§6.2) ---------------------
+
+    #[test]
+    fn in_over_list_field_matches_when_any_element_in_set() {
+        // body.to_domains = ["evil.example", "spam.example"]. `in` over a
+        // list field is any-element-in-set: evil.example is among recipients.
+        let y = parse("body.to_domains: { in: [evil.example] }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn in_over_list_field_misses_when_no_element_in_set() {
+        let y = parse("body.to_domains: { in: [acme.com] }");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn not_in_over_list_field_matches_when_no_element_in_set() {
+        // `not_in` is no-element-in-set: acme.com is not a recipient, and
+        // neither recipient is acme.com → none-in-set → true.
+        let y = parse("body.to_domains: { not_in: [acme.com] }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn not_in_over_list_field_misses_when_an_element_in_set() {
+        let y = parse("body.to_domains: { not_in: [evil.example] }");
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn equals_over_list_field_is_membership() {
+        // `equals` over a list is single-value membership.
+        let y = parse("body.to_domains: { equals: spam.example }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+        let y2 = parse("body.to_domains: { equals: acme.com }");
+        assert!(!evaluate(&y2, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn not_equals_over_list_field_is_non_membership() {
+        let y = parse("body.to_domains: { not_equals: acme.com }");
+        assert!(evaluate(&y, &ctx()).unwrap());
+        let y2 = parse("body.to_domains: { not_equals: evil.example }");
+        assert!(!evaluate(&y2, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn in_over_list_field_with_template_set_member_substitutes() {
+        // The rhs set elements still flow through template substitution, so a
+        // recipient-domain gate can reference `${customer_domain}`.
+        let y = parse("body.to_domains: { not_in: [\"${customer_domain}\"] }");
+        // customer_domain is acme.com; neither recipient is acme.com → none in
+        // set → not_in matches (the "all recipients external" reading).
         assert!(evaluate(&y, &ctx()).unwrap());
     }
 

@@ -14,6 +14,72 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ## [Unreleased]
 
+### Security
+
+- **Path / SSRF injection closed in the Drive & Gmail adapters**
+  ([surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md) §6.1).
+  axum percent-decodes `{id}` path params before the handler sees them, so a
+  `file_id` / `msg_id` carrying `/`, `?`, `#`, or an encoded slash re-injected
+  path/query/fragment delimiters and could steer the upstream call to a
+  *different* Google endpoint than the action label, policy layer, and PIC
+  chain were evaluated against (a confused-deputy vector). The Calendar
+  adapter's per-segment encoder is now promoted to a shared
+  `adapters::path_segment` helper and applied at all three sites. Regression
+  tests in `adapters/{mod,google_drive,google_gmail}.rs`.
+- **Federation `state` claim now bound to the callback session**
+  (§6.4). `FederationClaims.state` was parsed but never compared to the
+  callback `state`, so a federation token minted for one session could be
+  replayed into another (session fixation). `bridge_callback_body` now rejects
+  on mismatch before any DB write. (Ships ahead of the still-stubbed signature
+  check — see `oauth/bridge.rs`.)
+
+### Fixed
+
+- **Policy matcher now matches list-valued body fields** (§6.2). `apply_op`
+  resolved the LHS once as a scalar, so a JSON-array field (e.g.
+  `body.to_domains`) stringified to its JSON literal and `in`/`not_in`/`equals`
+  never matched — silently disabling any array-valued Layer-B gate (fails
+  open). The matcher now applies element-wise set semantics when
+  `ctx.lookup_list` returns an array: `in` = any-element-in-set, `not_in` =
+  no-element-in-set, `equals`/`not_equals` = single-value membership. Pinned
+  by a new end-to-end engine test wiring the recipient-domain gate over the
+  array.
+- **Burst-suppressor bucket map is now bounded** (§6.3). `drain_summaries`
+  only reset counters, so the `(policy_id, p_0)` map grew for the process
+  lifetime on high-cardinality, partly attacker-influenced `p_0` (DoS-of-
+  degree). It now prunes expired timestamps and drops idle buckets each drain,
+  and emits the `proxilion_burst_buckets` gauge.
+- **Retryable HTTP 429 is no longer dropped as permanent** (§6.5). The SIEM
+  forwarder and webhook notifier treated all 4xx as permanent; `429 Too Many
+  Requests` (and `408`) are retryable — Slack/PagerDuty/Datadog/Splunk HEC all
+  rate-limit with 429. Folded into the 5xx retry branch via a shared
+  `forwarder::is_retryable_4xx`, with a `proxilion_forwarder_retry_total`
+  counter.
+- **Still-valid bearer no longer rejected up to 60s early** (§6.6). A
+  session inside the 60s pre-expiry window with no refresh token returned 401
+  even though the Google access token was still valid. It now forwards the
+  still-valid token and lets Google 401 naturally at true expiry; only an
+  actually-expired token is rejected. Decision extracted to a pure
+  `token_action` helper with unit tests.
+- **PCA chain walk is depth-bounded and hop arithmetic is checked** (§6.7).
+  The verifier walk followed `predecessor_id` with no cap (cold-cache DB
+  amplification on a crafted deep chain) and used `parent.hop + 1` (debug
+  panic / release wrap at `u32::MAX`). Added a `MAX_CHAIN_HOPS` cap returning
+  a new `VerifierError::ChainTooLong`, and replaced the hop add with
+  `checked_add`.
+
+### Added
+
+- **Marketing-site delight** ([site/index.html](site/index.html),
+  surface-delight-and-correctness.md §5): a persisted dark-mode toggle
+  defaulting to `prefers-color-scheme` (no framework, ~40 lines of inline JS,
+  no build step), copy-to-clipboard on the quickstart commands, a mobile
+  scroll-fade on the install box, and `rel="noopener noreferrer"` on every
+  off-site link.
+- **README** — architecture + two-layer-enforcement Mermaid diagrams, a PIC
+  chain / invariants visualization, and policy-DSL + CLI + design-decision
+  cheat sheets.
+
 ### Changed
 
 - **Coverage gate honest reset — floor lowered from 60% / 60% to 35% lines /

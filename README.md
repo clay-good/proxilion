@@ -47,6 +47,64 @@ original Proxilion work:
   preventative chokepoint for governing managed agents you don't own, and
   that prevention-by-construction is still possible there.
 
+## Architecture at a glance
+
+Every agent request crosses Proxilion on the way to the SaaS provider. The
+proxy resolves the session to a human principal, verifies the cryptographic
+authority chain, evaluates policy, mints a *narrowed* successor capability,
+forwards the call, then filters the response before the agent ever reads it.
+
+```mermaid
+flowchart LR
+    A["Managed AI agent"] -->|"OAuth + API calls<br/>(Proxilion bearer)"| P{{"Proxilion proxy<br/>(in-path, your perimeter)"}}
+    P -->|"1 · resolve session<br/>+ verify PCA chain"| TP[("Trust Plane<br/>CAT signing keys")]
+    P -->|"2 · Layer B policy"| POL[["policy.yaml<br/>match-expr engine"]]
+    P -->|"3 · mint narrowed PCA_2"| TP
+    P -->|"4 · forward"| G[("Google Drive /<br/>Gmail / Calendar")]
+    G -->|"response"| P
+    P -->|"5 · read-filter<br/>quarantine injection"| A
+    P -.->|"every action (signed)"| NATS["NATS JetStream"]
+    NATS --> SIEM["SIEM / webhook forwarder"]
+    NATS --> DASH["/admin chain inspector + SSE tail"]
+```
+
+**The two enforcement layers compose** — a request must clear *both*:
+
+```mermaid
+flowchart TB
+    R["Agent request"] --> LA["Layer A — PIC ops grammar<br/>(enforced by construction)"]
+    LA -->|"action NOT in PCA ops set"| BLK["Refused — non-expressible<br/>Trust Plane won't mint successor"]
+    LA -->|"action in ops set"| LB["Layer B — content / context policy<br/>(YAML match-expression engine)"]
+    LB -->|"allow"| FWD["Forward to SaaS<br/>then read-filter the response"]
+    LB -->|"block / require_confirmation / rate_limit"| HITL["Human-in-the-loop<br/>Slack modal / email link"]
+```
+
+- **Layer A (PIC, by construction).** Defeats the confused deputy, cross-user
+  access, privilege escalation, identity laundering, and forged chains —
+  these are *non-expressible*, not merely detected. The Trust Plane refuses to
+  issue authority the principal never held.
+- **Layer B (Proxilion-original, in the hot path).** Of the operations PIC
+  *allows*, decides which need read-filtering (prompt-injection quarantine),
+  write-gating, confirmation, or an outright block, based on request/response
+  **content**. Authored in YAML, evaluated at p99 < 1 ms.
+
+**The PIC chain** is a monotonic capability ladder rooted at the human:
+
+```
+PCA_0   p_0 = alice@acme.com   ops = { drive:*, gmail:send:*, … }   hop 0   ← root, signed by CAT key
+  └── PCA_1   p_0 = alice       ops ⊆ PCA_0.ops  (granted scope)     hop 1   ← narrowed at OAuth callback
+        └── PCA_2   p_0 = alice  ops ⊆ PCA_1.ops (this request)      hop 2   ← per-request successor
+```
+
+Three invariants hold on every link, and verification walks the chain
+leaf→root checking all three:
+
+| Invariant | Rule | What it kills |
+|---|---|---|
+| **Provenance** | each link carries its predecessor's CAT signature | forged / spliced chains |
+| **Identity** | `p_0` is copied from the predecessor, never re-derived | identity laundering via token exchange |
+| **Continuity** | `child.ops ⊆ parent.ops`, `child.hop == parent.hop + 1` | privilege escalation across hops |
+
 ## Credits: standing on PIC's shoulders
 
 The cryptographic primitive Proxilion uses for signed authority chains is the
@@ -143,6 +201,71 @@ customer-held. Proxilion is self-hosted for that reason; we never see your
 keys, your traffic, or your PCAs. The marketing site at
 [proxilion.com](https://proxilion.com) is a static HTML page that points
 here. No telemetry, no phone-home, no upsell paths in the admin UI.
+
+## Policy cheat sheet
+
+Layer-B policy is a list of rules in `config/policy.yaml`. Each rule binds a
+`vendor` + `action`, an optional `match` expression, a `decision`, and a
+`pic_mode`. Hot-reloaded via `proxilion-cli policy reload`.
+
+```yaml
+- id: gmail-external-send-gate        # block any send with an external recipient
+  vendor: google
+  action: gmail.messages.send
+  match:
+    body.external_recipient: { equals: true }
+  decision: block                     # allow | block | require_confirmation | rate_limit
+  override: requires_justification    # human-in-the-loop can release it
+  required_ops:                        # ${...} templates; list-valued vars fan out per element
+    - "gmail:send:${user.email}:to:${body.to_domains}"
+  pic_mode: runtime-gate              # audit (observe) | runtime-gate (enforce Layer A)
+```
+
+**Match-expression operators** (spec.md §0.3). A top-level mapping is `AND`ed;
+the right-hand side of any clause may interpolate `${path.id}`,
+`${user.email}`, `${customer_domain}`, etc.
+
+| Operator | Scalar field | List-valued `body.*` field (JSON array) |
+|---|---|---|
+| `equals` / `not_equals` | exact string compare | single-value membership / non-membership |
+| `in` / `not_in` | is / isn't in the literal set | `in` = **any** element in set, `not_in` = **no** element in set |
+| `matches` | regex over the value | regex over the array's JSON form |
+| `greater_than` / `less_than` | numeric compare | (scalar only) |
+| `all` / `any` / `not` | combinators over sub-expressions | — |
+| `exists` | field is present | — |
+
+List-valued set semantics let a recipient-domain gate match directly on the
+array the adapter exposes, e.g. `body.to_domains: { not_in: ["${customer_domain}"] }`
+fires when every recipient is external.
+
+## CLI cheat sheet
+
+`proxilion-cli` is the operator surface — there is no web dashboard. Output
+defaults to an aligned `pretty` table; `--format json|ndjson` for machines.
+
+| Command | What it does |
+|---|---|
+| `status` / `health` / `selftest` | one-screen readiness + synthetic end-to-end probe |
+| `pic show <id>` / `pic verify <id>` | fetch a PCA; walk the chain leaf→root and report invariant verification |
+| `actions tail` / `actions list` / `actions export` | live SSE stream / query / bulk export of the signed action log |
+| `policy list` / `policy show <id>` / `policy diff` | inspect the loaded rule set |
+| `policy set-mode <id> …` / `policy edit` / `policy reload` | flip observe↔enforce, `$EDITOR` the live YAML, hot-reload |
+| `policy simulate` | replay traffic and report would-have-blocked deltas per policy |
+| `blocked list` / `blocked show <id>` / `blocked approve <id>` / `blocked reject <id>` | the human-in-the-loop queue |
+| `killswitch session\|user\|all` | revoke an agent/user's authority; rejected on the next request |
+| `clients list\|add\|revoke` / `tokens …` | OAuth client + operator-token registry |
+| `metrics sample` / `trust-plane …` / `notifier …` | Prometheus, Trust Plane, and notifier diagnostics |
+
+## Design decisions
+
+| Decision | Why |
+|---|---|
+| **Self-hosted, in-path proxy** | Layer-B policy and full-fidelity audit require plaintext bodies; CAT keys + cleartext SaaS payloads must stay inside the customer perimeter, never ours. |
+| **No web dashboard** | A dashboard is a standing attack surface and a maintenance tax. The terminal (`proxilion-cli`), Prometheus, and a single embedded `/admin/` chain-inspector cover the operator's needs. |
+| **Default-deny body exposure** | Adapters opt **into** exposing `body.*` fields to policy (Gmail send declares `to_domains`; Drive read declares none) to minimize in-memory cleartext surface. |
+| **PIC as a SHA-pinned dependency** | We consume the upstream reference implementation, never vendor or reimplement it — the cryptography stays auditable against its source of truth. |
+| **YAML match-expression interpreter, not Rego** | A direct interpreter keeps the build slim and the p99 < 1 ms hot-path budget; the `evaluate` API is Rego-swappable later without touching adapters. |
+| **Best-effort, isolated audit sinks** | The durable `action_events` row is written by the primary before fan-out; NATS / SIEM / notifier failures (incl. retryable 429s) never block the request or each other. |
 
 ## License
 

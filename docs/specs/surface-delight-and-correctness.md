@@ -1,0 +1,302 @@
+# Spec — Surface Delight & Correctness
+
+**One line:** Make the three customer-facing surfaces (CLI, human-in-the-loop approvals, marketing site) a pleasure to use, and close the concrete correctness gaps an audit of the existing code surfaced — without adding a dashboard.
+
+**Status:** Partially implemented (2026-06-11). The entire correctness work-stream (§6.1–§6.7, Phase 0 + Phase 1) and the marketing-site delight items (§5.1–§5.4, Phase 4) have landed with regression tests; the CLI delight (§3) and approval-justification capture (§4) remain Proposed. Companion to [spec.md](spec.md) and [ui-less-surfaces.md](ui-less-surfaces.md). This spec **extends** the three surfaces defined in `ui-less-surfaces.md` (it does not supersede them) and **adds** a correctness work-stream (§6) for bugs found during the 2026-06-11 repo audit. The "no React dashboard" decision in `ui-less-surfaces.md` §0 stands — every item here lands in a surface that already exists.
+
+**Author intent:** The three surfaces are functionally complete (see `ui-less-surfaces.md` §3–§5 status blocks), but "complete" is not the same as "delightful," and the audit found six real defects ranging from a path-injection / confused-deputy vector to a silently-broken flagship policy gate. This spec packages the polish and the fixes as one coherent unit of work so the delight items don't ship on top of latent correctness bugs.
+
+---
+
+## Table of Contents
+
+1. Why this spec, why now
+2. Design principles (what "delight" means for a UI-less product)
+3. Surface A — `proxilion-cli` delight
+4. Surface B — human-in-the-loop approval delight (Slack / email)
+5. Surface C — marketing site delight
+6. Correctness fixes (the bug work-stream)
+7. New & changed metrics
+8. Out of scope (explicit non-goals)
+9. Implementation playbook (per-step, with verify criteria)
+10. Open questions
+
+---
+
+## 1. Why this spec, why now
+
+The 2026-06-11 audit reached two conclusions:
+
+1. **The surfaces work but under-delight.** The CLI emits raw JSON blobs where a human reading a terminal wants an aligned table; destructive commands lack a `--dry-run`; there is no shell completion; approvals capture *who* but never *why*; the marketing site ships dark-mode CSS variables but no toggle and no copy button on its one install command.
+2. **Six concrete defects exist in shipped code.** Two are high severity: a path/SSRF injection in the Drive and Gmail adapters (a confused-deputy vector on exactly the requests the proxy exists to gate), and a policy-engine matcher that can never match list-valued body fields — which silently breaks the flagship `gmail-external-send-gate` example from `spec.md` §9.
+
+Shipping delight on top of latent correctness bugs is backwards. This spec sequences the fixes first (§6, §9 Phase 0), then the polish (§3–§5).
+
+---
+
+## 2. Design principles
+
+The product is deliberately UI-less (`ui-less-surfaces.md` §0). "Good UI" here is therefore **not** a web app — it is the felt quality of the surfaces a security engineer actually touches: a terminal, a Slack message, an email, and the one marketing page that decides whether they try it at all.
+
+1. **The terminal is the UI.** Tables, color, and completion are not decoration; they are the difference between `jq`-piping every command and reading output directly. Respect `NO_COLOR` and non-TTY pipes.
+2. **Every approval is an audit artifact.** An approve/reject that records *who* but not *why* loses the single most valuable field at incident-review time. Justification capture is a correctness requirement wearing a UX hat.
+3. **Reversible-by-default for destructive ops.** A killswitch with no `--dry-run` is a footgun. Show the blast radius before the bang.
+4. **No new always-on surface.** Nothing here adds a server users must remember to open. The marketing site stays a single static file; the CLI stays a thin HTTP wrapper.
+5. **Observable.** Every new behavior emits a metric (§7), consistent with `ui-less-surfaces.md` §3.
+
+---
+
+## 3. Surface A — `proxilion-cli` delight
+
+Reference: [crates/cli/src/main.rs](../../crates/cli/src/main.rs). The CLI already has `pretty | json | ndjson` formats, SSE tail, `$EDITOR` policy edit, and humantime parsing. The gaps below are what stop it from feeling first-class.
+
+### 3.1 Colored, aligned tables for every list command — `[ ]` Proposed
+
+Today `blocked list` and `policy list` print raw JSON ([main.rs](../../crates/cli/src/main.rs) `blocked`/`policy` arms); only `actions list` renders a table. **Requirement:** every `*-list` command's `pretty` format renders an aligned ASCII table. Minimum columns:
+
+| Command | Columns |
+|---|---|
+| `blocked list` | `blocked_id` · `p_0` · `policy_id` · `status` · `expires_at` |
+| `policy list` | `policy_id` · `mode` · `layer` · `last_reload` |
+| `clients list` | `client_id` · `name` · `created_at` · `revoked` |
+
+`--format json` / `ndjson` behavior is unchanged. Table rendering shares one helper (column auto-width, header rule) so all commands align identically.
+
+### 3.2 Global `--color auto|always|never`, honoring `NO_COLOR` — `[ ]` Proposed
+
+Color constants exist but are applied inconsistently. **Requirement:** a top-level `--color` flag (default `auto`) gates all ANSI output. `auto` = color iff stdout is a TTY. `never`, the `NO_COLOR` env var, and a non-TTY pipe all disable color. One `should_color()` predicate, checked at every styled write-site.
+
+### 3.3 `--dry-run` on every destructive command — `[ ]` Proposed
+
+`killswitch session|user|all` ([main.rs](../../crates/cli/src/main.rs) killswitch arm) executes after only a `--confirm yes` gate. **Requirement:** `--dry-run` resolves the target and prints the blast radius (count of sessions/bearers that *would* be revoked, the resolved `p_0`/session ids) **without** calling the revoke endpoint. Applies to `killswitch *`, `clients revoke`, and `actions purge`. This needs a proxy-side read-only "resolve target" path (count only) — see §9 Phase 2.
+
+### 3.4 Shell completion — `[ ]` Proposed
+
+**Requirement:** `proxilion-cli completion bash|zsh|fish` emits a completion script via `clap_complete`. Documented in `README.md` install section. Subcommand discovery without memorization is the single biggest first-run ergonomics win.
+
+### 3.5 Progress feedback on long operations — `[ ]` Proposed
+
+`actions export` and `policy simulate` can stream thousands of rows with only a trailing `eprintln`. **Requirement:** when stderr is a TTY, show a lightweight progress indicator (rows processed, elapsed). Suppressed under `--format json`, non-TTY, and `--color never`. No new heavy dependency — a periodic stderr counter is sufficient.
+
+### 3.6 Actionable error messages — `[ ]` Proposed
+
+Errors like `invalid --older-than` ([main.rs](../../crates/cli/src/main.rs)) state the problem but not the fix. **Requirement:** parse-failure messages name the accepted forms (e.g. `expected RFC3339 timestamp or duration like "24h", "7d"`). Bounded scope: the ~6 user-input parse sites, not a framework.
+
+---
+
+## 4. Surface B — human-in-the-loop approval delight
+
+References: [notifier/slack.rs](../../crates/proxy/src/notifier/slack.rs), [notifier/email.rs](../../crates/proxy/src/notifier/email.rs), [api/notifier_slack.rs](../../crates/proxy/src/api/notifier_slack.rs), the email approve/reject landing handler in [api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs).
+
+### 4.1 Capture justification on approve — `[ ]` Proposed (audit-critical)
+
+Both surfaces record the approver but synthesize the justification (`"approved via Slack by {approver}"`). The reviewer-supplied *reason* — the field that matters six months later — is never captured.
+
+**Requirement:**
+- **Slack:** the **Approve** button opens a Block Kit modal with a single required free-text "Justification" input before the override commits. **Reject** opens the same modal (reason optional). The entered text becomes the override `justification`, replacing the synthesized string.
+- **Email:** the approve/reject link lands on a confirmation page (it already redirects to `/notifier/approve?t=…`) that now renders a short form with a justification textarea and a confirm button. This also fixes the email-client link-prefetch hazard (a prefetch can today consume the single-use token silently) — the token is consumed on **form POST**, not on GET.
+- **CLI:** `blocked approve <id> --justification "<text>"` makes `--justification` required for `approve` (optional for `reject`).
+
+The justification column already exists on the override audit row; this populates it with human intent instead of boilerplate.
+
+### 4.2 Email "View details (no action)" link — `[ ]` Proposed
+
+Slack has a non-destructive **Why?** button; email has no read-only path — to see full context an operator must approve or reject. **Requirement:** the email body gains a `View details` link to a read-only page (no token consumption) showing policy, matched detail, requested ops, and the request snapshot. Mirrors Slack's forensic affordance.
+
+### 4.3 Absolute "expires at" timestamp — `[ ]` Proposed
+
+Messages say "expires in 30 minutes" (relative, computed at send) — misleading once the message sits unread. **Requirement:** Slack footer and email body show an absolute `expires_at` (UTC, e.g. `2026-06-11 14:35 UTC`) alongside or instead of the relative phrasing.
+
+### 4.4 Inline the matched detail (stop truncating to 140 chars) — `[ ]` Proposed
+
+Slack truncates `detail` to 140 chars ([notifier/slack.rs](../../crates/proxy/src/notifier/slack.rs)); email truncates similarly. The matched pattern / rule is often exactly what the approver needs and is exactly what gets cut. **Requirement:** show the matched rule id and a longer detail excerpt (Slack section block tolerates ~3000 chars) inline, so a confident approve needs zero clicks.
+
+---
+
+## 5. Surface C — marketing site delight
+
+Reference: [site/index.html](../../site/index.html) — a single static file, strong on SEO/accessibility/semantics. Keep it one file; keep JS minimal and inline.
+
+### 5.1 Dark-mode toggle — `[x]` Done (2026-06-11)
+
+The CSS variables and theming are already in place but `<meta name="color-scheme">` is `light` only — a dark-OS visitor gets a light page with no escape. **Requirement:** ~20 lines of inline JS toggling a `data-theme` attribute, persisted to `localStorage`, defaulting to `prefers-color-scheme`. No framework, no build step.
+
+### 5.2 Copy-to-clipboard on the install command — `[x]` Done (2026-06-11)
+
+The `git clone …` snippet is plain selectable text. **Requirement:** a copy button using the Clipboard API with a "Copied" confirmation. Highest-ROI conversion polish on the page.
+
+### 5.3 Safe external links — `[x]` Done (2026-06-11)
+
+External links (GitHub, pic-protocol.org) lack `rel="noopener"`. **Requirement:** add `rel="noopener noreferrer"` (and `target="_blank"` where opening a new tab is intended) to every off-site link. Small security + UX correctness fix.
+
+### 5.4 Mobile install-snippet scroll affordance — `[x]` Done (2026-06-11)
+
+The install box is `overflow-x: auto` with no visual cue it scrolls on a phone. **Requirement:** a fade/scroll indicator so mobile visitors don't miss the tail of the command. Lowest priority.
+
+---
+
+## 6. Correctness fixes (the bug work-stream)
+
+Each item: file:line, the defect, why it is wrong, impact, the fix, and the regression test that proves it. Severity ranked. Findings #1 and #2 are blocking and land in Phase 0 (§9) **before** any delight work.
+
+### 6.1 HIGH — Path / SSRF injection in Drive & Gmail adapters — `[x]` Done (2026-06-11)
+
+**Where:** [google_drive.rs:76](../../crates/proxy/src/adapters/google_drive.rs#L76) (`get_file`), [google_drive.rs:99](../../crates/proxy/src/adapters/google_drive.rs#L99) (`export_file`), [google_gmail.rs:150](../../crates/proxy/src/adapters/google_gmail.rs#L150) (`get_message`).
+
+**Defect:** the attacker-controlled path id is interpolated raw:
+```rust
+upstream_path: format!("/drive/v3/files/{}", file_id),
+```
+This string becomes the upstream URL at [google_drive.rs:358](../../crates/proxy/src/adapters/google_drive.rs#L358) / [google_gmail.rs:407](../../crates/proxy/src/adapters/google_gmail.rs#L407) (`format!("{}{}", base, upstream_path)` → `reqwest.get(url)`). axum percent-**decodes** the `{id}` path param before the handler sees it, so a `file_id` carrying `?`, `#`, or an encoded `/` (e.g. `..%2F..%2Foauth2%2Fv4%2Ftoken`) re-injects literal path/query/fragment delimiters and steers the call to a **different** Google endpoint than the one the action label, policy layer, and PIC chain were evaluated against.
+
+**Why it's a bug, not intent:** the Calendar adapter percent-encodes *every* segment via `urlencoding()` ([google_calendar.rs:101-133](../../crates/proxy/src/adapters/google_calendar.rs#L101-L133)); Drive and Gmail simply omit it. An inconsistency, not a design choice.
+
+**Impact:** confused-deputy / authorization-bypass on the exact requests the proxy exists to gate. HIGH.
+
+**Fix:** percent-encode each interpolated id. Promote Calendar's `urlencoding()` into a shared adapter helper (e.g. `adapters::path_segment()`) and call it at all three sites.
+
+**Test:** unit test asserting `get_file("a/b?x")` / `get_message("..%2F..")` produce an `upstream_path` with the delimiters percent-escaped; mirror Calendar's existing `urlencoding_escapes_slashes` test ([google_calendar.rs:952](../../crates/proxy/src/adapters/google_calendar.rs#L952)).
+
+### 6.2 HIGH — Policy matcher never matches list-valued body fields — `[x]` Done (2026-06-11)
+
+**Where:** [match_expr.rs:110](../../crates/policy-engine/src/match_expr.rs#L110) (`eval_field` resolves `let lhs = ctx.lookup(field);`) and the `in` / `not_in` / `equals` arms of `apply_op` ([match_expr.rs:132-141](../../crates/policy-engine/src/match_expr.rs#L132-L141)).
+
+**Defect:** `eval_field` resolves the LHS once as a **scalar**. When the body field is a JSON **array** (e.g. `body.to_domains = ["evil.com","spam.com"]`), `lookup` stringifies it to the JSON literal `["evil.com","spam.com"]`, so `in`/`not_in` compare each allowed element against that whole bracketed string — never equal. The correct primitive already exists and is tested — `RequestContext::lookup_list` ([context.rs:38](../../crates/policy-engine/src/context.rs#L38)) — but `match_expr` never calls it. A test comment even records operators "work around this" ([context.rs](../../crates/policy-engine/src/context.rs) line ~645).
+
+**Impact:** the flagship Layer-B example from `spec.md` §9 — `gmail-external-send-gate` ("block when a recipient domain is not in the allowed set") — does not work. An `in`-style **allow**-gate over an array silently never fires (**fails open** — the dangerous direction); a `not_in` **block**-gate matches unconditionally (blocks everything). HIGH.
+
+**Fix:** when `ctx.lookup_list(field)` returns `Some(elements)`, apply set semantics element-wise (define and document: `in` = any-element-in-set, `not_in` = no-element-in-set). Thread the field name into `apply_op`, or resolve both scalar and list forms in `eval_field` and dispatch on shape.
+
+**Test:** policy fixture with `body.to_domains = ["a.com","b.com"]` asserting `in: ["a.com"]` matches and `not_in: ["c.com"]` matches, plus the negative cases. Wire the actual `gmail-external-send-gate` YAML from `spec.md` §9 into an end-to-end engine test so the regression can't recur silently.
+
+### 6.3 MEDIUM — Burst-suppressor bucket map grows unbounded — `[x]` Done (2026-06-11)
+
+**Where:** [notifier/burst.rs:193](../../crates/proxy/src/notifier/burst.rs#L193) (`admit` → `entry(key).or_default()`), [notifier/burst.rs:221-243](../../crates/proxy/src/notifier/burst.rs#L221-L243) (`drain_summaries`).
+
+**Defect:** `buckets: HashMap<(String, Option<String>), Bucket>` is keyed on `(policy_id, p_0)`. `drain_summaries` uses `iter_mut` and only resets counters — entries are **never removed**. `p_0` is high-cardinality, partly attacker-influenced principal identity, so a stream of blocks across many `p_0` values grows the map for the process lifetime.
+
+**Impact:** slow unbounded memory growth (DoS-of-degree). MEDIUM.
+
+**Fix:** in `drain_summaries` (or a periodic sweep) drop buckets whose timestamp window is empty after pruning and whose `suppressed == 0`.
+
+**Test:** insert N distinct `p_0` keys, advance the clock past the window, drain, assert `buckets.len()` returns to 0.
+
+### 6.4 MEDIUM — Federation `state` claim never bound to the session (replay) — `[x]` Done (2026-06-11)
+
+**Where:** [oauth/bridge.rs:30](../../crates/proxy/src/oauth/bridge.rs#L30) (`FederationClaims.state`), [oauth/routes.rs:190-228](../../crates/proxy/src/oauth/routes.rs#L190-L228) (`bridge_callback_body`).
+
+**Defect:** `FederationClaims.state` is parsed but never compared to `params.state` (the session UUID) in the bridge callback. A federation token minted for one session can be replayed into another. (The sibling issue — `validate_federation_token` being payload-only with no signature check, [bridge.rs:74](../../crates/proxy/src/oauth/bridge.rs#L74) — is a *documented* pre-production stub per the module header and `spec.md` §0.4; the missing `state` binding is **not** documented.)
+
+**Impact:** session-fixation / replay across federation callbacks. MEDIUM (gated behind the same not-yet-production federation path, but should be fixed alongside the signature step, not after).
+
+**Fix:** in `bridge_callback_body`, reject when `claims.state != params.state`. Add it next to the signature-verification TODO so they ship together.
+
+**Test:** callback with a token whose `state` differs from the query `state` returns 400/401 and does not establish a session.
+
+### 6.5 LOW/MEDIUM — Retryable HTTP 429 dropped as permanent in all forwarders — `[x]` Done (2026-06-11)
+
+**Where:** [forwarder/siem.rs:200](../../crates/proxy/src/forwarder/siem.rs#L200), [forwarder/siem.rs:323](../../crates/proxy/src/forwarder/siem.rs#L323), [notifier/webhook.rs:172](../../crates/proxy/src/notifier/webhook.rs#L172), [notifier/webhook.rs:243](../../crates/proxy/src/notifier/webhook.rs#L243).
+
+**Defect:** retry logic treats `status().is_client_error()` (all 4xx) as permanent. `429 Too Many Requests` is retryable — Slack, PagerDuty, Datadog, and Splunk HEC all rate-limit with 429. Under load, deliverable audit/notification events are silently dropped.
+
+**Impact:** audit/notification delivery loss exactly when volume is highest. LOW/MEDIUM.
+
+**Fix:** special-case `StatusCode::TOO_MANY_REQUESTS` (and arguably `408 Request Timeout`) into the 5xx retry branch; honor `Retry-After` when present.
+
+**Test:** mock upstream returns 429 then 200; assert the forwarder retries and succeeds.
+
+### 6.6 LOW — Still-valid bearer rejected up to 60s early when no refresh token — `[x]` Done (2026-06-11)
+
+**Where:** [auth_middleware.rs:207-213](../../crates/proxy/src/auth_middleware.rs#L207-L213).
+
+**Defect:** `needs_refresh = expires_at <= now + 60s`. When true **and** there is no refresh token, the middleware returns `AuthFail::Refresh` → 401, even though the Google access token is still valid for up to 60 more seconds.
+
+**Impact:** spurious 401s ~60s before true expiry on refresh-token-less sessions. LOW.
+
+**Fix:** when no refresh token is present, reject only if actually expired (`expires_at <= now`); otherwise forward with the still-valid token and let Google 401 naturally at true expiry.
+
+**Test:** session with `expires_at = now + 30s` and no refresh token forwards successfully rather than 401-ing.
+
+### 6.7 LOW — PCA chain walk lacks depth bound; `u32` hop overflow — `[x]` Done (2026-06-11)
+
+**Where:** [pic/verifier.rs:154-207](../../crates/proxy/src/pic/verifier.rs#L154-L207) (`walk`), [pic/verifier.rs:245](../../crates/proxy/src/pic/verifier.rs#L245) (`parent.hop + 1`).
+
+**Defect:** the chain walk follows `predecessor_id` with no visited-set and no max-hop cap; a crafted deep chain forces unbounded DB round-trips (bounded only by the strictly-increasing hop invariant — DoS-of-degree, not a hang). Separately, `parent.hop + 1` on `u32` panics in debug / wraps in release for a crafted `hop == u32::MAX` row.
+
+**Impact:** cold-path DB amplification + a panic/wrap edge. LOW.
+
+**Fix:** add a sane `MAX_CHAIN_HOPS` bound returning a verification error past the cap; replace `parent.hop + 1` with `parent.hop.checked_add(1)` and treat overflow as invalid.
+
+**Test:** a 1000-hop synthetic chain is rejected at the cap; a `hop == u32::MAX` parent yields a verification error, not a panic.
+
+### 6.8 Minor — confirm-or-document (not scheduled)
+
+Recorded for triage, not committed work: `nats.rs` `sanitize_token` keeps `.` though the doc comment says subjects can't contain it (latent — adapter enums can't currently emit a `.`); the read-filter egress allowlist skips binary types so `BlockRequest`/`ReplaceWithMarker` don't apply to Drive `export` of PDF/docx (confirm against `spec.md` §1.4); Google tokens are persisted before the `pca1_ops.is_empty()` check, orphaning encrypted rows on empty-intersection ([oauth/routes.rs:360](../../crates/proxy/src/oauth/routes.rs#L360)); `err_to_result` hardcodes `links_verified: 0` on failure, discarding partial-progress observability.
+
+---
+
+## 7. New & changed metrics
+
+Consistent with `ui-less-surfaces.md` §3, every new behavior is observable:
+
+| Metric | Type | Surface | Why |
+|---|---|---|---|
+| `proxilion_override_justification_present_total{surface,decision}` | counter | §4.1 | Track that approvals carry real justification (vs empty) per surface |
+| `proxilion_adapter_path_encoded_total{vendor}` | counter | §6.1 | Confidence the encode path is exercised in prod |
+| `proxilion_policy_list_match_total{op,result}` | counter | §6.2 | Detect list-field gates actually firing post-fix |
+| `proxilion_forwarder_retry_total{forwarder,status}` | counter | §6.5 | Surface 429-driven retries |
+| `proxilion_burst_buckets` | gauge | §6.3 | Prove the map stays bounded |
+
+CLI/site items (§3, §5) are client-side and emit no server metrics.
+
+---
+
+## 8. Out of scope (explicit non-goals)
+
+- **A web dashboard, in any form.** Re-affirms `ui-less-surfaces.md` §0. The marketing site stays a single static file; it is not an app.
+- **A TUI.** The CLI gains tables and color, not a full-screen interactive interface.
+- **Slack/email snooze, escalation, per-policy channel routing.** Already tracked as deferred in `ui-less-surfaces.md` §5.7; this spec does not pull them forward.
+- **Federation signature verification.** The documented stub ([bridge.rs:74](../../crates/proxy/src/oauth/bridge.rs#L74)) stays out of scope here; §6.4 fixes only the *undocumented* state-binding gap. Full federation lands with the bridge service (`spec.md` §0.4).
+- **Rich text / WYSIWYG anything.** Plain text, markdown, Block Kit — no editors.
+
+---
+
+## 9. Implementation playbook (per-step, with verify criteria)
+
+Ordered so correctness blockers land first. Each step is independently shippable.
+
+**Phase 0 — Blocking fixes (do first)**
+1. §6.1 adapter path encoding → **verify:** new escaping unit tests pass; existing adapter tests unaffected; manual `cargo test -p proxilion-proxy adapters` green.
+2. §6.2 list-valued policy matching → **verify:** `gmail-external-send-gate` end-to-end engine test (the §9 YAML) blocks an external domain and allows an internal one; scalar-field tests unchanged.
+
+**Phase 1 — Remaining correctness**
+3. §6.3 burst-map bounding → **verify:** map returns to 0 after drain past window.
+4. §6.4 federation state binding → **verify:** mismatched-state callback rejected.
+5. §6.5 429 retry → **verify:** mock 429-then-200 retries and succeeds.
+6. §6.6 bearer near-expiry → **verify:** 30s-remaining no-refresh session forwards, not 401.
+7. §6.7 chain-walk bound + checked hop → **verify:** deep chain capped; `u32::MAX` hop errors not panics.
+
+**Phase 2 — CLI delight**
+8. §3.2 `--color` + `should_color()` → **verify:** `NO_COLOR=1` and piped stdout emit no ANSI; TTY emits color.
+9. §3.1 list tables → **verify:** `blocked list` / `policy list` / `clients list` pretty output is an aligned table; `--format json` byte-identical to today.
+10. §3.3 `--dry-run` (needs proxy read-only resolve-count path) → **verify:** `killswitch user <p0> --dry-run` prints a count and makes no revoke call (assert via metrics/no state change).
+11. §3.4 completion, §3.5 progress, §3.6 error messages → **verify:** completion script sources cleanly in bash/zsh; long export shows a counter on a TTY only; parse errors name accepted forms.
+
+**Phase 3 — Approval delight**
+12. §4.1 justification capture (Slack modal + email form + CLI flag) → **verify:** override audit row carries operator-entered text; email token consumed on POST not GET (prefetch-safe).
+13. §4.2 email view-details, §4.3 absolute expiry, §4.4 inline detail → **verify:** read-only page consumes no token; messages show a UTC `expires_at`; matched rule id visible without truncation.
+
+**Phase 4 — Site delight**
+14. §5.1 dark-mode toggle, §5.2 copy button, §5.3 `rel=noopener`, §5.4 scroll cue → **verify:** toggle persists across reload and respects `prefers-color-scheme`; copy button writes the clone command to the clipboard; all external links carry `rel="noopener noreferrer"`.
+
+**Phase 5 — Observability**
+15. §7 metrics → **verify:** each new series appears in `GET /metrics` and the bundled Grafana dashboard (`ops/grafana/proxilion.json`) references the override-justification and burst-bucket series.
+
+---
+
+## 10. Open questions
+
+1. ~~**List-match set semantics (§6.2):** is `in` over an array "any element matches" or "all elements match"?~~ **Resolved 2026-06-11:** `in` = any-element-in-set, `not_in` = no-element-in-set, `equals` = single-value membership, `not_equals` = non-membership. Implemented in [match_expr.rs](../../crates/policy-engine/src/match_expr.rs) `apply_op` and pinned by the end-to-end `list_match_blocks_fully_external_recipient_set` test in [gmail_external_send.rs](../../crates/policy-engine/tests/gmail_external_send.rs).
+2. **Dry-run count endpoint (§3.3):** does the proxy expose a cheap "how many sessions/bearers match this target" count, or must `--dry-run` resolve client-side from a `list` call? Prefer a server count to avoid a TOCTOU gap between preview and execution.
+3. **Justification requiredness (§4.1):** required on **approve** is settled (audit value); is it also required on **reject**, or optional? Default proposed: required on approve, optional on reject.
+4. **Email confirmation page hosting (§4.1, §4.2):** the approve/reject/view pages are served by the proxy itself ([api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs)). Confirm this stays in-proxy and is not pushed to the static site (it needs request state and token validation).

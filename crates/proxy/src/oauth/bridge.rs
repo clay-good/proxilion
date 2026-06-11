@@ -14,7 +14,7 @@ use super::error::OAuthError;
 /// Claims emitted by the (future) federation-bridge when it 302s the user
 /// back to the proxy after PCA_0 issuance.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // `state` / `iat` round-trip for log correlation and clock-skew checks
+#[allow(dead_code)] // `iat` round-trips for clock-skew checks; `state` binds the callback session
 pub struct FederationClaims {
     /// Trust Plane PCA id (UUID).
     pub pca_0_id: Uuid,

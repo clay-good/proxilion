@@ -197,7 +197,7 @@ impl SiemForwarder {
                     debug!(status = %r.status(), attempt, count, "siem batch ok");
                     return;
                 }
-                Ok(r) if r.status().is_client_error() => {
+                Ok(r) if r.status().is_client_error() && !super::is_retryable_4xx(r.status()) => {
                     warn!(status = %r.status(), count, "siem batch: 4xx; not retrying");
                     metrics::counter!(
                         "proxilion_siem_forward_failures_total",
@@ -207,7 +207,14 @@ impl SiemForwarder {
                     return;
                 }
                 Ok(r) => {
-                    warn!(status = %r.status(), attempt, count, "siem batch: 5xx");
+                    // 5xx, plus retryable 4xx (429/408) folded in via §6.5.
+                    warn!(status = %r.status(), attempt, count, "siem batch: retryable upstream status");
+                    metrics::counter!(
+                        "proxilion_forwarder_retry_total",
+                        "forwarder" => "siem",
+                        "status" => r.status().as_u16().to_string(),
+                    )
+                    .increment(1);
                     if attempt > self.max_retries {
                         metrics::counter!(
                             "proxilion_siem_forward_failures_total",
@@ -320,7 +327,7 @@ impl ActionStream for SiemForwarder {
                     debug!(status = %r.status(), attempt, "siem forward ok");
                     return;
                 }
-                Ok(r) if r.status().is_client_error() => {
+                Ok(r) if r.status().is_client_error() && !super::is_retryable_4xx(r.status()) => {
                     // 4xx: the webhook rejected us. Retrying won't help.
                     warn!(status = %r.status(), "siem: webhook rejected (4xx); not retrying");
                     metrics::counter!(
@@ -331,7 +338,14 @@ impl ActionStream for SiemForwarder {
                     return;
                 }
                 Ok(r) => {
-                    warn!(status = %r.status(), attempt, "siem: webhook 5xx");
+                    // 5xx, plus retryable 4xx (429/408) folded in via §6.5.
+                    warn!(status = %r.status(), attempt, "siem: retryable upstream status");
+                    metrics::counter!(
+                        "proxilion_forwarder_retry_total",
+                        "forwarder" => "siem",
+                        "status" => r.status().as_u16().to_string(),
+                    )
+                    .increment(1);
                     if attempt > self.max_retries {
                         metrics::counter!(
                             "proxilion_siem_forward_failures_total",

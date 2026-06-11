@@ -169,7 +169,10 @@ impl WebhookNotifier {
                     debug!(status = %r.status(), attempt, "notifier delivered");
                     return;
                 }
-                Ok(r) if r.status().is_client_error() => {
+                Ok(r)
+                    if r.status().is_client_error()
+                        && !crate::forwarder::is_retryable_4xx(r.status()) =>
+                {
                     warn!(status = %r.status(), "notifier: webhook 4xx; not retrying");
                     metrics::counter!(
                         "proxilion_notifier_send_failures_total",
@@ -179,7 +182,14 @@ impl WebhookNotifier {
                     return;
                 }
                 Ok(r) => {
-                    warn!(status = %r.status(), attempt, "notifier: webhook 5xx");
+                    // 5xx, plus retryable 4xx (429/408) folded in via §6.5.
+                    warn!(status = %r.status(), attempt, "notifier: retryable upstream status");
+                    metrics::counter!(
+                        "proxilion_forwarder_retry_total",
+                        "forwarder" => "webhook",
+                        "status" => r.status().as_u16().to_string(),
+                    )
+                    .increment(1);
                     if attempt > self.max_retries {
                         metrics::counter!(
                             "proxilion_notifier_send_failures_total",
@@ -240,7 +250,10 @@ impl WebhookNotifier {
                     debug!(policy_id = %s.policy_id, suppressed = s.suppressed_count, "summary delivered");
                     return;
                 }
-                Ok(r) if r.status().is_client_error() => {
+                Ok(r)
+                    if r.status().is_client_error()
+                        && !crate::forwarder::is_retryable_4xx(r.status()) =>
+                {
                     warn!(status = %r.status(), "summary: 4xx; not retrying");
                     return;
                 }
@@ -726,6 +739,61 @@ mod tests {
             .with_max_retries(5);
         let ops: Vec<String> = vec![];
         n.notify(&sample(Uuid::new_v4(), &ops)).await;
+    }
+
+    #[tokio::test]
+    async fn retries_on_429_then_succeeds() {
+        // §6.5 regression — 429 Too Many Requests is retryable, not permanent.
+        // Two 429s then a 200; the success mock asserts `.expect(1)` so a
+        // refactor that treated 429 as a permanent 4xx (stopping at the first
+        // 429) would fail verification on server drop.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let secret = WebhookSecret::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let n = WebhookNotifier::new(server.uri(), secret, "https://proxy.local".into())
+            .unwrap()
+            .with_max_retries(5);
+        let ops: Vec<String> = vec![];
+        n.notify(&sample(Uuid::new_v4(), &ops)).await;
+    }
+
+    #[test]
+    fn is_retryable_4xx_only_for_408_and_429() {
+        // §6.5 — the retryable-4xx set is exactly {408, 429}; every other 4xx
+        // stays permanent. A widened set would re-deliver genuinely-rejected
+        // (400/401/403/404) events forever.
+        use reqwest::StatusCode;
+        assert!(crate::forwarder::is_retryable_4xx(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(crate::forwarder::is_retryable_4xx(
+            StatusCode::REQUEST_TIMEOUT
+        ));
+        for s in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+        ] {
+            assert!(
+                !crate::forwarder::is_retryable_4xx(s),
+                "{s} must be permanent"
+            );
+        }
+        // 5xx are handled by the separate retry branch, not this predicate.
+        assert!(!crate::forwarder::is_retryable_4xx(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 
     // ─── round 183 (2026-05-20): WebhookSecret + NotifierBuildError + WebhookNotifier surfaces ───

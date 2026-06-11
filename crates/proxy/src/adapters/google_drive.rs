@@ -73,7 +73,7 @@ async fn get_file(
         &session,
         DriveRequest {
             action: "drive.files.get".into(),
-            upstream_path: format!("/drive/v3/files/{}", file_id),
+            upstream_path: format!("/drive/v3/files/{}", super::path_segment(&file_id)),
             policy_path,
             query,
             body_for_policy: HashMap::new(),
@@ -96,7 +96,7 @@ async fn export_file(
         &session,
         DriveRequest {
             action: "drive.files.export".into(),
-            upstream_path: format!("/drive/v3/files/{}/export", file_id),
+            upstream_path: format!("/drive/v3/files/{}/export", super::path_segment(&file_id)),
             policy_path,
             query,
             body_for_policy: HashMap::new(),
@@ -1202,5 +1202,32 @@ mod tests {
             Ok(unit) => require_unit(unit),
             Err(e) => panic!("Allow must return Ok(()), got {e:?}"),
         }
+    }
+
+    #[test]
+    fn get_and_export_upstream_path_percent_encode_the_file_id_segment() {
+        // §6.1 regression: axum percent-decodes the `{id}` param, so a file_id
+        // carrying delimiters must be re-encoded before interpolation or it
+        // steers the call to a different Google endpoint than the one the
+        // policy layer and PIC chain were evaluated against. These mirror the
+        // exact `format!` the handlers use.
+        let evil = "a/b?x";
+        assert_eq!(
+            format!("/drive/v3/files/{}", super::super::path_segment(evil)),
+            "/drive/v3/files/a%2Fb%3Fx"
+        );
+        assert_eq!(
+            format!(
+                "/drive/v3/files/{}/export",
+                super::super::path_segment(evil)
+            ),
+            "/drive/v3/files/a%2Fb%3Fx/export"
+        );
+        // Real ids are unaffected.
+        let id = "1A2b3C4d5E";
+        assert_eq!(
+            format!("/drive/v3/files/{}", super::super::path_segment(id)),
+            "/drive/v3/files/1A2b3C4d5E"
+        );
     }
 }

@@ -147,7 +147,10 @@ async fn get_message(
         &session,
         GmailRequest {
             action: "gmail.messages.get".into(),
-            upstream_path: format!("/gmail/v1/users/me/messages/{}", msg_id),
+            upstream_path: format!(
+                "/gmail/v1/users/me/messages/{}",
+                super::path_segment(&msg_id)
+            ),
             method: Method::GET,
             policy_path,
             query,
@@ -1327,5 +1330,29 @@ mod tests {
         // engine errors" would silently change the call-site
         // `?`-chain conversion.
         let _f: fn(&[u8]) -> Result<ParsedSend, mailparse::MailParseError> = parse_mime;
+    }
+
+    #[test]
+    fn get_message_upstream_path_percent_encodes_the_msg_id_segment() {
+        // §6.1 regression: a message id that already contains an encoded
+        // slash (`..%2F..`) would, without re-encoding, decode through axum to
+        // literal `../..` path traversal against the Gmail base. Mirror the
+        // exact `format!` the handler uses.
+        let evil = "..%2F..%2Foauth2";
+        assert_eq!(
+            format!(
+                "/gmail/v1/users/me/messages/{}",
+                super::super::path_segment(evil)
+            ),
+            "/gmail/v1/users/me/messages/..%252F..%252Foauth2"
+        );
+        let id = "18f0a1b2c3d4e5f6";
+        assert_eq!(
+            format!(
+                "/gmail/v1/users/me/messages/{}",
+                super::super::path_segment(id)
+            ),
+            "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6"
+        );
     }
 }

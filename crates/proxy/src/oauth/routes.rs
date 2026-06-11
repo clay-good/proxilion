@@ -187,11 +187,35 @@ async fn bridge_callback_inner(
     }
 }
 
+/// surface-delight-and-correctness.md §6.4 — the federation token's `state`
+/// claim (the session UUID the bridge minted it for) must equal the callback's
+/// `state` query param. Comparison is on the canonical UUID string form because
+/// the claim arrives as a `String`. Returning `false` here means a token minted
+/// for a different session is being replayed and the callback must be rejected.
+fn federation_state_matches(claim_state: &str, session: Uuid) -> bool {
+    claim_state == session.to_string()
+}
+
 async fn bridge_callback_body(
     state: OAuthState,
     params: BridgeCallback,
     claims: super::bridge::FederationClaims,
 ) -> Result<Redirect, OAuthError> {
+    // surface-delight-and-correctness.md §6.4 — bind the federation token's
+    // `state` claim to the callback session. The bridge mints the token for a
+    // specific session UUID; a token minted for one session must not be
+    // replayable into another (session fixation). The query already scopes the
+    // UPDATE to `params.state`, but without this check a token whose `state`
+    // names session A could be presented on session B's callback and steer B's
+    // PCA_0 / p_0 from A's claims. Compared as strings since the claim is the
+    // session UUID in canonical form. (Ships alongside the signature-
+    // verification step still stubbed in `bridge::validate_federation_token`.)
+    if !federation_state_matches(&claims.state, params.state) {
+        return Err(OAuthError::BridgeRejected(
+            "federation token state does not match callback session".into(),
+        ));
+    }
+
     if let Some(b64) = claims.pca_0_cbor_b64.as_deref() {
         let cbor = B64
             .decode(b64)
@@ -1472,5 +1496,33 @@ mod tests {
         // making `mint_successor(pca0.cbor.clone(), pca1_ops, ...)`
         // borrow-across-await-boundary impossible.
         let _: fn(&[String], &str) -> Vec<String> = narrowed_ops_for_pca1;
+    }
+
+    #[test]
+    fn federation_state_matches_only_when_claim_equals_session() {
+        // §6.4 — the federation token's `state` claim must equal the callback
+        // session UUID, else a token minted for session A is being replayed
+        // into session B (session fixation). `bridge_callback_body` rejects on
+        // a false return before any DB write, so no session is established.
+        let session = Uuid::new_v4();
+        assert!(
+            federation_state_matches(&session.to_string(), session),
+            "matching state must bind",
+        );
+        let other = Uuid::new_v4();
+        assert!(
+            !federation_state_matches(&other.to_string(), session),
+            "a token minted for a different session must be rejected",
+        );
+        // Garbage / empty claim never matches a real session.
+        assert!(!federation_state_matches("", session));
+        assert!(!federation_state_matches("not-a-uuid", session));
+        // The comparison is on canonical (hyphenated, lowercase) form; the
+        // simple/uppercase variants are not accepted, which is fine — the
+        // bridge always emits the canonical form `Uuid::to_string` produces.
+        assert!(!federation_state_matches(
+            &session.simple().to_string(),
+            session
+        ));
     }
 }

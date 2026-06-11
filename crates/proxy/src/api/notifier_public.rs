@@ -1117,4 +1117,116 @@ mod tests {
         // error-handling shape.
         let _f: fn(NotifierPublicState) -> Router = router;
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Skips when no test database is configured — see `test_support`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Construct a `NotifierPublicState` over a real pool. `reject_inner` (the
+    /// path this test exercises) touches only `db`, but `BlockedApiState`
+    /// requires the pca_cache + pic fields to exist.
+    async fn public_state(pool: sqlx::PgPool) -> NotifierPublicState {
+        let pca_cache = crate::pic::PcaCache::new(pool.clone());
+        let pic = crate::pic::executor::PicExecutor::dev_ephemeral("http://localhost:0".into())
+            .expect("ephemeral pic executor builds");
+        let blocked = std::sync::Arc::new(crate::api::blocked::BlockedApiState {
+            db: pool.clone(),
+            pca_cache,
+            pic,
+        });
+        NotifierPublicState { db: pool, blocked }
+    }
+
+    async fn body_str(r: Response) -> String {
+        let bytes = axum::body::to_bytes(r.into_body(), 256_000).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn db_backed_landing_get_does_not_consume_token_but_post_does() {
+        // §4.1 prefetch-safety, end-to-end against real SQL: an email client
+        // (or scanner) that GETs the approve link must NOT consume the single-
+        // use token — only the form POST may. This is the load-bearing
+        // property that makes the email approval link prefetch-safe.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        let blocked_id = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO blocked_actions (id, request_id, vendor, action, layer, policy_id, detail, status)
+             VALUES ($1, $2, 'google', 'gmail.messages.send', 'policy', 'gmail-ext', 'external recipient', 'pending')",
+        )
+        .bind(blocked_id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("seed blocked_actions");
+        sqlx::query(
+            "INSERT INTO notifier_tokens (token_id, blocked_id, action, expires_at)
+             VALUES ($1, $2, 'reject', now() + interval '30 minutes')",
+        )
+        .bind(token_id)
+        .bind(blocked_id)
+        .execute(&pool)
+        .await
+        .expect("seed notifier_tokens");
+
+        let state = public_state(pool.clone()).await;
+
+        // 1. GET the landing — renders the form, consumes NOTHING.
+        let resp = landing(State(state.clone()), Query(TokenQ { t: token_id })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_str(resp).await;
+        assert!(
+            html.contains("name=\"reason\""),
+            "GET should render the reject form"
+        );
+        let consumed: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT consumed_at FROM notifier_tokens WHERE token_id = $1")
+                .bind(token_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            consumed.is_none(),
+            "PREFETCH HAZARD: GET consumed the single-use token",
+        );
+
+        // 2. POST the form — commits the reject and consumes the token.
+        let resp = submit(
+            State(state.clone()),
+            Form(SubmitForm {
+                t: token_id,
+                justification: None,
+                reason: Some("not authorized for this external recipient".into()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let status: String = sqlx::query_scalar("SELECT status FROM blocked_actions WHERE id = $1")
+            .bind(blocked_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "rejected", "POST should commit the reject");
+        let consumed: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT consumed_at FROM notifier_tokens WHERE token_id = $1")
+                .bind(token_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(consumed.is_some(), "POST must consume the token");
+
+        // 3. GET again — the token is spent; landing shows the already-used page.
+        let resp = landing(State(state), Query(TokenQ { t: token_id })).await;
+        let html = body_str(resp).await;
+        assert!(
+            html.contains("already") || html.to_lowercase().contains("used"),
+            "a consumed token must render the already-used page, got: {}",
+            &html[..html.len().min(300)],
+        );
+    }
 }

@@ -287,6 +287,29 @@ proxilion-cli completion fish > ~/.config/fish/completions/proxilion-cli.fish
 | **Best-effort, isolated audit sinks** | The durable `action_events` row is written by the primary before fan-out; NATS / SIEM / notifier failures (incl. retryable 429s) never block the request or each other. |
 | **Justification capture as graceful enhancement** | The Slack approve modal needs a bot token (`PROXILION_SLACK_BOT_TOKEN`); when it's set, the click opens a `views.open` modal and the override commits on `view_submission` with the reviewer's text. Without it, the original direct-commit path (incoming-webhook only) is unchanged — the feature is purely additive, no schema or config-row change. |
 
+## Testing
+
+The default suite is hermetic — `cargo test --workspace --locked` needs no
+database or network and is what CI gates on. Beyond it, a set of **DB-backed
+integration tests** drives real handlers against a real Postgres (the proxy is
+a binary-only crate, so these live as in-module `#[cfg(test)]` tests that can
+reach private handlers). They are **opt-in**: each returns early unless
+`PROXILION_TEST_DATABASE_URL` is set, so the default run (and CI) skips them
+and stays green. To run them locally:
+
+```bash
+docker run -d --name pg -e POSTGRES_USER=proxilion -e POSTGRES_PASSWORD=proxilion \
+    -e POSTGRES_DB=proxilion_test -p 55432:5432 postgres:16-alpine
+PROXILION_TEST_DATABASE_URL=postgres://proxilion:proxilion@localhost:55432/proxilion_test \
+    cargo test -p proxy db_backed
+```
+
+They migrate the schema (`sqlx::migrate!`) and assert security-critical
+properties end-to-end — e.g. the email approval link consumes its single-use
+token only on **POST**, never on a prefetch GET; the killswitch `--dry-run`
+count matches the real revoke exactly. Wiring a Postgres service into CI to run
+these on every push is the next step (tracked against the coverage ratchet).
+
 ## License
 
 MIT. Built on [`clay-good/provenance`](https://github.com/clay-good/provenance)

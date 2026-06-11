@@ -16,6 +16,19 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **DB-backed integration tests** ([crates/proxy/src/test_support.rs](crates/proxy/src/test_support.rs))
+  — the long-deferred end-to-end harness (spec.md §1.1 deviation 3), now seeded.
+  Because the proxy is a binary-only crate, these live as in-module
+  `#[cfg(test)]` tests that drive private handlers against a real Postgres
+  (migrated via `sqlx::migrate!`). They are **opt-in**: each returns early
+  unless `PROXILION_TEST_DATABASE_URL` is set, so the default `cargo test`
+  run and CI skip them and stay hermetic/green. Two security-critical flows
+  are covered end-to-end: the `notifier_public` email approval landing (the
+  single-use token is consumed only on **POST**, never on a prefetch GET —
+  §4.1) and the `killswitch` `--dry-run` (the preview `count(*)` matches the
+  real revoke exactly, with no state change and no `kill_records` row — §3.3).
+  Verified locally against `postgres:16`. Wiring a Postgres `services:` block
+  into CI to run them on every push is the documented next step.
 - **Slack approve/reject justification modal** (surface-delight-and-correctness.md
   §4.1, audit-critical) — when a Slack **bot** token is set
   (`PROXILION_SLACK_BOT_TOKEN`), an Approve/Reject click calls `views.open`

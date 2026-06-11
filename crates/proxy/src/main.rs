@@ -22,6 +22,8 @@ mod pic;
 mod policy_handle;
 mod server;
 mod session;
+#[cfg(test)]
+mod test_support;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

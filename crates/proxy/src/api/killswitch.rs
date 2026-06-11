@@ -1098,4 +1098,176 @@ mod tests {
         fn require_clone<T: Clone>() {}
         require_clone::<KillswitchApiState>();
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Skips when no test database is configured — see `test_support`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Seed the full FK chain for one active bearer rooted at `p_0`:
+    /// oauth_client → oauth_session → google_tokens + pca_cache → agent_bearer.
+    /// Returns the `(session_id, bearer_sha256)` so a test can revoke by either.
+    async fn seed_bearer(pool: &PgPool, p_0: &str) -> (Uuid, Vec<u8>) {
+        let client_id = format!("client-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO oauth_clients (id, name, redirect_uris) VALUES ($1, 'it', ARRAY['https://x/cb'])",
+        )
+        .bind(&client_id)
+        .execute(pool)
+        .await
+        .expect("seed oauth_clients");
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO oauth_sessions
+               (id, client_id, agent_redirect_uri, agent_state, agent_code_challenge,
+                agent_code_challenge_method, agent_requested_scope, p_0, expires_at)
+             VALUES ($1, $2, 'https://x/cb', 'st', 'ch', 'S256', 'scope', $3, now() + interval '1 hour')",
+        )
+        .bind(session_id)
+        .bind(&client_id)
+        .bind(p_0)
+        .execute(pool)
+        .await
+        .expect("seed oauth_sessions");
+        let gt_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO google_tokens
+               (id, session_id, access_token_ciphertext, access_token_nonce, scope, expires_at)
+             VALUES ($1, $2, '\\x00', '\\x00', 'scope', now() + interval '1 hour')",
+        )
+        .bind(gt_id)
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .expect("seed google_tokens");
+        let pca_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO pca_cache (pca_id, cbor, p_0, ops, hop, signature)
+             VALUES ($1, '\\x00', $2, '[]'::jsonb, 1, '\\x00')",
+        )
+        .bind(pca_id)
+        .bind(p_0)
+        .execute(pool)
+        .await
+        .expect("seed pca_cache");
+        // bearer_sha256 is a 32-byte BYTEA; make it unique per bearer.
+        let mut sha = vec![0u8; 32];
+        sha[..16].copy_from_slice(&Uuid::new_v4().into_bytes());
+        sqlx::query(
+            "INSERT INTO agent_bearers (bearer_sha256, session_id, google_tokens_id, pca_1_id, scope)
+             VALUES ($1, $2, $3, $4, 'scope')",
+        )
+        .bind(&sha)
+        .bind(session_id)
+        .bind(gt_id)
+        .bind(pca_id)
+        .execute(pool)
+        .await
+        .expect("seed agent_bearers");
+        (session_id, sha)
+    }
+
+    async fn live_bearer_count(pool: &PgPool, session_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM agent_bearers WHERE session_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn db_backed_dry_run_counts_without_revoking_then_real_revoke_matches() {
+        // §3.3, end-to-end against real SQL: the dry-run `SELECT count(*)` must
+        // (a) return the blast radius, (b) change NO state, and (c) match the
+        // real revoke's count exactly — proving the preview predicate and the
+        // UPDATE predicate stay in lockstep (no TOCTOU surprise).
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        let p_0 = format!("alice-{}@acme.com", Uuid::new_v4());
+        let (session_id, _) = seed_bearer(&pool, &p_0).await;
+        // Add a second bearer under the SAME session so count > 1.
+        let client2 = format!("client-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO oauth_clients (id, name, redirect_uris) VALUES ($1,'it',ARRAY['https://x/cb'])")
+            .bind(&client2).execute(&pool).await.unwrap();
+        let gt2 = Uuid::new_v4();
+        sqlx::query("INSERT INTO google_tokens (id, session_id, access_token_ciphertext, access_token_nonce, scope, expires_at) VALUES ($1,$2,'\\x00','\\x00','s', now()+interval '1 hour')")
+            .bind(gt2).bind(session_id).execute(&pool).await.unwrap();
+        let pca2 = Uuid::new_v4();
+        sqlx::query("INSERT INTO pca_cache (pca_id, cbor, p_0, ops, hop, signature) VALUES ($1,'\\x00',$2,'[]'::jsonb,1,'\\x00')")
+            .bind(pca2).bind(&p_0).execute(&pool).await.unwrap();
+        let mut sha2 = vec![0u8; 32];
+        sha2[..16].copy_from_slice(&Uuid::new_v4().into_bytes());
+        sqlx::query("INSERT INTO agent_bearers (bearer_sha256, session_id, google_tokens_id, pca_1_id, scope) VALUES ($1,$2,$3,$4,'s')")
+            .bind(&sha2).bind(session_id).bind(gt2).bind(pca2).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            live_bearer_count(&pool, session_id).await,
+            2,
+            "two live bearers seeded"
+        );
+
+        let state = Arc::new(KillswitchApiState {
+            db: pool.clone(),
+            kill_cache: crate::kill_cache::KillCache::new(),
+        });
+
+        // 1. Dry-run: counts 2, revokes nothing, persists no kill_record.
+        let kr_before: i64 = sqlx::query_scalar("SELECT count(*) FROM kill_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let preview = kill_session(
+            State(state.clone()),
+            axum::extract::Path(session_id),
+            Some(Json(KillBody {
+                dry_run: Some(true),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("dry-run ok")
+        .0;
+        assert!(preview.dry_run);
+        assert_eq!(preview.bearers_revoked, 2, "dry-run blast radius");
+        assert_eq!(preview.record_id, Uuid::nil(), "dry-run persists no record");
+        assert_eq!(
+            live_bearer_count(&pool, session_id).await,
+            2,
+            "dry-run revoked nothing"
+        );
+        let kr_after: i64 = sqlx::query_scalar("SELECT count(*) FROM kill_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kr_before, kr_after, "dry-run wrote no kill_record");
+
+        // 2. Real revoke: same count, state mutated, kill_record persisted.
+        let real = kill_session(
+            State(state),
+            axum::extract::Path(session_id),
+            Some(Json(KillBody::default())),
+        )
+        .await
+        .expect("revoke ok")
+        .0;
+        assert!(!real.dry_run);
+        assert_eq!(
+            real.bearers_revoked, preview.bearers_revoked,
+            "real revoke count must match the dry-run preview",
+        );
+        assert_ne!(
+            real.record_id,
+            Uuid::nil(),
+            "real revoke persists a kill_record"
+        );
+        assert_eq!(
+            live_bearer_count(&pool, session_id).await,
+            0,
+            "all bearers revoked"
+        );
+    }
 }

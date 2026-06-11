@@ -91,6 +91,52 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+  integration:
+    name: db-backed integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # A real Postgres for the opt-in DB-backed tests (crates/proxy/src/
+    # test_support.rs). Without PROXILION_TEST_DATABASE_URL these tests skip;
+    # here we provide one so they actually run on every push, exercising real
+    # handlers against real SQL (the email approval-token consume-on-POST
+    # property, the killswitch dry-run predicate parity, the blocked-queue
+    # filters + auto-expire). Migrations are applied by `sqlx::migrate!` inside
+    # the test harness — no separate migrate step needed.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: proxilion
+          POSTGRES_PASSWORD: proxilion
+          POSTGRES_DB: proxilion_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U proxilion"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PROXILION_TEST_DATABASE_URL: postgres://proxilion:proxilion@localhost:5432/proxilion_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-test-
+      - name: db-backed tests
+        run: cargo test -p proxy --locked db_backed -- --nocapture
+
   build-release:
     name: cargo build --release
     runs-on: ubuntu-latest

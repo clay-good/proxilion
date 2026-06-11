@@ -16,6 +16,14 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **CI now runs the DB-backed integration tests** — a new `integration` job in
+  [.github/workflows/ci.yml](.github/workflows/ci.yml) provisions a
+  `postgres:16-alpine` service and sets `PROXILION_TEST_DATABASE_URL`, so the
+  opt-in DB-backed tests execute (not skip) on every push. The job is
+  independent of `fmt`/`clippy`/`test`/`build-release`. Also extended the
+  harness with a **blocked-queue** test (`list` status/policy filters, the
+  auto-expire-on-list of past-due pending rows, and `show` → 404 on unknown id),
+  verified locally against `postgres:16`.
 - **DB-backed integration tests** ([crates/proxy/src/test_support.rs](crates/proxy/src/test_support.rs))
   — the long-deferred end-to-end harness (spec.md §1.1 deviation 3), now seeded.
   Because the proxy is a binary-only crate, these live as in-module

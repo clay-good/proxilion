@@ -1333,4 +1333,131 @@ mod tests {
         fn require_clone<T: Clone>() {}
         require_clone::<BlockedApiState>();
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Skips when no test database is configured — see `test_support`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    async fn blocked_state(pool: sqlx::PgPool) -> Arc<BlockedApiState> {
+        let pca_cache = PcaCache::new(pool.clone());
+        let pic = PicExecutor::dev_ephemeral("http://localhost:0".into())
+            .expect("ephemeral pic executor builds");
+        Arc::new(BlockedApiState {
+            db: pool,
+            pca_cache,
+            pic,
+        })
+    }
+
+    /// Insert a blocked row with explicit status + expiry so the test can
+    /// drive the list filters and the auto-expire side effect. Returns the id.
+    async fn seed_blocked(
+        pool: &sqlx::PgPool,
+        p_0: &str,
+        policy_id: &str,
+        status: &str,
+        expires_in: chrono::Duration,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO blocked_actions
+               (id, request_id, vendor, action, layer, policy_id, p_0, status, expires_at)
+             VALUES ($1, $2, 'google', 'gmail.messages.send', 'policy', $3, $4, $5, now() + $6)",
+        )
+        .bind(id)
+        .bind(Uuid::new_v4())
+        .bind(policy_id)
+        .bind(p_0)
+        .bind(status)
+        .bind(expires_in)
+        .execute(pool)
+        .await
+        .expect("seed blocked_actions");
+        id
+    }
+
+    fn list_params(status: &str, policy_id: Option<&str>) -> ListParams {
+        ListParams {
+            status: Some(status.to_string()),
+            p_0: None,
+            policy_id: policy_id.map(str::to_string),
+            session_id: None,
+            limit: Some(500),
+            before: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn db_backed_blocked_list_filters_auto_expires_and_show_round_trip() {
+        // Exercises the `list` filters + the auto-expire side effect + `show`
+        // against real SQL (these handlers are otherwise uncovered).
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        // Unique tag so this test's rows don't collide with a shared DB.
+        let tag = Uuid::new_v4().simple().to_string();
+        let pa = format!("alice-{tag}@acme.com");
+        let pol_a = format!("gate-a-{tag}");
+        let pol_b = format!("gate-b-{tag}");
+        // A: pending, valid for an hour.
+        let id_a = seed_blocked(&pool, &pa, &pol_a, "pending", chrono::Duration::hours(1)).await;
+        // B: pending, but ALREADY expired (expires_at in the past).
+        let id_b = seed_blocked(&pool, &pa, &pol_b, "pending", chrono::Duration::hours(-1)).await;
+        // C: already rejected.
+        let id_c = seed_blocked(&pool, &pa, &pol_a, "rejected", chrono::Duration::hours(1)).await;
+
+        let state = blocked_state(pool.clone()).await;
+
+        // 1. list(status=pending) auto-expires B and returns only A.
+        let resp = list(State(state.clone()), Query(list_params("pending", None)))
+            .await
+            .expect("list ok")
+            .0;
+        let ids: Vec<Uuid> = resp.rows.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&id_a), "A (live pending) must be listed");
+        assert!(!ids.contains(&id_b), "B (expired) must NOT be in pending");
+        assert!(!ids.contains(&id_c), "C (rejected) must NOT be in pending");
+        // The auto-expire UPDATE flipped B's status.
+        let b_status: String =
+            sqlx::query_scalar("SELECT status FROM blocked_actions WHERE id = $1")
+                .bind(id_b)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            b_status, "expired",
+            "list must auto-expire past-due pending rows"
+        );
+
+        // 2. list(status=all, policy_id=pol_a) returns A and C (both gate-a), not B.
+        let resp = list(
+            State(state.clone()),
+            Query(list_params("all", Some(&pol_a))),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        let ids: Vec<Uuid> = resp.rows.iter().map(|r| r.id).collect();
+        assert!(
+            ids.contains(&id_a) && ids.contains(&id_c),
+            "both gate-a rows"
+        );
+        assert!(!ids.contains(&id_b), "gate-b row excluded by policy filter");
+
+        // 3. show(id) round-trips the row; a random id is NotFound.
+        let row = show(State(state.clone()), Path(id_a))
+            .await
+            .expect("show ok")
+            .0;
+        assert_eq!(row.id, id_a);
+        assert_eq!(row.policy_id.as_deref(), Some(pol_a.as_str()));
+        assert_eq!(row.status, "pending");
+        let missing = show(State(state), Path(Uuid::new_v4())).await;
+        assert!(
+            matches!(missing, Err(ApiError::NotFound)),
+            "unknown id → NotFound"
+        );
+    }
 }

@@ -290,12 +290,14 @@ proxilion-cli completion fish > ~/.config/fish/completions/proxilion-cli.fish
 ## Testing
 
 The default suite is hermetic — `cargo test --workspace --locked` needs no
-database or network and is what CI gates on. Beyond it, a set of **DB-backed
-integration tests** drives real handlers against a real Postgres (the proxy is
-a binary-only crate, so these live as in-module `#[cfg(test)]` tests that can
-reach private handlers). They are **opt-in**: each returns early unless
-`PROXILION_TEST_DATABASE_URL` is set, so the default run (and CI) skips them
-and stays green. To run them locally:
+database or network and is what the `fmt` / `clippy` / `test` / `build-release`
+CI jobs gate on. Beyond it, a set of **DB-backed integration tests** drives
+real handlers against a real Postgres (the proxy is a binary-only crate, so
+these live as in-module `#[cfg(test)]` tests that can reach private handlers).
+They are **opt-in**: each returns early unless `PROXILION_TEST_DATABASE_URL`
+is set, so the default `cargo test` run skips them. The CI `integration` job
+provisions a `postgres:16-alpine` service and sets that env var, so they run
+for real on every push; locally:
 
 ```bash
 docker run -d --name pg -e POSTGRES_USER=proxilion -e POSTGRES_PASSWORD=proxilion \
@@ -305,10 +307,16 @@ PROXILION_TEST_DATABASE_URL=postgres://proxilion:proxilion@localhost:55432/proxi
 ```
 
 They migrate the schema (`sqlx::migrate!`) and assert security-critical
-properties end-to-end — e.g. the email approval link consumes its single-use
-token only on **POST**, never on a prefetch GET; the killswitch `--dry-run`
-count matches the real revoke exactly. Wiring a Postgres service into CI to run
-these on every push is the next step (tracked against the coverage ratchet).
+properties end-to-end:
+
+| Flow | Property pinned |
+|---|---|
+| email approval landing | the single-use token is consumed only on **POST**, never on a prefetch GET; a re-GET shows "already used" |
+| `killswitch --dry-run` | the preview `count(*)` equals the real revoke exactly, changes no state, and writes no `kill_records` row |
+| blocked-queue `list` / `show` | status/policy filters, the auto-expire-on-list of past-due pending rows, and unknown-id → 404 |
+
+The next slice is the wiremock'd Google / Trust-Plane adapter scenarios (which
+also need a seeded `pca_cache` + a successor PoC).
 
 ## License
 

@@ -143,6 +143,32 @@ Regardless of tier:
   is targeting the wrong tenant — Slack's signing secret is per
   workspace, not per directory.
 
+## 4b. Capturing the approver's *justification* (optional bot token)
+
+By default a Slack approve/reject records *who* but synthesizes the
+*why* (`"approved via Slack by <user>"`). To capture the reviewer's
+real justification, set a Slack **bot** token so the proxy can open a
+Block Kit modal (surface-delight-and-correctness.md §4.1):
+
+```bash
+# A bot token (xoxb-…) for a Slack app with the `views:write` scope,
+# installed to the workspace. Set in the proxy's environment.
+export PROXILION_SLACK_BOT_TOKEN="xoxb-…"
+```
+
+With it set, an **Approve** click opens a modal with a required
+free-text justification (≥ 20 chars, matching the email form); the
+override commits only on submit, with the entered text written to the
+audit row's `justification`. **Reject** opens the same modal with an
+optional reason. The interaction endpoint already verifies Slack's
+signed request, so the modal needs no extra auth wiring.
+
+**Graceful by default.** With no `PROXILION_SLACK_BOT_TOKEN`, the
+click commits immediately with the synthesized justification — exactly
+as before. The token only *adds* the modal step; nothing else changes.
+(`PROXILION_SLACK_API_BASE` overrides the Slack Web API base, used by
+tests.)
+
 ## 5. What this doesn't do
 
 - No support for **multi-Slack-workspace** Proxilion deployments in

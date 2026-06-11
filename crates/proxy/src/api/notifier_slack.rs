@@ -11,6 +11,7 @@
 //! the credential.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -22,6 +23,7 @@ use axum::{
 };
 use sqlx::PgPool;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::api::blocked::{ApproveBody, BlockedApiState, RejectBody, approve_inner, reject_inner};
 use crate::notifier::{SlackAction, SlackHandle, parse_button_value};
@@ -149,6 +151,12 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
         Err(e) => return slack_err(StatusCode::BAD_REQUEST, &format!("payload json: {e}")),
     };
 
+    // §4.1 — a submitted justification modal arrives as `view_submission`
+    // (no `actions` array). Commit the override with the entered text.
+    if payload["type"].as_str() == Some("view_submission") {
+        return handle_view_submission(&state, &payload).await;
+    }
+
     // Extract `actions[0].value` and the user that clicked.
     let value = payload["actions"][0]["value"].as_str().unwrap_or("");
     let user_id = payload["user"]["id"].as_str();
@@ -165,6 +173,45 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
     // ephemeral message visible only to the clicker.
     if matches!(action, SlackAction::Why) {
         return handle_why(&state.db, blocked_id).await;
+    }
+
+    // §4.1 — when a Slack bot token is configured, open a justification modal
+    // instead of committing immediately. The click is read-only (it opens a
+    // view); the actual approve/reject runs on the modal's `view_submission`
+    // with the operator-entered justification, so we do NOT claim the
+    // trigger_id here (no mutation yet). Falls through to the direct path
+    // below when no bot token is set.
+    if let Some(bot_token) = slack_bot_token() {
+        let trigger_id = payload["trigger_id"].as_str().unwrap_or("");
+        if !trigger_id.is_empty() {
+            let view = justification_modal(action, blocked_id);
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
+            return match views_open(&http, &slack_api_base(), &bot_token, trigger_id, view).await {
+                Ok(()) => {
+                    metrics::counter!(
+                        "proxilion_slack_interact_total",
+                        "result" => "modal_opened",
+                    )
+                    .increment(1);
+                    slack_ack_empty()
+                }
+                Err(e) => {
+                    warn!(blocked_id = %blocked_id, error = %e, "views.open failed; modal not shown");
+                    metrics::counter!(
+                        "proxilion_slack_interact_total",
+                        "result" => "modal_open_failed",
+                    )
+                    .increment(1);
+                    slack_err(
+                        StatusCode::BAD_GATEWAY,
+                        "could not open justification modal",
+                    )
+                }
+            };
+        }
     }
 
     // Trigger-id idempotency (ui-less-surfaces.md §5.3 deviation 3).
@@ -218,10 +265,10 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
         .unwrap_or_else(|| format!("slack:{approver}"));
     let outcome: Result<String, String> = match action {
         SlackAction::Approve => {
-            // Slack messages don't carry a justification field today; we
-            // synthesize one from the Slack user id so the audit row is
-            // not empty. A future iteration could prompt the user for a
-            // reason via a modal-open call before recording.
+            // Fallback path (no Slack bot token configured): we can't open a
+            // modal to capture a justification, so synthesize one from the
+            // Slack user id and timestamp. With a bot token set, the §4.1
+            // modal above captures the reviewer's real justification instead.
             let justification = format!(
                 "approved via Slack by {approver} at {}",
                 chrono::Utc::now().to_rfc3339()
@@ -421,6 +468,230 @@ fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// §4.1 — Block Kit justification modal (surface-delight-and-correctness.md)
+//
+// When a Slack *bot* token is configured (env `PROXILION_SLACK_BOT_TOKEN`),
+// the Approve/Reject button opens a modal that captures the reviewer's
+// justification BEFORE the override commits, replacing the synthesized
+// "approved via Slack by <user>" string with real human intent. Without a bot
+// token the handler keeps the original direct-commit behavior — incoming-
+// webhook-only installs are unaffected. The bot token lives in the env (not
+// the per-driver `notifier_config` row) so this is purely additive: no struct
+// field, no schema change, no behavior change by default.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Slack bot token (`xoxb-…`) used to call `views.open`. `None` when unset or
+/// empty — the modal flow is then skipped entirely.
+fn slack_bot_token() -> Option<String> {
+    std::env::var("PROXILION_SLACK_BOT_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// Slack Web API base. Overridable via `PROXILION_SLACK_API_BASE` so tests can
+/// point `views.open` at a mock server.
+fn slack_api_base() -> String {
+    std::env::var("PROXILION_SLACK_API_BASE")
+        .unwrap_or_else(|_| "https://slack.com/api".to_string())
+}
+
+/// Minimum justification length on **approve** — mirrors the email landing
+/// form ([api/notifier_public.rs](../notifier_public.rs)) so both human-in-the-
+/// loop surfaces enforce the same audit-quality bar.
+const MIN_JUSTIFICATION_LEN: usize = 20;
+
+/// Build the Block Kit modal view that captures a justification for `action`
+/// on `blocked_id`. `private_metadata` reuses the button-value encoding
+/// (`approve:<uuid>` / `reject:<uuid>`) so `view_submission` can route it back
+/// through [`parse_button_value`]. Approve requires the input (≥ 20 chars
+/// enforced on submit); reject leaves it optional.
+fn justification_modal(action: SlackAction, blocked_id: Uuid) -> serde_json::Value {
+    let (verb, optional, pm_prefix, label) = match action {
+        SlackAction::Approve => (
+            "Approve",
+            false,
+            "approve",
+            "Justification (required, \u{2265} 20 chars)",
+        ),
+        SlackAction::Reject => ("Reject", true, "reject", "Reason (optional)"),
+        // Why has no modal; callers guard against this, but stay total.
+        SlackAction::Why => ("View", true, "why", "Note (optional)"),
+    };
+    let private_metadata = format!("{pm_prefix}:{blocked_id}");
+    serde_json::json!({
+        "type": "modal",
+        "callback_id": "proxilion_justification",
+        "private_metadata": private_metadata,
+        "title": { "type": "plain_text", "text": format!("{verb} action") },
+        "submit": { "type": "plain_text", "text": verb },
+        "close": { "type": "plain_text", "text": "Cancel" },
+        "blocks": [
+            { "type": "section",
+              "text": { "type": "mrkdwn", "text": format!("Blocked action `{blocked_id}`") } },
+            { "type": "input",
+              "block_id": "justification",
+              "optional": optional,
+              "label": { "type": "plain_text", "text": label },
+              "element": { "type": "plain_text_input", "action_id": "value", "multiline": true } }
+        ],
+    })
+}
+
+/// Extract `(action, blocked_id, justification_text)` from a `view_submission`
+/// payload. Routes on `private_metadata` (button-value shape) and reads the
+/// entered text from `view.state.values.justification.value.value`.
+fn parse_view_submission(payload: &serde_json::Value) -> Option<(SlackAction, Uuid, String)> {
+    let pm = payload["view"]["private_metadata"].as_str()?;
+    let (action, blocked_id) = parse_button_value(pm)?;
+    let text = payload["view"]["state"]["values"]["justification"]["value"]["value"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    Some((action, blocked_id, text))
+}
+
+/// POST `views.open` to the Slack Web API. Returns `Ok(())` on `{ok:true}`,
+/// otherwise the Slack `error` string.
+async fn views_open(
+    http: &reqwest::Client,
+    api_base: &str,
+    bot_token: &str,
+    trigger_id: &str,
+    view: serde_json::Value,
+) -> Result<(), String> {
+    let body = serde_json::json!({ "trigger_id": trigger_id, "view": view });
+    let resp = http
+        .post(format!("{}/views.open", api_base.trim_end_matches('/')))
+        .bearer_auth(bot_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if v["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        Err(v["error"].as_str().unwrap_or("unknown_error").to_string())
+    }
+}
+
+/// Acknowledge a `block_actions` interaction with an empty 200 — the modal is
+/// opened out-of-band by the `views.open` call, so Slack needs only the ack.
+fn slack_ack_empty() -> Response {
+    (StatusCode::OK, [("content-type", "application/json")], "").into_response()
+}
+
+/// A `view_submission` success response: empty 200 closes the modal.
+fn slack_view_close() -> Response {
+    (StatusCode::OK, [("content-type", "application/json")], "").into_response()
+}
+
+/// A `view_submission` validation error: 200 with `response_action: errors`,
+/// which keeps the modal open and renders `msg` under the input `block_id`.
+fn slack_view_error(block_id: &str, msg: &str) -> Response {
+    let body = serde_json::json!({
+        "response_action": "errors",
+        "errors": { block_id: msg },
+    });
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Handle a submitted justification modal: commit the approve/reject with the
+/// reviewer-entered text. Approve enforces the ≥ 20-char minimum (keeping the
+/// modal open with an inline error otherwise); reject treats an empty reason
+/// as the synthesized fallback.
+async fn handle_view_submission(
+    state: &SlackInteractState,
+    payload: &serde_json::Value,
+) -> Response {
+    let Some((action, blocked_id, justification)) = parse_view_submission(payload) else {
+        return slack_err(StatusCode::BAD_REQUEST, "malformed view_submission");
+    };
+    let user_id = payload["user"]["id"].as_str();
+    let user_name = payload["user"]["username"].as_str();
+    let approver = user_name.or(user_id).unwrap_or("slack-user");
+    let approver_subject = state
+        .slack
+        .current()
+        .and_then(|s| s.resolve_user(user_id, user_name))
+        .unwrap_or_else(|| format!("slack:{approver}"));
+
+    match action {
+        SlackAction::Approve => {
+            let just = justification.trim();
+            if just.len() < MIN_JUSTIFICATION_LEN {
+                metrics::counter!(
+                    "proxilion_slack_interact_total",
+                    "result" => "modal_justification_too_short",
+                )
+                .increment(1);
+                return slack_view_error(
+                    "justification",
+                    "Justification must be at least 20 characters.",
+                );
+            }
+            match approve_inner(
+                &state.blocked,
+                blocked_id,
+                ApproveBody {
+                    justification: just.to_string(),
+                    ttl_minutes: None,
+                    approver_subject: Some(approver_subject),
+                },
+                "slack",
+            )
+            .await
+            {
+                Ok(_) => {
+                    metrics::counter!(
+                        "proxilion_slack_interact_total",
+                        "result" => "approved_modal",
+                    )
+                    .increment(1);
+                    info!(blocked_id = %blocked_id, "slack modal approve committed");
+                    slack_view_close()
+                }
+                Err(e) => slack_view_error("justification", &format!("Approve failed: {e}")),
+            }
+        }
+        SlackAction::Reject => {
+            let reason = if justification.trim().is_empty() {
+                format!("rejected via Slack by {approver}")
+            } else {
+                justification.trim().to_string()
+            };
+            match reject_inner(
+                &state.blocked,
+                blocked_id,
+                RejectBody {
+                    reason,
+                    approver_subject: Some(approver_subject),
+                },
+            )
+            .await
+            {
+                Ok(_) => {
+                    metrics::counter!(
+                        "proxilion_slack_interact_total",
+                        "result" => "rejected_modal",
+                    )
+                    .increment(1);
+                    info!(blocked_id = %blocked_id, "slack modal reject committed");
+                    slack_view_close()
+                }
+                Err(e) => slack_view_error("justification", &format!("Reject failed: {e}")),
+            }
+        }
+        SlackAction::Why => slack_err(StatusCode::BAD_REQUEST, "why has no modal"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +703,123 @@ mod tests {
         h.insert("x-slack-signature", HeaderValue::from_static("v0=abc"));
         assert_eq!(header_str(&h, "x-slack-signature"), Some("v0=abc"));
         assert_eq!(header_str(&h, "x-slack-timestamp"), None);
+    }
+
+    // ─── §4.1 justification modal ───
+
+    #[test]
+    fn justification_modal_approve_requires_input_and_encodes_metadata() {
+        let id = Uuid::new_v4();
+        let v = justification_modal(SlackAction::Approve, id);
+        assert_eq!(v["type"], "modal");
+        assert_eq!(v["callback_id"], "proxilion_justification");
+        // private_metadata reuses the button-value encoding so view_submission
+        // can route it back through parse_button_value.
+        assert_eq!(v["private_metadata"], format!("approve:{id}"));
+        assert_eq!(v["submit"]["text"], "Approve");
+        let input = &v["blocks"][1];
+        assert_eq!(input["type"], "input");
+        assert_eq!(input["block_id"], "justification");
+        // Approve requires the justification.
+        assert_eq!(input["optional"], false);
+        assert_eq!(input["element"]["action_id"], "value");
+        assert_eq!(input["element"]["multiline"], true);
+    }
+
+    #[test]
+    fn justification_modal_reject_makes_reason_optional() {
+        let id = Uuid::new_v4();
+        let v = justification_modal(SlackAction::Reject, id);
+        assert_eq!(v["private_metadata"], format!("reject:{id}"));
+        assert_eq!(v["submit"]["text"], "Reject");
+        assert_eq!(v["blocks"][1]["optional"], true);
+    }
+
+    #[test]
+    fn parse_view_submission_extracts_action_id_and_text_and_round_trips_metadata() {
+        let id = Uuid::new_v4();
+        // Build the private_metadata via the modal builder, then a realistic
+        // view_submission payload carrying the entered justification.
+        let modal = justification_modal(SlackAction::Approve, id);
+        let pm = modal["private_metadata"].as_str().unwrap().to_string();
+        let payload = serde_json::json!({
+            "type": "view_submission",
+            "user": { "id": "U1", "username": "alice" },
+            "view": {
+                "private_metadata": pm,
+                "state": { "values": { "justification": { "value": {
+                    "type": "plain_text_input",
+                    "value": "Customer asked for this report; verified the recipient."
+                } } } }
+            }
+        });
+        let (action, blocked_id, text) = parse_view_submission(&payload).expect("parses");
+        assert_eq!(action, SlackAction::Approve);
+        assert_eq!(blocked_id, id);
+        assert!(text.starts_with("Customer asked"));
+    }
+
+    #[test]
+    fn parse_view_submission_rejects_missing_metadata() {
+        let payload = serde_json::json!({ "type": "view_submission", "view": {} });
+        assert!(parse_view_submission(&payload).is_none());
+    }
+
+    #[tokio::test]
+    async fn views_open_returns_ok_on_ok_true_and_err_on_ok_false() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // ok:true → Ok.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/views.open"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let view = justification_modal(SlackAction::Approve, Uuid::nil());
+        assert!(
+            views_open(&http, &server.uri(), "xoxb-test", "trig-1", view.clone())
+                .await
+                .is_ok()
+        );
+
+        // ok:false → Err carrying the Slack error string.
+        let server2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/views.open"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "trigger_id expired" }),
+                ),
+            )
+            .mount(&server2)
+            .await;
+        let err = views_open(&http, &server2.uri(), "xoxb-test", "trig-2", view)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "trigger_id expired");
+    }
+
+    #[tokio::test]
+    async fn slack_view_error_is_response_action_errors_keyed_on_block_id() {
+        let r = slack_view_error("justification", "too short");
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["response_action"], "errors");
+        assert_eq!(v["errors"]["justification"], "too short");
+    }
+
+    #[tokio::test]
+    async fn slack_view_close_and_ack_empty_are_empty_200() {
+        for r in [slack_view_close(), slack_ack_empty()] {
+            assert_eq!(r.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+            assert!(bytes.is_empty(), "expected empty body");
+        }
     }
 
     #[test]

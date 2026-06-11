@@ -16,6 +16,18 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Slack approve/reject justification modal** (surface-delight-and-correctness.md
+  §4.1, audit-critical) — when a Slack **bot** token is set
+  (`PROXILION_SLACK_BOT_TOKEN`), an Approve/Reject click calls `views.open`
+  to show a Block Kit modal capturing the reviewer's justification, and the
+  override commits on `view_submission` with that text (replacing the
+  synthesized "approved via Slack by …" string), enforcing the same ≥ 20-char
+  minimum as the email form. **Graceful degradation:** with no bot token the
+  original direct-commit path is unchanged, so incoming-webhook-only installs
+  are unaffected — the token lives in the env, not the `notifier_config` row,
+  so there is no schema/struct/pin change. Pure helpers (modal JSON,
+  `view_submission` parse + round-trip) and the `views.open` call (via
+  wiremock) are unit-tested. This completes the surface-delight spec's §4.
 - **CLI: `--color auto|always|never`** (surface-delight-and-correctness.md
   §3.2) — a global flag gating all ANSI output, honoring `NO_COLOR` and
   non-TTY pipes. The four `const` SGR codes were replaced with a runtime-gated

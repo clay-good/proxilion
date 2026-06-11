@@ -34,7 +34,11 @@ original Proxilion work:
   instructions") and stripped or quarantined before the agent reads them.
 - **Write-gating with human-in-the-loop.** External email sends, mass deletes,
   external file shares are blocked unless a real human explicitly approves
-  through Slack or a ticket. Configurable per sender, per domain, per op.
+  through Slack or email. Configurable per sender, per domain, per op. Every
+  approval captures the reviewer's *justification* — a Slack Block Kit modal
+  (`views.open`, when a bot token is set) or the email confirmation form — so
+  the audit row records *why*, not just *who*. The email link lands on a form
+  and consumes its single-use token on **POST**, not GET (prefetch-safe).
 - **Real-time action stream + killswitch.** Every agent action streams to an
   operator dashboard and your SIEM the moment it happens. One click revokes
   every capability tied to that agent or user within one request cycle.
@@ -281,6 +285,7 @@ proxilion-cli completion fish > ~/.config/fish/completions/proxilion-cli.fish
 | **PIC as a SHA-pinned dependency** | We consume the upstream reference implementation, never vendor or reimplement it — the cryptography stays auditable against its source of truth. |
 | **YAML match-expression interpreter, not Rego** | A direct interpreter keeps the build slim and the p99 < 1 ms hot-path budget; the `evaluate` API is Rego-swappable later without touching adapters. |
 | **Best-effort, isolated audit sinks** | The durable `action_events` row is written by the primary before fan-out; NATS / SIEM / notifier failures (incl. retryable 429s) never block the request or each other. |
+| **Justification capture as graceful enhancement** | The Slack approve modal needs a bot token (`PROXILION_SLACK_BOT_TOKEN`); when it's set, the click opens a `views.open` modal and the override commits on `view_submission` with the reviewer's text. Without it, the original direct-commit path (incoming-webhook only) is unchanged — the feature is purely additive, no schema or config-row change. |
 
 ## License
 

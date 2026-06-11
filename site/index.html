@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>Proxilion. Confused-deputy defense for managed AI agents. MIT, self-hosted, free.</title>
+<title>Proxilion: Security for AI Agents</title>
 
 <meta name="description" content="Proxilion is a free, MIT-licensed, self-hosted reverse proxy that prevents confused-deputy attacks against managed AI agents (Anthropic's hosted Claude, OpenAI assistants, Google Vertex agents). OAuth-path interception, prompt-injection read-filtering, write-gating with human-in-the-loop, real-time action stream, instant killswitch, YAML policy engine, SaaS adapters for Google Drive, Gmail, and Calendar. Cryptographic audit chains via the open PIC protocol. SOC 2, HIPAA, ISO 27001 ready. No telemetry. No paid product.">
 <meta name="keywords" content="AI agent security, managed AI agents, confused deputy attack, OAuth proxy, prompt injection defense, Anthropic Claude security, OpenAI assistants security, Google Vertex agent security, PIC protocol, Provenance Identity Continuity, pic-protocol.org, cryptographic audit logs, COSE Ed25519, Rust security proxy, MCP security, agent governance, agentic AI security, zero trust AI, AI compliance SOC2, AI compliance HIPAA, ISO 27001 AI, FedRAMP AI agent, MIT licensed security, self-hosted, agent identity, OAuth interception, capability chain, PCA chain, Proof of Causal Authority, Trust Plane, data exfiltration prevention, AI data loss prevention, CISO AI security, security engineer AI agents">
@@ -32,9 +32,8 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#07090d" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#fcfbf8">
+<meta name="color-scheme" content="light">
 
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://proxilion.com/">
@@ -156,87 +155,41 @@
 }
 </script>
 
-<script>
-  // Apply theme before paint to avoid flash.
-  (function () {
-    try {
-      var saved = localStorage.getItem('proxilion-theme');
-      var prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
-      var theme = saved || (prefersLight ? 'light' : 'dark');
-      document.documentElement.setAttribute('data-theme', theme);
-    } catch (e) {
-      document.documentElement.setAttribute('data-theme', 'dark');
-    }
-  })();
-</script>
-
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-:root,
-:root[data-theme="dark"] {
-  --ink: #0a0e14;
-  --ink-soft: #1a1f29;
-  --body: #c8ccd4;
-  --muted: #8b919c;
-  --line: #1f2530;
-  --line-soft: #161a22;
-  --bg: #07090d;
-  --surface: #0d1117;
-  --surface-2: #11161f;
-  --heading: #f5f7fa;
-  --accent: #00e5a8;
-  --accent-strong: #00e5a8;
-  --accent-soft: rgba(0, 229, 168, 0.12);
-  --accent-glow: rgba(0, 229, 168, 0.25);
-  --info: #6cc8ff;
-  --info-soft: rgba(0, 180, 255, 0.12);
-  --info-border: rgba(0, 180, 255, 0.3);
-  --danger: #ff6b6b;
-  --button-fg: #0a0e14;
-  --button-bg: linear-gradient(180deg, #f5f7fa 0%, #d0d4dc 100%);
-  --button-border: rgba(255,255,255,0.18);
-  --hero-grad-1: radial-gradient(1200px 700px at 80% -10%, rgba(0, 229, 168, 0.06), transparent 60%);
-  --hero-grad-2: radial-gradient(900px 500px at -10% 30%, rgba(0, 180, 255, 0.04), transparent 60%);
-  --diagram-node-bg: #11161f;
-  --diagram-node-stroke: #1f2530;
-  --diagram-node-text: #f5f7fa;
-  --diagram-node-sub: #8b919c;
-  --diagram-flow-back: #4b5563;
+:root {
+  --ink: #131c26;
+  --ink-soft: #2a3744;
+  --body: #46525f;
+  --muted: #79838f;
+  --line: #e6e2d7;
+  --line-soft: #f0ece2;
+  --bg: #fcfbf8;
+  --surface: #ffffff;
+  --surface-2: #f6f4ee;
+  --heading: #131c26;
+  --accent: #0a917a;
+  --accent-strong: #07795f;
+  --accent-soft: rgba(10, 145, 122, 0.1);
+  --accent-glow: rgba(10, 145, 122, 0.16);
+  --info: #0d74ad;
+  --info-soft: rgba(13, 116, 173, 0.08);
+  --info-border: rgba(13, 116, 173, 0.22);
+  --danger: #c0392b;
+  --button-fg: #ffffff;
+  --button-bg: linear-gradient(180deg, #1c2733 0%, #131c26 100%);
+  --button-border: rgba(0,0,0,0.1);
+  --hero-grad-1: radial-gradient(1200px 700px at 80% -10%, rgba(10, 145, 122, 0.07), transparent 60%);
+  --hero-grad-2: radial-gradient(900px 500px at -10% 30%, rgba(13, 116, 173, 0.045), transparent 60%);
+  --diagram-node-bg: #ffffff;
+  --diagram-node-stroke: #e6e2d7;
+  --diagram-node-text: #131c26;
+  --diagram-node-sub: #79838f;
+  --diagram-flow-back: #9aa4af;
   --max: 1180px;
   --r: 10px;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-:root[data-theme="light"] {
-  --ink: #0d1117;
-  --ink-soft: #2a2f3a;
-  --body: #3a3f4b;
-  --muted: #6b7280;
-  --line: #e6e4dd;
-  --line-soft: #efece4;
-  --bg: #ffffff;
-  --surface: #faf8f3;
-  --surface-2: #f3f1ea;
-  --heading: #0d1117;
-  --accent: #00a883;
-  --accent-strong: #00926f;
-  --accent-soft: rgba(0, 168, 131, 0.1);
-  --accent-glow: rgba(0, 168, 131, 0.2);
-  --info: #0277b6;
-  --info-soft: rgba(2, 119, 182, 0.08);
-  --info-border: rgba(2, 119, 182, 0.25);
-  --danger: #c8302e;
-  --button-fg: #ffffff;
-  --button-bg: linear-gradient(180deg, #0d1117 0%, #1a1f29 100%);
-  --button-border: rgba(0,0,0,0.12);
-  --hero-grad-1: radial-gradient(1200px 700px at 80% -10%, rgba(0, 168, 131, 0.08), transparent 60%);
-  --hero-grad-2: radial-gradient(900px 500px at -10% 30%, rgba(2, 119, 182, 0.05), transparent 60%);
-  --diagram-node-bg: #ffffff;
-  --diagram-node-stroke: #e6e4dd;
-  --diagram-node-text: #0d1117;
-  --diagram-node-sub: #6b7280;
-  --diagram-flow-back: #9ca3af;
 }
 
 html { font-size: 18px; line-height: 1.7; scroll-behavior: smooth; -webkit-text-size-adjust: 100%; scroll-padding-top: 5rem; }
@@ -344,47 +297,27 @@ code, .mono { font-family: var(--mono); }
 .nav-cta:hover { transform: translateY(-1px); box-shadow: 0 8px 24px var(--accent-glow); text-decoration: none; }
 @media (min-width: 720px) { .nav-links { display: flex; } }
 
-/* Theme toggle */
-.theme-toggle {
-  width: 44px; height: 44px;
-  min-width: 44px;
-  border-radius: 10px;
+/* Secondary nav button (Interested in buying) */
+.nav-ghost {
+  font-size: 0.85rem; font-weight: 600; color: var(--heading);
+  background: var(--surface); padding: 0.55rem 1rem;
+  text-decoration: none; border-radius: var(--r); white-space: nowrap;
   border: 1px solid var(--line);
-  background: var(--surface);
-  color: var(--body);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  padding: 0;
-  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.15s;
+  transition: border-color 0.15s, color 0.15s, transform 0.15s;
 }
-.theme-toggle:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
-.theme-toggle svg { width: 18px; height: 18px; }
-.theme-toggle .icon-sun { display: none; }
-.theme-toggle .icon-moon { display: block; }
-:root[data-theme="light"] .theme-toggle .icon-sun { display: block; }
-:root[data-theme="light"] .theme-toggle .icon-moon { display: none; }
+.nav-ghost:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); text-decoration: none; }
+@media (max-width: 480px) {
+  .nav-inner { padding: 0 0.9rem; gap: 0.4rem; }
+  .nav-logo { font-size: 0.82rem; letter-spacing: 0.05em; gap: 0.45rem; }
+  .nav-logo .dot { width: 7px; height: 7px; }
+  .nav-right { gap: 0.35rem; }
+  .nav-cta, .nav-ghost { padding: 0.45rem 0.7rem; font-size: 0.78rem; }
+}
 
 /* ---------- Hero ---------- */
 .hero { padding: 3rem 0 2.5rem; text-align: center; }
 @media (min-width: 640px) { .hero { padding: 5rem 0 4rem; } }
 @media (min-width: 960px) { .hero { padding: 6rem 0 5rem; } }
-.eyebrow {
-  display: inline-flex; align-items: center; gap: 0.5rem;
-  font-size: 0.78rem; font-weight: 600; letter-spacing: 0.06em;
-  color: var(--accent); background: var(--accent-soft);
-  padding: 0.4rem 0.9rem; border-radius: 999px;
-  margin-bottom: 1.5rem;
-  border: 1px solid var(--accent-soft);
-}
-.eyebrow .pulse {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--accent); display: inline-block;
-  animation: pulse 2s ease-in-out infinite;
-}
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-
 .hero h1 { margin-bottom: 1.5rem; max-width: 19ch; margin-left: auto; margin-right: auto; padding: 0 0.25rem; }
 .hero h1 .accent {
   background: linear-gradient(135deg, var(--accent), var(--accent-strong));
@@ -415,8 +348,7 @@ code, .mono { font-family: var(--mono); }
   max-width: 100%;
   box-shadow:
     0 0 0 1px var(--accent-glow),
-    0 0 60px var(--accent-glow),
-    0 20px 50px rgba(0, 0, 0, 0.35);
+    0 12px 32px rgba(19, 28, 38, 0.12);
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 .cta-github:hover {
@@ -424,8 +356,7 @@ code, .mono { font-family: var(--mono); }
   text-decoration: none;
   box-shadow:
     0 0 0 1px var(--accent),
-    0 0 90px var(--accent-glow),
-    0 28px 70px rgba(0, 0, 0, 0.4);
+    0 18px 44px rgba(19, 28, 38, 0.16);
 }
 .cta-github svg { width: 26px; height: 26px; flex-shrink: 0; }
 @media (min-width: 640px) {
@@ -515,7 +446,7 @@ code, .mono { font-family: var(--mono); }
   margin-bottom: 1.25rem;
 }
 .attribution-card h2 {
-  font-size: clamp(1.4rem, 3vw, 1.9rem);
+  font-size: clamp(1.2rem, 2.5vw, 1.65rem);
   margin-bottom: 1.25rem;
   line-height: 1.3;
 }
@@ -551,9 +482,9 @@ code, .mono { font-family: var(--mono); }
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
 }
-@media (min-width: 640px) { .diagram-wrap { padding: 2.5rem 1.5rem; } }
-@media (min-width: 960px) { .diagram-wrap { padding: 3.5rem 2rem; } }
-.diagram-wrap svg { max-width: 100%; height: auto; display: block; margin: 0 auto; min-width: 720px; }
+@media (min-width: 640px) { .diagram-wrap { padding: 2.5rem 1rem; } }
+@media (min-width: 960px) { .diagram-wrap { padding: 3rem 1.25rem; } }
+.diagram-wrap svg { max-width: 100%; height: auto; display: block; margin: 0 auto; min-width: 900px; }
 .diagram-legend {
   display: flex; flex-wrap: wrap; justify-content: center;
   gap: 1rem 1.75rem; margin-top: 2rem; font-size: 0.85rem; color: var(--muted);
@@ -609,6 +540,13 @@ code, .mono { font-family: var(--mono); }
   color: var(--body);
   margin: 2rem 0 0;
 }
+.pull-lead { margin: 0 0 2rem; }
+.pull code {
+  background: var(--surface-2); color: var(--accent-strong);
+  padding: 0.1rem 0.4rem; border-radius: 4px;
+  font-size: 0.85em; border: 1px solid var(--line);
+  font-family: var(--mono);
+}
 
 /* ---------- Closing CTA ---------- */
 .closing {
@@ -617,7 +555,7 @@ code, .mono { font-family: var(--mono); }
   border-top: 1px solid var(--line);
 }
 @media (min-width: 720px) { .closing { padding: 6rem 0 7rem; } }
-.closing h2 { max-width: 22ch; margin: 0 auto 1.25rem; }
+.closing h2 { font-size: clamp(1.4rem, 3.2vw, 2rem); max-width: 26ch; margin: 0 auto 1.25rem; }
 .closing p { color: var(--muted); max-width: 540px; margin: 0 auto 2.5rem; }
 .closing-actions {
   display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
@@ -664,16 +602,8 @@ code, .mono { font-family: var(--mono); }
         <a href="#how" class="nav-link">How</a>
         <a href="#risks" class="nav-link">Risks</a>
       </div>
-      <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle color theme" title="Toggle light or dark theme">
-        <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-        </svg>
-        <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="4"/>
-          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
-        </svg>
-      </button>
       <a href="https://github.com/clay-good/proxilion" class="nav-cta">GitHub</a>
+      <a href="mailto:hi@claygood.com?subject=%5BProxilion%5D" class="nav-ghost">Let's chat</a>
     </div>
   </div>
 </nav>
@@ -683,13 +613,12 @@ code, .mono { font-family: var(--mono); }
   <!-- ============ HERO ============ -->
   <section class="hero">
     <div class="container-narrow">
-      <span class="eyebrow"><span class="pulse"></span> MIT-licensed. Self-hosted. Zero telemetry.</span>
-      <h1>Your managed AI agent has <span class="accent">too much authority</span>. Proxilion fixes that.</h1>
+      <h1>Your AI agent has <span class="accent">too much authority</span>. Proxilion fixes that.</h1>
       <p class="hero-lead">
-        Your organization is wiring managed AI agents into Google Workspace, Salesforce, Jira, Notion, and a dozen other systems that hold PHI, PII, source code, customer data, and trade secrets. You are giving those agents skills, memories, and multi-step workflows. The honest truth is that any of those agents can quietly do the wrong thing, on the wrong data, for the wrong user, and the only signal you would get is a forensic audit log from the agent vendor after the damage is already done.
+        Managed AI agents hold OAuth tokens to your most sensitive systems, but those tokens never say which user the agent is acting for. So an agent can be tricked into doing the wrong thing, on the wrong data, for the wrong person.
       </p>
       <p class="hero-lead">
-        Proxilion is a self-hosted reverse proxy that sits in the OAuth path between the agent and every SaaS API it touches. It refuses any action the human user did not personally authorize, strips prompt injection out of fetched documents before the agent ever sees them, gates external sends, streams every action to your SOC in real time, and gives you a killswitch that revokes an agent's authority in one request cycle. Prevention by construction, not detection after the fact.
+        Proxilion is a self-hosted reverse proxy that sits in the OAuth path and refuses any action the user did not authorize. Prevention by construction, not detection after the fact.
       </p>
 
       <div class="cta-wrap">
@@ -719,13 +648,13 @@ code, .mono { font-family: var(--mono); }
   <section class="section attribution" id="attribution">
     <div class="container-narrow">
       <div class="attribution-card">
-        <div class="attribution-eyebrow">Thank you, standing on the shoulders of giants</div>
+        <div class="attribution-eyebrow">Standing on the shoulders of giants</div>
         <h2>The cryptographic primitive underneath is <a href="https://www.pic-protocol.org/" rel="noopener" target="_blank">PIC</a> (Provenance, Identity, Continuity).</h2>
         <p>
-          The math that lets Proxilion say "this exact action was authorized by this exact human" is not something we invented. It comes from <a href="https://www.pic-protocol.org/" rel="noopener" target="_blank">PIC</a>, an authority protocol built around three formal invariants: <strong>Provenance</strong> (every action traces back to an immutable origin), <strong>Identity</strong> (the origin identity cannot mutate across hops), and <strong>Continuity</strong> (authority can only shrink, never broaden, at each step). We use the open-source PIC reference implementation as our signing and verification primitive. Credit and respect to <a href="https://github.com/ngallo" rel="noopener" target="_blank">Nicola Gallo</a> for designing and publishing it.
+          PIC is an authority protocol built on three invariants: <strong>Provenance</strong>, every action traces back to an immutable origin; <strong>Identity</strong>, that origin cannot mutate across hops; and <strong>Continuity</strong>, authority can only shrink, never grow. Proxilion uses its open-source reference implementation to sign and verify every step. Credit to <a href="https://github.com/ngallo" rel="noopener" target="_blank">Nicola Gallo</a> for designing and publishing it.
         </p>
         <p>
-          Everything else, the OAuth interception layer, the SaaS adapters, the read filtering, the write gating, the real-time action stream, the killswitch, the YAML policy engine, the dashboard, the SIEM plumbing, the Rust reverse proxy, the threat model, the deployment story, and the entire applied thesis that the OAuth boundary is the one preventative chokepoint for governing managed AI agents, is original Proxilion work. PIC is the cryptographic primitive. Proxilion is the deployable system that turns that primitive into something a security team can use against the actual confused-deputy attacks they are facing today.
+          Everything else is original Proxilion work: the OAuth interception, the SaaS adapters, the read filtering, the write gating, the action stream, the killswitch, the policy engine, and the Rust proxy itself. PIC is the primitive. Proxilion is the deployable system built on it.
         </p>
         <div class="attribution-links">
           <a href="https://www.pic-protocol.org/" class="attribution-link" rel="noopener" target="_blank">Read about PIC</a>
@@ -739,25 +668,25 @@ code, .mono { font-family: var(--mono); }
   <section class="section">
     <div class="container">
       <div class="section-head">
-        <h2>Three things every other tool cannot give you</h2>
-        <p>Not a prompt firewall. Not an LLM gateway. Not an MCP middleware. A cryptographic enforcement plane in the OAuth path.</p>
+        <h2>Three things no other tool gives you</h2>
+        <p>Not a prompt firewall. Not an LLM gateway. A cryptographic enforcement plane in the OAuth path.</p>
       </div>
 
       <div class="pillars">
         <div class="pillar">
           <div class="pillar-icon">P&#8320;</div>
-          <h3>Every action traces back to a real human</h3>
-          <p>Before the agent does anything, Proxilion authenticates the actual human user at your identity provider (Okta, Azure AD, or Google Workspace) and mints a signed statement of who they are and what they can do. The agent cannot invent authority for itself, it can only spend what that human was given, and the chain of custody is mathematically provable forever.</p>
+          <h3>Every action traces to a real human</h3>
+          <p>Proxilion authenticates the user at your identity provider, then signs a statement of who they are and what they can do. The agent cannot invent authority. It can only spend what the human already has.</p>
         </div>
         <div class="pillar">
           <div class="pillar-icon">&#8849;</div>
-          <h3>Permissions can only get smaller, never larger</h3>
-          <p>Once Alice grants her agent read access to one specific document, that agent cannot upgrade itself partway through a task to write access on every document in the tenant. Each step in the chain is allowed to do equal or less than the step before it, and Proxilion refuses to sign anything else. There are no heuristics to game and no prompt-engineering bypasses.</p>
+          <h3>Permissions only shrink, never grow</h3>
+          <p>An agent granted read access to one document cannot upgrade itself to write access across the tenant. Each step can do equal or less than the one before it, and Proxilion refuses to sign anything more.</p>
         </div>
         <div class="pillar">
           <div class="pillar-icon">&#8718;</div>
-          <h3>Audit logs an auditor can actually trust</h3>
-          <p>Every single agent action is logged with a cryptographic signature you can verify offline, years later, on your own machine. Hand the logs to a SOC 2, ISO 27001, HIPAA, or FedRAMP auditor and they can confirm authenticity themselves, without taking your word for it, without trusting the agent vendor, and without trusting Proxilion either.</p>
+          <h3>Audit logs an auditor can trust</h3>
+          <p>Every action is logged with a signature you can verify offline, years later. Hand the logs to a SOC 2, ISO 27001, or HIPAA auditor and they confirm authenticity without trusting you, the agent vendor, or Proxilion.</p>
         </div>
       </div>
     </div>
@@ -767,40 +696,40 @@ code, .mono { font-family: var(--mono); }
   <section class="section" id="what-proxilion-adds">
     <div class="container">
       <div class="section-head">
-        <h2>What Proxilion actually does for your org</h2>
-        <p>Cryptographic capability chains alone do not stop a managed agent from acting on the wrong data. Proxilion turns the math into a deployable enforcement layer that real security teams can install this afternoon.</p>
+        <h2>What Proxilion does for your org</h2>
+        <p>A deployable enforcement layer your security team can install this afternoon.</p>
       </div>
 
       <div class="pillars">
         <div class="pillar">
           <div class="pillar-icon">1</div>
           <h3>OAuth interception, in the path</h3>
-          <p>Proxilion intercepts the OAuth flow between the agent platform and your SaaS providers before consent, swaps in a Proxilion-issued bearer token, and stays in path for every subsequent request. The agent vendor sees a normal upstream; you see, sign, and gate every call.</p>
+          <p>Proxilion intercepts the OAuth flow, swaps in its own bearer token, and stays in path for every request. The agent vendor sees a normal upstream. You see, sign, and gate every call.</p>
         </div>
         <div class="pillar">
           <div class="pillar-icon">2</div>
           <h3>Read-filtering for prompt injection</h3>
-          <p>Documents returned from Drive, Gmail, Notion, and other upstreams are scanned before they reach the agent. Known prompt-injection patterns (delimiter confusion, hidden Unicode, base64-encoded instructions, "ignore prior instructions") are stripped or quarantined. The agent literally cannot read the poison.</p>
+          <p>Documents from Drive, Gmail, and other upstreams are scanned before the agent sees them. Known injection patterns are stripped or quarantined. The agent cannot read the poison.</p>
         </div>
         <div class="pillar">
           <div class="pillar-icon">3</div>
-          <h3>Write-gating with human-in-the-loop</h3>
-          <p>Outgoing emails to external domains, mass deletes, calendar invites to attackers, file shares outside the org are blocked unless a real human explicitly approves through Slack or a ticket. Configurable per sender, per domain, per action class.</p>
+          <h3>Write-gating with a human in the loop</h3>
+          <p>External emails, mass deletes, and shares outside the org are blocked until a real human approves through Slack or a ticket. Configurable per sender, domain, and action class.</p>
         </div>
         <div class="pillar">
           <div class="pillar-icon">4</div>
-          <h3>Real-time action stream and killswitch</h3>
-          <p>Every agent action streams to a live operator dashboard and your SIEM the moment it happens. If something goes wrong, one click revokes every capability tied to that agent or user. The agent's next request returns 403 within one request cycle, no matter how many tokens it cached.</p>
+          <h3>Action stream and killswitch</h3>
+          <p>Every action streams to a live dashboard and your SIEM as it happens. One click revokes every capability tied to an agent or user. The next request returns 403 within one cycle.</p>
         </div>
         <div class="pillar">
           <div class="pillar-icon">5</div>
-          <h3>Policy engine, written in YAML</h3>
-          <p>A fast, compiled match-expression engine lets your security team write rules like "this agent can read engineering docs but never finance" or "no external email sends without justification" in YAML, with hot-reload. No DSL to learn, no rules engine vendor to negotiate with.</p>
+          <h3>Policy engine in YAML</h3>
+          <p>Write rules like "read engineering docs, never finance" in plain YAML, with hot-reload. No DSL to learn, no rules-engine vendor to negotiate with.</p>
         </div>
         <div class="pillar">
           <div class="pillar-icon">6</div>
           <h3>SaaS adapters you can extend</h3>
-          <p>Google Drive, Gmail, and Calendar adapters ship at launch, each one understanding the upstream's request shape so policy can reason about specific files, recipients, and events, not just URLs. The adapter pattern is open; add Salesforce, Jira, Notion, or your internal API in a few hundred lines of Rust.</p>
+          <p>Drive, Gmail, and Calendar ship at launch, each understanding its upstream so policy can reason about real files, recipients, and events. Add your own in a few hundred lines of Rust.</p>
         </div>
       </div>
     </div>
@@ -811,13 +740,17 @@ code, .mono { font-family: var(--mono); }
     <div class="container">
       <div class="section-head">
         <h2>Sits between the agent and your SaaS APIs</h2>
-        <p>Proxilion intercepts the OAuth flow before it hits Google, Microsoft, or any other upstream. Then it stays in path, minting and verifying a fresh PCA per action.</p>
+        <p>It intercepts the OAuth flow before it reaches any upstream, then stays in path, minting and verifying a fresh PCA per action.</p>
+      </div>
+
+      <div class="pull pull-lead">
+        <strong>"Wait, where's the API key?"</strong> You never give Proxilion one. Proxilion is the redirect target in the OAuth handshake, so the SaaS provider hands the access token to <em>Proxilion</em>, not the agent. Proxilion encrypts it at rest (AES-256-GCM) and gives the agent its own opaque <code>pxl_live_…</code> bearer instead. On every call the agent presents that bearer; Proxilion checks policy, attaches the real upstream token, and forwards. The agent never holds your credential, and you never paste a key into a config file.
       </div>
 
       <div class="diagram-wrap">
         <svg viewBox="0 0 1200 660" role="img" aria-labelledby="diagramTitle diagramDesc" xmlns="http://www.w3.org/2000/svg">
           <title id="diagramTitle">Proxilion system architecture diagram</title>
-          <desc id="diagramDesc">A managed AI agent calls a SaaS API through Proxilion. Proxilion authenticates the human user at the IdP, runs the in-process policy engine (Layer A ops shape, Layer B content policy, Layer C response read-filter) to decide whether to proceed, then requests a signed successor PCA from the Trust Plane. The Trust Plane is a narrow cryptographic notary that enforces only the PIC protocol invariants (Provenance, Identity, Continuity) — no customer policy ever crosses that boundary. Proxilion forwards the approved request upstream and logs every PCA to an append-only audit store.</desc>
+          <desc id="diagramDesc">A managed AI agent calls a SaaS API through Proxilion. Because Proxilion is the redirect target in the OAuth handshake, the SaaS provider hands the real access token to Proxilion, which encrypts it at rest with AES-256-GCM; the agent only ever receives an opaque Proxilion bearer token (pxl_live_). On each request Proxilion authenticates the human user at the IdP, runs the in-process policy engine (Layer A ops shape, Layer B content policy, Layer C response read-filter) to decide whether to proceed, then requests a signed successor PCA from the Trust Plane and attaches the real upstream token before forwarding. The Trust Plane is a narrow cryptographic notary that enforces only the PIC protocol invariants (Provenance, Identity, Continuity) — no customer policy ever crosses that boundary. Proxilion forwards the approved request upstream and logs every PCA to an append-only audit store.</desc>
 
           <defs>
             <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -833,14 +766,14 @@ code, .mono { font-family: var(--mono); }
             .node-prox { fill: var(--diagram-node-bg); stroke: var(--accent); stroke-width: 1.8; }
             .node-engine { fill: var(--diagram-node-bg); stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 3 3; }
             .node-trust { fill: var(--diagram-node-bg); stroke: var(--accent); stroke-width: 1.6; stroke-dasharray: 4 3; }
-            .lbl { font: 700 14px ui-sans-serif, system-ui, sans-serif; fill: var(--diagram-node-text); }
-            .lbl-accent { font: 700 16px ui-sans-serif, system-ui, sans-serif; fill: var(--accent); letter-spacing: 0.04em; }
-            .lbl-engine { font: 700 13px ui-sans-serif, system-ui, sans-serif; fill: var(--accent); letter-spacing: 0.02em; }
-            .sub { font: 500 11px ui-sans-serif, system-ui, sans-serif; fill: var(--diagram-node-sub); }
-            .pca { font: 700 11px ui-monospace, monospace; fill: var(--accent); }
+            .lbl { font: 700 16px ui-sans-serif, system-ui, sans-serif; fill: var(--diagram-node-text); }
+            .lbl-accent { font: 700 18px ui-sans-serif, system-ui, sans-serif; fill: var(--accent); letter-spacing: 0.04em; }
+            .lbl-engine { font: 700 14px ui-sans-serif, system-ui, sans-serif; fill: var(--accent); letter-spacing: 0.02em; }
+            .sub { font: 500 12px ui-sans-serif, system-ui, sans-serif; fill: var(--diagram-node-sub); }
+            .pca { font: 700 12.5px ui-monospace, monospace; fill: var(--accent); }
             .flow { stroke: var(--accent); stroke-width: 2; fill: none; }
             .flow-back { stroke: var(--diagram-flow-back); stroke-width: 1.5; fill: none; stroke-dasharray: 4 4; }
-            .flow-lbl { font: 600 11px ui-monospace, monospace; fill: var(--body); }
+            .flow-lbl { font: 600 12.5px ui-monospace, monospace; fill: var(--body); }
           </style>
 
           <!-- Top row: User & Agent -->
@@ -851,18 +784,18 @@ code, .mono { font-family: var(--mono); }
 
           <rect class="node" x="940" y="40" width="200" height="92"/>
           <text x="1040" y="78" text-anchor="middle" class="lbl">Managed AI Agent</text>
-          <text x="1040" y="100" text-anchor="middle" class="sub">Anthropic hosted Claude</text>
-          <text x="1040" y="118" text-anchor="middle" class="sub">OpenAI assistants</text>
+          <text x="1040" y="100" text-anchor="middle" class="sub">Anthropic Claude . OpenAI</text>
+          <text x="1040" y="118" text-anchor="middle" class="sub">pxl_live_, never yours</text>
 
           <!-- Middle: Proxilion outer box -->
           <rect class="node-prox" x="300" y="200" width="600" height="220"/>
           <text x="600" y="232" text-anchor="middle" class="lbl-accent">PROXILION  .  Reverse Proxy</text>
-          <text x="600" y="254" text-anchor="middle" class="sub">OAuth interception  .  agent-token binding  .  upstream forwarding  .  killswitch</text>
+          <text x="600" y="254" text-anchor="middle" class="sub">OAuth interception  .  encrypts + vaults your OAuth token (AES-256-GCM)  .  killswitch</text>
 
           <!-- Policy Engine sub-box (visually INSIDE Proxilion) -->
           <rect class="node-engine" x="324" y="272" width="552" height="84"/>
           <text x="600" y="294" text-anchor="middle" class="lbl-engine">Policy Engine  .  in-process</text>
-          <text x="600" y="313" text-anchor="middle" class="sub">Layer A: ops shape  .  Layer B: content + recipient policy  .  Layer C: response read-filter</text>
+          <text x="600" y="313" text-anchor="middle" class="sub">Layer A: ops shape  .  Layer B: content policy  .  Layer C: read-filter</text>
           <text x="600" y="331" text-anchor="middle" class="sub">YAML rules  .  hot-reloadable  .  per-tenant  .  customer policy never leaves this box</text>
           <text x="600" y="349" text-anchor="middle" class="pca">decision &rarr; allow / block / require_confirmation</text>
 
@@ -906,7 +839,7 @@ code, .mono { font-family: var(--mono); }
 
           <!-- Agent -> Proxilion (OAuth + actions) -->
           <path class="flow" d="M 1040 132 C 1040 160, 860 175, 780 200" marker-end="url(#arrow)"/>
-          <text x="900" y="160" class="flow-lbl">2. agent request</text>
+          <text x="900" y="160" class="flow-lbl">2. request + pxl_live_ token</text>
 
           <!-- Proxilion -> Trust Plane (request signed PCA) -->
           <path class="flow" d="M 300 286 L 260 286" marker-end="url(#arrow)"/>
@@ -924,7 +857,7 @@ code, .mono { font-family: var(--mono); }
           <path class="flow" d="M 480 420 C 480 470, 410 470, 410 520" marker-end="url(#arrow)"/>
           <path class="flow" d="M 600 420 L 600 520" marker-end="url(#arrow)"/>
           <path class="flow" d="M 720 420 C 720 470, 790 470, 790 520" marker-end="url(#arrow)"/>
-          <text x="600" y="462" text-anchor="middle" class="flow-lbl">3. forward, PCA_2 bound</text>
+          <text x="600" y="462" text-anchor="middle" class="flow-lbl">3. forward + your real OAuth token, PCA-bound</text>
 
           <!-- Return path (dashed) -->
           <path class="flow-back" d="M 410 520 C 410 470, 480 470, 480 420" marker-end="url(#arrow-muted)"/>
@@ -938,7 +871,7 @@ code, .mono { font-family: var(--mono); }
       </div>
 
       <div class="pull">
-        <strong>The invariant, in plain English.</strong> The agent shows up holding a token. Proxilion checks who that token actually belongs to (a specific human user, say Alice), and what Alice was originally allowed to do. If the action the agent is trying to take is something Alice was not allowed to do, Proxilion refuses the request and never forwards it to Google or any other upstream. The refused attempt is then signed, logged forever, and shipped straight to your SIEM so your security team sees exactly what was tried, by which agent, on whose behalf.
+        <strong>The invariant, in plain English.</strong> The agent shows up with a token. Proxilion checks who it belongs to and what that person is allowed to do. If the action is outside their authority, the request is refused and never forwarded upstream. The attempt is signed, logged, and shipped to your SIEM, so your team sees exactly what was tried, by which agent, on whose behalf.
       </div>
     </div>
   </section>
@@ -947,8 +880,8 @@ code, .mono { font-family: var(--mono); }
   <section class="section" id="risks">
     <div class="container">
       <div class="section-head">
-        <h2>The risks of managed AI agents, and what Proxilion does about each one</h2>
-        <p>Every row is a real, exploitable failure mode in production agent deployments today. Every detection and block is implemented, not aspirational.</p>
+        <h2>The risks, and what Proxilion does about each one</h2>
+        <p>Every row is a real failure mode in production agent deployments today. Every detection and block is implemented, not aspirational.</p>
       </div>
 
       <div class="risk-table-wrap">
@@ -966,8 +899,8 @@ code, .mono { font-family: var(--mono); }
                 <span class="risk-name">Confused deputy</span>
                 <span class="risk-sub">Agent acts beyond the user's authority because the OAuth token has no principal binding.</span>
               </td>
-              <td>Every request the agent makes carries a Proxilion-issued token that names the exact human user it is acting for, with that user's identity cryptographically signed. If the user identity is missing or tampered with, the request fails immediately.</td>
-              <td>Proxilion checks the requested action against what that named human user is actually allowed to do. If the action is outside the user's authority, it is refused before ever reaching Google, Gmail, or any other upstream. This is a deterministic permission check on signed claims, not a guess from a language model.</td>
+              <td>Every request carries a Proxilion-issued token naming the exact user the agent acts for, signed. If the identity is missing or tampered with, the request fails.</td>
+              <td>The action is checked against what that user is allowed to do, and refused before it reaches any upstream. A deterministic check on signed claims, not a guess from a model.</td>
             </tr>
             <tr>
               <td>
@@ -975,7 +908,7 @@ code, .mono { font-family: var(--mono); }
                 <span class="risk-sub">Agent chains tool calls and broadens scope mid-chain. <code>read</code> becomes <code>write</code>.</span>
               </td>
               <td>Each successor PCA's ops are diffed against its predecessor; any non-subset op is a continuity violation.</td>
-              <td>Proxilion refuses to sign any capability that grants more authority than the step before it. Each handoff in the chain can only have equal or fewer permissions than the previous one, enforced cryptographically at every hop, so the agent simply cannot escalate even if its prompt tells it to.</td>
+              <td>Proxilion refuses to sign any capability broader than the step before it. Each hop can do equal or less, enforced cryptographically, so the agent cannot escalate even if its prompt tells it to.</td>
             </tr>
             <tr>
               <td>
@@ -990,8 +923,8 @@ code, .mono { font-family: var(--mono); }
                 <span class="risk-name">Unscoped OAuth tokens</span>
                 <span class="risk-sub">Agent holds <code>drive.readonly</code> for the whole tenant when it only needs one doc.</span>
               </td>
-              <td>Proxilion sits in the OAuth flow and records exactly which scopes the user consented to. Then, for every individual action the agent takes, Proxilion records the specific file, email, or calendar event being touched.</td>
-              <td>Even though the OAuth token may technically grant access to the whole tenant, Proxilion narrows each action to just the one resource the agent is supposed to touch right now. Any attempt to reach a different file or mailbox in the same scope is refused.</td>
+              <td>Proxilion records which scopes the user consented to, then logs the specific file, email, or event each action touches.</td>
+              <td>Even when the token covers the whole tenant, each action is narrowed to the one resource it should touch. Reaching any other file or mailbox in the same scope is refused.</td>
             </tr>
             <tr>
               <td>
@@ -999,23 +932,23 @@ code, .mono { font-family: var(--mono); }
                 <span class="risk-sub">Agent is talked into emailing sensitive content to attacker-controlled domains.</span>
               </td>
               <td><code>messages.send</code> calls are parsed; recipient domains are extracted and matched against your allow-list.</td>
-              <td>If a recipient is outside your organization, Proxilion refuses to send the email until a real human (not the agent) explicitly approves it through a separate channel like Slack or a ticket. Fully configurable per sender and per domain, so internal traffic stays frictionless and only the risky sends get gated.</td>
+              <td>External recipients hold the email until a real human approves it through Slack or a ticket. Configurable per sender and domain, so internal traffic stays frictionless and only risky sends get gated.</td>
             </tr>
             <tr>
               <td>
                 <span class="risk-name">Bulk or mass-mutation abuse</span>
                 <span class="risk-sub">Compromised agent deletes thousands of files or sends mass email.</span>
               </td>
-              <td>Proxilion counts how many actions each user's agent session is taking and at what rate. When a single user's agent suddenly tries to delete a thousand files in a minute, the counter trips before damage is done.</td>
-              <td>One-click killswitch that instantly revokes every active capability tied to that user or agent, network-wide, within a single request cycle. The agent's next call returns 403, no matter how many tokens it is holding.</td>
+              <td>Proxilion counts actions per session and their rate. When an agent suddenly tries to delete a thousand files in a minute, the counter trips before damage is done.</td>
+              <td>A one-click killswitch revokes every capability tied to that user or agent, network-wide, within one request cycle. The next call returns 403, no matter how many tokens it holds.</td>
             </tr>
             <tr>
               <td>
                 <span class="risk-name">Replay and token reuse</span>
                 <span class="risk-sub">Captured bearer token is reused beyond the intended action.</span>
               </td>
-              <td>Every action gets a unique one-time identifier and a short expiration window. If a stolen token is replayed, Proxilion sees the same identifier come through twice.</td>
-              <td>The replayed request is rejected at the Proxilion edge before it ever reaches Google or any upstream. No duplicate side-effect, no data leaked, and the attempt is logged with the source IP.</td>
+              <td>Every action gets a one-time identifier and a short expiry. A replayed token shows the same identifier coming through twice.</td>
+              <td>The replayed request is rejected at the edge before it reaches any upstream. No duplicate side-effect, no data leaked, and the attempt is logged with the source IP.</td>
             </tr>
             <tr>
               <td>
@@ -1023,15 +956,15 @@ code, .mono { font-family: var(--mono); }
                 <span class="risk-sub">"Which user was the agent acting for when it touched this PHI?" No one can answer.</span>
               </td>
               <td>Every upstream call is logged with the full PCA chain, COSE-signed, append-only.</td>
-              <td>This one is not a block, it is an evidence guarantee. Every agent action is logged with a cryptographic signature that anyone can verify years later, offline, without trusting Proxilion or any vendor. SOC 2, HIPAA, and ISO 27001 audit evidence drops out of the proxy automatically. When an auditor asks "which user was the agent acting for," you can prove it.</td>
+              <td>Not a block, an evidence guarantee. Every action is signed and verifiable years later, offline, without trusting any vendor. SOC 2, HIPAA, and ISO 27001 evidence drops out of the proxy automatically. When an auditor asks which user the agent acted for, you can prove it.</td>
             </tr>
             <tr>
               <td>
                 <span class="risk-name">Vendor and supply-chain trust assumption</span>
                 <span class="risk-sub">You are trusting the agent vendor's claims about what their model did.</span>
               </td>
-              <td>The CAT signing key is <em>customer-held</em>. Proxilion has no way to forge PCAs on your behalf. Neither does Anthropic, OpenAI, or anyone else.</td>
-              <td>Trust is rooted at your own identity provider (Okta, Azure AD, Google Workspace) and a signing key only you hold. You no longer have to take Anthropic, OpenAI, or any agent vendor at their word about what their model did. The proof is in your hands, on your infrastructure.</td>
+              <td>The signing key is <em>customer-held</em>. Proxilion cannot forge PCAs on your behalf, and neither can any agent vendor.</td>
+              <td>Trust is rooted at your own identity provider and a key only you hold. You no longer take any agent vendor at their word about what their model did. The proof is on your infrastructure.</td>
             </tr>
             <tr>
               <td>
@@ -1039,7 +972,7 @@ code, .mono { font-family: var(--mono); }
                 <span class="risk-sub">Legitimate user uses the agent as a laundering layer to do things their direct credentials cannot.</span>
               </td>
               <td>PCA_0 is bound to the user's IdP ops; the agent inherits nothing the user did not already have.</td>
-              <td>The agent inherits the exact same permissions as the human using it, nothing more. If the user cannot read HR records when logged into Google Workspace directly, asking an AI agent to do it for them fails the same way. The agent is not a permissions loophole.</td>
+              <td>The agent inherits exactly the human's permissions, nothing more. If the user cannot read HR records directly, asking the agent to do it fails the same way. The agent is not a permissions loophole.</td>
             </tr>
           </tbody>
         </table>
@@ -1052,15 +985,15 @@ code, .mono { font-family: var(--mono); }
     <div class="container-narrow">
       <div class="attribution-card">
         <div class="attribution-eyebrow">The Skill Overreach problem</div>
-        <h2>An agent "trained with skills" for the whole org is, in effect, a super-user. Proxilion is the only thing that forces it back into the Human User box.</h2>
+        <h2>An agent skilled for the whole org is, in effect, a super-user. Proxilion forces it back into the user's box.</h2>
         <p>
-          The agent platforms now ship <strong>skills</strong>. You train one agent for the whole organization, attach it to Drive, Gmail, Salesforce, Jira, Notion, and a couple of internal APIs, and hand it out to every employee. That single agent now holds the <em>union</em> of every permission any of its users have. You have, in effect, deployed a super-user. The OAuth scope says <code>drive.readonly</code> for the tenant. The skill says "summarize anything the user asks about." The runtime has no idea whether the human on the other end is an intern, a finance lead, or the CEO.
+          Agent platforms now ship <strong>skills</strong>. You train one agent for the org, attach it to Drive, Gmail, and a few internal APIs, and hand it to every employee. That agent now holds the <em>union</em> of every permission its users have. The scope says <code>drive.readonly</code> for the tenant. The runtime has no idea whether the human on the other end is an intern or the CEO.
         </p>
         <p>
-          That is the Skill Overreach problem. A skill is authority defined at the <strong>agent</strong> level. A user is authority defined at the <strong>human</strong> level. The gap between them is exactly where confused-deputy attacks, prompt-injection exfiltration, and insider laundering live.
+          That is Skill Overreach. A skill is authority at the <strong>agent</strong> level. A user is authority at the <strong>human</strong> level. The gap between them is where confused-deputy attacks and insider misuse live.
         </p>
         <p>
-          Proxilion is the only thing in the stack that forces the skilled agent back into the Human User box. Every call the agent makes is bound to a PCA chain rooted at the specific human it is acting for at that moment. The intern's request to "summarize Q3 financials" fails the same way it would if the intern opened Drive directly. The CEO's request succeeds. The skill stays the same; the <em>authority</em> is no longer the skill's, it is the user's. Prevention by construction, even when the skill itself is overpowered.
+          Proxilion binds every call to a PCA chain rooted at the specific human acting at that moment. The intern's request to summarize Q3 financials fails the way it would if they opened Drive directly. The CEO's succeeds. The skill stays the same; the authority is the user's. Prevention by construction, even when the skill is overpowered.
         </p>
       </div>
     </div>
@@ -1070,7 +1003,7 @@ code, .mono { font-family: var(--mono); }
   <section class="closing">
     <div class="container-narrow">
       <h2>Stop hoping your agent behaves. <span style="color:var(--accent);">Prove it cannot misbehave.</span></h2>
-      <p>Self-host in an afternoon. Free, forever. No sales call. No license keys. No data leaves your network.</p>
+      <p>Self-host in an afternoon. Free, forever. No sales call, no license keys, no data leaving your network.</p>
 
       <div class="closing-actions">
         <a href="https://claygood.com" class="cta-secondary" aria-label="Made with love by Clay Good">
@@ -1091,19 +1024,6 @@ code, .mono { font-family: var(--mono); }
   </section>
 
 </main>
-
-<script>
-  (function () {
-    var btn = document.getElementById('themeToggle');
-    if (!btn) return;
-    btn.addEventListener('click', function () {
-      var current = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
-      var next = current === 'light' ? 'dark' : 'light';
-      document.documentElement.setAttribute('data-theme', next);
-      try { localStorage.setItem('proxilion-theme', next); } catch (e) {}
-    });
-  })();
-</script>
 
 </body>
 </html>

@@ -1525,4 +1525,138 @@ mod tests {
             session
         ));
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Drives the §6.4 federation state-binding through the real callback body
+    // against real SQL. Skips when no test DB — see test_support.
+    // ─────────────────────────────────────────────────────────────────────
+
+    async fn seed_session(pool: &sqlx::PgPool, id: Uuid) {
+        let client_id = format!("client-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO oauth_clients (id, name, redirect_uris) VALUES ($1,'it',ARRAY['https://x/cb'])")
+            .bind(&client_id).execute(pool).await.expect("seed oauth_clients");
+        sqlx::query(
+            "INSERT INTO oauth_sessions
+               (id, client_id, agent_redirect_uri, agent_state, agent_code_challenge,
+                agent_code_challenge_method, agent_requested_scope, expires_at)
+             VALUES ($1,$2,'https://x/cb','st','ch','S256',
+                     'https://www.googleapis.com/auth/drive.readonly', now()+interval '1 hour')",
+        )
+        .bind(id)
+        .bind(&client_id)
+        .execute(pool)
+        .await
+        .expect("seed oauth_sessions");
+    }
+
+    fn oauth_state_for(pool: sqlx::PgPool) -> OAuthState {
+        OAuthState {
+            db: pool,
+            cipher: std::sync::Arc::new(
+                crate::crypto::TokenCipher::from_bytes(&[0u8; 32]).unwrap(),
+            ),
+            pic: crate::pic::PicExecutor::dev_ephemeral("http://127.0.0.1:1".into()).unwrap(),
+            google: crate::oauth::state::GoogleClient {
+                client_id: "c".into(),
+                client_secret: "s".into(),
+                auth_url: "https://accounts.google.test/auth".into(),
+                token_url: "https://oauth2.googleapis.test/token".into(),
+            },
+            federation_bridge_authorize_url: "https://bridge.test/authorize".into(),
+            proxy_base_url: "https://proxy.test".into(),
+        }
+    }
+
+    fn claims_for(state_str: String) -> crate::oauth::bridge::FederationClaims {
+        let now = chrono::Utc::now().timestamp();
+        crate::oauth::bridge::FederationClaims {
+            pca_0_id: Uuid::new_v4(),
+            p_0: "alice@acme.com".into(),
+            ops: vec!["drive:read:file/abc".into()],
+            pca_0_cbor_b64: None,
+            state: state_str,
+            iat: now - 10,
+            exp: now + 3600,
+            iss: Some("https://acme.okta.com".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn db_backed_bridge_callback_binds_session_on_match_and_rejects_replay() {
+        // surface-delight-and-correctness.md §6.4, end-to-end against real SQL.
+        // A federation token whose `state` claim equals the callback session
+        // establishes it (pca_0_id / p_0 / granted_ops are written). A token
+        // whose `state` names a DIFFERENT session is a replay (session
+        // fixation) — it must be rejected BEFORE the UPDATE, leaving the
+        // target session untouched.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+
+        // 1. Matching state → session is bound.
+        let sid = Uuid::new_v4();
+        seed_session(&pool, sid).await;
+        let claims = claims_for(sid.to_string());
+        let pca_0 = claims.pca_0_id;
+        let res = bridge_callback_body(
+            oauth_state_for(pool.clone()),
+            BridgeCallback {
+                state: sid,
+                federation_token: String::new(),
+            },
+            claims,
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "matching state must establish the session: {res:?}"
+        );
+        let (bound_pca, bound_p0): (Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT pca_0_id, p_0 FROM oauth_sessions WHERE id = $1")
+                .bind(sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bound_pca, Some(pca_0), "pca_0_id must be written on bind");
+        assert_eq!(
+            bound_p0.as_deref(),
+            Some("alice@acme.com"),
+            "p_0 must be written"
+        );
+
+        // 2. Mismatched state → replay rejected, target session untouched.
+        let victim = Uuid::new_v4();
+        seed_session(&pool, victim).await;
+        // The token was minted for some OTHER session, not `victim`.
+        let claims = claims_for(Uuid::new_v4().to_string());
+        let err = bridge_callback_body(
+            oauth_state_for(pool.clone()),
+            BridgeCallback {
+                state: victim,
+                federation_token: String::new(),
+            },
+            claims,
+        )
+        .await
+        .expect_err("a state-mismatched token must be rejected");
+        assert!(
+            matches!(err, OAuthError::BridgeRejected(_)),
+            "expected BridgeRejected, got: {err:?}",
+        );
+        // (The 401 status mapping for BridgeRejected is pinned in error.rs.)
+        // The victim session was NOT modified — the replay was blocked before
+        // the UPDATE.
+        let victim_pca: Option<Uuid> =
+            sqlx::query_scalar("SELECT pca_0_id FROM oauth_sessions WHERE id = $1")
+                .bind(victim)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            victim_pca.is_none(),
+            "replay must not establish/modify the target session",
+        );
+    }
 }

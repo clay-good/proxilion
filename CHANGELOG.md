@@ -16,6 +16,15 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **OAuth federation state-binding integration test** (surface-delight §6.4) —
+  the session-fixation/replay defense was unit-tested only on the pure
+  comparator. [oauth/routes.rs](crates/proxy/src/oauth/routes.rs)
+  `db_backed_bridge_callback_binds_session_on_match_and_rejects_replay` now
+  drives `bridge_callback_body` against real SQL: a matching-`state` token
+  writes `pca_0_id`/`p_0`/`granted_ops` to the session, while a token minted
+  for a *different* session returns `BridgeRejected` and leaves the target
+  session untouched (`pca_0_id` still NULL — the replay is blocked before the
+  UPDATE).
 - **Operator-auth boundary integration test** (ui-less-surfaces.md §4.4) — the
   authentication gate for the *entire* operator API (`/api/v1/*`:
   killswitch / blocked / policy / actions / …) was DB-backed but had no

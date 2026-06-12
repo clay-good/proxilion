@@ -322,6 +322,7 @@ properties end-to-end:
 | Calendar `events.insert`, external attendee | the write gate (the Calendar adapter's distinguishing path) blocks before any mint/upstream — `PolicyBlocked` (403) + a `layer='policy'` blocked row; completes the Drive/Gmail/Calendar trio |
 | Google token refresh, 50 concurrent | the per-bearer mutex coalesces a stampede: with an expired token, **50 concurrent** refreshers hit Google **exactly once** (asserted via wiremock's `received_requests`) and all see the fresh token |
 | Operator-auth boundary (the gate for all `/api/v1/*`) | the real `middleware` + `scope_check` composition, driven via `tower::oneshot` against seeded `operator_tokens`: valid+scope → 200, wildcard → 200, revoked → 401, unknown → 401, wrong scope → 403, missing/malformed → 401, and a successful auth touches `last_used_at` |
+| OAuth federation callback (replay binding) | a federation token whose `state` matches the callback session establishes it (`pca_0_id`/`p_0` written); a token minted for a *different* session is rejected (`BridgeRejected`, 401) and the target session stays untouched — session-fixation defense (§6.4) |
 
 These run in the CI `integration` job (postgres service) on every push, against
 in-process wiremock Trust Plane + Google. The shared scaffolding lives in

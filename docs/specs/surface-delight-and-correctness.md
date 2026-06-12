@@ -203,7 +203,7 @@ This string becomes the upstream URL at [google_drive.rs:358](../../crates/proxy
 
 **Fix:** in `bridge_callback_body`, reject when `claims.state != params.state`. Add it next to the signature-verification TODO so they ship together.
 
-**Test:** callback with a token whose `state` differs from the query `state` returns 400/401 and does not establish a session.
+**Test:** callback with a token whose `state` differs from the query `state` returns 400/401 and does not establish a session. **`[x]` Done (2026-06-11)** — the pure check is unit-tested (`federation_state_matches_only_when_claim_equals_session`), and the end-to-end property is now pinned by a DB-backed integration test ([oauth/routes.rs](../../crates/proxy/src/oauth/routes.rs) `db_backed_bridge_callback_binds_session_on_match_and_rejects_replay`): a matching-state token writes `pca_0_id`/`p_0`/`granted_ops` to the session, while a mismatched-state token returns `BridgeRejected` (401) and leaves the target session **untouched** (`pca_0_id` still NULL — the replay is blocked *before* the UPDATE). Runs in the CI `integration` job.
 
 ### 6.5 LOW/MEDIUM — Retryable HTTP 429 dropped as permanent in all forwarders — `[x]` Done (2026-06-11)
 

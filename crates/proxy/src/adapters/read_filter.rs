@@ -542,7 +542,7 @@ mod tests {
         // `"[redacted]"` (without the brand) would silently break
         // every anchor and force a coordinated docs/dashboard update.
         // Pin the byte sequence AND the `&'static str` lifetime AND
-        // the byte length (38 bytes) so a one-byte drift surfaces.
+        // the byte length (35 bytes) so a one-byte drift surfaces.
         fn require_static_str(_: &'static str) {}
         require_static_str(MARKER);
         assert_eq!(MARKER, "[redacted by proxilion read-filter]");
@@ -746,9 +746,9 @@ mod tests {
         // The `MARKER` byte length is the load-bearing axis the audit
         // dashboard's "before/after diff" relies on for column-aligned
         // rendering. The existing `marker_constant_is_static_str_byte_exact`
-        // test pins the string content AND the byte length (35) — but
-        // the comment in that test mentions "38 bytes" (a stale doc
-        // bug). Pin the ACTUAL byte count via two distinct paths
+        // test pins the string content AND the byte length (35; its
+        // comment states 35 bytes too). This test independently re-pins
+        // the ACTUAL byte count via two distinct paths
         // (`.len()` byte count AND `.as_bytes().len()` slice length)
         // so a future refactor that swapped to a multibyte unicode
         // marker (e.g. `"[🚫 redacted]"`) would surface the byte-vs-char

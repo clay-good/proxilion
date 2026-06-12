@@ -16,6 +16,14 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **`read_bounded` branch coverage completed** — the shared upstream-body cap
+  helper added with the §1.4 streaming fix had tests only for the
+  `Content-Length`-absent streaming path; its `Content-Length` *pre-check*
+  branch was unexercised. Added `read_bounded_rejects_on_oversized_content_length_before_reading_body`
+  (advertised length over cap → reject before reading a byte) and its
+  within-cap complement, plus a signature-witness test pinning the
+  `(reqwest::Response, usize) -> Result<Vec<u8>, AppError>` shape against an
+  `anyhow`/borrowed-return refactor. [adapters/mod.rs](crates/proxy/src/adapters/mod.rs)
 - **Action-log `purge` dry-run integration test** — completes the
   destructive-operation dry-run coverage (alongside `killswitch`).
   [api/actions.rs](crates/proxy/src/api/actions.rs)
@@ -153,6 +161,11 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Stale `MARKER` byte-length comment** — a read-filter test's comment said
+  the `[redacted by proxilion read-filter]` marker is "38 bytes" while it
+  asserts (correctly) `MARKER.len() == 35`; a later test even flagged it as a
+  known stale doc bug. Corrected the comment to 35 bytes and updated the
+  cross-reference. [adapters/read_filter.rs](crates/proxy/src/adapters/read_filter.rs)
 - **Upstream response cap is now a true memory bound** (spec.md §1.4,
   surface-delight-and-correctness.md §6.8) — `read_bounded` checked the
   advertised `Content-Length`, then called `resp.bytes().await` and checked the

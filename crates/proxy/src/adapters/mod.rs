@@ -157,4 +157,64 @@ mod tests {
         let out = read_bounded(resp, 64).await.unwrap();
         assert_eq!(out.len(), 64);
     }
+
+    /// Build a `reqwest::Response` from a **sized** body, so reqwest derives a
+    /// `Content-Length` header. This exercises the cheap header pre-check branch
+    /// — the complement of `streaming_resp`, which deliberately omits it.
+    fn sized_resp(body: Vec<u8>) -> reqwest::Response {
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(body))
+            .unwrap();
+        reqwest::Response::from(http_resp)
+    }
+
+    #[tokio::test]
+    async fn read_bounded_rejects_on_oversized_content_length_before_reading_body() {
+        // The cheap pre-check: a body whose advertised `Content-Length` already
+        // exceeds the cap is rejected outright, before the chunk loop reads a
+        // single byte. 100 advertised bytes against a 10-byte cap →
+        // UpstreamTooLarge. (The streaming tests above force Content-Length to
+        // be absent; this is the sibling branch they can't reach.)
+        let resp = sized_resp(vec![b'z'; 100]);
+        assert_eq!(
+            resp.content_length(),
+            Some(100),
+            "precondition: this response advertises a Content-Length",
+        );
+        let r = read_bounded(resp, 10).await;
+        assert!(
+            matches!(r, Err(AppError::UpstreamTooLarge)),
+            "oversized Content-Length must reject at the header pre-check",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_bounded_with_content_length_within_cap_returns_full_body() {
+        // Complement: an advertised length under the cap passes the pre-check
+        // and the body is returned intact — proving the early reject doesn't
+        // false-positive on legitimately-sized responses.
+        let resp = sized_resp(b"ok".to_vec());
+        assert_eq!(resp.content_length(), Some(2));
+        let out = read_bounded(resp, 1024).await.unwrap();
+        assert_eq!(out, b"ok");
+    }
+
+    #[test]
+    fn read_bounded_signature_is_response_usize_to_result_vec_u8_apperror() {
+        // Pin the shared helper's signature so a refactor that widened the
+        // error to `anyhow::Error` (losing the structured `UpstreamTooLarge`
+        // variant the operator dashboard's size-cap panel keys on) or changed
+        // the owned `Vec<u8>` return (which every adapter moves across the
+        // `.await` into the read-filter + audit pipeline) surfaces here rather
+        // than at the three call sites. The generic bound names the exact arg
+        // and `Output` types without having to name the opaque future.
+        fn assert_sig<F, Fut>(_: F)
+        where
+            F: Fn(reqwest::Response, usize) -> Fut,
+            Fut: std::future::Future<Output = Result<Vec<u8>, AppError>>,
+        {
+        }
+        assert_sig(read_bounded);
+    }
 }

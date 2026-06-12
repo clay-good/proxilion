@@ -1524,4 +1524,113 @@ mod tests {
         // the return lifetime to the input email slice.
         let _f: fn(&str) -> Option<String> = domain_of;
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed adapter integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Skips when no test DB — see test_support.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn db_backed_calendar_insert_external_attendee_is_blocked_403() {
+        // The Calendar adapter's distinguishing path: a WRITE gate. spec.md §9
+        // calendar-external-attendee-gate blocks `events.insert` whenever an
+        // attendee's domain isn't the customer's. The block lands at Layer B
+        // (before any mint / upstream POST) → PolicyBlocked (403) + a
+        // `layer='policy'` blocked_actions row. Decided purely on the exposed
+        // body context (`body.external_attendee`), so no Trust Plane / Google
+        // is contacted. Mirrors the Gmail external-send gate for the third
+        // adapter, completing the trio's integration coverage.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        use std::collections::HashMap;
+
+        let leaf_pca_id = Uuid::new_v4();
+        crate::test_support::seed_pca_cache(&pool, leaf_pca_id, "alice@acme.com").await;
+
+        let policy_yaml = r#"
+- id: calendar-external-attendee-gate
+  vendor: google
+  action: calendar.events.insert
+  match:
+    body.external_attendee:
+      equals: true
+  decision: block
+  override: requires_justification
+  pic_mode: runtime-gate
+"#;
+        // Dead Trust Plane / Google URLs — the gate must block before either.
+        let state = crate::test_support::adapter_state(
+            pool.clone(),
+            policy_yaml,
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+        );
+        let session = crate::test_support::mock_session(leaf_pca_id, "alice@acme.com");
+
+        let before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM blocked_actions WHERE layer = 'policy' AND policy_id = 'calendar-external-attendee-gate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut body_for_policy = HashMap::new();
+        body_for_policy.insert("external_attendee".to_string(), Value::Bool(true));
+        body_for_policy.insert(
+            "attendee_domains".to_string(),
+            Value::Array(vec![Value::String("othercorp.example".into())]),
+        );
+        let err = proxy_request(
+            &state,
+            &session,
+            CalendarRequest {
+                action: "calendar.events.insert".into(),
+                upstream_path: "/calendar/v3/calendars/primary/events".into(),
+                method: Method::POST,
+                policy_path: HashMap::new(),
+                query: HashMap::new(),
+                body_for_policy,
+                upstream_body: None,
+            },
+        )
+        .await
+        .expect_err("an external attendee must be blocked");
+
+        assert!(
+            matches!(err, AppError::PolicyBlocked { .. }),
+            "expected PolicyBlocked, got: {err:?}",
+        );
+        assert_eq!(err.status(), StatusCode::FORBIDDEN, "must map to 403");
+        match &err {
+            AppError::PolicyBlocked {
+                policy_id,
+                override_allowed,
+                ..
+            } => {
+                assert_eq!(
+                    policy_id.as_deref(),
+                    Some("calendar-external-attendee-gate")
+                );
+                assert!(
+                    override_allowed,
+                    "gate declares override: requires_justification"
+                );
+            }
+            other => panic!("expected PolicyBlocked, got {other:?}"),
+        }
+
+        let after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM blocked_actions WHERE layer = 'policy' AND policy_id = 'calendar-external-attendee-gate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "a Layer-B blocked_actions row must be persisted"
+        );
+    }
 }

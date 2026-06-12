@@ -16,6 +16,14 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Calendar write-gate integration test** (spec.md §2.1 / §8 / §9) —
+  [google_calendar.rs](crates/proxy/src/adapters/google_calendar.rs)
+  `db_backed_calendar_insert_external_attendee_is_blocked_403` exercises the
+  Calendar adapter's distinguishing **write** path: `events.insert` with an
+  external attendee is blocked at Layer B → `PolicyBlocked` (403) +
+  `layer='policy'` blocked row, no Trust Plane / Google contacted. Completes
+  integration coverage of all three adapters (Drive / Gmail / Calendar) on the
+  shared `test_support` harness.
 - **Concurrent-refresh coalescing integration test** (spec.md §1.1 deviation 3,
   the last "structural-not-integration" gap) —
   [auth_middleware.rs](crates/proxy/src/auth_middleware.rs)

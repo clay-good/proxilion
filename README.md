@@ -319,6 +319,7 @@ properties end-to-end:
 | Drive adapter, runtime-gate (valid mint, happy path) | Trust Plane *issues* a successor → the PCA_2 is cached at `hop=2` with the leaf as predecessor (the chain grows a hop) and a clean upstream body passes through untouched |
 | Drive adapter, read-filter `block_request` | a matched pattern quarantines the **whole** response → `ReadFilterBlocked` (403) + a `layer='read_filter'` blocked row (vs the `replace_with_marker` row above, which lets the request proceed) |
 | Gmail send, external recipient | the flagship Layer-B gate blocks before any mint/upstream — `PolicyBlocked` (403) + a `layer='policy'` blocked row carrying `policy_id` + `override_allowed` |
+| Calendar `events.insert`, external attendee | the write gate (the Calendar adapter's distinguishing path) blocks before any mint/upstream — `PolicyBlocked` (403) + a `layer='policy'` blocked row; completes the Drive/Gmail/Calendar trio |
 | Google token refresh, 50 concurrent | the per-bearer mutex coalesces a stampede: with an expired token, **50 concurrent** refreshers hit Google **exactly once** (asserted via wiremock's `received_requests`) and all see the fresh token |
 
 These run in the CI `integration` job (postgres service) on every push, against

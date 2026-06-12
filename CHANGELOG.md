@@ -16,6 +16,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Action-log `list` API integration test** —
+  [api/actions.rs](crates/proxy/src/api/actions.rs)
+  `db_backed_actions_list_filters_and_cursor` pins the query backing
+  `proxilion-cli actions list` + `policy simulate`: seeds `action_events` rows
+  and asserts the `p_0` / `decision` / `action` filters and the `limit` +
+  `next_before` cursor against real SQL.
+- **README** — a per-request-hot-path Mermaid **sequence diagram**, a
+  **threat-model** table (defended-by-PIC / defended-by-Proxilion / not-defended,
+  from spec.md §10), and an **observability cheat sheet** of the key Prometheus
+  series (verified against the metric names actually emitted).
 - **OAuth federation state-binding integration test** (surface-delight §6.4) —
   the session-fixation/replay defense was unit-tested only on the pure
   comparator. [oauth/routes.rs](crates/proxy/src/oauth/routes.rs)

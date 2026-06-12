@@ -109,6 +109,38 @@ leaf→root checking all three:
 | **Identity** | `p_0` is copied from the predecessor, never re-derived | identity laundering via token exchange |
 | **Continuity** | `child.ops ⊆ parent.ops`, `child.hop == parent.hop + 1` | privilege escalation across hops |
 
+**The per-request hot path** — what happens on every SaaS call the agent makes
+(this is the sequence the integration tests in [§Testing](#testing) pin
+end-to-end):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent
+    participant P as Proxilion
+    participant TP as Trust Plane
+    participant G as Google SaaS
+    A->>P: GET /google/drive/v3/files/{id}<br/>Authorization: Bearer pxl_live_…
+    P->>P: resolve session from bearer (DB JOIN)<br/>+ in-process kill-cache check
+    P->>P: Layer B — evaluate policy.yaml against the request
+    alt blocked by a Layer-B policy
+        P-->>A: 403 policy_blocked + a blocked_actions row → HITL queue
+    else allowed
+        P->>TP: Layer A — mint PCA_2 successor (ops narrowed to this action)
+        alt ops not ⊆ parent (runtime-gate)
+            TP-->>P: 422 invariant violation
+            P-->>A: 403 pic_invariant_violation (+ pic_invariant blocked row)
+        else issued
+            TP-->>P: PCA_2 at hop+1
+            P->>G: forward with the Proxilion-held Google token
+            G-->>P: response body
+            P->>P: read-filter (quarantine prompt-injection patterns)
+            P-->>A: filtered response
+        end
+    end
+    Note over P,G: every outcome is signed into the action stream → NATS → SIEM
+```
+
 ## Credits: standing on PIC's shoulders
 
 The cryptographic primitive Proxilion uses for signed authority chains is the
@@ -206,6 +238,26 @@ keys, your traffic, or your PCAs. The marketing site at
 [proxilion.com](https://proxilion.com) is a static HTML page that points
 here. No telemetry, no phone-home, no upsell paths in the admin UI.
 
+## Threat model
+
+What each layer defends, and — just as important — what it deliberately does
+not (the honest ceiling of an interception proxy). Authority: [spec.md §10](docs/specs/spec.md).
+
+| Threat | Status | How |
+|---|---|---|
+| Confused deputy (agent acts beyond the human's authority) | **Defended by PIC, by construction** | Trust Plane refuses to mint the successor PCA — the action is *non-expressible*, not merely detected |
+| Cross-user access (act for Alice, read Bob's data) | **Defended by PIC** | `p_0 = alice` is immutable; `read:drive:bob/*` isn't in Alice's ops set → refused |
+| Privilege escalation via chain length | **Defended by PIC** | the monotonicity invariant (`child.ops ⊆ parent.ops`) refuses any broadening hop |
+| Identity laundering via token exchange | **Defended by PIC** | `p_0` is copied from the predecessor, never re-derived from a token |
+| Forged / spliced chain | **Defended by PIC** | any link without a valid predecessor CAT signature fails verification |
+| Prompt injection via documents | **Defended by Proxilion (Layer B)** | the read filter quarantines known injection patterns before the agent reads them |
+| Unauthorized state change within the user's ops | **Defended by Proxilion (Layer B)** | the write gate blocks (or sends to human approval) |
+| Bearer theft from a compromised agent process | **Defended by Proxilion** | the `pxl_live_` bearer is opaque and Proxilion-only; the killswitch revokes it within one request cycle |
+| Insider misuse via the agent | **Defended (audit)** | every action is signed into the PCA chain and streamed to the SOC |
+| Compromised Proxilion / Trust Plane / IdP | **Not defended** | customer infrastructure; CAT keys and the federation source are the trust root |
+| Out-of-band egress (HTTP that skips OAuth) | **Not defended** | the customer's egress controls cover this — Proxilion only sees the OAuth path |
+| Side-channel exfiltration through *allowed* actions | **Not defended** | a determined attacker can encode data into permitted Drive writes |
+
 ## Policy cheat sheet
 
 Layer-B policy is a list of rules in `config/policy.yaml`. Each rule binds a
@@ -274,6 +326,29 @@ proxilion-cli completion zsh > "${fpath[1]}/_proxilion-cli"
 # fish
 proxilion-cli completion fish > ~/.config/fish/completions/proxilion-cli.fish
 ```
+
+## Observability cheat sheet
+
+The proxy exposes OpenMetrics at `GET /metrics` (spec.md §3.2). The series an
+operator actually alerts on — the ones that say "is enforcement working and
+healthy":
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `proxilion_pic_invariant_violations_total` | counter | Layer-A refusals — agents attempting actions outside their authority (the confused-deputy signal) |
+| `proxilion_blocks_total` | counter | Layer-B policy blocks, by `policy_id` / decision |
+| `proxilion_readfilter_scans_total{result}` | counter | read-filter outcomes (`clean` / `stripped` / `quarantined`) — prompt-injection hits |
+| `proxilion_pca_verify_failures_total` | counter | PCA signature verifications that failed — tampering or key drift |
+| `proxilion_overrides_pending` / `_resolved_total{outcome}` | gauge / counter | the human-in-the-loop queue depth and approve/reject throughput |
+| `proxilion_oauth_token_refreshes_total{result}` | counter | Google refreshes, incl. the `coalesced` label (the 50→1 stampede defense) |
+| `proxilion_adapter_request_duration_seconds` | histogram | end-to-end latency per `{vendor,action}` (policy + mint + upstream + filter) |
+| `proxilion_policy_evaluation_duration_seconds` | histogram | the Layer-B engine's hot-path budget (target p99 < 1 ms) |
+| `proxilion_trust_plane_up` / `proxilion_federation_bridge_up` | gauge | dependency liveness |
+| `proxilion_operator_auth_total{result}` | counter | operator-API auth accept/reject (token + scope) |
+
+Pull them with `proxilion-cli metrics sample` (top series by sample count) or
+scrape into Prometheus; the bundled Grafana dashboard lives in
+[`ops/grafana/`](ops/).
 
 ## Design decisions
 

@@ -1440,4 +1440,113 @@ mod tests {
         // error-handling shape.
         let _f: fn(ActionsApiState) -> Router = router;
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Drives the action-log `list` query (the CLI `actions list` + `policy
+    // simulate` data source) against real SQL. Skips when no test DB.
+    // ─────────────────────────────────────────────────────────────────────
+
+    async fn seed_action(pool: &PgPool, p_0: &str, vendor: &str, action: &str, decision: &str) {
+        sqlx::query(
+            "INSERT INTO action_events
+               (request_id, p_0, vendor, action, method, path, status, decision)
+             VALUES (gen_random_uuid(), $1, $2, $3, 'GET', '/x', '200', $4)",
+        )
+        .bind(p_0)
+        .bind(vendor)
+        .bind(action)
+        .bind(decision)
+        .execute(pool)
+        .await
+        .expect("seed action_events");
+    }
+
+    fn list_params(
+        p_0: Option<&str>,
+        decision: Option<&str>,
+        action: Option<&str>,
+        limit: Option<u32>,
+    ) -> ListParams {
+        ListParams {
+            limit,
+            before: None,
+            decision: decision.map(str::to_string),
+            p_0: p_0.map(str::to_string),
+            vendor: None,
+            action: action.map(str::to_string),
+            session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn db_backed_actions_list_filters_and_cursor() {
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        // Unique tag so this test's rows don't collide with a shared DB.
+        let tag = Uuid::new_v4().simple().to_string();
+        let alice = format!("alice-{tag}@acme.com");
+        let bob = format!("bob-{tag}@acme.com");
+        seed_action(&pool, &alice, "google", "drive.files.get", "allow").await;
+        seed_action(&pool, &alice, "google", "gmail.messages.send", "block").await;
+        seed_action(&pool, &bob, "google", "drive.files.get", "allow").await;
+
+        let state = ActionsApiState {
+            db: pool.clone(),
+            stream: BroadcastingActionStream::new(pool.clone()),
+            pca_cache: PcaCache::new(pool.clone()),
+        };
+
+        // Filter by p_0=alice → her two rows (and only hers).
+        let resp = list(
+            State(state.clone()),
+            Query(list_params(Some(&alice), None, None, None)),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        assert_eq!(resp.rows.len(), 2, "alice has two action rows");
+        assert!(resp.rows.iter().all(|r| r.p_0 == alice));
+
+        // Filter by p_0=alice AND decision=block → only the gmail send.
+        let resp = list(
+            State(state.clone()),
+            Query(list_params(Some(&alice), Some("block"), None, None)),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        assert_eq!(resp.rows.len(), 1);
+        assert_eq!(resp.rows[0].action, "gmail.messages.send");
+        assert_eq!(resp.rows[0].decision, "block");
+
+        // Filter by p_0=alice AND action=drive.files.get → only the drive read.
+        let resp = list(
+            State(state.clone()),
+            Query(list_params(
+                Some(&alice),
+                None,
+                Some("drive.files.get"),
+                None,
+            )),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        assert_eq!(resp.rows.len(), 1);
+        assert_eq!(resp.rows[0].action, "drive.files.get");
+
+        // limit=1 over alice's two rows → one row + a `next_before` cursor.
+        let resp = list(
+            State(state),
+            Query(list_params(Some(&alice), None, None, Some(1))),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        assert_eq!(resp.rows.len(), 1, "limit caps the page");
+        assert!(resp.next_before.is_some(), "a full page yields a cursor");
+    }
 }

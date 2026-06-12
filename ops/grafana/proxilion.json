@@ -386,7 +386,7 @@
       "type": "timeseries",
       "title": "Auth attempts by result (1m rate)",
       "datasource": { "type": "prometheus" },
-      "gridPos": { "x": 0, "y": 40, "w": 8, "h": 7 },
+      "gridPos": { "x": 0, "y": 40, "w": 6, "h": 7 },
       "targets": [
         {
           "expr": "sum by (result) (rate(proxilion_auth_attempts_total[1m]))",
@@ -399,7 +399,7 @@
       "type": "timeseries",
       "title": "PCA cache hits / misses (1m rate)",
       "datasource": { "type": "prometheus" },
-      "gridPos": { "x": 8, "y": 40, "w": 8, "h": 7 },
+      "gridPos": { "x": 6, "y": 40, "w": 6, "h": 7 },
       "targets": [
         { "expr": "rate(proxilion_pca_cache_hits_total[1m])", "legendFormat": "hits" },
         { "expr": "rate(proxilion_pca_cache_misses_total[1m])", "legendFormat": "misses" }
@@ -410,11 +410,25 @@
       "type": "timeseries",
       "title": "Adapter upstream errors by kind (5m rate)",
       "datasource": { "type": "prometheus" },
-      "gridPos": { "x": 16, "y": 40, "w": 8, "h": 7 },
+      "gridPos": { "x": 12, "y": 40, "w": 6, "h": 7 },
       "targets": [
         {
           "expr": "sum by (kind) (rate(proxilion_adapter_upstream_errors_total[5m]))",
           "legendFormat": "{{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Token refresh outcomes (1m rate)",
+      "description": "Google OAuth token refreshes by result. `coalesced` is the per-bearer stampede defense (concurrent refreshers collapse to a single upstream call); a rising `upstream_err` means the Google refresh call is failing.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 18, "y": 40, "w": 6, "h": 7 },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(proxilion_oauth_token_refreshes_total[1m]))",
+          "legendFormat": "{{result}}"
         }
       ]
     },

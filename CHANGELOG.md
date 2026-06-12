@@ -161,6 +161,22 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Operator-facing metric name corrected: `oauth_token_refreshes_total`** —
+  `ops/README.md` and three `spec.md` references named the refresh counter
+  `proxilion_token_refreshes_total`, but the code emits it with the `oauth_`
+  prefix (`proxilion_oauth_token_refreshes_total`). An operator pasting the
+  documented name into a PromQL alert would have silently gotten no data.
+  Corrected every reference repo-wide and added the `coalesced` stampede-defense
+  note + `vendor` label to the ops metrics table.
+  [ops/README.md](ops/README.md)
+- **Grafana dashboard: added the missing "Token refresh outcomes" panel** —
+  the `ops/README.md` Grafana section advertised a token-refresh panel, but the
+  bundled dashboard had none. Added a `Token refresh outcomes (1m rate)`
+  timeseries (`sum by (result) (rate(proxilion_oauth_token_refreshes_total[1m]))`)
+  to the "Is the system healthy?" row — surfacing the `ok` / `coalesced` /
+  `upstream_err` split, including the 50→1 per-bearer coalescing defense — and
+  rebalanced that row to four even panels. Verified the dashboard now references
+  zero metrics the code doesn't emit. [ops/grafana/proxilion.json](ops/grafana/proxilion.json)
 - **Stale `MARKER` byte-length comment** — a read-filter test's comment said
   the `[redacted by proxilion read-filter]` marker is "38 bytes" while it
   asserts (correctly) `MARKER.len() == 35`; a later test even flagged it as a

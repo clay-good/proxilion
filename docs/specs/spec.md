@@ -1200,7 +1200,7 @@ Extractor:
 
 Metrics:
   proxilion_auth_attempts_total{result}
-  proxilion_token_refreshes_total{result}
+  proxilion_oauth_token_refreshes_total{result}
   proxilion_pca_cache_hits_total
   proxilion_pca_cache_misses_total
 
@@ -1222,7 +1222,7 @@ Acceptance:
 - [crates/proxy/src/session.rs](proxilion/crates/proxy/src/session.rs) — `SessionContext` (Debug redacts the Google token) and `SessionCtx` extractor pulling `Arc<SessionContext>` from request extensions.
 - [crates/proxy/src/pic/cat_key.rs](proxilion/crates/proxy/src/pic/cat_key.rs) — `CatKeyRegistry`: lazy fetch + cache of the Trust Plane CAT verifying key via `GET /v1/federation/info`.
 - [crates/proxy/src/auth_middleware.rs](proxilion/crates/proxy/src/auth_middleware.rs) — `auth_middleware` does: header → format check (`Bearer::parse`) → DB join (`agent_bearers ⨯ google_tokens ⨯ oauth_sessions`) → revocation check → decrypt → refresh-if-near-expiry (coalesced via moka-cached per-bearer `tokio::sync::Mutex`) → load PCA_1 from `pca_cache` → verify CAT signature → build `SessionContext`. Every failure path returns a fixed `401 unauthorized` body; the cause goes to `tracing::warn!` and `metrics::counter!` only.
-- **Metrics** wired via the `metrics` facade: `proxilion_auth_attempts_total{result}`, `proxilion_token_refreshes_total{result}`, `proxilion_pca_cache_hits_total`, `proxilion_pca_cache_misses_total`, `proxilion_pca_verify_failures_total`. Exporter (Prometheus or OTLP) is M2 — for now the facade is a no-op, but call sites are in place.
+- **Metrics** wired via the `metrics` facade: `proxilion_auth_attempts_total{result}`, `proxilion_oauth_token_refreshes_total{result}`, `proxilion_pca_cache_hits_total`, `proxilion_pca_cache_misses_total`, `proxilion_pca_verify_failures_total`. Exporter (Prometheus or OTLP) is M2 — for now the facade is a no-op, but call sites are in place.
 - Mounted via a small protected route in [server.rs](proxilion/crates/proxy/src/server.rs) — `GET /internal/whoami` returns a redacted view of `SessionContext`. Exercises the middleware end-to-end; real adapters land in §1.3.
 
 **Tests added (`auth_middleware::tests`):**
@@ -1580,7 +1580,7 @@ Acceptance:
 **Status:** Done (ui-less-surfaces variant). Per [`ui-less-surfaces.md`](./ui-less-surfaces.md) §10.2, the dashboard work is dropped and replaced by `proxilion-cli` + Prometheus `/metrics`. Delivered:
 - [crates/cli/src/main.rs](../../crates/cli/src/main.rs) — `proxilion-cli actions {tail,list,show,export}` plus `health`, `pca`, `verify`, `selftest`. `tail` consumes the proxy's SSE stream with client-side decision/vendor/action filters; `list` paginates by `before=` cursor (1..=500); `show` renders the PCA chain inline (root→leaf, hop / 🌱 root / 🔗 successor, p_0 carried through, ops narrowing diff, ✓/✗ chain summary); `export` streams NDJSON or CSV from the proxy to stdout/file with O(1) memory at both ends.
 - [crates/proxy/src/api/actions.rs](../../crates/proxy/src/api/actions.rs) — `GET /api/v1/actions` (paginated `{rows,next_before}` envelope), `/actions/recent`, `/actions/stream` (SSE, 5s keep-alive), `/actions/export` (chunked NDJSON/CSV directly from a postgres cursor), `/actions/{id}` (full record with embedded `chain[]`), `/sessions/{id}/chain`.
-- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) `/metrics` Prometheus exposition wired via `metrics_exporter_prometheus`; emitters in `auth_middleware.rs`, `adapters/action_stream.rs`, `adapters/google_drive.rs`, `api/actions.rs` cover `proxilion_auth_attempts_total`, `proxilion_token_refreshes_total`, `proxilion_pca_cache_{hits,misses}_total`, `proxilion_pca_verify_failures_total`, `proxilion_action_events_persisted_total{decision}`, `proxilion_audit_export_{requests,bytes}_total{format}`.
+- [crates/proxy/src/server.rs](../../crates/proxy/src/server.rs) `/metrics` Prometheus exposition wired via `metrics_exporter_prometheus`; emitters in `auth_middleware.rs`, `adapters/action_stream.rs`, `adapters/google_drive.rs`, `api/actions.rs` cover `proxilion_auth_attempts_total`, `proxilion_oauth_token_refreshes_total`, `proxilion_pca_cache_{hits,misses}_total`, `proxilion_pca_verify_failures_total`, `proxilion_action_events_persisted_total{decision}`, `proxilion_audit_export_{requests,bytes}_total{format}`.
 - [ops/grafana/proxilion.json](../../ops/grafana/proxilion.json) — 23-panel + 4-row dashboard matching the four-quadrant layout (security / annoyance / rollout / health) from `ui-less-surfaces.md` §3.4. Imports cleanly into Grafana 10+. (Updated 2026-05-12 — original five-panel scaffold replaced.)
 
 **Verified end-to-end against the live compose stack (2026-05-11):**

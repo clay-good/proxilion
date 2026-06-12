@@ -33,7 +33,7 @@ Prometheus datasource.
 | Metric | Type | Labels | Notes |
 |---|---|---|---|
 | `proxilion_auth_attempts_total` | counter | `result` (`ok` / `rejected`) | Per request through the bearer middleware. |
-| `proxilion_token_refreshes_total` | counter | `result` (`ok` / `coalesced` / `upstream_err`) | Google OAuth refresh flow. |
+| `proxilion_oauth_token_refreshes_total` | counter | `result` (`ok` / `coalesced` / `upstream_err`), `vendor` | Google OAuth refresh flow. `coalesced` is the per-bearer stampede defense. |
 | `proxilion_pca_cache_hits_total` | counter | — | `pca_cache` row found locally. |
 | `proxilion_pca_cache_misses_total` | counter | — | Miss → 401 (we don't fall back to Trust Plane since upstream has no `GET /v1/pca/{id}` endpoint yet — see spec.md §1.2 deviations). |
 | `proxilion_pca_verify_failures_total` | counter | — | CAT signature verification failed. **Must stay 0** in steady state. |

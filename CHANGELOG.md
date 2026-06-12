@@ -16,6 +16,15 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Concurrent-refresh coalescing integration test** (spec.md §1.1 deviation 3,
+  the last "structural-not-integration" gap) —
+  [auth_middleware.rs](crates/proxy/src/auth_middleware.rs)
+  `db_backed_refresh_coalesces_50_concurrent_into_one_google_call` fires 50
+  concurrent `refresh_with_coalescing` calls (same bearer, an expired seeded
+  `google_tokens` row) at a **wiremock'd Google token endpoint** and asserts via
+  `received_requests()` that Google is hit **exactly once** and all 50 callers
+  get the fresh token — pinning the per-bearer `Arc<Mutex>` + post-lock DB
+  re-read under real concurrency. Runs in the CI `integration` job.
 - **Adapter happy-path + read-filter-block integration tests** — completes the
   `proxy_request` branch matrix on the wiremock'd harness:
   `..._valid_mint_caches_successor_and_passes_through` (Trust Plane *issues* a

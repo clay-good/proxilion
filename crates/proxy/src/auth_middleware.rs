@@ -1271,4 +1271,117 @@ mod tests {
         );
         require_arc_token_cipher(cipher);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Skips when no test database is configured — see `test_support`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn db_backed_refresh_coalesces_50_concurrent_into_one_google_call() {
+        // spec.md §1.1 "50 concurrent requests with the same expired token →
+        // exactly one Google refresh call". The per-bearer `Arc<Mutex>` from
+        // `RefreshCoordinator` serializes the refreshers; the first does the
+        // POST and persists the new token, the rest re-read under the lock,
+        // see the freshened expiry, and coalesce — so Google is hit exactly
+        // once. Verified empirically against a wiremock'd token endpoint.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Google token endpoint: hands back a fresh access token. wiremock
+        // records every request so we can assert the call count.
+        let google = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access-token",
+                "expires_in": 3600
+            })))
+            .mount(&google)
+            .await;
+
+        let cipher = Arc::new(crate::crypto::TokenCipher::from_bytes(&[0u8; 32]).unwrap());
+
+        // Seed client → session → google_tokens (already EXPIRED, with an
+        // encrypted access + refresh token) so a refresh is forced.
+        let client_id = format!("client-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO oauth_clients (id, name, redirect_uris) VALUES ($1,'it',ARRAY['https://x/cb'])")
+            .bind(&client_id).execute(&pool).await.unwrap();
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO oauth_sessions
+               (id, client_id, agent_redirect_uri, agent_state, agent_code_challenge,
+                agent_code_challenge_method, agent_requested_scope, p_0, expires_at)
+             VALUES ($1,$2,'https://x/cb','st','ch','S256','scope','alice@acme.com', now()+interval '1 hour')",
+        )
+        .bind(session_id).bind(&client_id).execute(&pool).await.unwrap();
+        let gt_id = Uuid::new_v4();
+        let access_ct = cipher.encrypt(b"old-access-token").unwrap();
+        let refresh_ct = cipher.encrypt(b"refresh-token-xyz").unwrap();
+        sqlx::query(
+            "INSERT INTO google_tokens
+               (id, session_id, access_token_ciphertext, access_token_nonce,
+                refresh_token_ciphertext, refresh_token_nonce, scope, expires_at)
+             VALUES ($1,$2,$3,$4,$5,$6,'scope', now() - interval '1 hour')",
+        )
+        .bind(gt_id)
+        .bind(session_id)
+        .bind(&access_ct.bytes)
+        .bind(&access_ct.nonce)
+        .bind(&refresh_ct.bytes)
+        .bind(&refresh_ct.nonce)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // One shared AuthState (and thus one shared RefreshCoordinator) across
+        // all 50 tasks — the coalescing depends on them sharing the per-hash
+        // lock map.
+        let state = Arc::new(AuthState {
+            db: pool.clone(),
+            cipher: cipher.clone(),
+            pca_cache: PcaCache::new(pool.clone()),
+            cat_keys: CatKeyRegistry::new("http://127.0.0.1:1/".into()),
+            refresh_coordinator: RefreshCoordinator::default(),
+            google_token_url: format!("{}/token", google.uri()),
+            google_client_id: "c".into(),
+            google_client_secret: "s".into(),
+            http: reqwest::Client::new(),
+            kill_cache: KillCache::new(),
+        });
+
+        let bearer_hash = [7u8; 32];
+        let mut handles = Vec::with_capacity(50);
+        for _ in 0..50 {
+            let state = state.clone();
+            let refresh_ct = refresh_ct.clone();
+            handles.push(tokio::spawn(async move {
+                refresh_with_coalescing(&state, bearer_hash, gt_id, &refresh_ct).await
+            }));
+        }
+        let mut ok = 0;
+        for h in handles {
+            let plain = h.await.unwrap().expect("refresh succeeds");
+            assert_eq!(
+                plain, b"new-access-token",
+                "all callers see the fresh token"
+            );
+            ok += 1;
+        }
+        assert_eq!(ok, 50, "all 50 concurrent refreshes succeed");
+
+        // The load-bearing assertion: exactly ONE Google call despite 50
+        // concurrent refreshers.
+        let reqs = google.received_requests().await.unwrap();
+        let token_hits = reqs.iter().filter(|r| r.url.path() == "/token").count();
+        assert_eq!(
+            token_hits, 1,
+            "refresh must coalesce to a single Google call; got {token_hits}",
+        );
+    }
 }

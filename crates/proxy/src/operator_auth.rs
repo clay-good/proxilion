@@ -1134,4 +1134,139 @@ mod tests {
             "operator and agent prefixes must be wire-disjoint",
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Drives the real operator-auth boundary (DB token lookup → principal
+    // attach → per-route scope_check) end-to-end via tower's `oneshot`.
+    // Skips when no test DB — see test_support.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Insert an `operator_tokens` row and return the matching bearer token.
+    async fn seed_operator_token(pool: &PgPool, scopes: &[&str], revoked: bool) -> String {
+        let token = generate();
+        let h = hash(&token);
+        let scopes_vec: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        sqlx::query(
+            "INSERT INTO operator_tokens (token_hash, name, scopes, revoked_at)
+             VALUES ($1, 'it', $2, $3)",
+        )
+        .bind(&h[..])
+        .bind(&scopes_vec)
+        .bind(if revoked { Some(Utc::now()) } else { None })
+        .execute(pool)
+        .await
+        .expect("seed operator_tokens");
+        token
+    }
+
+    #[tokio::test]
+    async fn db_backed_operator_auth_boundary_enforces_token_and_scope() {
+        // The auth gate for the entire operator API: every `/api/v1/*` request
+        // crosses `middleware` (DB token lookup, revocation check, principal
+        // attach) then a per-route `scope_check`. Pin the full decision matrix
+        // against real SQL: valid+scope→200, wildcard→200, unknown→401,
+        // revoked→401, wrong-scope→403, missing→401, malformed→401.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::middleware::from_fn_with_state;
+        use axum::routing::get;
+        use moka::future::Cache;
+        use tower::ServiceExt; // oneshot
+
+        // Seed four tokens covering the decision space.
+        let tok_read = seed_operator_token(&pool, &["blocks:read"], false).await;
+        let tok_wildcard = seed_operator_token(&pool, &[WILDCARD], false).await;
+        let tok_revoked = seed_operator_token(&pool, &["blocks:read"], true).await;
+        let tok_wrong_scope = seed_operator_token(&pool, &["policy:read"], false).await;
+        // A well-formed token that was never inserted.
+        let tok_unknown = generate();
+
+        let op_state = OperatorAuthState {
+            db: pool.clone(),
+            enforced: true,
+            touch_cache: Cache::builder().build(),
+        };
+
+        // Build the same two-layer shape `server.rs` uses: an inner handler
+        // behind a `blocks:read` scope_check, wrapped by the DB middleware.
+        let make_app = || {
+            Router::new()
+                .route("/guarded", get(|| async { "ok" }))
+                .route_layer(from_fn_with_state("blocks:read", scope_check))
+                .layer(from_fn_with_state(op_state.clone(), middleware))
+        };
+
+        async fn status_for(app: Router, auth: Option<&str>) -> axum::http::StatusCode {
+            let mut b = Request::builder().uri("/guarded");
+            if let Some(a) = auth {
+                b = b.header("authorization", format!("Bearer {a}"));
+            }
+            let resp = app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+            resp.status()
+        }
+
+        use axum::http::StatusCode;
+        // Valid token with the required scope → 200.
+        assert_eq!(
+            status_for(make_app(), Some(&tok_read)).await,
+            StatusCode::OK,
+            "valid token + matching scope must pass",
+        );
+        // Wildcard scope → 200.
+        assert_eq!(
+            status_for(make_app(), Some(&tok_wildcard)).await,
+            StatusCode::OK,
+            "wildcard scope must pass",
+        );
+        // Revoked token → 401 (the DB lookup filters `revoked_at IS NULL`).
+        assert_eq!(
+            status_for(make_app(), Some(&tok_revoked)).await,
+            StatusCode::UNAUTHORIZED,
+            "revoked token must be rejected",
+        );
+        // Valid token, wrong scope → 403.
+        assert_eq!(
+            status_for(make_app(), Some(&tok_wrong_scope)).await,
+            StatusCode::FORBIDDEN,
+            "insufficient scope must be 403",
+        );
+        // Well-formed but unknown token → 401.
+        assert_eq!(
+            status_for(make_app(), Some(&tok_unknown)).await,
+            StatusCode::UNAUTHORIZED,
+            "unknown token must be rejected",
+        );
+        // Missing Authorization header → 401.
+        assert_eq!(
+            status_for(make_app(), None).await,
+            StatusCode::UNAUTHORIZED,
+            "missing token must be rejected",
+        );
+        // Malformed token (agent prefix, not operator) → 401.
+        assert_eq!(
+            status_for(make_app(), Some("pxl_live_not_an_operator_token")).await,
+            StatusCode::UNAUTHORIZED,
+            "malformed token must be rejected",
+        );
+
+        // The DB UPDATE of `last_used_at` is spawned best-effort; give it a
+        // moment, then confirm the valid token's row was touched.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let touched: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT last_used_at FROM operator_tokens WHERE token_hash = $1")
+                .bind(&hash(&tok_read)[..])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            touched.is_some(),
+            "a successful auth must touch last_used_at"
+        );
+    }
 }

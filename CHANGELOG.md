@@ -16,6 +16,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Operator-auth boundary integration test** (ui-less-surfaces.md §4.4) — the
+  authentication gate for the *entire* operator API (`/api/v1/*`:
+  killswitch / blocked / policy / actions / …) was DB-backed but had no
+  integration coverage. [operator_auth.rs](crates/proxy/src/operator_auth.rs)
+  `db_backed_operator_auth_boundary_enforces_token_and_scope` drives the real
+  `middleware` (DB `operator_tokens` lookup + revocation check + principal
+  attach) composed with a per-route `scope_check`, via `tower::oneshot` against
+  seeded tokens, pinning the full decision matrix: valid+scope → 200,
+  wildcard → 200, revoked → 401, unknown → 401, wrong scope → 403,
+  missing/malformed → 401 — plus the `last_used_at` touch on success.
 - **Calendar write-gate integration test** (spec.md §2.1 / §8 / §9) —
   [google_calendar.rs](crates/proxy/src/adapters/google_calendar.rs)
   `db_backed_calendar_insert_external_attendee_is_blocked_403` exercises the

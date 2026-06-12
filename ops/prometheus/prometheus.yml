@@ -1,0 +1,44 @@
+# Proxilion — Prometheus scrape config.
+#
+# The proxy exposes OpenMetrics at `GET /metrics` on its TLS port (spec.md
+# §3.2). Drop this in as your Prometheus config, or merge the `proxilion`
+# scrape job into an existing one. Pair it with the Grafana dashboard in
+# ../grafana/proxilion.json and the metric catalogue in ../README.md.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: proxilion
+    metrics_path: /metrics
+    scheme: https
+    tls_config:
+      # Dev only: the compose stack self-issues a cert on first boot, so the
+      # scraper can't verify it. In production, drop `insecure_skip_verify`
+      # and point `ca_file` at the CA bundle that signed the proxy's cert:
+      #   ca_file: /etc/prometheus/proxilion-ca.pem
+      insecure_skip_verify: true
+    static_configs:
+      # Compose service name + TLS port. Replace with your proxy's address
+      # (and add more targets behind a load balancer as needed).
+      - targets: ["proxy:8443"]
+
+# Alerting: the one series that must always read zero is
+# `proxilion_pca_verify_failures_total` — any increase means a tampered PCA was
+# loaded from cache or a CAT-key rotation hasn't propagated (page someone). Wire
+# it through Alertmanager with a rule like:
+#
+#   rule_files:
+#     - proxilion-alerts.yml
+#
+#   # proxilion-alerts.yml
+#   groups:
+#     - name: proxilion
+#       rules:
+#         - alert: ProxilionPcaVerifyFailure
+#           expr: increase(proxilion_pca_verify_failures_total[5m]) > 0
+#           for: 0m
+#           labels: { severity: page }
+#           annotations:
+#             summary: "PCA chain verification failed — tampered PCA or stale CAT key"

@@ -16,6 +16,15 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **`ops/prometheus/prometheus.yml`** — a ready-to-use Prometheus scrape config
+  for the proxy's `/metrics` endpoint, completing the operator-artifacts set
+  (the `ops/prometheus/` directory existed but was empty, and the README repo
+  tree already listed "Prometheus scrape config" as a deliverable). It carries
+  the `proxilion` scrape job (matching the previously inline-only example), a
+  production-TLS note, and an example Alertmanager rule for the must-be-zero
+  `proxilion_pca_verify_failures_total` series. `ops/README.md` now points at
+  this file as the canonical source instead of duplicating the YAML inline.
+  [ops/prometheus/prometheus.yml](ops/prometheus/prometheus.yml)
 - **`read_bounded` branch coverage completed** — the shared upstream-body cap
   helper added with the §1.4 streaming fix had tests only for the
   `Content-Length`-absent streaming path; its `Content-Length` *pre-check*

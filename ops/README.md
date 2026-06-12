@@ -4,7 +4,10 @@ Operator-facing artifacts for running Proxilion.
 
 ## Prometheus
 
-The proxy exposes a `/metrics` endpoint on its TLS port. Sample scrape config:
+The proxy exposes a `/metrics` endpoint on its TLS port. A ready-to-use scrape
+config — drop in directly or merge the `proxilion` job into an existing one —
+lives in [`prometheus/prometheus.yml`](prometheus/prometheus.yml). The core of
+it:
 
 ```yaml
 scrape_configs:
@@ -12,10 +15,13 @@ scrape_configs:
     metrics_path: /metrics
     scheme: https
     tls_config:
-      insecure_skip_verify: true   # dev only
+      insecure_skip_verify: true   # dev only — see the file for the prod TLS note
     static_configs:
       - targets: ["proxy:8443"]
 ```
+
+That file also carries an example Alertmanager rule for the one series that must
+always read zero (`proxilion_pca_verify_failures_total`).
 
 ## Grafana
 

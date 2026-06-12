@@ -38,10 +38,15 @@ impl NatsBridge {
     }
 
     fn subject_for(&self, event: &ActionEvent) -> String {
-        // Sanitize: NATS subjects can't contain spaces, `*`, `>`, `.` (we
-        // already split on `.`). The vendor/action enums in the adapter
-        // produce alphanum + `.`, so we just need to swap any other char
-        // for `_` defensively.
+        // The `.` is the NATS token separator and is **deliberately preserved**
+        // by `sanitize_token`: a dotted action like `gmail.messages.send`
+        // expands into the documented hierarchy
+        // `<prefix>.<vendor>.gmail.messages.send`, which customers subscribe to
+        // as `actions.*.gmail.messages.send`. What `sanitize_token` neutralizes
+        // (→ `_`) are the genuinely subject-injecting chars: spaces, `*`
+        // (single-token wildcard), and `>` (multi-token wildcard). The
+        // vendor/action enums are alphanum + `.` today, so this is defense in
+        // depth against a future adapter emitting a reserved char.
         let action = sanitize_token(&event.action);
         let vendor = sanitize_token(&event.vendor);
         format!("{}.{}.{}", self.prefix, vendor, action)

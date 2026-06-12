@@ -243,7 +243,12 @@ This string becomes the upstream URL at [google_drive.rs:358](../../crates/proxy
 
 ### 6.8 Minor — confirm-or-document (not scheduled)
 
-Recorded for triage, not committed work: `nats.rs` `sanitize_token` keeps `.` though the doc comment says subjects can't contain it (latent — adapter enums can't currently emit a `.`); the read-filter egress allowlist skips binary types so `BlockRequest`/`ReplaceWithMarker` don't apply to Drive `export` of PDF/docx (confirm against `spec.md` §1.4); Google tokens are persisted before the `pca1_ops.is_empty()` check, orphaning encrypted rows on empty-intersection ([oauth/routes.rs:360](../../crates/proxy/src/oauth/routes.rs#L360)); `err_to_result` hardcodes `links_verified: 0` on failure, discarding partial-progress observability.
+Recorded for triage. Two items resolved:
+
+- **(resolved)** `nats.rs` `sanitize_token` keeps `.` though the doc comment claimed subjects "can't contain" it — the comment was self-contradictory, since `.` is the NATS token *separator* and is deliberately preserved so a dotted action (`gmail.messages.send`) expands into the documented `<prefix>.<vendor>.gmail.messages.send` hierarchy (subscribed as `actions.*.gmail.messages.send`). Rewrote the comment in [forwarder/nats.rs](../../crates/proxy/src/forwarder/nats.rs) to state this explicitly and to name the genuinely-reserved chars that `sanitize_token` neutralizes (space, `*`, `>`). No code change — the keep-`.` behavior was already correct.
+- **(resolved)** Google tokens were persisted before the `pca1_ops.is_empty()` check, orphaning encrypted `google_tokens` rows on an empty scope intersection. The intersection + empty-rejection now runs immediately after the token exchange, *before* `persist_google_tokens`, so an empty-intersection callback returns `PicInvariant` without writing a row no bearer would reference ([oauth/routes.rs](../../crates/proxy/src/oauth/routes.rs)).
+
+Still open (lower priority): the read-filter egress allowlist skips binary types so `BlockRequest`/`ReplaceWithMarker` don't apply to Drive `export` of PDF/docx (confirm against `spec.md` §1.4); `err_to_result` hardcodes `links_verified: 0` on failure, discarding partial-progress observability.
 
 ---
 

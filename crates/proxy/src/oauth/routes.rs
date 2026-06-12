@@ -370,6 +370,20 @@ async fn google_callback_inner(
         .json()
         .await?;
 
+    // surface-delight-and-correctness.md §6.8 — compute the PCA_1 ops intersection
+    // and reject an empty intersection BEFORE persisting the Google tokens. The
+    // `narrowed_ops_for_pca1` inputs (`pca0_ops`, the granted scope) are already
+    // in hand, so doing this here means an empty-intersection callback (a common
+    // operator-error path: the agent's granted scope doesn't overlap PCA_0's ops
+    // at all) returns without orphaning an encrypted `google_tokens` row that no
+    // bearer would ever reference.
+    let pca1_ops = narrowed_ops_for_pca1(&pca0_ops, &token_resp.scope);
+    if pca1_ops.is_empty() {
+        return Err(OAuthError::PicInvariant(
+            "no Google scope intersected with PCA_0 ops".into(),
+        ));
+    }
+
     // Encrypt + persist Google tokens.
     let access_ct = state
         .cipher
@@ -398,12 +412,8 @@ async fn google_callback_inner(
         .await
         .map_err(|e| OAuthError::Internal(e.to_string()))?
         .ok_or_else(|| OAuthError::Internal("PCA_0 not in cache".into()))?;
-    let pca1_ops = narrowed_ops_for_pca1(&pca0_ops, &token_resp.scope);
-    if pca1_ops.is_empty() {
-        return Err(OAuthError::PicInvariant(
-            "no Google scope intersected with PCA_0 ops".into(),
-        ));
-    }
+    // `pca1_ops` was computed + checked non-empty above (before the
+    // google_tokens persist) per §6.8.
     let binding = ExecutorBinding::new()
         .with("service", "proxilion-proxy")
         .with("session", params.state.to_string());

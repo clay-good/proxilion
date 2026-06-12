@@ -153,6 +153,21 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **OAuth callback: no orphaned encrypted token rows on empty scope
+  intersection** (surface-delight-and-correctness.md §6.8) — the Google
+  callback persisted the encrypted `google_tokens` row *before* checking
+  whether the granted scope intersected the PCA_0 ops. An empty intersection
+  then returned `PicInvariant` after the write, leaving an encrypted row no
+  bearer would ever reference. The `pca1_ops` intersection + empty-rejection
+  now runs immediately after the token exchange, before `persist_google_tokens`.
+  [oauth/routes.rs](crates/proxy/src/oauth/routes.rs)
+- **NATS subject doc comment corrected** (surface-delight-and-correctness.md
+  §6.8) — `subject_for`'s comment claimed subjects "can't contain" `.` while
+  the code deliberately preserves it. `.` is the NATS token separator: a dotted
+  action (`gmail.messages.send`) is *meant* to expand into the
+  `actions.<vendor>.gmail.messages.send` hierarchy. Rewrote the comment to say
+  so and to name the chars `sanitize_token` actually neutralizes (space, `*`,
+  `>`). Behavior unchanged. [forwarder/nats.rs](crates/proxy/src/forwarder/nats.rs)
 - **CLI: `killswitch all` now forwards `--confirm` to the server** — it
   validated `--confirm yes` locally but never sent `confirm` in the request
   body, so a real fleet-wide kill would have been rejected by the server's

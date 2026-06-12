@@ -42,6 +42,39 @@ pub(crate) fn path_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH).to_string()
 }
 
+/// Read an upstream response body into memory under a hard `max`-byte cap,
+/// shared by every Google adapter.
+///
+/// Authority: spec.md §1.4 ("Buffer responses with a 10MB cap; reject
+/// larger"). The cap is a *true* memory bound: we reject early on the
+/// advertised `Content-Length` (cheap, before reading a byte), then
+/// accumulate the body chunk-by-chunk and abort the instant the running
+/// total would exceed `max`. An upstream that omits `Content-Length` and
+/// streams past the cap (chunked transfer, or simply lying) is therefore cut
+/// off at `max` bytes rather than fully buffered into memory first — which a
+/// `resp.bytes().await` followed by a length check would not prevent.
+pub(crate) async fn read_bounded(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, AppError> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > max {
+            return Err(AppError::UpstreamTooLarge);
+        }
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        // `buf.len() <= max` is the loop invariant, so `max - buf.len()` can't
+        // underflow; comparing against the remaining headroom also avoids any
+        // `buf.len() + chunk.len()` overflow on a pathological chunk size.
+        if chunk.len() > max - buf.len() {
+            return Err(AppError::UpstreamTooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::path_segment;
@@ -63,5 +96,65 @@ mod tests {
         assert_eq!(path_segment("1a2b3c4d5e"), "1a2b3c4d5e");
         assert_eq!(path_segment("alice@org.com"), "alice@org.com");
         assert_eq!(path_segment("me"), "me");
+    }
+
+    use super::{AppError, read_bounded};
+    use bytes::Bytes;
+
+    /// Build a `reqwest::Response` whose body is an unsized stream — so it
+    /// carries **no** `Content-Length` and `read_bounded` is forced down the
+    /// chunk-accumulation path (the branch the spec.md §1.4 streaming cap
+    /// protects) rather than the cheap header pre-check. The body is split into
+    /// several small chunks so the running-total comparison is exercised
+    /// across multiple loop iterations.
+    fn streaming_resp(body: Vec<u8>) -> reqwest::Response {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = body
+            .chunks(8)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let stream = futures_util::stream::iter(chunks);
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::wrap_stream(stream))
+            .unwrap();
+        reqwest::Response::from(http_resp)
+    }
+
+    #[tokio::test]
+    async fn read_bounded_streams_body_under_cap_through_unchanged() {
+        let resp = streaming_resp(b"hello world".to_vec());
+        // Precondition: no Content-Length, so the streaming loop is what runs.
+        assert!(
+            resp.content_length().is_none(),
+            "test must exercise the chunk-accumulation path, not the header pre-check",
+        );
+        let out = read_bounded(resp, 10 * 1024).await.unwrap();
+        assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_bounded_rejects_oversized_body_with_no_content_length() {
+        // §1.4 — the regression this guards: an upstream that omits
+        // `Content-Length` and streams past the cap must be cut off, not
+        // buffered whole. 100 bytes against a 10-byte cap → UpstreamTooLarge,
+        // and the loop aborts as soon as the running total crosses the cap.
+        let resp = streaming_resp(vec![b'x'; 100]);
+        assert!(resp.content_length().is_none());
+        let r = read_bounded(resp, 10).await;
+        assert!(
+            matches!(r, Err(AppError::UpstreamTooLarge)),
+            "oversized no-Content-Length body must be rejected",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_bounded_accepts_body_exactly_at_cap() {
+        // Boundary: a body whose length equals the cap is allowed (the loop
+        // rejects only when a chunk would push the total *over* `max`). 64
+        // bytes in 8-byte chunks against a 64-byte cap → the final chunk lands
+        // exactly on the boundary.
+        let resp = streaming_resp(vec![b'y'; 64]);
+        let out = read_bounded(resp, 64).await.unwrap();
+        assert_eq!(out.len(), 64);
     }
 }

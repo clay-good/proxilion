@@ -70,3 +70,8 @@ lettre = { workspace = true }
 tokio = { workspace = true }
 wiremock = "0.6"
 regex = { workspace = true }
+# `stream` is test-only (dev-dependency): it lets read_bounded's tests build a
+# Content-Length-less streaming body to exercise the chunk-accumulation cap.
+# The release build (no dev-deps) keeps reqwest's feature set minimal.
+reqwest = { workspace = true, features = ["stream"] }
+futures-util = "0.3"

@@ -579,7 +579,7 @@ async fn proxy_request(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
-    let body_bytes = read_bounded(upstream_resp, MAX_BODY).await?;
+    let body_bytes = super::read_bounded(upstream_resp, MAX_BODY).await?;
 
     // Read filter — only on GETs.
     let (final_body, filter_outcome) =
@@ -804,19 +804,6 @@ fn enforce_pre_request_decision(outcome: &Outcome) -> Result<(), AppError> {
         }
         Decision::RateLimit { .. } => Err(AppError::RateLimit),
     }
-}
-
-async fn read_bounded(resp: reqwest::Response, max: usize) -> Result<Vec<u8>, AppError> {
-    if let Some(len) = resp.content_length() {
-        if len as usize > max {
-            return Err(AppError::UpstreamTooLarge);
-        }
-    }
-    let bytes = resp.bytes().await?;
-    if bytes.len() > max {
-        return Err(AppError::UpstreamTooLarge);
-    }
-    Ok(bytes.to_vec())
 }
 
 fn insert_proxy_headers(

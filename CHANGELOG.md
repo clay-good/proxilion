@@ -153,6 +153,19 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Upstream response cap is now a true memory bound** (spec.md §1.4,
+  surface-delight-and-correctness.md §6.8) — `read_bounded` checked the
+  advertised `Content-Length`, then called `resp.bytes().await` and checked the
+  length *after* buffering the whole body. An upstream that omits
+  `Content-Length` and streams past the 10MB cap would be fully buffered into
+  memory first, defeating the cap. It now streams the body chunk-by-chunk and
+  aborts the moment the running total would exceed the cap. The byte-identical
+  copy that lived in all three Google adapters is consolidated into one shared
+  `adapters::read_bounded`. New tests build a `Content-Length`-less streaming
+  body to exercise the rejection path (`read_bounded_rejects_oversized_body_with_no_content_length`
+  + under-cap / exact-cap boundaries); `reqwest`'s `stream` feature is enabled
+  as a **dev-dependency only**, so the release binary's feature set is unchanged.
+  [adapters/mod.rs](crates/proxy/src/adapters/mod.rs)
 - **PIC chain verifier: partial walk progress preserved on a broken chain**
   (surface-delight-and-correctness.md §6.8) — `err_to_result` hardcoded
   `links_verified: 0` (and `p_0: None`) on every verification failure, so a

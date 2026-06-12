@@ -129,6 +129,18 @@ pub fn apply(
     (rewritten.into_bytes(), out)
 }
 
+/// Decide whether a response body is worth scanning for quarantine patterns,
+/// based on its `Content-Type`.
+///
+/// Authority: spec.md §1.4 — "Filtering binary file exports is meaningless —
+/// gate on content-type." Prompt-injection patterns are textual, so scanning a
+/// PDF/docx/image/octet-stream body is wasted work *and* a false-positive risk
+/// (a random pattern match inside compressed bytes). This is **by design**, not
+/// an oversight: a policy that wants to stop a binary Drive `export` wholesale
+/// expresses that as a Layer-B action gate on `drive.files.export`, not as a
+/// read-filter content match — the read-filter only ever rewrites/blocks on
+/// what it can actually read. We scan `application/json`, `application/xml`, and
+/// any `text/*`; an absent content-type is scanned conservatively.
 fn should_scan(content_type: Option<&str>) -> bool {
     let Some(ct) = content_type else { return true };
     let main = ct

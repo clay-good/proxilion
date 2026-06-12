@@ -248,7 +248,11 @@ Recorded for triage. Two items resolved:
 - **(resolved)** `nats.rs` `sanitize_token` keeps `.` though the doc comment claimed subjects "can't contain" it — the comment was self-contradictory, since `.` is the NATS token *separator* and is deliberately preserved so a dotted action (`gmail.messages.send`) expands into the documented `<prefix>.<vendor>.gmail.messages.send` hierarchy (subscribed as `actions.*.gmail.messages.send`). Rewrote the comment in [forwarder/nats.rs](../../crates/proxy/src/forwarder/nats.rs) to state this explicitly and to name the genuinely-reserved chars that `sanitize_token` neutralizes (space, `*`, `>`). No code change — the keep-`.` behavior was already correct.
 - **(resolved)** Google tokens were persisted before the `pca1_ops.is_empty()` check, orphaning encrypted `google_tokens` rows on an empty scope intersection. The intersection + empty-rejection now runs immediately after the token exchange, *before* `persist_google_tokens`, so an empty-intersection callback returns `PicInvariant` without writing a row no bearer would reference ([oauth/routes.rs](../../crates/proxy/src/oauth/routes.rs)).
 
-Still open (lower priority): the read-filter egress allowlist skips binary types so `BlockRequest`/`ReplaceWithMarker` don't apply to Drive `export` of PDF/docx (confirm against `spec.md` §1.4); `err_to_result` hardcodes `links_verified: 0` on failure, discarding partial-progress observability.
+A third item resolved:
+
+- **(resolved)** `err_to_result` hardcoded `links_verified: 0` (and `p_0: None`) on every chain-verification failure, discarding how far the walk got before the break. A break 3 hops deep reported `links_verified: 0`, so the dashboard chain-walker showed "nothing verified" even when most of the chain was sound. `walk` now accumulates `links_verified` + `p_0` into a `WalkProgress` owned by `verify_chain`; the `?`-early-returns leave it holding the partial state, which `err_to_result` reports instead of zeroing ([pic/verifier.rs](../../crates/proxy/src/pic/verifier.rs)). Pinned by `err_to_result_carries_partial_walk_progress_not_zero`.
+
+Still open (lower priority): the read-filter egress allowlist skips binary types so `BlockRequest`/`ReplaceWithMarker` don't apply to Drive `export` of PDF/docx (confirm against `spec.md` §1.4).
 
 ---
 

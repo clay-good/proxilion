@@ -153,6 +153,15 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **PIC chain verifier: partial walk progress preserved on a broken chain**
+  (surface-delight-and-correctness.md §6.8) — `err_to_result` hardcoded
+  `links_verified: 0` (and `p_0: None`) on every verification failure, so a
+  break 3 hops deep reported "nothing verified" and the dashboard chain-walker
+  couldn't show how much of the chain was sound before the failed link. `walk`
+  now accumulates `links_verified` + `p_0` into a `WalkProgress` that survives
+  the early-return, and the error result carries it. New regression test
+  `err_to_result_carries_partial_walk_progress_not_zero`.
+  [pic/verifier.rs](crates/proxy/src/pic/verifier.rs)
 - **OAuth callback: no orphaned encrypted token rows on empty scope
   intersection** (surface-delight-and-correctness.md §6.8) — the Google
   callback persisted the encrypted `google_tokens` row *before* checking

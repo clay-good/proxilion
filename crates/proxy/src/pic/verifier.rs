@@ -116,11 +116,15 @@ impl PicVerifier {
         // the cold path only (cache misses); §1.5's p99 budget is "<5ms
         // warm / <20ms cold," and warm is by-construction free here.
         let started = Instant::now();
-        let result = self.walk(leaf_pca_id).await;
+        // `progress` accumulates `links_verified` + `p_0` as `walk` descends, so
+        // a mid-chain break (§6.8) can still report *how far* the walk got
+        // before failing instead of reporting a useless `links_verified: 0`.
+        let mut progress = WalkProgress::default();
+        let result = self.walk(leaf_pca_id, &mut progress).await;
         let (arc, violation_kind) = match result {
             Ok(r) => (Arc::new(r), None),
             Err(ref e) => (
-                Arc::new(err_to_result(leaf_pca_id, e)),
+                Arc::new(err_to_result(leaf_pca_id, e, &progress)),
                 Some(invariant_kind(e)),
             ),
         };
@@ -149,7 +153,11 @@ impl PicVerifier {
         Ok(arc)
     }
 
-    async fn walk(&self, leaf_pca_id: Uuid) -> Result<VerificationResult, VerifierError> {
+    async fn walk(
+        &self,
+        leaf_pca_id: Uuid,
+        progress: &mut WalkProgress,
+    ) -> Result<VerificationResult, VerifierError> {
         let key = self
             .cat_keys
             .get()
@@ -157,8 +165,6 @@ impl PicVerifier {
             .map_err(|e| VerifierError::CatKey(e.to_string()))?;
 
         let mut current_id = leaf_pca_id;
-        let mut links_verified = 0usize;
-        let mut p_0: Option<String> = None;
         let mut chain_profile: Option<String> = None;
         let mut profile_mismatch_at: Option<Uuid> = None;
 
@@ -173,15 +179,17 @@ impl PicVerifier {
 
             key.verify_pca(&signed_current)
                 .map_err(|_| VerifierError::BadCatSignature(current_id))?;
-            links_verified += 1;
+            progress.links_verified += 1;
             // §6.7 — bound the walk so a crafted deep chain can't force
             // unbounded cold-cache DB round-trips.
-            if links_verified > MAX_CHAIN_HOPS as usize {
+            if progress.links_verified > MAX_CHAIN_HOPS as usize {
                 return Err(VerifierError::ChainTooLong {
                     cap: MAX_CHAIN_HOPS,
                 });
             }
-            p_0.get_or_insert_with(|| pca_current.p_0.value.clone());
+            progress
+                .p_0
+                .get_or_insert_with(|| pca_current.p_0.value.clone());
             // Track the chain's PIC profile. First link sets it; subsequent
             // links that disagree get recorded as a mismatch (not yet a
             // hard error — surfaces the drift in API output for audit).
@@ -226,14 +234,25 @@ impl PicVerifier {
 
         Ok(VerificationResult {
             intact: true,
-            links_verified,
-            p_0,
+            links_verified: progress.links_verified,
+            p_0: progress.p_0.take(),
             broken_at: None,
             reason: None,
             pic_profile: chain_profile,
             pic_profile_mismatch_at: profile_mismatch_at,
         })
     }
+}
+
+/// Partial progress accumulated as [`PicVerifier::walk`] descends a chain.
+/// Held by `verify_chain` so that on a mid-chain break the error path can
+/// report *how far* the walk got (§6.8) — `links_verified` counts the PCAs
+/// whose CAT signature verified before the break, and `p_0` carries the
+/// chain root if it was reached, instead of zeroing both.
+#[derive(Default)]
+struct WalkProgress {
+    links_verified: usize,
+    p_0: Option<String>,
 }
 
 /// Pure invariant check between a child PCA and its predecessor. Splits the
@@ -313,7 +332,7 @@ fn invariant_kind(e: &VerifierError) -> &'static str {
     }
 }
 
-fn err_to_result(leaf_id: Uuid, e: &VerifierError) -> VerificationResult {
+fn err_to_result(leaf_id: Uuid, e: &VerifierError, progress: &WalkProgress) -> VerificationResult {
     let broken_at = match e {
         VerifierError::Missing(id) => Some(*id),
         VerifierError::BadCatSignature(id) => Some(*id),
@@ -322,8 +341,12 @@ fn err_to_result(leaf_id: Uuid, e: &VerifierError) -> VerificationResult {
     };
     VerificationResult {
         intact: false,
-        links_verified: 0,
-        p_0: None,
+        // §6.8 — carry the partial walk progress rather than zeroing it. A
+        // break 3 hops deep reports `links_verified: 3` + the discovered `p_0`,
+        // so the dashboard chain-walker shows how much of the chain was sound
+        // before the failed link, not a misleading "nothing verified."
+        links_verified: progress.links_verified,
+        p_0: progress.p_0.clone(),
         broken_at,
         reason: Some(e.to_string()),
         pic_profile: None,
@@ -677,9 +700,10 @@ mod tests {
         // surface that, not the leaf id. The rest fall back to the leaf.
         let leaf = Uuid::new_v4();
         let other = Uuid::new_v4();
-        let r = err_to_result(leaf, &VerifierError::Missing(other));
+        let progress = WalkProgress::default();
+        let r = err_to_result(leaf, &VerifierError::Missing(other), &progress);
         assert_eq!(r.broken_at, Some(other));
-        let r = err_to_result(leaf, &VerifierError::BadCatSignature(other));
+        let r = err_to_result(leaf, &VerifierError::BadCatSignature(other), &progress);
         assert_eq!(r.broken_at, Some(other));
         let r = err_to_result(
             leaf,
@@ -687,6 +711,7 @@ mod tests {
                 child: other,
                 parent: leaf,
             },
+            &progress,
         );
         assert_eq!(
             r.broken_at,
@@ -699,6 +724,7 @@ mod tests {
             &VerifierError::Monotonicity {
                 missing: "x".into(),
             },
+            &progress,
         );
         assert_eq!(r.broken_at, Some(leaf));
     }
@@ -709,7 +735,13 @@ mod tests {
         // `reason` — the dashboard surfaces both. A regression that
         // returned `intact=true` with a reason would mislead operators.
         let leaf = Uuid::new_v4();
-        let r = err_to_result(leaf, &VerifierError::Decode("bad cbor".into()));
+        // A break at the very first link (nothing verified yet) reports zero —
+        // the default-progress case.
+        let r = err_to_result(
+            leaf,
+            &VerifierError::Decode("bad cbor".into()),
+            &WalkProgress::default(),
+        );
         assert!(!r.intact);
         assert_eq!(r.links_verified, 0);
         assert!(r.p_0.is_none());
@@ -719,6 +751,41 @@ mod tests {
             "reason carries Display: {reason}",
         );
         assert!(reason.contains("bad cbor"));
+    }
+
+    #[test]
+    fn err_to_result_carries_partial_walk_progress_not_zero() {
+        // §6.8 — when the walk verified several links before breaking, the
+        // error result must report that partial progress (links_verified +
+        // discovered p_0), not a misleading `0`/`null`. The dashboard
+        // chain-walker uses these to show how much of the chain was sound
+        // before the failed link. Simulates a break 3 hops deep on a chain
+        // whose root was already discovered.
+        let leaf = Uuid::new_v4();
+        let broken = Uuid::new_v4();
+        let progress = WalkProgress {
+            links_verified: 3,
+            p_0: Some("alice@demo.local".into()),
+        };
+        let r = err_to_result(
+            leaf,
+            &VerifierError::ContinuityBroken {
+                child: broken,
+                parent: leaf,
+            },
+            &progress,
+        );
+        assert!(!r.intact);
+        assert_eq!(
+            r.links_verified, 3,
+            "partial progress preserved, not zeroed",
+        );
+        assert_eq!(
+            r.p_0.as_deref(),
+            Some("alice@demo.local"),
+            "the chain root discovered before the break is reported",
+        );
+        assert_eq!(r.broken_at, Some(broken));
     }
 
     #[test]
@@ -797,6 +864,7 @@ mod tests {
                 child: 5,
                 parent: 2,
             },
+            &WalkProgress::default(),
         );
         assert_eq!(r.broken_at, Some(leaf));
         assert!(!r.intact);

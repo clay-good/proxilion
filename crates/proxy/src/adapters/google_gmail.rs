@@ -1355,4 +1355,114 @@ mod tests {
             "/gmail/v1/users/me/messages/18f0a1b2c3d4e5f6"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DB-backed adapter integration test (opt-in via PROXILION_TEST_DATABASE_URL).
+    // Skips when no test DB — see test_support.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn db_backed_gmail_send_external_recipient_is_blocked_403() {
+        // spec.md §1.5 / §9 flagship Layer-B gate: a `gmail.messages.send` with
+        // an external recipient is blocked at Layer B (before any mint or
+        // upstream call) — `proxy_request` returns PolicyBlocked (403) and
+        // persists a `blocked_actions` row (layer='policy') the human-in-the-
+        // loop queue reads. The block is decided purely on the exposed body
+        // context (`body.external_recipient`), so no Trust Plane / Google is
+        // contacted.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        use std::collections::HashMap;
+
+        let leaf_pca_id = Uuid::new_v4();
+        crate::test_support::seed_pca_cache(&pool, leaf_pca_id, "alice@acme.com").await;
+
+        let policy_yaml = r#"
+- id: gmail-external-send-gate
+  vendor: google
+  action: gmail.messages.send
+  match:
+    body.external_recipient:
+      equals: true
+  decision: block
+  override: requires_justification
+  pic_mode: runtime-gate
+"#;
+        // Dead Trust Plane / Google URLs — the gate must block before reaching
+        // either, so neither is contacted.
+        let state = crate::test_support::adapter_state(
+            pool.clone(),
+            policy_yaml,
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+        );
+        let session = crate::test_support::mock_session(leaf_pca_id, "alice@acme.com");
+
+        let before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM blocked_actions WHERE layer = 'policy' AND policy_id = 'gmail-external-send-gate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut body_for_policy = HashMap::new();
+        body_for_policy.insert(
+            "external_recipient".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        body_for_policy.insert(
+            "to_domains".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("evilcorp.example".into())]),
+        );
+        let err = proxy_request(
+            &state,
+            &session,
+            GmailRequest {
+                action: "gmail.messages.send".into(),
+                upstream_path: "/gmail/v1/users/me/messages/send".into(),
+                method: Method::POST,
+                policy_path: HashMap::new(),
+                query: HashMap::new(),
+                body_for_policy,
+                upstream_body: None,
+                upstream_content_type: None,
+            },
+        )
+        .await
+        .expect_err("external send must be blocked");
+
+        assert!(
+            matches!(err, AppError::PolicyBlocked { .. }),
+            "expected PolicyBlocked, got: {err:?}",
+        );
+        assert_eq!(err.status(), StatusCode::FORBIDDEN, "must map to 403");
+        match &err {
+            AppError::PolicyBlocked {
+                policy_id,
+                override_allowed,
+                ..
+            } => {
+                assert_eq!(policy_id.as_deref(), Some("gmail-external-send-gate"));
+                assert!(
+                    override_allowed,
+                    "gate declares override: requires_justification"
+                );
+            }
+            other => panic!("expected PolicyBlocked, got {other:?}"),
+        }
+
+        let after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM blocked_actions WHERE layer = 'policy' AND policy_id = 'gmail-external-send-gate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "a Layer-B blocked_actions row must be persisted"
+        );
+    }
 }

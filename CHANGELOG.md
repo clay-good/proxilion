@@ -16,6 +16,17 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Adapter block-path integration tests** (spec.md §1.3 / §1.5 / §9, the last
+  two deferred wire-level scenarios) — both build on the wiremock'd harness:
+  `db_backed_drive_get_runtime_gate_forced_ops_mismatch_is_blocked_403` proves
+  the runtime-gate guarantee (Trust Plane 422 → `PicInvariantViolation` (403),
+  upstream never reached, `layer='pic_invariant'` blocked row persisted), and
+  `db_backed_gmail_send_external_recipient_is_blocked_403` proves the flagship
+  external-send gate (Layer-B `PolicyBlocked` (403) + `layer='policy'` blocked
+  row with `policy_id` + `override_allowed`, no Trust Plane / Google contacted).
+  Shared scaffolding (`adapter_state`, `mock_session`, `mock_trust_plane_reject`)
+  extracted to [test_support.rs](crates/proxy/src/test_support.rs); the existing
+  Drive read-filter test was refactored onto it.
 - **End-to-end Drive adapter integration test** (spec.md §1.3 "read filter
   triggers → marker present", the long-deferred wiremock'd-Google scenario) —
   [google_drive.rs](crates/proxy/src/adapters/google_drive.rs)

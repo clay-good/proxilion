@@ -16,6 +16,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Adapter happy-path + read-filter-block integration tests** — completes the
+  `proxy_request` branch matrix on the wiremock'd harness:
+  `..._valid_mint_caches_successor_and_passes_through` (Trust Plane *issues* a
+  successor via the new `mock_trust_plane_issue` helper → the PCA_2 is cached at
+  `hop=2` with the leaf as predecessor and a clean upstream body passes through)
+  and `..._read_filter_block_request_quarantines_full_body_403` (the
+  `block_request` action quarantines the whole response → `ReadFilterBlocked`
+  (403) + a `layer='read_filter'` blocked row, distinct from the
+  `replace_with_marker` path). The adapter core is now covered across allow /
+  audit-fallback / valid-mint / mint-refused / Layer-B-block.
 - **Adapter block-path integration tests** (spec.md §1.3 / §1.5 / §9, the last
   two deferred wire-level scenarios) — both build on the wiremock'd harness:
   `db_backed_drive_get_runtime_gate_forced_ops_mismatch_is_blocked_403` proves

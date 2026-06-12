@@ -315,7 +315,9 @@ properties end-to-end:
 | `killswitch --dry-run` | the preview `count(*)` equals the real revoke exactly, changes no state, and writes no `kill_records` row |
 | blocked-queue `list` / `show` | status/policy filters, the auto-expire-on-list of past-due pending rows, and unknown-id → 404 |
 | Drive adapter, audit mode | policy eval → PIC mint vs a **wiremock'd Trust Plane** (422 → audit fallback) → upstream GET to a **wiremock'd Google** → read-filter quarantines an injection pattern (replaced by `[redacted by proxilion read-filter]`) while surrounding text passes through |
-| Drive adapter, runtime-gate mode | the same 422 is **not** passed through — `proxy_request` returns `PicInvariantViolation` (403), never calls upstream, and persists a `layer='pic_invariant'` blocked row (prevention by construction) |
+| Drive adapter, runtime-gate (mint refused) | the same 422 is **not** passed through — `proxy_request` returns `PicInvariantViolation` (403), never calls upstream, and persists a `layer='pic_invariant'` blocked row (prevention by construction) |
+| Drive adapter, runtime-gate (valid mint, happy path) | Trust Plane *issues* a successor → the PCA_2 is cached at `hop=2` with the leaf as predecessor (the chain grows a hop) and a clean upstream body passes through untouched |
+| Drive adapter, read-filter `block_request` | a matched pattern quarantines the **whole** response → `ReadFilterBlocked` (403) + a `layer='read_filter'` blocked row (vs the `replace_with_marker` row above, which lets the request proceed) |
 | Gmail send, external recipient | the flagship Layer-B gate blocks before any mint/upstream — `PolicyBlocked` (403) + a `layer='policy'` blocked row carrying `policy_id` + `override_allowed` |
 
 These run in the CI `integration` job (postgres service) on every push, against

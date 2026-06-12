@@ -137,3 +137,33 @@ pub async fn mock_trust_plane_reject() -> wiremock::MockServer {
         .await;
     tp
 }
+
+/// Mount a wiremock Trust Plane that registers the executor key (200) and
+/// **issues** a successor PCA (200) for `(p_0, ops)` at `hop`. The returned
+/// `pca` is well-shaped base64 CBOR (opaque bytes — `proxy_request` caches it
+/// without verifying the signature; chain verification happens later). Drives
+/// the adapter happy-path: mint succeeds, the successor is cached, the request
+/// proceeds upstream.
+pub async fn mock_trust_plane_issue(p_0: &str, ops: Vec<String>, hop: u32) -> wiremock::MockServer {
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let tp = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/keys/executor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&tp)
+        .await;
+    let pca_b64 = B64.encode(b"successor-pca-cbor-opaque-bytes");
+    Mock::given(method("POST"))
+        .and(path("/v1/poc/process"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pca": pca_b64,
+            "hop": hop,
+            "p_0": p_0,
+            "ops": ops,
+        })))
+        .mount(&tp)
+        .await;
+    tp
+}

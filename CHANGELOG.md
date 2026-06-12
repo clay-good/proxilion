@@ -161,6 +161,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **spec.md §1.3 error-code list was missing `policy_engine_error` (500)** —
+  the inline "Codes:" summary listed 8 of the 9 distinct wire strings the
+  `ErrorCode` enum emits, omitting `policy_engine_error` (returned on a
+  malformed policy YAML / ops-template at evaluation time — `AppError::Policy` /
+  `OpsTemplate` in adapters/error.rs). Added it, and pointed the list at the
+  canonical, test-pinned catalogue [docs/error-codes.md](docs/error-codes.md)
+  so future drift goes to one source of truth. Also added a discoverable pointer
+  to that catalogue from the README's observability section — the block-counter
+  `reason`/`code` labels and the response-envelope `code` field were documented
+  inline but never linked to the full table. [docs/specs/spec.md](docs/specs/spec.md)
 - **docker-compose set the wrong public-URL env var** — the proxy service
   exported `PROXILION_BASE_URL`, but the code reads `PROXILION_PUBLIC_URL`
   (config.rs maps it to the internal `proxy_base_url` field — the likely source

@@ -350,6 +350,12 @@ Pull them with `proxilion-cli metrics sample` (top series by sample count) or
 scrape into Prometheus; the bundled Grafana dashboard lives in
 [`ops/grafana/`](ops/).
 
+The `reason` / `code` label values on the block counters (and the `code` field
+in every 4xx/5xx response envelope) are the stable error codes catalogued in
+[docs/error-codes.md](docs/error-codes.md) — each with its default HTTP status,
+when it fires, and the suggested operator action. That table is the source of
+truth for alerting and runbooks.
+
 ## Design decisions
 
 | Decision | Why |

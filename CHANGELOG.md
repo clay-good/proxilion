@@ -161,6 +161,18 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **docker-compose set the wrong public-URL env var** — the proxy service
+  exported `PROXILION_BASE_URL`, but the code reads `PROXILION_PUBLIC_URL`
+  (config.rs maps it to the internal `proxy_base_url` field — the likely source
+  of the wrong guess). The misnamed var was consumed by nobody. It's latent at
+  the default (the field defaults to `https://localhost:8443`, which matched the
+  compose default), but it **silently breaks operator overrides**: setting
+  `PROXILION_BASE_URL=https://proxilion.acme.com` in a `.env` — following the
+  compose file's own name — is ignored, so the notifier's human-in-the-loop
+  approve/reject links keep pointing at `localhost` in production. Renamed the
+  compose key (and its `${…}` interpolation) to `PROXILION_PUBLIC_URL`; verified
+  every `PROXILION_*` var compose sets is now consumed by the code.
+  [docker-compose.yml](docker-compose.yml)
 - **21 broken in-repo links in `spec.md`** — a set of markdown links carried a
   stale `proxilion/` path prefix (e.g. `](proxilion/crates/proxy/src/pic/)`)
   and one bare `](site/)`, left over from when the repo was nested under a

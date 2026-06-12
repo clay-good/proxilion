@@ -161,6 +161,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **21 broken in-repo links in `spec.md`** — a set of markdown links carried a
+  stale `proxilion/` path prefix (e.g. `](proxilion/crates/proxy/src/pic/)`)
+  and one bare `](site/)`, left over from when the repo was nested under a
+  `proxilion/` subdirectory. From `docs/specs/`, those resolve to non-existent
+  `docs/specs/proxilion/...` paths even though the link *text* and the target
+  files are correct. Repointed all 21 to the proper `../../…` relative path and
+  verified every target exists via a repo-wide link scan. (The remaining
+  `qiuth-main/*` links are deliberate citations to the external sibling
+  source-of-truth project, not in this tree, and are left as-is.)
+  [docs/specs/spec.md](docs/specs/spec.md)
 - **Operator-facing metric name corrected: `oauth_token_refreshes_total`** —
   `ops/README.md` and three `spec.md` references named the refresh counter
   `proxilion_token_refreshes_total`, but the code emits it with the `oauth_`

@@ -1549,4 +1549,98 @@ mod tests {
         assert_eq!(resp.rows.len(), 1, "limit caps the page");
         assert!(resp.next_before.is_some(), "a full page yields a cursor");
     }
+
+    #[tokio::test]
+    async fn db_backed_actions_purge_dry_run_counts_without_deleting_then_real_purge_deletes() {
+        // Destructive audit-retention op: `dry_run` must COUNT old rows and
+        // change nothing; the real purge deletes rows older than the cutoff
+        // while leaving recent rows intact; a future `older_than` is refused.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        let tag = Uuid::new_v4().simple().to_string();
+        let p0 = format!("purge-{tag}@acme.com");
+        // Two OLD rows (10 days) + one RECENT row, all tagged.
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO action_events (request_id, p_0, vendor, action, method, path, status, decision, at)
+                 VALUES (gen_random_uuid(), $1, 'google', 'drive.files.get', 'GET', '/x', '200', 'allow', now() - interval '10 days')",
+            )
+            .bind(&p0).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO action_events (request_id, p_0, vendor, action, method, path, status, decision, at)
+             VALUES (gen_random_uuid(), $1, 'google', 'drive.files.get', 'GET', '/x', '200', 'allow', now())",
+        )
+        .bind(&p0).execute(&pool).await.unwrap();
+
+        let state = ActionsApiState {
+            db: pool.clone(),
+            stream: BroadcastingActionStream::new(pool.clone()),
+            pca_cache: PcaCache::new(pool.clone()),
+        };
+        let my_old = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM action_events WHERE p_0 = $1 AND at < now() - interval '1 day'",
+            )
+            .bind(&p0)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let cutoff = Utc::now() - chrono::Duration::days(1);
+        assert_eq!(my_old().await, 2, "two old rows seeded");
+
+        // Dry-run: counts ≥ my two old rows, deletes nothing.
+        let preview = purge(
+            State(state.clone()),
+            Json(PurgeRequest {
+                older_than: cutoff,
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect("dry-run ok")
+        .0;
+        assert!(preview.dry_run);
+        assert!(preview.deleted >= 2, "dry-run counts the old rows");
+        assert_eq!(my_old().await, 2, "dry-run deleted nothing");
+
+        // Real purge: my old rows gone, the recent row survives.
+        let real = purge(
+            State(state.clone()),
+            Json(PurgeRequest {
+                older_than: cutoff,
+                dry_run: false,
+            }),
+        )
+        .await
+        .expect("purge ok")
+        .0;
+        assert!(!real.dry_run);
+        assert!(real.deleted >= 2, "real purge deletes the old rows");
+        assert_eq!(my_old().await, 0, "old rows are gone");
+        let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM action_events WHERE p_0 = $1")
+            .bind(&p0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(recent, 1, "the recent row must survive the purge");
+
+        // Future cutoff is refused (operator-error guard).
+        let err = purge(
+            State(state),
+            Json(PurgeRequest {
+                older_than: Utc::now() + chrono::Duration::days(1),
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect_err("future older_than must be rejected");
+        assert!(
+            matches!(err, ActionsApiError::BadRequest(_)),
+            "got: {err:?}"
+        );
+    }
 }

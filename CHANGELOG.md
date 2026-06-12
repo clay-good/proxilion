@@ -16,6 +16,13 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Action-log `purge` dry-run integration test** — completes the
+  destructive-operation dry-run coverage (alongside `killswitch`).
+  [api/actions.rs](crates/proxy/src/api/actions.rs)
+  `db_backed_actions_purge_dry_run_counts_without_deleting_then_real_purge_deletes`
+  pins the audit-retention purge against real SQL: `dry_run` counts old rows
+  and changes nothing; the real purge deletes rows past the cutoff while recent
+  rows survive; a future `older_than` is refused.
 - **Action-log `list` API integration test** —
   [api/actions.rs](crates/proxy/src/api/actions.rs)
   `db_backed_actions_list_filters_and_cursor` pins the query backing

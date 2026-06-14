@@ -68,7 +68,7 @@ impl OAuthError {
                 .with_fix("Check the OAuth parameters the agent sent: response_type=code, S256 PKCE, scope, and a registered redirect_uri.")
                 .with_docs("https://proxilion.com/docs/oauth/intercept"),
             OAuthError::UnknownClient => ErrorBody::new("unknown OAuth client", "unknown_client")
-                .with_fix("Add the agent's client_id to oauth_clients. Run `proxilion-cli clients add <id> <redirect_uri>` (planned, M3) or seed via migration.")
+                .with_fix("Add the agent's client_id to oauth_clients. Run `proxilion-cli clients add <id> <redirect_uri>` or seed via migration.")
                 .with_docs("https://proxilion.com/docs/oauth/clients"),
             OAuthError::SessionGone => ErrorBody::new("session expired", "session_gone")
                 .with_fix("Sessions expire after 10 minutes. Start the OAuth flow again at /oauth/google/authorize.")

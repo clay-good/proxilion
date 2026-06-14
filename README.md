@@ -307,7 +307,7 @@ pipes). Destructive commands take `--dry-run` to preview the blast radius
 | `status` / `health` / `selftest` | one-screen readiness + synthetic end-to-end probe |
 | `pic show <id>` / `pic verify <id>` | fetch a PCA; walk the chain leaf→root and report invariant verification |
 | `actions tail` / `actions list` / `actions export` | live SSE stream / query / bulk export of the signed action log |
-| `policy list` / `policy show <id>` / `policy diff` | inspect the loaded rule set |
+| `policy list` / `policy show <id>` / `policy validate <file>` / `policy diff` | inspect the loaded rule set; `validate` parse-checks a candidate YAML locally (CI-safe, no proxy hit) |
 | `policy set-mode <id> …` / `policy edit` / `policy reload` | flip observe↔enforce, `$EDITOR` the live YAML, hot-reload |
 | `policy simulate` | replay traffic and report would-have-blocked deltas per policy |
 | `blocked list` / `blocked show <id>` / `blocked approve <id>` / `blocked reject <id>` | the human-in-the-loop queue |

@@ -170,6 +170,23 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Four operator-facing error `fix` hints pointed at non-existent or
+  mislabelled CLI commands** — the `with_fix` strings on `OAuthError::UnknownClient`,
+  `AppError::PolicyBlocked`, `AppError::Policy`/`OpsTemplate`, and the
+  `/setup` OAuth-client check told operators to run commands marked
+  `(planned, M3)` that have, in fact, shipped — or that never existed under
+  the printed name. Corrected to the real, shipping commands:
+  `proxilion-cli clients add` (was marked planned in [oauth/error.rs](crates/proxy/src/oauth/error.rs)
+  and [api/setup.rs](crates/proxy/src/api/setup.rs)); `proxilion-cli blocked approve <id>`
+  (the block-release path — the hint named a non-existent `override` subcommand,
+  [adapters/error.rs](crates/proxy/src/adapters/error.rs)); and
+  `proxilion-cli policy validate <file>` (the hint named a non-existent
+  `policy check` and called it planned, but `policy validate` is a shipped,
+  CI-safe local command — [adapters/error.rs](crates/proxy/src/adapters/error.rs)).
+  These strings are surfaced verbatim in 4xx/5xx JSON envelopes and `/setup`
+  output, so the drift was directly operator-visible. Also added `policy validate`
+  to the README CLI cheat sheet, where it was the one shipped `policy` subcommand
+  left off the table. [README.md](README.md)
 - **spec.md §1.3 error-code list was missing `policy_engine_error` (500)** —
   the inline "Codes:" summary listed 8 of the 9 distinct wire strings the
   `ErrorCode` enum emits, omitting `policy_engine_error` (returned on a

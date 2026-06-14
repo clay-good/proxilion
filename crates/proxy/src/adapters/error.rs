@@ -77,7 +77,7 @@ impl AppError {
             AppError::PolicyBlocked { policy_id, reason, override_allowed } => {
                 ErrorBody::new("blocked by policy", code)
                     .with_detail(reason.clone())
-                    .with_fix("If this block is incorrect, edit the matching policy in your policy YAML or grant a one-time override via `proxilion-cli override <request_id>` (planned, M3).")
+                    .with_fix("If this block is incorrect, edit the matching policy in your policy YAML or release it via `proxilion-cli blocked approve <id>` (or a Slack / email override).")
                     .with_docs("https://proxilion.com/docs/policy/layer-b")
                     .with_extras(serde_json::json!({
                         "policy_id": policy_id,
@@ -110,7 +110,7 @@ impl AppError {
                 .with_docs("https://proxilion.com/docs/policy/read-filter"),
             AppError::Policy(_) | AppError::OpsTemplate(_) => {
                 ErrorBody::new("policy evaluation error", code)
-                    .with_fix("Policy YAML failed to evaluate. Validate it with `proxilion-cli policy check <file>` (planned, M3) or see the structured error in proxy logs.")
+                    .with_fix("Policy YAML failed to evaluate. Validate it with `proxilion-cli policy validate <file>` or see the structured error in proxy logs.")
                     .with_docs("https://proxilion.com/docs/policy/authoring")
             }
             AppError::Db(_) | AppError::Internal(_) => {

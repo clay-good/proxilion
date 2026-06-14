@@ -102,7 +102,7 @@ async fn status(State(state): State<SetupApiState>) -> Result<Json<SetupStatus>,
             None
         } else {
             Some(
-                "Register the managed agent as an OAuth client. The seed migration adds `anthropic-managed-claude`; add more via SQL or `proxilion-cli clients add` (planned, M3).",
+                "Register the managed agent as an OAuth client. The seed migration adds `anthropic-managed-claude`; add more via SQL or `proxilion-cli clients add`.",
             )
         },
         docs: "https://proxilion.com/docs/oauth/clients",

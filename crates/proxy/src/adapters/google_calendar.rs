@@ -910,9 +910,11 @@ fn domain_of(email: &str) -> Option<String> {
 fn urlencoding(s: &str) -> String {
     // Promoted to the shared `adapters::path_segment` helper so Drive and
     // Gmail encode identically (surface-delight-and-correctness.md §6.1).
-    // This thin wrapper is retained for the adapter's existing call sites
-    // and tests.
-    super::path_segment(s)
+    // Routes through `encoded_segment` so the §7
+    // `proxilion_adapter_path_encoded_total{vendor}` counter covers Calendar
+    // too. This thin wrapper is retained for the adapter's existing call
+    // sites and tests.
+    super::encoded_segment("google", s)
 }
 
 // Silence unused-import lints for re-exports kept symmetrical with the

@@ -73,7 +73,10 @@ async fn get_file(
         &session,
         DriveRequest {
             action: "drive.files.get".into(),
-            upstream_path: format!("/drive/v3/files/{}", super::path_segment(&file_id)),
+            upstream_path: format!(
+                "/drive/v3/files/{}",
+                super::encoded_segment("google", &file_id)
+            ),
             policy_path,
             query,
             body_for_policy: HashMap::new(),
@@ -96,7 +99,10 @@ async fn export_file(
         &session,
         DriveRequest {
             action: "drive.files.export".into(),
-            upstream_path: format!("/drive/v3/files/{}/export", super::path_segment(&file_id)),
+            upstream_path: format!(
+                "/drive/v3/files/{}/export",
+                super::encoded_segment("google", &file_id)
+            ),
             policy_path,
             query,
             body_for_policy: HashMap::new(),

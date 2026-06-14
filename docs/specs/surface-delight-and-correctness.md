@@ -2,7 +2,7 @@
 
 **One line:** Make the three customer-facing surfaces (CLI, human-in-the-loop approvals, marketing site) a pleasure to use, and close the concrete correctness gaps an audit of the existing code surfaced — without adding a dashboard.
 
-**Status:** Implemented (2026-06-11). Every item in this spec has landed with regression tests: the correctness work-stream (§6.1–§6.7), the marketing-site delight (§5.1–§5.4), all of CLI delight §3 (§3.1 tables, §3.2 `--color`, §3.3 `--dry-run`, §3.4 completion, §3.5 progress, §3.6 errors), and all of approval delight §4 — §4.1 justification capture across CLI (`--justification`), email (form + token-on-POST, [api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs)), and **Slack (Block Kit `views.open` modal gated on `PROXILION_SLACK_BOT_TOKEN`, [api/notifier_slack.rs](../../crates/proxy/src/api/notifier_slack.rs))**; §4.2 read-only context (the GET landing already serves it); §4.3 absolute expiry; §4.4 inline detail. The only remaining nicety is a *dedicated* §4.2 "View details" link distinct from the GET landing — low value since the landing is already non-destructive. Companion to [spec.md](spec.md) and [ui-less-surfaces.md](ui-less-surfaces.md). This spec **extends** the three surfaces defined in `ui-less-surfaces.md` (it does not supersede them) and **adds** a correctness work-stream (§6) for bugs found during the 2026-06-11 repo audit. The "no React dashboard" decision in `ui-less-surfaces.md` §0 stands — every item here lands in a surface that already exists.
+**Status:** Implemented (2026-06-11). Every item in this spec has landed with regression tests: the correctness work-stream (§6.1–§6.7), the marketing-site delight (§5.1–§5.4), all of CLI delight §3 (§3.1 tables, §3.2 `--color`, §3.3 `--dry-run`, §3.4 completion, §3.5 progress, §3.6 errors), and all of approval delight §4 — §4.1 justification capture across CLI (`--justification`), email (form + token-on-POST, [api/notifier_public.rs](../../crates/proxy/src/api/notifier_public.rs)), and **Slack (Block Kit `views.open` modal gated on `PROXILION_SLACK_BOT_TOKEN`, [api/notifier_slack.rs](../../crates/proxy/src/api/notifier_slack.rs))**; §4.2 read-only context (the GET landing already serves it); §4.3 absolute expiry; §4.4 inline detail. The only remaining nicety is a *dedicated* §4.2 "View details" link distinct from the GET landing — low value since the landing is already non-destructive. Companion to [spec.md](spec.md) and [ui-less-surfaces.md](ui-less-surfaces.md). This spec **extends** the three surfaces defined in `ui-less-surfaces.md` (it does not supersede them) and **adds** a correctness work-stream (§6) for bugs found during the 2026-06-11 repo audit. The "no React dashboard" decision in `ui-less-surfaces.md` §0 stands — every item here lands in a surface that already exists. *(Addendum 2026-06-13: a follow-up audit found three of the five §7 observability series were declared but never emitted; they were wired and dashboarded — see §7 Status and §9 Phase 5.)*
 
 **Author intent:** The three surfaces are functionally complete (see `ui-less-surfaces.md` §3–§5 status blocks), but "complete" is not the same as "delightful," and the audit found six real defects ranging from a path-injection / confused-deputy vector to a silently-broken flagship policy gate. This spec packages the polish and the fixes as one coherent unit of work so the delight items don't ship on top of latent correctness bugs.
 
@@ -271,6 +271,35 @@ Consistent with `ui-less-surfaces.md` §3, every new behavior is observable:
 | `proxilion_forwarder_retry_total{forwarder,status}` | counter | §6.5 | Surface 429-driven retries |
 | `proxilion_burst_buckets` | gauge | §6.3 | Prove the map stays bounded |
 
+*Status (2026-06-13): all five series wired + dashboarded.* An audit found
+that while `proxilion_forwarder_retry_total` (§6.5) and
+`proxilion_burst_buckets` (§6.3) shipped with their respective fixes, the other
+three series in this table were declared here but never emitted. Closed:
+
+- `proxilion_override_justification_present_total{surface,decision}` — emitted
+  in [api/blocked.rs](../../crates/proxy/src/api/blocked.rs) `approve_inner` /
+  `reject_inner` on every committed override, gated on non-empty justification
+  text, labelled by the existing `channel` surface (`api`/`email`/`slack`) and
+  the decision. Divided by `proxilion_overrides_resolved_total` it yields the
+  per-surface fill rate. Threading the surface label into `reject_inner` also
+  fixed a latent mislabel — the reject path hardcoded `channel="api"` for the
+  pre-existing `overrides_resolved_total` counter regardless of the real
+  surface.
+- `proxilion_adapter_path_encoded_total{vendor}` — emitted by the new
+  `adapters::encoded_segment(vendor, s)` wrapper that every Drive/Gmail/Calendar
+  production call site now routes through; the pure `path_segment` stays
+  metric-free for the encoding unit tests.
+- `proxilion_policy_list_match_total{op,result}` — emitted in
+  [match_expr.rs](../../crates/policy-engine/src/match_expr.rs) `apply_op` on the
+  §6.2 list-valued path, labelled by operator (`in`/`not_in`/`equals`/
+  `not_equals`) and outcome (`match`/`no_match`), proving the flagship gate
+  actually fires post-fix. Added `metrics` (the no-op-without-recorder facade)
+  to the policy-engine crate for this.
+
+The bundled Grafana dashboard ([ops/grafana/proxilion.json](../../ops/grafana/proxilion.json))
+gained an "Approval quality & resource bounds" row with the override-justification
+fill-rate and burst-bucket panels (§9 Phase 5 step 15).
+
 CLI/site items (§3, §5) are client-side and emit no server metrics.
 
 ---
@@ -313,8 +342,8 @@ Ordered so correctness blockers land first. Each step is independently shippable
 **Phase 4 — Site delight**
 14. §5.1 dark-mode toggle, §5.2 copy button, §5.3 `rel=noopener`, §5.4 scroll cue → **verify:** toggle persists across reload and respects `prefers-color-scheme`; copy button writes the clone command to the clipboard; all external links carry `rel="noopener noreferrer"`.
 
-**Phase 5 — Observability**
-15. §7 metrics → **verify:** each new series appears in `GET /metrics` and the bundled Grafana dashboard (`ops/grafana/proxilion.json`) references the override-justification and burst-bucket series.
+**Phase 5 — Observability** — `[x]` Done (2026-06-13)
+15. §7 metrics → **verify:** each new series appears in `GET /metrics` and the bundled Grafana dashboard (`ops/grafana/proxilion.json`) references the override-justification and burst-bucket series. **Done:** all five §7 series are now emitted (the three that were declared-but-unwired — `override_justification_present`, `adapter_path_encoded`, `policy_list_match` — were closed 2026-06-13; see §7 Status) and the dashboard's new "Approval quality & resource bounds" row references both required series.
 
 ---
 

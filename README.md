@@ -342,15 +342,23 @@ healthy":
 | `proxilion_readfilter_scans_total{result}` | counter | read-filter outcomes (`clean` / `stripped` / `quarantined`) — prompt-injection hits |
 | `proxilion_pca_verify_failures_total` | counter | PCA signature verifications that failed — tampering or key drift |
 | `proxilion_overrides_pending` / `_resolved_total{outcome}` | gauge / counter | the human-in-the-loop queue depth and approve/reject throughput |
+| `proxilion_override_justification_present_total{surface,decision}` | counter | over `_resolved_total`: the per-surface fill rate — did the reviewer record *why*, not just *who* (the field that matters at incident review) |
 | `proxilion_oauth_token_refreshes_total{result}` | counter | Google refreshes, incl. the `coalesced` label (the 50→1 stampede defense) |
 | `proxilion_adapter_request_duration_seconds` | histogram | end-to-end latency per `{vendor,action}` (policy + mint + upstream + filter) |
 | `proxilion_policy_evaluation_duration_seconds` | histogram | the Layer-B engine's hot-path budget (target p99 < 1 ms) |
 | `proxilion_trust_plane_up` / `proxilion_federation_bridge_up` | gauge | dependency liveness |
 | `proxilion_operator_auth_total{result}` | counter | operator-API auth accept/reject (token + scope) |
 
+Two lower-traffic confidence counters round out the set:
+`proxilion_adapter_path_encoded_total{vendor}` proves the §6.1 path-encode
+(confused-deputy) fix is exercised in prod, and
+`proxilion_policy_list_match_total{op,result}` proves list-valued policy gates
+(e.g. the external-send gate) actually fire post-§6.2-fix.
+
 Pull them with `proxilion-cli metrics sample` (top series by sample count) or
 scrape into Prometheus; the bundled Grafana dashboard lives in
-[`ops/grafana/`](ops/).
+[`ops/grafana/`](ops/) (its "Approval quality & resource bounds" row charts the
+override-justification fill rate and the burst-suppressor bucket bound).
 
 The `reason` / `code` label values on the block counters (and the `code` field
 in every 4xx/5xx response envelope) are the stable error codes catalogued in

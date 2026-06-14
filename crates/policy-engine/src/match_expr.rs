@@ -139,24 +139,44 @@ fn apply_op(
     // `less_than` have no defined list semantics and fall through to the
     // scalar path below (regex/number against the array's string form).
     if let Some(elems) = ctx.lookup_list(field) {
-        match op {
+        // `op` is matched to a static label so the hot-path metric stays
+        // allocation-free (the list arms are the only ones that emit it).
+        let list_result: Option<(&'static str, bool)> = match op {
             "in" => {
                 let xs = as_str_seq(rhs, "in", ctx)?;
-                return Ok(elems.iter().any(|e| xs.iter().any(|x| x == e)));
+                Some(("in", elems.iter().any(|e| xs.iter().any(|x| x == e))))
             }
             "not_in" => {
                 let xs = as_str_seq(rhs, "not_in", ctx)?;
-                return Ok(!elems.iter().any(|e| xs.iter().any(|x| x == e)));
+                Some(("not_in", !elems.iter().any(|e| xs.iter().any(|x| x == e))))
             }
             "equals" => {
                 let r = as_str_subst(rhs, ctx)?;
-                return Ok(r.map(|r| elems.iter().any(|e| e == &r)).unwrap_or(false));
+                Some((
+                    "equals",
+                    r.map(|r| elems.iter().any(|e| e == &r)).unwrap_or(false),
+                ))
             }
             "not_equals" => {
                 let r = as_str_subst(rhs, ctx)?;
-                return Ok(r.map(|r| !elems.iter().any(|e| e == &r)).unwrap_or(true));
+                Some((
+                    "not_equals",
+                    r.map(|r| !elems.iter().any(|e| e == &r)).unwrap_or(true),
+                ))
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some((op_label, matched)) = list_result {
+            // surface-delight-and-correctness.md §7 — prove the §6.2 list-field
+            // set semantics actually fire in prod (the flagship gate silently
+            // never matched before the fix). Labelled by operator and outcome.
+            metrics::counter!(
+                "proxilion_policy_list_match_total",
+                "op" => op_label,
+                "result" => if matched { "match" } else { "no_match" },
+            )
+            .increment(1);
+            return Ok(matched);
         }
     }
     match op {

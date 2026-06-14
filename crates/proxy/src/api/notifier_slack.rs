@@ -302,6 +302,7 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
                     reason,
                     approver_subject: Some(approver_subject.clone()),
                 },
+                "slack",
             )
             .await
             {
@@ -673,6 +674,7 @@ async fn handle_view_submission(
                     reason,
                     approver_subject: Some(approver_subject),
                 },
+                "slack",
             )
             .await
             {

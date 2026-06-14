@@ -153,6 +153,7 @@ async fn submit(
                     reason: reason.clone(),
                     approver_subject: Some(approver.clone()),
                 },
+                "email",
             )
             .await
             {

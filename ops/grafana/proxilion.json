@@ -4,7 +4,7 @@
   "tags": ["proxilion", "pic", "agent-security"],
   "timezone": "browser",
   "schemaVersion": 38,
-  "version": 2,
+  "version": 3,
   "refresh": "10s",
   "time": { "from": "now-6h", "to": "now" },
   "templating": {
@@ -455,6 +455,60 @@
               { "value": 1, "color": "red" }
             ]
           }
+        }
+      }
+    },
+    {
+      "id": 500,
+      "type": "row",
+      "title": "Approval quality & resource bounds",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 53, "w": 24, "h": 1 }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Override justification fill-rate by surface (1h)",
+      "description": "surface-delight-and-correctness.md §7 — fraction of resolved overrides that carried a real (non-empty) justification, per surface (api/email/slack). 1.0 = every approve/reject recorded *why*. A dip means a surface started committing boilerplate or empty reasons — the single most valuable field at incident-review time. Numerator: proxilion_override_justification_present_total; denominator: proxilion_overrides_resolved_total.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 54, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "sum by (surface) (increase(proxilion_override_justification_present_total[1h])) / clamp_min(sum by (surface) (increase(proxilion_overrides_resolved_total{outcome=~\"approved|rejected\"}[1h])), 1)",
+          "legendFormat": "{{surface}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 10, "lineWidth": 2 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": 0, "color": "red" },
+              { "value": 0.99, "color": "green" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Burst-suppressor buckets (bounded)",
+      "description": "surface-delight-and-correctness.md §6.3 / §7 — live size of the per-(policy_id, p_0) burst-suppressor map. p_0 is high-cardinality, partly attacker-influenced principal identity; the §6.3 fix sweeps empty buckets on drain so this gauge stays flat instead of growing for the process lifetime. A monotonic climb means the sweep regressed (memory DoS-of-degree).",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 54, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "proxilion_burst_buckets",
+          "legendFormat": "live buckets"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
         }
       }
     }

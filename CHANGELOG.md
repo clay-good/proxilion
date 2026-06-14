@@ -16,6 +16,31 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Wired the three declared-but-missing §7 observability series** (completes
+  surface-delight-and-correctness.md §7 / §9 Phase 5 step 15). An audit found
+  that of the five metrics that spec declares, only `proxilion_forwarder_retry_total`
+  and `proxilion_burst_buckets` were actually emitted; the other three were
+  documented but never wired. Closed:
+  `proxilion_override_justification_present_total{surface,decision}` (emitted on
+  every committed override in [api/blocked.rs](crates/proxy/src/api/blocked.rs)
+  `approve_inner`/`reject_inner`, gated on non-empty justification — divided by
+  `proxilion_overrides_resolved_total` it gives the per-surface "did the reviewer
+  record *why*" fill rate);
+  `proxilion_adapter_path_encoded_total{vendor}` (new
+  [`adapters::encoded_segment`](crates/proxy/src/adapters/mod.rs) wrapper that the
+  Drive/Gmail/Calendar production call sites route through, keeping the pure
+  `path_segment` metric-free for its encoding unit tests); and
+  `proxilion_policy_list_match_total{op,result}` (emitted on the §6.2 list-valued
+  match path in [match_expr.rs](crates/policy-engine/src/match_expr.rs), proving
+  the flagship external-send gate fires post-fix). The bundled Grafana dashboard
+  ([ops/grafana/proxilion.json](ops/grafana/proxilion.json)) gained an "Approval
+  quality & resource bounds" row with the override-justification fill-rate and
+  burst-bucket panels.
+- **Fixed a latent metric mislabel surfaced while wiring the above:**
+  `reject_inner` hardcoded `channel="api"` on the pre-existing
+  `proxilion_overrides_resolved_total` counter, so email/Slack rejects were
+  miscounted as API rejects. Threading the real surface label through
+  `reject_inner` corrects it.
 - **Marketing site `/pic` explainer page** — completes spec.md §4.3 (the only
   playbook step that lacked a Status block). [site/pic/index.html](site/pic/index.html)
   is a standalone, no-build static page that explains the PIC protocol the spec

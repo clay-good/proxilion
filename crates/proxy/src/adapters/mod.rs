@@ -42,6 +42,20 @@ pub(crate) fn path_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH).to_string()
 }
 
+/// `path_segment` with the §7 `proxilion_adapter_path_encoded_total{vendor}`
+/// counter incremented once per call — the production entry point every
+/// adapter routes its interpolated ids through.
+///
+/// Authority: surface-delight-and-correctness.md §7 ("Confidence the encode
+/// path is exercised in prod"). The pure `path_segment` stays metric-free so
+/// the encoding unit tests assert output without a recorder; this thin
+/// wrapper carries the observability so the §6.1 fix is provably hot in
+/// production rather than only proven in tests.
+pub(crate) fn encoded_segment(vendor: &'static str, s: &str) -> String {
+    metrics::counter!("proxilion_adapter_path_encoded_total", "vendor" => vendor).increment(1);
+    path_segment(s)
+}
+
 /// Read an upstream response body into memory under a hard `max`-byte cap,
 /// shared by every Google adapter.
 ///

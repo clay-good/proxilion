@@ -149,7 +149,7 @@ async fn get_message(
             action: "gmail.messages.get".into(),
             upstream_path: format!(
                 "/gmail/v1/users/me/messages/{}",
-                super::path_segment(&msg_id)
+                super::encoded_segment("google", &msg_id)
             ),
             method: Method::GET,
             policy_path,

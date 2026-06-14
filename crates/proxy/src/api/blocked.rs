@@ -470,6 +470,17 @@ pub async fn approve_inner(
         "outcome" => "approved", "channel" => channel
     )
     .increment(1);
+    // surface-delight-and-correctness.md §7 — count overrides that carry a
+    // real (non-empty) justification, by surface + decision. Compared against
+    // `proxilion_overrides_resolved_total` it yields the per-surface fill
+    // rate, so a regression that re-synthesized boilerplate or dropped the
+    // field shows up as a diverging ratio. Approve always clears the ≥ 20-char
+    // gate above, so the justification is unconditionally present here.
+    metrics::counter!(
+        "proxilion_override_justification_present_total",
+        "surface" => channel, "decision" => "approve"
+    )
+    .increment(1);
     // spec.md §3.2 — `proxilion_override_latency_seconds{outcome}` histogram.
     // Measures wall-clock from the original block (blocked_actions.at) to
     // the operator's decision. Powers §3.5's "p50 < 5 min" override SLO.
@@ -508,13 +519,16 @@ async fn reject(
     Path(id): Path<Uuid>,
     Json(body): Json<RejectBody>,
 ) -> Result<Json<RejectResponse>, ApiError> {
-    Ok(Json(reject_inner(&state, id, body).await?))
+    Ok(Json(reject_inner(&state, id, body, "api").await?))
 }
 
+/// Inner reject implementation, reusable from the email/Slack approval
+/// surfaces. `channel` is the metric label (`api`, `email`, `slack`).
 pub async fn reject_inner(
     state: &BlockedApiState,
     id: Uuid,
     body: RejectBody,
+    channel: &'static str,
 ) -> Result<RejectResponse, ApiError> {
     if body.reason.trim().is_empty() {
         return Err(ApiError::BadRequest("reason must be non-empty".into()));
@@ -556,7 +570,16 @@ pub async fn reject_inner(
     }
     metrics::counter!(
         "proxilion_overrides_resolved_total",
-        "outcome" => "rejected", "channel" => "api"
+        "outcome" => "rejected", "channel" => channel
+    )
+    .increment(1);
+    // surface-delight-and-correctness.md §7 — a reject carries a justification
+    // (the reviewer's reason) too; the non-empty gate above guarantees it is
+    // present here. Counted by surface so the fill-rate panel covers both
+    // decisions symmetrically.
+    metrics::counter!(
+        "proxilion_override_justification_present_total",
+        "surface" => channel, "decision" => "reject"
     )
     .increment(1);
     if let Some((blocked_at,)) = returned {

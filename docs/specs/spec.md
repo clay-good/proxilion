@@ -2067,6 +2067,14 @@ Tests:
 **SEO targets (updated):** managed agent security, Claude OAuth proxy, confused deputy AI agents, PIC protocol Anthropic, agent action governance, prompt injection defense managed agents, cryptographic AI audit log, Okta managed agent security.
 *(Otherwise same as v0 spec. Add a /pic page explaining PIC and linking to pic-protocol.org and clay-good/provenance with full attribution.)*
 
+**Status:** Done (static-HTML variant, not Astro). The site lives at [site/](../../site/) and deploys to `proxilion.com` via Cloudflare Workers Static Assets straight from `main` with **no build step** ([wrangler.toml](../../wrangler.toml), [.cloudflare/worker.js](../../.cloudflare/worker.js)). Delivered:
+
+- [site/index.html](../../site/index.html) — the single-page landing: hero + CTA, PIC attribution card, the three "what Proxilion adds" pillars, an inline SVG system diagram, the threat/risk table, and the Skill-Overreach section. Self-contained (inline CSS + two tiny inline theme/copy scripts), dark-mode aware (`prefers-color-scheme` + persisted toggle), and carries the full SEO surface: canonical/hreflang, Open Graph + Twitter cards, and `Organization` / `BreadcrumbList` / `TechArticle` / `SoftwareApplication` / `FAQPage` JSON-LD.
+- [site/pic/index.html](../../site/pic/index.html) — **the `/pic` page** the spec asks for. Explains PIC end-to-end: the problem (confused deputy), the three invariants (Provenance / Identity / Continuity) as pillars + detail cards, an inline SVG PCA-chain diagram showing authority narrowing root→leaf with one *refused* escalation branch (`MonotonicityViolation`), the COSE_Sign1/CBOR/Ed25519 encoding + Trust Plane roles, how Proxilion mints `PCA_0/1/2`, and a "what PIC does / does not promise" table. Attribution to **Nicola Gallo** is the first content section, linking [pic-protocol.org](https://www.pic-protocol.org/) and [clay-good/provenance](https://github.com/clay-good/provenance). Reuses the homepage design system verbatim so the two pages are visually identical; cross-linked via the nav and `sitemap.xml`.
+- Supporting assets: [site/sitemap.xml](../../site/sitemap.xml) (both URLs), [site/robots.txt](../../site/robots.txt) (allows the major AI crawlers), [site/_headers](../../site/_headers) (HSTS + a strict CSP — `default-src 'none'`, no third-party origins), `site.webmanifest`, and the favicon/OG image set.
+
+**Deviation — static HTML, not Astro.** The v0 spec said "Astro site." Per the [`ui-less-surfaces.md`](./ui-less-surfaces.md) no-JS-framework posture (and the dedicated `static-html-no-js` CI lint), the site is hand-authored static HTML with no build step — which is why the Cloudflare deploy command is empty. The SEO/attribution requirements are met identically; the framework was the only thing dropped.
+
 ---
 
 ### Step 4.4 — Reference demo (forked from upstream `examples/02-ai-agent-insurance`)

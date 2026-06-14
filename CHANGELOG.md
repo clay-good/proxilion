@@ -16,6 +16,21 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Marketing site `/pic` explainer page** — completes spec.md §4.3 (the only
+  playbook step that lacked a Status block). [site/pic/index.html](site/pic/index.html)
+  is a standalone, no-build static page that explains the PIC protocol the spec
+  asked for: the confused-deputy problem, the three invariants
+  (Provenance / Identity / Continuity) as pillars + detail cards, an inline SVG
+  PCA-chain diagram showing authority narrowing root→leaf with one *refused*
+  escalation branch (`MonotonicityViolation`), the COSE_Sign1/CBOR/Ed25519
+  encoding + Trust Plane roles, how Proxilion mints `PCA_0/1/2`, and a
+  "what PIC does / does not promise" table. Attribution to **Nicola Gallo**
+  ([pic-protocol.org](https://www.pic-protocol.org/),
+  [clay-good/provenance](https://github.com/clay-good/provenance)) is the first
+  content section. Reuses the homepage design system verbatim (dark-mode aware,
+  full JSON-LD/OG/Twitter SEO surface); cross-linked from the homepage nav and
+  added to [site/sitemap.xml](site/sitemap.xml). spec.md §4.3 now carries a
+  Status block documenting the static-HTML-not-Astro deviation.
 - **`ops/prometheus/prometheus.yml`** — a ready-to-use Prometheus scrape config
   for the proxy's `/metrics` endpoint, completing the operator-artifacts set
   (the `ops/prometheus/` directory existed but was empty, and the README repo

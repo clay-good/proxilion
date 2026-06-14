@@ -12,4 +12,15 @@
       <image:caption>A self-hosted reverse proxy that cryptographically binds every managed-agent action to the human user it is acting for.</image:caption>
     </image:image>
   </url>
+  <url>
+    <loc>https://proxilion.com/pic/</loc>
+    <lastmod>2026-06-13</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+    <image:image>
+      <image:loc>https://proxilion.com/og-image.png</image:loc>
+      <image:title>PIC explained: Provenance, Identity, Continuity.</image:title>
+      <image:caption>The open authority protocol by Nicola Gallo that Proxilion is built on — three invariants, signed PCA chains, monotonically narrowing authority.</image:caption>
+    </image:image>
+  </url>
 </urlset>

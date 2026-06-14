@@ -201,7 +201,7 @@ proxilion/
 │   ├── cli/                # `proxilion-cli` operator binary
 │   ├── policy-engine/      # YAML → match expression + ops template grammar
 │   └── shared-types/       # re-exports of upstream provenance-core
-├── site/                   # proxilion.com, static, Cloudflare Pages
+├── site/                   # proxilion.com (static HTML, no build) — landing + /pic explainer
 ├── docs/specs/spec.md      # the design doc
 ├── ops/                    # Prometheus scrape config + Grafana JSON
 ├── docker/                 # Dockerfiles for proxy and trust-plane
@@ -235,8 +235,10 @@ The platform sends us metadata; we evaluate, mint a PCA, and respond.
 PIC's preventative property depends on the **CAT signing key** being
 customer-held. Proxilion is self-hosted for that reason; we never see your
 keys, your traffic, or your PCAs. The marketing site at
-[proxilion.com](https://proxilion.com) is a static HTML page that points
-here. No telemetry, no phone-home, no upsell paths in the admin UI.
+[proxilion.com](https://proxilion.com) is static HTML that points here (with
+a [/pic](https://proxilion.com/pic/) explainer of the underlying protocol);
+it deploys to Cloudflare Workers Static Assets from `main` with no build step.
+No telemetry, no phone-home, no upsell paths in the admin UI.
 
 ## Threat model
 

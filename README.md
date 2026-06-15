@@ -453,7 +453,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through ten rounds of
+**Verification posture.** The shipped code has been through eleven rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -462,13 +462,20 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
-The tenth pass closed a capability-URL secret leak (Slack/webhook/SIEM endpoint
-tokens reaching logs via `reqwest`'s URL-bearing error Display and boot-time
-`info!` lines), made `policy validate` compile policies rather than only
-shape-check the YAML, hardened two fail-open shapes to fail closed (a typo'd
-policy key, a malformed PCA-cache `ops` column), and bounded the CLI live-tail's
-SSE reassembly buffer. This is a track record, not a guarantee — the
-threat-model table above states the honest ceiling of an interception proxy.
+The eleventh pass extended the tenth's `deny_unknown_fields` hardening to the
+*nested* policy-config structs — a typo'd `quarantine_actoin: block_request`
+under a `read_filter:` block had silently fallen back to the marker-splice
+default, downgrading an intended hard block of an injected response to one the
+agent still reads — and closed a CLI subtraction-overflow panic on an absurd
+`--since`/`--against` duration that the fifth pass's checked *constructors* had
+left on a separate `DateTime - TimeDelta` surface. The tenth pass closed a
+capability-URL secret leak (Slack/webhook/SIEM endpoint tokens reaching logs via
+`reqwest`'s URL-bearing error Display and boot-time `info!` lines), made `policy
+validate` compile policies rather than only shape-check the YAML, hardened two
+fail-open shapes to fail closed (a typo'd policy key, a malformed PCA-cache `ops`
+column), and bounded the CLI live-tail's SSE reassembly buffer. This is a track
+record, not a guarantee — the threat-model table above states the honest ceiling
+of an interception proxy.
 
 **One known pre-production gap, by design.** The federation-bridge token
 signature is **not** verified in M0/M1 — upstream `provenance-bridge` ships no

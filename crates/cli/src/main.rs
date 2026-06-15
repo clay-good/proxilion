@@ -1229,7 +1229,14 @@ fn parse_since(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     })?;
     let chrono_dur =
         chrono::Duration::from_std(dur).map_err(|_| anyhow!("--since duration overflows"))?;
-    Ok(chrono::Utc::now() - chrono_dur)
+    // `from_std` only bounds the `Duration` itself; the subtraction has a
+    // *separate* overflow surface — `DateTime - TimeDelta` is `expect`-on-
+    // `checked_sub_signed` in chrono, so a `Duration` valid in isolation but
+    // large enough to push the date past `NaiveDate`'s ±262k-year range
+    // (e.g. `--since 100000000d`) panics. Subtract with the checked variant.
+    chrono::Utc::now()
+        .checked_sub_signed(chrono_dur)
+        .ok_or_else(|| anyhow!("--since duration overflows"))
 }
 
 /// Append the longest valid-UTF-8 prefix of `pending` to `out`, draining the
@@ -3047,6 +3054,17 @@ mod simulate_tests {
         // return an error, not panic inside `Duration::days`.
         assert!(parse_window("last-200000000000000d").is_err());
         assert!(parse_window("last-9223372036854775807s").is_err());
+        // Middle range: `try_days` *succeeds* (TimeDelta spans ~106e9 days) but
+        // the subtraction pushes the date past `NaiveDate`'s ±262k-year range,
+        // so `now() - dur` panicked before the `checked_sub_signed` fix.
+        assert!(parse_window("last-100000000d").is_err());
+    }
+
+    #[test]
+    fn parse_since_rejects_subtraction_overflow_without_panicking() {
+        // Same middle-range hazard via the `humantime` path: `from_std` builds a
+        // valid `Duration` that overflows the date subtraction. Must error.
+        assert!(parse_since("100000000d").is_err());
     }
 }
 
@@ -3132,7 +3150,14 @@ fn parse_window(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
             "s" => chrono::Duration::try_seconds(n).ok_or_else(overflow)?,
             other => return Err(anyhow!("unknown window unit `{other}` (use d|h|m|s)")),
         };
-        return Ok(chrono::Utc::now() - dur);
+        // The `try_*` constructors bound the `Duration`, but `now() - dur` is a
+        // *separate* overflow surface: `DateTime - TimeDelta` is `expect`-on-
+        // `checked_sub_signed` in chrono, so a magnitude that builds a valid
+        // `Duration` yet pushes the date past `NaiveDate`'s ±262k-year range
+        // (e.g. `last-100000000d`) still panics. Subtract checked.
+        return chrono::Utc::now()
+            .checked_sub_signed(dur)
+            .ok_or_else(overflow);
     }
     // Try as RFC 3339.
     chrono::DateTime::parse_from_rfc3339(s)

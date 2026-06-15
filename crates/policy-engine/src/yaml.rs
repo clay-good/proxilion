@@ -86,6 +86,10 @@ pub enum AuditBodyMode {
 /// the `notifier_config.email` payload shape. Each field is independently
 /// optional — `None` means "inherit the global value."
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Same fail-loud rationale as `ReadFilterCfg`/`PolicyDoc`: a typo'd
+// `escalation_after_minutes` should be an authoring error, not a silently
+// dropped key that disables escalation.
+#[serde(deny_unknown_fields)]
 pub struct RecipientsCfg {
     #[serde(default, deserialize_with = "deserialize_string_or_vec_opt")]
     pub to: Option<Vec<String>>,
@@ -123,6 +127,9 @@ where
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+// Fail loud on a typo'd `threshold`/`window_seconds` rather than silently
+// leaving burst detection unconfigured. See `ReadFilterCfg`.
+#[serde(deny_unknown_fields)]
 pub struct BurstCfg {
     #[serde(default)]
     pub threshold: Option<usize>,
@@ -160,6 +167,15 @@ fn default_pic_mode() -> PicMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Mirror `PolicyDoc`'s `deny_unknown_fields`: without it a typo'd
+// `quarantine_actoin: block_request` is silently dropped and
+// `quarantine_action` falls back to its `ReplaceWithMarker` default — a
+// *fail-open* that downgrades an operator's intended hard block of an
+// injected upstream response to a marker-splice that still reaches the agent.
+// `Engine::validate` (behind `policy validate`) runs after the unknown key is
+// already gone, so it green-lights the broken policy; only failing the parse
+// catches it.
+#[serde(deny_unknown_fields)]
 pub struct ReadFilterCfg {
     #[serde(default)]
     pub quarantine_patterns: Vec<QuarantinePatternCfg>,
@@ -947,6 +963,42 @@ mod tests {
         // The correctly-spelled form parses.
         let ok = "- id: x\n  vendor: g\n  action: a\n  decision: block\n";
         assert!(parse_policies(ok).is_ok());
+    }
+
+    #[test]
+    fn read_filter_cfg_rejects_unknown_keys_so_a_typod_action_cant_fail_open() {
+        // A misspelled `quarantine_action` (here `quarantine_actoin`) must NOT
+        // parse: without deny_unknown_fields on ReadFilterCfg the unknown key is
+        // silently dropped and `quarantine_action` falls back to its
+        // ReplaceWithMarker default — downgrading an operator's intended hard
+        // `block_request` of an injected upstream response to a marker-splice
+        // that still reaches the agent.
+        let typo = "\
+- id: rf
+  vendor: g
+  action: a
+  read_filter:
+    quarantine_patterns: [\"system prompt:\"]
+    quarantine_actoin: block_request
+";
+        assert!(
+            parse_policies(typo).is_err(),
+            "a typo'd `quarantine_action` key must be rejected, not silently dropped to the marker default"
+        );
+        // The correctly-spelled form parses and keeps the intended action.
+        let ok = "\
+- id: rf
+  vendor: g
+  action: a
+  read_filter:
+    quarantine_patterns: [\"system prompt:\"]
+    quarantine_action: block_request
+";
+        let docs = parse_policies(ok).expect("valid read_filter parses");
+        assert!(matches!(
+            docs[0].read_filter.as_ref().unwrap().quarantine_action,
+            QuarantineActionCfg::BlockRequest
+        ));
     }
 
     #[test]

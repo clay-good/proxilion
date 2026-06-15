@@ -210,6 +210,39 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Read-filter `quarantine_action` could silently fail open** (an
+  eleventh-audit-pass finding, 2026-06-15). `PolicyDoc` carries
+  `#[serde(deny_unknown_fields)]` (so a typo'd top-level key fails loudly), but
+  the tenth-pass fix was never extended to the *nested* config structs. A
+  misspelled `quarantine_actoin: block_request` under a `read_filter:` block was
+  therefore silently dropped, and `quarantine_action` fell back to its
+  `replace_with_marker` default — downgrading an operator's intended *hard block*
+  of an injected upstream response to a marker-splice that still reaches the
+  agent. `Engine::validate` (behind `policy validate`) runs *after* the unknown
+  key is gone, so it green-lit the broken policy. Fixed by adding
+  `#[serde(deny_unknown_fields)]` to `ReadFilterCfg` (plus `RecipientsCfg` and
+  `BurstCfg` for the same silent-drop footgun on `escalation_after_minutes` /
+  `threshold` / `window_seconds`) in
+  [policy-engine/src/yaml.rs](crates/policy-engine/src/yaml.rs). New regression
+  test `read_filter_cfg_rejects_unknown_keys_so_a_typod_action_cant_fail_open`.
+  MEDIUM (fail-open on the read-filter response-quarantine control).
+- **`proxilion-cli` could panic on an absurd `--since` / `--against` duration**
+  (an eleventh-audit-pass finding, 2026-06-15). The fifth pass switched
+  `parse_window`/`parse_since` to chrono's checked `try_*` *constructors*, but
+  the subsequent `chrono::Utc::now() - dur` subtraction is a *separate* overflow
+  surface: `DateTime - TimeDelta` is `expect`-on-`checked_sub_signed` in chrono,
+  so a magnitude that builds a valid `Duration` (chrono's `TimeDelta` spans
+  ~106e9 days) yet pushes the date past `NaiveDate`'s ±262k-year range — e.g.
+  `actions purge --older-than 100000000d`, `policy simulate --against
+  last-100000000d` — aborted the CLI with `'DateTime - TimeDelta' overflowed`
+  instead of the intended friendly error. Fixed by subtracting via
+  `checked_sub_signed` and surfacing the existing overflow error
+  ([cli/src/main.rs](crates/cli/src/main.rs) `parse_window`/`parse_since`). New
+  regression tests `parse_window_rejects_overflowing_magnitude_without_panicking`
+  (extended) and `parse_since_rejects_subtraction_overflow_without_panicking`.
+  LOW (operator-local CLI panic, no server impact). The crypto/auth/oauth,
+  notifiers/forwarders/PIC/operator-API lanes were swept again and cleared with
+  no findings.
 - **Capability-URL secrets leaked into logs** (a tenth-audit-pass finding,
   2026-06-15). A Slack incoming-webhook URL carries its token *in the path*
   (`hooks.slack.com/services/T…/B…/XXXX`), and generic-webhook / SIEM URLs may

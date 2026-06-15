@@ -13,6 +13,14 @@ use uuid::Uuid;
 pub enum CacheError {
     #[error("postgres: {0}")]
     Db(#[from] sqlx::Error),
+    /// The persisted `ops` JSONB failed to decode into the op set. We fail
+    /// CLOSED rather than substituting an empty set: an empty op set is a
+    /// subset of every authority, so silently defaulting it would be a
+    /// monotonicity-bypass *shape* the moment any code consumes `cached.ops`
+    /// for a subset check. The byte payload is not echoed (it may carry
+    /// authority detail); only the serde message is surfaced.
+    #[error("malformed ops column: {0}")]
+    Decode(String),
 }
 
 /// The current PIC profile identifier. Pinned on every PCA cache row so a
@@ -111,18 +119,22 @@ impl PcaCache {
         .bind(pca_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(
-            row.map(|(id, cbor, p_0, ops, hop, pred, sig, profile)| CachedPca {
+        row.map(|(id, cbor, p_0, ops, hop, pred, sig, profile)| {
+            Ok(CachedPca {
                 pca_id: id,
                 cbor,
                 p_0,
-                ops: serde_json::from_value(ops.0).unwrap_or_default(),
+                // Fail closed on a malformed ops column (see CacheError::Decode)
+                // rather than `unwrap_or_default()`-ing to an empty set.
+                ops: serde_json::from_value(ops.0)
+                    .map_err(|e| CacheError::Decode(e.to_string()))?,
                 hop,
                 predecessor_id: pred,
                 signature: sig,
                 pic_profile: profile,
-            }),
-        )
+            })
+        })
+        .transpose()
     }
 }
 
@@ -557,20 +569,22 @@ mod tests {
     // ─── round 213 (2026-05-21): PcaCache + CachedPca + CacheError surfaces ───
 
     #[test]
-    fn cache_error_variant_count_pinned_exactly_one_via_exhaustive_match() {
-        // `CacheError` has EXACTLY one variant today: `Db`. Pin the count
-        // via exhaustive match with NO `_` wildcard arm so a future
-        // `Decode` (CBOR parse) or `RateLimited` (Trust Plane backoff)
-        // variant landing without operator runbook / dashboard panel
-        // update surfaces here as a compile error. The match-without-`_`
-        // pattern is symmetric to round-207 SlackAction + round-208
-        // VerifierError exhaustive-variant pins extended to this sibling
-        // cache-layer error enum.
-        let e = CacheError::Db(sqlx::Error::RowNotFound);
-        let name = match &e {
-            CacheError::Db(_) => "Db",
-        };
-        assert_eq!(name, "Db");
+    fn cache_error_variant_count_pinned_exactly_two_via_exhaustive_match() {
+        // `CacheError` has EXACTLY two variants: `Db` and `Decode` (the
+        // fail-closed arm for a malformed `ops` JSONB — see `get`). Pin the
+        // count via exhaustive match with NO `_` wildcard arm so a future
+        // `RateLimited` (Trust Plane backoff) variant landing without operator
+        // runbook / dashboard panel update surfaces here as a compile error.
+        for e in [
+            CacheError::Db(sqlx::Error::RowNotFound),
+            CacheError::Decode("bad".into()),
+        ] {
+            let name = match &e {
+                CacheError::Db(_) => "Db",
+                CacheError::Decode(_) => "Decode",
+            };
+            assert!(name == "Db" || name == "Decode");
+        }
     }
 
     #[test]
@@ -882,6 +896,7 @@ mod tests {
         let e = CacheError::from(sqlx::Error::RowNotFound);
         match e {
             CacheError::Db(_inner) => {}
+            CacheError::Decode(_) => unreachable!("constructed from sqlx::Error"),
         }
         // And the `?` conversion path lands on the SAME tuple-
         // positional variant — pin both shapes move in lockstep.
@@ -891,6 +906,7 @@ mod tests {
         })();
         match from_q.unwrap_err() {
             CacheError::Db(_inner) => {}
+            CacheError::Decode(_) => unreachable!("constructed from sqlx::Error"),
         }
     }
 

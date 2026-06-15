@@ -124,6 +124,26 @@ impl Engine {
         Ok(Self { policies })
     }
 
+    /// Statically validate every loaded policy beyond YAML deserialization:
+    /// each policy's decision shape parses, its `read_filter` regexes compile,
+    /// and its match expression uses only supported operators with well-formed
+    /// shapes and compilable literal regexes / numeric thresholds. This backs
+    /// `proxilion-cli policy validate`, so an operator/CI catches the
+    /// `BadDecision` / `BadRegex` / `UnsupportedOp` class *before* deploy. At
+    /// runtime these same errors fail closed (deny) on the first matching
+    /// request — safe, but a poor way to learn a policy file is broken, and the
+    /// runtime error page literally points operators at `policy validate`.
+    pub fn validate(&self) -> Result<(), Error> {
+        for p in &self.policies {
+            parse_decision(p)?;
+            if let Some(rf) = p.read_filter.as_ref() {
+                compile_read_filter(rf)?;
+            }
+            match_expr::validate(&p.match_)?;
+        }
+        Ok(())
+    }
+
     pub fn evaluate(&self, ctx: &RequestContext) -> Result<Outcome, Error> {
         for p in &self.policies {
             if p.vendor != ctx.vendor || p.action != ctx.action {
@@ -443,6 +463,67 @@ mod helper_tests {
         let y =
             format!("id: p1\nvendor: v\naction: a\ndecision: {yaml_decision}\nrequired_ops: []\n");
         serde_yaml::from_str(&y).unwrap()
+    }
+
+    #[test]
+    fn engine_validate_compiles_decision_read_filter_and_match_beyond_parse() {
+        // Files that *parse* (valid YAML shape) but are broken at compile time.
+        // parse_policies accepts each; Engine::validate must reject them.
+        let broken_regex = "\
+- id: p1
+  vendor: v
+  action: a
+  decision: block
+  read_filter:
+    quarantine_patterns:
+      - regex: \"(unclosed\"
+    quarantine_action: replace_with_marker
+";
+        assert!(
+            parse_policies(broken_regex).is_ok(),
+            "parse accepts the YAML shape"
+        );
+        let err = Engine::new(broken_regex).unwrap().validate().unwrap_err();
+        assert!(matches!(err, Error::BadRegex { .. }), "got {err:?}");
+
+        let unknown_decision = "- id: p1\n  vendor: v\n  action: a\n  decision: banhammer\n";
+        assert!(parse_policies(unknown_decision).is_ok());
+        assert!(matches!(
+            Engine::new(unknown_decision)
+                .unwrap()
+                .validate()
+                .unwrap_err(),
+            Error::BadDecision(_)
+        ));
+
+        let unknown_op = "\
+- id: p1
+  vendor: v
+  action: a
+  decision: block
+  match:
+    user.email: { equls: x }
+";
+        assert!(parse_policies(unknown_op).is_ok());
+        assert!(matches!(
+            Engine::new(unknown_op).unwrap().validate().unwrap_err(),
+            Error::Match(_)
+        ));
+
+        // A fully well-formed policy validates clean.
+        let ok = "\
+- id: p1
+  vendor: v
+  action: a
+  decision: block
+  match:
+    user.email: { matches: \"^a@b\\\\.com$\" }
+  read_filter:
+    quarantine_patterns:
+      - regex: \"ignore previous instructions\"
+    quarantine_action: replace_with_marker
+";
+        assert!(Engine::new(ok).unwrap().validate().is_ok());
     }
 
     #[test]

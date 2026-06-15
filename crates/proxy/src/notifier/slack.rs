@@ -215,7 +215,10 @@ impl SlackNotifier {
                 .increment(1);
             }
             Err(e) => {
-                warn!(error = %e, "slack: transport error");
+                // `e.without_url()` strips the ` for url (…)` suffix reqwest's
+                // Display appends — the Slack webhook URL embeds its secret
+                // token in the path.
+                warn!(error = %e.without_url(), "slack: transport error");
                 metrics::counter!(
                     "proxilion_slack_post_failures_total",
                     "reason" => "transport"
@@ -257,7 +260,7 @@ impl SlackNotifier {
                 .increment(1);
             }
             Err(e) => {
-                warn!(error = %e, "slack summary: transport error");
+                warn!(error = %e.without_url(), "slack summary: transport error");
                 metrics::counter!(
                     "proxilion_slack_summary_failures_total",
                     "reason" => "transport"

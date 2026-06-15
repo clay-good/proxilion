@@ -1284,12 +1284,23 @@ async fn actions_tail(
         .error_for_status()?;
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
+    // Bound the reassembly buffers. A server (or an on-path peer of this
+    // long-lived SSE connection) that streams bytes but never emits a `\n\n`
+    // frame delimiter would otherwise grow `buf` until this CLI OOMs — the
+    // proxy bounds its own upstream reads at 10 MB (adapters::read_bounded) and
+    // a single audit-event frame is kilobytes, so the same cap is generous here.
+    const MAX_SSE_BUF: usize = 10 * 1024 * 1024;
     let mut buf = String::new();
     let mut pending: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("SSE chunk")?;
         pending.extend_from_slice(&chunk);
         decode_utf8_streaming(&mut pending, &mut buf);
+        if buf.len() + pending.len() > MAX_SSE_BUF {
+            anyhow::bail!(
+                "SSE frame exceeded {MAX_SSE_BUF} bytes without a delimiter; aborting tail"
+            );
+        }
         while let Some(idx) = buf.find("\n\n") {
             let frame: String = buf.drain(..idx + 2).collect();
             let mut data = String::new();
@@ -2414,10 +2425,23 @@ async fn cmd_policy(http: &reqwest::Client, url: &str, token: &str, sub: PolicyC
         PolicyCmd::Validate { file } => {
             let yaml = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading policy file {file}"))?;
-            match policy_engine::yaml::parse_policies(&yaml) {
-                Ok(policies) => {
+            // Parse the YAML schema first (for the per-policy summary), then
+            // compile each policy via the engine so the decision shapes,
+            // read_filter regexes, and match-expression operators/regexes are
+            // exercised — parse_policies alone only checks the YAML shape, so a
+            // bad regex or unknown operator/decision would slip through here and
+            // only surface as a fail-closed 500 on the first matching request.
+            let policies = match policy_engine::yaml::parse_policies(&yaml) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{RED}✗ invalid{RESET}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match policy_engine::Engine::new(&yaml).and_then(|e| e.validate()) {
+                Ok(()) => {
                     println!(
-                        "{GREEN}✓ valid{RESET}: {} polic{} parsed from `{file}`",
+                        "{GREEN}✓ valid{RESET}: {} polic{} parsed and compiled from `{file}`",
                         policies.len(),
                         if policies.len() == 1 { "y" } else { "ies" }
                     );

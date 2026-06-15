@@ -218,8 +218,10 @@ Returns Prometheus exposition format. No auth in v1 — same trust boundary
 as `/api/v1/*` (assume operator network is private; revisit when the proxy
 is exposed to a multi-tenant ingress).
 
-`PROXILION_METRICS_EXPORTER` env: `prometheus` (default) or `otlp` for OTLP
-push to a customer-specified collector. Both can be on at once.
+Metrics are exposed in the Prometheus text format on `/metrics` (scrape it
+directly, or point an OTLP collector's Prometheus receiver at it). A native
+OTLP push exporter is *planned*, not yet implemented — there is no
+`PROXILION_METRICS_EXPORTER` env var today.
 
 ### 3.2 Metric names — the contract
 
@@ -392,7 +394,7 @@ adds shell ergonomics (pretty / JSON / NDJSON output, paging, `--watch`,
 proxilion <command> [subcommand] [flags]
 
 GLOBAL FLAGS
-  --endpoint URL         (default: $PROXILION_ENDPOINT or https://localhost:8443)
+  --url URL              (default: $PROXILION_URL or https://localhost:8443)
   --token  TOKEN         (default: $PROXILION_OPERATOR_TOKEN)
   --format pretty|json|ndjson|csv|tsv
   --no-color
@@ -536,14 +538,14 @@ unhealthy, 2 = transport error).
 
 ```bash
 # Live tail of blocked actions, formatted for humans
-proxilion actions tail --filter decision=block
+proxilion actions tail --decision block
 
-# Dump last 30 days of audit log to an S3-ready file
-proxilion actions export --since 30d --format ndjson --compress zst \
-  --output /tmp/proxilion-$(date +%F).ndjson.zst
+# Dump last 30 days of audit log to a file
+proxilion actions export --since 30d --format ndjson \
+  --output /tmp/proxilion-$(date +%F).ndjson
 
 # Grafana / Splunk: pipe NDJSON straight in
-proxilion actions tail --output ndjson | splunk -i forward:tcp:9997
+proxilion actions tail --format ndjson | splunk -i forward:tcp:9997
 
 # CI: fail the build if any policy would have changed behavior
 proxilion policy validate config/policy.yaml &&
@@ -551,10 +553,10 @@ proxilion policy validate config/policy.yaml &&
     --fail-if-delta-exceeds 5%
 
 # On-call runbook: who's blocked right now?
-proxilion blocked list --pending --since 1h --format ndjson | jq '.action'
+proxilion blocked list --status pending --format json | jq '.action'
 
 # Killswitch in one keystroke
-proxilion killswitch revoke user alice@org.com
+proxilion killswitch user alice@org.com
 ```
 
 ### 4.4 Authentication
@@ -1136,7 +1138,7 @@ CREATE TABLE notifier_tokens (
     consumed_at     TIMESTAMPTZ
 );
 
--- 0005_operator_tokens.sql
+-- 0006_operator_tokens.sql
 CREATE TABLE operator_tokens (
     id            UUID PRIMARY KEY,
     token_hash    BYTEA NOT NULL UNIQUE,       -- SHA-256 of pxl_operator_*

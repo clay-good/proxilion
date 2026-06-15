@@ -279,6 +279,19 @@ pub async fn run(cfg: Config) -> Result<()> {
                     notifiers,
                 )?;
                 app = app.merge(oauth::router(oauth_state));
+                // The /oauth/bridge/callback route trusts the federation token's
+                // *payload* without verifying its signature (oauth/bridge.rs —
+                // M0/M1 stub; upstream provenance-bridge has no binary target
+                // yet). Anyone who can reach the callback can forge p_0/ops/PCA_0,
+                // which the proxy then launders into a validly CAT-signed chain.
+                // Warn loudly at boot — mirroring the PROXILION_DISABLE_OPERATOR_AUTH
+                // posture above — so this can never ship silently. Swap in a
+                // JWKS-backed `jsonwebtoken::decode` before any production deploy.
+                warn!(
+                    "federation-bridge token signatures are NOT verified \
+                     (oauth/bridge.rs M0/M1 stub) — /oauth/bridge/callback accepts \
+                     forgeable p_0/ops. Dev/CI/smoke only; never use in production."
+                );
                 app = app.merge(protected_router(auth_state.clone()));
                 app = app.merge(adapter_router(adapter_state, auth_state));
                 info!("full set mounted (OAuth + adapters + admin + actions + PCA APIs)");
@@ -638,11 +651,11 @@ async fn build_nats_sink(cfg: &Config, tee: TeeStream) -> TeeStream {
     };
     match NatsBridge::connect(url, cfg.nats_subject_prefix.clone()).await {
         Ok(bridge) => {
-            info!(url = %url, prefix = %cfg.nats_subject_prefix, "NATS bridge connected");
+            info!(url = %crate::config::redacted_endpoint(url), prefix = %cfg.nats_subject_prefix, "NATS bridge connected");
             tee.with_sink(Arc::new(bridge))
         }
         Err(e) => {
-            warn!(url = %url, error = %e, "NATS bridge: connect failed; continuing without it");
+            warn!(url = %crate::config::redacted_endpoint(url), error = %e, "NATS bridge: connect failed; continuing without it");
             tee
         }
     }
@@ -783,7 +796,7 @@ async fn build_notifiers(
                     Ok(wn) => {
                         let notifier = Arc::new(wn);
                         info!(
-                            url = %url,
+                            url = %crate::config::redacted_endpoint(&url),
                             "blocked-action webhook notifier installed (with burst suppression)"
                         );
                         n.webhook.replace(Some(notifier));
@@ -805,7 +818,7 @@ async fn build_notifiers(
                     .with_user_map(slack_cfg.user_map)
                     .with_burst(slack_suppressor.clone());
                 let notifier = Arc::new(sn);
-                info!(url = %url, "blocked-action slack notifier installed (with burst suppression)");
+                info!(url = %crate::config::redacted_endpoint(&url), "blocked-action slack notifier installed (with burst suppression)");
                 n.slack.replace(Some(notifier));
             }
             Err(e) => warn!(error = %e, "SlackNotifier build failed; slack disabled"),
@@ -969,13 +982,13 @@ fn build_siem_sink(cfg: &Config, tee: TeeStream) -> TeeStream {
                 let interval = std::time::Duration::from_secs(cfg.siem_batch_max_age_secs);
                 fwd = fwd.with_batching(size, interval);
                 info!(
-                    url = %url,
+                    url = %crate::config::redacted_endpoint(url),
                     batch_size = size,
                     flush_secs = cfg.siem_batch_max_age_secs,
                     "SIEM forwarder installed (batched)"
                 );
             } else {
-                info!(url = %url, "SIEM forwarder installed (per-event)");
+                info!(url = %crate::config::redacted_endpoint(url), "SIEM forwarder installed (per-event)");
             }
             let arc_fwd = Arc::new(fwd);
             if arc_fwd.batching_enabled() {

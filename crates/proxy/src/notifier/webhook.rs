@@ -206,7 +206,9 @@ impl WebhookNotifier {
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, attempt, "notifier: transport error");
+                    // Strip reqwest's ` for url (…)` Display suffix — a generic
+                    // webhook URL may embed auth in its path/query.
+                    warn!(error = %e.without_url(), attempt, "notifier: transport error");
                     if attempt > self.max_retries {
                         metrics::counter!(
                             "proxilion_notifier_send_failures_total",

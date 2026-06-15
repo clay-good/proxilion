@@ -24,6 +24,30 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Render a capability URL down to a non-secret `scheme://host[:port]` label
+/// for logging.
+///
+/// Several operator-supplied endpoints embed secrets *in the URL itself*:
+/// a Slack incoming-webhook URL carries its token in the path
+/// (`hooks.slack.com/services/T…/B…/XXXX`), a generic webhook or SIEM URL may
+/// carry auth in the path/query, and a NATS URL may carry `user:pass@` userinfo.
+/// Logging the raw URL (`url = %url`, or a `reqwest::Error` whose `Display`
+/// appends ` for url (…)`) leaks those secrets into log aggregation/SIEM. This
+/// strips everything but scheme + host + port. Unparseable input collapses to a
+/// fixed placeholder rather than echoing the raw string.
+pub(crate) fn redacted_endpoint(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(u) => match u.host_str() {
+            Some(host) => match u.port() {
+                Some(port) => format!("{}://{}:{}", u.scheme(), host, port),
+                None => format!("{}://{}", u.scheme(), host),
+            },
+            None => format!("{}://(no host)", u.scheme()),
+        },
+        Err(_) => "(unparseable url)".to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -549,6 +573,34 @@ fn check_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacted_endpoint_strips_secret_bearing_url_parts() {
+        // Slack webhook: the token in the path must not survive. (The path
+        // segments are deliberately NOT in Slack's real T…/B…/<token> shape so
+        // GitHub push-protection doesn't flag this fixture as a live secret;
+        // what we assert is that everything after the host is dropped.)
+        let slack = "https://hooks.slack.com/services/TEAMID/CHANID/path-token-fixture";
+        let r = redacted_endpoint(slack);
+        assert_eq!(r, "https://hooks.slack.com");
+        assert!(!r.contains("path-token"), "path token leaked: {r}");
+
+        // Generic webhook with auth in query.
+        let wh = redacted_endpoint("https://hooks.example.com:8443/ingest?token=s3cr3t");
+        assert_eq!(wh, "https://hooks.example.com:8443");
+        assert!(!wh.contains("s3cr3t"), "query secret leaked: {wh}");
+
+        // NATS userinfo credentials must not survive.
+        let nats = redacted_endpoint("nats://user:p%40ss@nats.internal:4222");
+        assert_eq!(nats, "nats://nats.internal:4222");
+        assert!(
+            !nats.contains("p%40ss") && !nats.contains("user"),
+            "userinfo leaked: {nats}"
+        );
+
+        // Unparseable input collapses to a fixed placeholder (never echoed).
+        assert_eq!(redacted_endpoint("not a url"), "(unparseable url)");
+    }
 
     #[test]
     fn defaults_build_in_dev_mode() {

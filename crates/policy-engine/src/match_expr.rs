@@ -61,6 +61,126 @@ pub fn evaluate(expr: &Yaml, ctx: &RequestContext) -> Result<bool, MatchError> {
     Ok(true)
 }
 
+/// Statically validate a match expression with no request context.
+///
+/// `evaluate` only *reaches* a given regex / threshold / operator once a live
+/// request makes the enclosing clause matter, and it short-circuits on the
+/// first false top-level clause — so an authoring mistake (bad regex, unknown
+/// operator, non-numeric threshold) can lurk untriggered until the precise
+/// request that walks into it, at which point the request fails closed (deny).
+/// `validate` walks *every* branch up front and surfaces those errors, which is
+/// what `proxilion-cli policy validate` needs to be a real pre-deploy gate
+/// rather than a YAML-shape check. Values built from a `${...}` template only
+/// take their final form at request time, so they are checked structurally but
+/// their regex is not compiled here.
+pub fn validate(expr: &Yaml) -> Result<(), MatchError> {
+    if expr.is_null() {
+        return Ok(());
+    }
+    let map = expr.as_mapping().ok_or_else(|| MatchError::BadShape {
+        op: "<match>".into(),
+        expected: "mapping",
+        got: type_name(expr),
+    })?;
+    for (k, v) in map {
+        let key = k.as_str().ok_or_else(|| MatchError::BadShape {
+            op: "<match>".into(),
+            expected: "string key",
+            got: type_name(k),
+        })?;
+        validate_entry(key, v)?;
+    }
+    Ok(())
+}
+
+fn validate_entry(key: &str, val: &Yaml) -> Result<(), MatchError> {
+    match key {
+        "all" | "any" => {
+            let seq = val.as_sequence().ok_or_else(|| MatchError::BadShape {
+                op: key.to_string(),
+                expected: "sequence",
+                got: type_name(val),
+            })?;
+            for child in seq {
+                validate(child)?;
+            }
+            Ok(())
+        }
+        "not" => validate(val),
+        "exists" => {
+            val.as_str().ok_or_else(|| MatchError::BadShape {
+                op: "exists".into(),
+                expected: "string",
+                got: type_name(val),
+            })?;
+            Ok(())
+        }
+        field => validate_field(field, val),
+    }
+}
+
+fn validate_field(field: &str, val: &Yaml) -> Result<(), MatchError> {
+    let map = val.as_mapping().ok_or_else(|| MatchError::BadShape {
+        op: field.to_string(),
+        expected: "operator mapping",
+        got: type_name(val),
+    })?;
+    for (k, v) in map {
+        let op = k.as_str().ok_or_else(|| MatchError::BadShape {
+            op: "<op>".into(),
+            expected: "string",
+            got: type_name(k),
+        })?;
+        validate_op(op, v)?;
+    }
+    Ok(())
+}
+
+fn validate_op(op: &str, rhs: &Yaml) -> Result<(), MatchError> {
+    match op {
+        "equals" | "not_equals" => match rhs {
+            Yaml::String(_) | Yaml::Number(_) | Yaml::Bool(_) | Yaml::Null => Ok(()),
+            other => Err(MatchError::BadShape {
+                op: "<rhs>".into(),
+                expected: "scalar",
+                got: type_name(other),
+            }),
+        },
+        "in" | "not_in" => {
+            rhs.as_sequence().ok_or_else(|| MatchError::BadShape {
+                op: op.to_string(),
+                expected: "sequence",
+                got: type_name(rhs),
+            })?;
+            Ok(())
+        }
+        "matches" => {
+            let pat = rhs.as_str().ok_or_else(|| MatchError::BadShape {
+                op: "matches".into(),
+                expected: "string",
+                got: type_name(rhs),
+            })?;
+            if !pat.contains("${") {
+                regex::Regex::new(pat).map_err(|_| MatchError::BadShape {
+                    op: "matches".into(),
+                    expected: "valid regex",
+                    got: pat.to_string(),
+                })?;
+            }
+            Ok(())
+        }
+        "greater_than" | "less_than" => {
+            rhs_as_number(rhs).ok_or_else(|| MatchError::BadShape {
+                op: op.to_string(),
+                expected: "number",
+                got: type_name(rhs),
+            })?;
+            Ok(())
+        }
+        other => Err(MatchError::UnsupportedOp(other.to_owned())),
+    }
+}
+
 fn eval_entry(key: &str, val: &Yaml, ctx: &RequestContext) -> Result<bool, MatchError> {
     match key {
         "all" => seq_each(val, "all", ctx, |b, acc| acc && b, true),
@@ -1286,6 +1406,65 @@ body.tier:
             }
             other => panic!("expected Template(UnknownVar), got {other:?}"),
         }
+    }
+
+    // --- static validate() (context-free, every-branch) -----------
+
+    #[test]
+    fn validate_catches_unknown_operator_behind_a_short_circuiting_clause() {
+        // `evaluate` would short-circuit on the first false top-level clause and
+        // never reach the typo'd operator; `validate` must catch it regardless.
+        let y = parse(
+            r#"
+user.email: { equals: nobody@nowhere }
+body.recipient_count: { greatar_than: 5 }
+"#,
+        );
+        let err = validate(&y).unwrap_err();
+        assert!(matches!(err, MatchError::UnsupportedOp(ref op) if op == "greatar_than"));
+    }
+
+    #[test]
+    fn validate_catches_uncompilable_literal_regex() {
+        let y = parse(r#"user.email: { matches: "[unclosed" }"#);
+        let err = validate(&y).unwrap_err();
+        assert!(
+            matches!(err, MatchError::BadShape { ref op, expected, .. } if op == "matches" && expected == "valid regex")
+        );
+    }
+
+    #[test]
+    fn validate_catches_non_numeric_threshold() {
+        let y = parse(r#"body.recipient_count: { greater_than: "not-a-number" }"#);
+        let err = validate(&y).unwrap_err();
+        assert!(
+            matches!(err, MatchError::BadShape { ref op, expected: "number", .. } if op == "greater_than")
+        );
+    }
+
+    #[test]
+    fn validate_accepts_valid_and_templated_expressions() {
+        // A well-formed multi-operator expression validates clean.
+        let ok = parse(
+            r#"
+all:
+  - user.email: { matches: "^[a-z]+@acme\\.com$" }
+  - body.recipient_count: { greater_than: 5 }
+  - body.to_domains: { not_in: ["${customer_domain}"] }
+not: { exists: body.flag }
+"#,
+        );
+        assert!(
+            validate(&ok).is_ok(),
+            "valid expr must validate: {:?}",
+            validate(&ok)
+        );
+        // A template-bearing regex is accepted structurally (final form is only
+        // known at request time, so it is not compiled here).
+        let templated = parse(r#"user.email: { matches: "^${user.email}$" }"#);
+        assert!(validate(&templated).is_ok());
+        // Null / empty match validates (matches everything).
+        assert!(validate(&Yaml::Null).is_ok());
     }
 
     #[test]

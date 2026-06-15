@@ -6,7 +6,15 @@
 
 use serde::{Deserialize, Serialize};
 
+// `deny_unknown_fields` makes a misspelled key fail loudly instead of silently
+// dropping to a permissive default. Without it, `decison: block` (typo) leaves
+// the real `decision` field at its `Null` default → `parse_decision` returns
+// `Allow`, and a fat-fingered `mtch:` leaves `match_` Null → matches every
+// request: a fat-finger turns an intended `block` policy into match-everything
+// allow. `Engine::validate` can't catch this (a Null decision is a *valid*
+// Allow), so the schema must reject the unknown key at parse time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyDoc {
     pub id: String,
     pub vendor: String,
@@ -924,6 +932,21 @@ mod tests {
             bad.is_err(),
             "unknown-field object must NOT silently deserialize as either variant",
         );
+    }
+
+    #[test]
+    fn policy_doc_rejects_unknown_keys_so_a_typod_field_cant_fail_open() {
+        // A misspelled `decision` (here `decison`) must NOT parse: without
+        // deny_unknown_fields it would drop to the Null default → Allow,
+        // silently turning a block policy into match-everything allow.
+        let typo = "- id: x\n  vendor: g\n  action: a\n  decison: block\n";
+        assert!(
+            parse_policies(typo).is_err(),
+            "a typo'd `decision` key must be rejected, not silently dropped to Allow"
+        );
+        // The correctly-spelled form parses.
+        let ok = "- id: x\n  vendor: g\n  action: a\n  decision: block\n";
+        assert!(parse_policies(ok).is_ok());
     }
 
     #[test]

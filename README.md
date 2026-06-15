@@ -225,7 +225,7 @@ infrastructure. CAT keys + plaintext SaaS payloads belong inside your
 perimeter, not someone else's. To minimize the in-memory cleartext
 surface: **adapters opt into body-field exposure**. The Drive read adapter
 declares no body fields in the policy context; only adapters that
-actually need them (Gmail send → `body.to_domain`) do.
+actually need them (Gmail send → `body.to_domains` / `body.external_recipient`) do.
 
 In **Modes 2 and 3**, the proxy never sees the body or the OAuth token.
 The platform sends us metadata; we evaluate, mint a PCA, and respond.
@@ -318,7 +318,7 @@ pipes). Destructive commands take `--dry-run` to preview the blast radius
 | `status` / `health` / `selftest` | one-screen readiness + synthetic end-to-end probe |
 | `pic show <id>` / `pic verify <id>` | fetch a PCA; walk the chain leaf→root and report invariant verification |
 | `actions tail` / `actions list` / `actions export` | live SSE stream / query / bulk export of the signed action log |
-| `policy list` / `policy show <id>` / `policy validate <file>` / `policy diff` | inspect the loaded rule set; `validate` parse-checks a candidate YAML locally (CI-safe, no proxy hit) |
+| `policy list` / `policy show <id>` / `policy validate <file>` / `policy diff` | inspect the loaded rule set; `validate` parses **and compiles** a candidate YAML locally — decision shapes, read-filter regexes, and match-expression operators/regexes/thresholds, plus unknown-key rejection — so the `BadDecision`/`BadRegex`/`UnsupportedOp` class is caught in CI, not as a fail-closed 500 on the first matching request (no proxy hit) |
 | `policy set-mode <id> …` / `policy edit` / `policy reload` | flip observe↔enforce, `$EDITOR` the live YAML, hot-reload |
 | `policy simulate` | replay traffic and report would-have-blocked deltas per policy |
 | `blocked list` / `blocked show <id>` / `blocked approve <id>` / `blocked reject <id>` | the human-in-the-loop queue |
@@ -453,7 +453,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through nine rounds of
+**Verification posture.** The shipped code has been through ten rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -462,10 +462,22 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
-The most recent pass came back clean across all but one low-severity
-display-correctness item (an SSE multibyte-codepoint reassembly fix in the CLI
-live-tail). This is a track record, not a guarantee — the threat-model table
-above states the honest ceiling of an interception proxy.
+The tenth pass closed a capability-URL secret leak (Slack/webhook/SIEM endpoint
+tokens reaching logs via `reqwest`'s URL-bearing error Display and boot-time
+`info!` lines), made `policy validate` compile policies rather than only
+shape-check the YAML, hardened two fail-open shapes to fail closed (a typo'd
+policy key, a malformed PCA-cache `ops` column), and bounded the CLI live-tail's
+SSE reassembly buffer. This is a track record, not a guarantee — the
+threat-model table above states the honest ceiling of an interception proxy.
+
+**One known pre-production gap, by design.** The federation-bridge token
+signature is **not** verified in M0/M1 — upstream `provenance-bridge` ships no
+binary target yet, so `/oauth/bridge/callback` trusts the token payload
+(spec.md §0.4). Anyone who can reach that callback could forge `p_0`/`ops`, so
+the proxy emits a loud `warn!` at boot whenever the OAuth router is mounted and
+the route must not be exposed in production until the JWKS-backed
+`jsonwebtoken::decode` swap lands. The smoke/CI/demo flows use the stub
+deliberately.
 
 ## The Skill Overreach problem
 

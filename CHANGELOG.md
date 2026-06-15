@@ -210,6 +210,80 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Capability-URL secrets leaked into logs** (a tenth-audit-pass finding,
+  2026-06-15). A Slack incoming-webhook URL carries its token *in the path*
+  (`hooks.slack.com/services/T…/B…/XXXX`), and generic-webhook / SIEM URLs may
+  carry auth in path/query, NATS URLs `user:pass@` userinfo. Two leak classes:
+  (a) transport-error logs formatted a `reqwest::Error` with `%e`, and reqwest's
+  `Display` appends ` for url (…)` — so any DNS/connect/TLS failure wrote the
+  full secret-bearing endpoint into a WARN line
+  ([notifier/slack.rs](crates/proxy/src/notifier/slack.rs),
+  [notifier/webhook.rs](crates/proxy/src/notifier/webhook.rs),
+  [forwarder/siem.rs](crates/proxy/src/forwarder/siem.rs)); (b) boot-time
+  `info!(url = %url, …)` lines logged the raw endpoint *unconditionally* on every
+  start ([server.rs](crates/proxy/src/server.rs): webhook/Slack/SIEM/NATS
+  installs). Fixed by stripping the URL from transport errors via
+  `reqwest::Error::without_url()` and routing every boot log through a new
+  [`config::redacted_endpoint`](crates/proxy/src/config.rs) helper that renders
+  only `scheme://host[:port]` (userinfo/path/query dropped; unparseable input →
+  a fixed placeholder, never echoed). New test
+  `redacted_endpoint_strips_secret_bearing_url_parts`. MEDIUM (secret exposure to
+  log aggregation/SIEM).
+- **`proxilion-cli policy validate` under-validated — it green-lit policies the
+  engine rejects at runtime** (a tenth-audit-pass finding, 2026-06-15). The
+  command ran only `yaml::parse_policies` (a YAML-shape check), so a bad
+  read-filter regex, an unknown `decision`, or a typo'd match operator
+  (`equls:`) passed `✓ valid` with exit 0 — then hard-denied (500, fail-closed)
+  every matching request on deploy. Worse, the runtime error page literally
+  tells operators to run `policy validate` to catch exactly that class. Fixed by
+  adding [`Engine::validate`](crates/policy-engine/src/rego.rs) (compiles every
+  policy's decision shape + read-filter regexes) and a context-free, every-branch
+  [`match_expr::validate`](crates/policy-engine/src/match_expr.rs) (operator
+  vocabulary + literal regex/threshold compilation, lenient on `${…}`-templated
+  values), wired into the CLI. New tests
+  `engine_validate_compiles_decision_read_filter_and_match_beyond_parse` and the
+  `validate_*` match-expr suite. MEDIUM (operator-trust / availability).
+- **Two fail-open shapes hardened to fail closed** (a tenth-audit-pass finding,
+  2026-06-15). (a) `PolicyDoc` lacked `#[serde(deny_unknown_fields)]`, so a
+  fat-fingered key (`decison: block`) silently dropped to the permissive default
+  — `decision` Null → `Allow`, `match` Null → match-everything — turning an
+  intended block policy into match-everything allow that `Engine::validate`
+  cannot catch (a Null decision is a *valid* Allow). Now rejected at parse time
+  ([yaml.rs](crates/policy-engine/src/yaml.rs); test
+  `policy_doc_rejects_unknown_keys_so_a_typod_field_cant_fail_open`). (b) The
+  PCA-cache `get` decoded a malformed `ops` JSONB with `unwrap_or_default()` → an
+  *empty* op set, which is a subset of every authority — a monotonicity-bypass
+  shape the moment any caller trusts `cached.ops`. Now a new
+  `CacheError::Decode` fails the lookup closed
+  ([pic/cache.rs](crates/proxy/src/pic/cache.rs)), surfacing as `AuthFail::Other`
+  (401) in the auth middleware. LOW (defense-in-depth; neither reachable as an
+  exploit today).
+- **`proxilion-cli actions tail` SSE reassembly buffer was unbounded** (a
+  tenth-audit-pass finding, 2026-06-15). The live-tail loop appended decoded
+  bytes to `buf` and only drained on a `\n\n` frame delimiter, so a server (or an
+  on-path peer of the long-lived SSE connection) that streamed bytes without ever
+  emitting a delimiter grew `buf` until the operator's CLI OOM'd — the proxy
+  bounds its own upstream reads at 10 MB but the client had no analog. Bounded at
+  10 MB with a clean bail ([cli/src/main.rs](crates/cli/src/main.rs)). LOW
+  (client-side DoS).
+- **Federation-bridge signature stub now warns loudly at boot.** `/oauth/bridge/
+  callback` trusts the federation token *payload* without verifying its signature
+  (M0/M1 — upstream `provenance-bridge` has no binary target; spec.md §0.4), so
+  anyone reaching it could forge `p_0`/`ops`. The stub shipped with no runtime
+  signal. It now emits a loud `warn!` whenever the OAuth router is mounted
+  ([server.rs](crates/proxy/src/server.rs)), mirroring the
+  `PROXILION_DISABLE_OPERATOR_AUTH` posture, so the documented pre-production gap
+  can never ship silently. (Full JWKS verification remains the upstream-blocked
+  swap; spec.md §15 #2.)
+- **Docs drift in [ui-less-surfaces.md](docs/specs/ui-less-surfaces.md)** (a
+  tenth-audit-pass finding): a SQL block mis-captioned `0005_operator_tokens.sql`
+  (it is `0006`); copy-pasteable CLI examples using flags that don't exist
+  (`actions export --compress`, `actions tail --output`/`--filter`, `blocked list
+  --pending --since`, `killswitch revoke`, `--endpoint`/`$PROXILION_ENDPOINT`)
+  corrected to the real surface (`--format`, `--decision`, `--status`,
+  `killswitch user`, `--url`/`$PROXILION_URL`); and a fictional
+  `PROXILION_METRICS_EXPORTER`/OTLP env var replaced with the actual
+  Prometheus-on-`/metrics` story.
 - **`proxilion-cli actions tail` dropped a whole SSE chunk on a multibyte
   codepoint split across a TCP fragment boundary** (a ninth-audit-pass finding,
   2026-06-15). The live-tail loop in [cli/src/main.rs](crates/cli/src/main.rs)

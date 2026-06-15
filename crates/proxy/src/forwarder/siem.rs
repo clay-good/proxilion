@@ -232,7 +232,9 @@ impl SiemForwarder {
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, attempt, count, "siem batch: transport error");
+                    // `without_url()` strips reqwest's ` for url (…)` suffix —
+                    // the SIEM URL may carry auth in its path/query.
+                    warn!(error = %e.without_url(), attempt, count, "siem batch: transport error");
                     if attempt > self.max_retries {
                         metrics::counter!(
                             "proxilion_siem_forward_failures_total",
@@ -363,7 +365,7 @@ impl ActionStream for SiemForwarder {
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, attempt, "siem: webhook transport error");
+                    warn!(error = %e.without_url(), attempt, "siem: webhook transport error");
                     if attempt > self.max_retries {
                         metrics::counter!(
                             "proxilion_siem_forward_failures_total",

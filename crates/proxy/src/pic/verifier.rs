@@ -294,8 +294,19 @@ fn check_invariants(
             parent_p0: parent.p_0.value.clone(),
         });
     }
+    // PIC Identity invariant (spec.md §1.5 #5, §6.3 #2): `child.ops ⊆ parent.ops`.
+    // Subset is **wildcard-aware** — `Pca::contains_op` is the exact primitive
+    // the Trust Plane mints the chain under (provenance-core `Pca::contains_op`
+    // / `OperationSet::is_subset_of`): `drive:read:*` *contains*
+    // `drive:read:file/0Bw…`, and `*` contains everything. A plain
+    // `o == op` string-equality here rejected every legitimately-narrowed chain
+    // (the production shape: a wildcard PCA_1 → a concrete per-request PCA_2,
+    // see `narrowed_ops_for_pca1` + the adapters' per-action `required_ops`) as
+    // a *false* `Monotonicity` violation — and falsely incremented
+    // `proxilion_pic_invariant_violations_total{kind="monotonicity"}`. Matching
+    // the issuer's semantics keeps the verifier in lockstep with the mint.
     for op in &child.ops {
-        if !parent.ops.iter().any(|o| o == op) {
+        if !parent.contains_op(op) {
             return Err(VerifierError::Monotonicity {
                 missing: op.clone(),
             });
@@ -556,6 +567,49 @@ mod tests {
         );
         let _ = signed1;
         let _ = cat;
+    }
+
+    #[test]
+    fn check_invariants_accepts_wildcard_narrowing_to_concrete_op() {
+        // Regression: the production chain shape narrows a *wildcard* parent op
+        // (`drive:read:engineering/*`, the granted-scope ops carried on PCA_1)
+        // to a *concrete* leaf op (`drive:read:engineering/file1`, an adapter's
+        // per-request `required_ops`). This is a valid PIC subset — the Trust
+        // Plane mints it — but a plain string-equality monotonicity check
+        // rejected it as a false `Monotonicity` violation. `Pca::contains_op`
+        // (the issuer's own primitive) accepts it.
+        let cat = KeyPair::generate("cat-test");
+        let executor = KeyPair::generate("proxy-test");
+
+        let (id0, cbor0, pca0) = signed_pca_0(
+            &cat,
+            "alice@demo.local",
+            &["drive:read:engineering/*", "gmail:send:alice"],
+        );
+        let signed0 = SignedPca::from_bytes(&cbor0).unwrap();
+
+        // Successor narrows the wildcard to one concrete file under it.
+        let (id1, cbor1, pca1) = signed_pca_successor(
+            &cat,
+            &executor,
+            &pca0,
+            &signed0,
+            &["drive:read:engineering/file1"],
+        );
+
+        check_invariants(&pca1, &pca0, id1, id0, &signed0)
+            .expect("concrete op under a wildcard parent must verify as a subset");
+
+        // Negative: a concrete op under a *different* wildcard branch is still
+        // a real violation (the wildcard prefix must actually cover it).
+        let (id_bad, cbor_bad, pca_bad) =
+            signed_pca_successor(&cat, &executor, &pca0, &signed0, &["drive:read:hr/file1"]);
+        let err = check_invariants(&pca_bad, &pca0, id_bad, id0, &signed0).unwrap_err();
+        assert!(
+            matches!(err, VerifierError::Monotonicity { ref missing } if missing == "drive:read:hr/file1"),
+            "got {err:?}"
+        );
+        let _ = (cbor1, cbor_bad);
     }
 
     #[test]

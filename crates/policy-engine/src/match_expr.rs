@@ -204,15 +204,48 @@ fn apply_op(
             Ok(lhs.map(|v| re.is_match(v)).unwrap_or(false))
         }
         "greater_than" | "less_than" => {
+            // The RHS is the policy-authored threshold. A non-numeric threshold
+            // is an authoring error, not runtime data, so surface it as
+            // `BadShape` — which the adapters turn into a fail-CLOSED request
+            // rejection — rather than silently returning false, which would make
+            // a deny gate never fire (a YAML-quoted threshold like
+            // `greater_than: "100"` deserializes to a `String`, not a `Number`).
+            // A *numeric* string is accepted as the number it plainly denotes.
+            // This mirrors `matches`, which BadShape-errors on a malformed RHS
+            // while degrading a non-matching LHS to false.
+            let b = rhs_as_number(rhs).ok_or_else(|| MatchError::BadShape {
+                op: op.to_string(),
+                expected: "number",
+                got: type_name(rhs),
+            })?;
+            // The LHS is the runtime request value: a non-numeric value
+            // gracefully degrades to "no match" (pinned by the
+            // {greater,less}_than_non_numeric_lhs tests).
             let a = lhs.and_then(|v| v.parse::<f64>().ok());
-            let b = rhs.as_f64().or_else(|| rhs.as_i64().map(|i| i as f64));
-            match (a, b) {
-                (Some(a), Some(b)) => Ok(if op == "greater_than" { a > b } else { a < b }),
-                _ => Ok(false),
-            }
+            Ok(match a {
+                Some(a) => {
+                    if op == "greater_than" {
+                        a > b
+                    } else {
+                        a < b
+                    }
+                }
+                None => false,
+            })
         }
         other => Err(MatchError::UnsupportedOp(other.to_owned())),
     }
+}
+
+/// Coerce a policy-authored `greater_than`/`less_than` threshold to a number.
+/// Accepts a YAML number or a numeric *string* (`greater_than: "100"` — a common
+/// quoting slip). Returns `None` for a genuinely non-numeric threshold (bool,
+/// null, non-numeric string), which the caller surfaces as a fail-closed
+/// `BadShape` error rather than a silent no-match.
+fn rhs_as_number(v: &Yaml) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|i| i as f64))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
 }
 
 fn as_str_subst(v: &Yaml, ctx: &RequestContext) -> Result<Option<String>, MatchError> {
@@ -489,10 +522,50 @@ mod tests {
     #[test]
     fn greater_than_non_numeric_lhs_returns_false() {
         // user.email isn't parseable as f64 — comparison returns false
-        // rather than erroring (graceful degradation per
-        // apply_op's `_ => Ok(false)` fall-through).
+        // rather than erroring (graceful degradation per the LHS
+        // `None => false` arm). The LHS is runtime data; non-numeric data is
+        // not an authoring error.
         let y = parse("user.email: { greater_than: 5 }");
         assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn greater_than_quoted_numeric_threshold_is_accepted() {
+        // A YAML-quoted threshold (`greater_than: "5"`) deserializes to a
+        // `String`, not a `Number`. It must still compare numerically —
+        // before the fix this silently returned false (the deny gate never
+        // fired), a fail-open footgun. recipient_count is 7, so 7 > 5 holds.
+        let y = parse(r#"body.recipient_count: { greater_than: "5" }"#);
+        assert!(evaluate(&y, &ctx()).unwrap());
+        // Symmetric for less_than: 7 < 10.
+        let y = parse(r#"body.recipient_count: { less_than: "10" }"#);
+        assert!(evaluate(&y, &ctx()).unwrap());
+        // And the quoted form agrees with the unquoted form on a non-match.
+        let y = parse(r#"body.recipient_count: { greater_than: "99" }"#);
+        assert!(!evaluate(&y, &ctx()).unwrap());
+    }
+
+    #[test]
+    fn greater_than_non_numeric_threshold_is_bad_shape_not_silent_false() {
+        // A genuinely non-numeric *threshold* is a policy-authoring error.
+        // It must fail CLOSED (BadShape → the adapters reject the request),
+        // never silently degrade to "no match" the way a non-numeric LHS does.
+        let y = parse(r#"body.recipient_count: { greater_than: "not-a-number" }"#);
+        let err = evaluate(&y, &ctx()).unwrap_err();
+        assert!(
+            matches!(err, MatchError::BadShape { ref op, expected: "number", .. } if op == "greater_than"),
+            "expected BadShape{{op=greater_than, expected=number}}, got {err:?}"
+        );
+        // A boolean threshold is likewise rejected (none of `rhs_as_number`'s
+        // three coercions succeed → `None`), here under less_than.
+        let y = parse("body.recipient_count: { less_than: true }");
+        assert!(matches!(
+            evaluate(&y, &ctx()).unwrap_err(),
+            MatchError::BadShape {
+                expected: "number",
+                ..
+            }
+        ));
     }
 
     // --- all / any / not / exists ---------------------------------

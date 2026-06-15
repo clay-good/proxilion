@@ -210,6 +210,31 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Silently-disabled numeric deny gate when a `greater_than`/`less_than`
+  threshold is YAML-quoted** (a seventh-audit-pass finding, 2026-06-15).
+  [match_expr.rs](crates/policy-engine/src/match_expr.rs) `apply_op` read the
+  policy-authored threshold only via `rhs.as_f64().or_else(as_i64)`, so a quoted
+  threshold (`greater_than: "100"`, which `serde_yaml` deserializes to a
+  `String`, not a `Number`) coerced to `None` and the whole comparison fell
+  through to `Ok(false)` — the deny condition **never matched**, so a gate an
+  operator believed was blocking (e.g. "block if `recipient_count` >
+  threshold") silently allowed every request. The RHS is policy config, not
+  runtime data, so a non-numeric threshold is an authoring error: it now fails
+  **closed** as a `MatchError::BadShape` — which every adapter's
+  `evaluate_with_trace` error arm turns into a request rejection
+  ([google_gmail.rs](crates/proxy/src/adapters/google_gmail.rs) `Err(e) =>
+  return Err(e.into())`) — exactly mirroring how the `matches` operator already
+  `BadShape`-errors on a malformed RHS. A *numeric* string is now accepted as
+  the number it plainly denotes (the common quoting slip just works). The LHS
+  (the runtime request value) is unchanged: a non-numeric value still degrades
+  gracefully to "no match" (it's data, not config), pinned by the existing
+  `{greater,less}_than_non_numeric_lhs` tests. New regression coverage:
+  `greater_than_quoted_numeric_threshold_is_accepted` (quoted `"5"`/`"10"`
+  compare numerically; quoted `"99"` agrees with the unquoted no-match) and
+  `greater_than_non_numeric_threshold_is_bad_shape_not_silent_false` (a
+  non-numeric / boolean threshold errors fail-closed). The other three sweep
+  lanes (adapters/MIME, crypto/PIC/oauth/auth, notifiers/forwarders/config/CLI)
+  were re-audited and cleared with no findings. MEDIUM.
 - **Reachable panic in the Slack `[Why?]` handler on attacker-influenced
   multibyte request snapshots** (a sixth-audit-pass finding, 2026-06-15).
   [api/notifier_slack.rs](crates/proxy/src/api/notifier_slack.rs) `handle_why`

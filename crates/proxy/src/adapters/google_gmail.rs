@@ -876,9 +876,14 @@ fn build_send_body_ctx(
                 .collect(),
         ),
     );
-    // `to_domain` is the FIRST unique recipient domain (alphabetical). This
-    // matches the spec.md §9 example policy which compares a single value via
-    // `not_in`. Multi-domain expansion is §2.2.
+    // `to_domain` is the FIRST unique recipient domain (alphabetical) — a
+    // convenience/display value and an input to single-domain ops narrowing.
+    // SECURITY: do NOT author an external-send gate against `to_domain`. It
+    // reflects only one recipient, so a send to `[internal, external]` whose
+    // internal domain sorts first masks the external one and the gate fails
+    // OPEN. Gate on `external_recipient` (bool over all recipients) or
+    // `to_domains` (the full sorted set) instead. Multi-domain ops expansion
+    // uses `to_domains` (§2.2).
     body.insert("to_domain".into(), Value::String(to_domain_first));
     body.insert(
         "to_domains".into(),

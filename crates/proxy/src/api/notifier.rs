@@ -48,12 +48,19 @@ pub fn router(state: NotifierApiState) -> Router {
             "/api/v1/notifier/test",
             post(test).route_layer(from_fn_with_state("notifier:test", scope_check)),
         )
+        // Each method gets its OWN `.route()` call so its scope layer wraps only
+        // that method. Chaining `get(..).route_layer(read).post(..).route_layer(write)`
+        // on a single MethodRouter applies the *second* `route_layer` over the
+        // whole router (axum semantics), double-gating GET behind `notifier:write`
+        // and defeating least-privilege `notifier:read` access. axum merges the two
+        // same-path MethodRouters since the methods don't overlap.
         .route(
             "/api/v1/notifier/config",
-            get(get_config)
-                .route_layer(from_fn_with_state("notifier:read", scope_check))
-                .post(set_config)
-                .route_layer(from_fn_with_state("notifier:write", scope_check)),
+            get(get_config).route_layer(from_fn_with_state("notifier:read", scope_check)),
+        )
+        .route(
+            "/api/v1/notifier/config",
+            post(set_config).route_layer(from_fn_with_state("notifier:write", scope_check)),
         )
         .with_state(state)
 }
@@ -258,66 +265,53 @@ struct TestRequest {
 // /api/v1/notifier/config (ui-less-surfaces.md §8.4)
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Strip secret-bearing fields from a stored notifier `config` JSON before it's
+/// returned by `GET /api/v1/notifier/config`.
+///
+/// - Each `secret_field` (opaque token / signing key) is removed and replaced
+///   with a `<field>_set` boolean so an operator can confirm "a value is set"
+///   without seeing it.
+/// - Each `url_field` is removed and replaced with a host-only `<field>_redacted`
+///   form. **SECURITY:** a webhook / Slack incoming-webhook URL is *itself* a
+///   bearer credential (possession ⇒ ability to post / replay a `?token=`), so
+///   the cleartext MUST NOT survive into the response handed to a `notifier:read`
+///   operator. This single helper (rather than three hand-rolled branches) is the
+///   fix for the divergence that left `url` / `incoming_webhook_url` leaking while
+///   only `smtp_url` was stripped.
+///
+/// Fields that are neither secret nor URL (e.g. Slack `user_map` — non-secret
+/// id↔email mappings already visible in the audit trail) pass through unchanged.
+fn redact_notifier_config(cfg: &Value, secret_fields: &[&str], url_fields: &[&str]) -> Value {
+    let mut c = cfg.clone();
+    if let Some(obj) = c.as_object_mut() {
+        for f in secret_fields {
+            let present = obj.remove(*f).is_some();
+            obj.insert(format!("{f}_set"), Value::Bool(present));
+        }
+        for f in url_fields {
+            if let Some(url) = cfg.get(*f).and_then(|v| v.as_str()) {
+                obj.insert(format!("{f}_redacted"), Value::String(redact_url(url)));
+                obj.remove(*f);
+            }
+        }
+    }
+    c
+}
+
 async fn get_config(State(state): State<NotifierApiState>) -> impl IntoResponse {
     let rows: Vec<(String, bool, Value)> =
         sqlx::query_as("SELECT id, enabled, config FROM notifier_config ORDER BY id")
             .fetch_all(&state.db)
             .await
             .unwrap_or_default();
-    let webhook = rows
-        .iter()
-        .find(|(id, _, _)| id == "webhook")
-        .map(|(_, enabled, cfg)| {
-            let mut c = cfg.clone();
-            if let Some(obj) = c.as_object_mut() {
-                obj.remove("hmac_key");
-                obj.insert(
-                    "hmac_key_set".into(),
-                    Value::Bool(cfg.get("hmac_key").is_some()),
-                );
-                if let Some(url) = cfg.get("url").and_then(|v| v.as_str()) {
-                    obj.insert("url_redacted".into(), Value::String(redact_url(url)));
-                }
-            }
-            json!({ "enabled": enabled, "config": c })
-        });
-    let slack = rows
-        .iter()
-        .find(|(id, _, _)| id == "slack")
-        .map(|(_, enabled, cfg)| {
-            let mut c = cfg.clone();
-            if let Some(obj) = c.as_object_mut() {
-                obj.remove("signing_secret");
-                obj.insert(
-                    "signing_secret_set".into(),
-                    Value::Bool(cfg.get("signing_secret").is_some()),
-                );
-                if let Some(url) = cfg.get("incoming_webhook_url").and_then(|v| v.as_str()) {
-                    obj.insert(
-                        "incoming_webhook_url_redacted".into(),
-                        Value::String(redact_url(url)),
-                    );
-                }
-                // user_map (ui-less-surfaces.md §5.3 dev 4) is not secret — Slack
-                // user ids + operator emails are routinely visible in the audit
-                // trail. Echo it through so operators can audit the mapping.
-            }
-            json!({ "enabled": enabled, "config": c })
-        });
-    let email = rows
-        .iter()
-        .find(|(id, _, _)| id == "email")
-        .map(|(_, enabled, cfg)| {
-            let mut c = cfg.clone();
-            // smtp_url usually contains user:pass — redact host portion only.
-            if let Some(obj) = c.as_object_mut() {
-                if let Some(url) = cfg.get("smtp_url").and_then(|v| v.as_str()) {
-                    obj.insert("smtp_url_redacted".into(), Value::String(redact_url(url)));
-                    obj.remove("smtp_url");
-                }
-            }
-            json!({ "enabled": enabled, "config": c })
-        });
+    let redact = |id: &str, secret_fields: &[&str], url_fields: &[&str]| {
+        rows.iter().find(|(rid, _, _)| rid == id).map(|(_, enabled, cfg)| {
+            json!({ "enabled": enabled, "config": redact_notifier_config(cfg, secret_fields, url_fields) })
+        })
+    };
+    let webhook = redact("webhook", &["hmac_key"], &["url"]);
+    let slack = redact("slack", &["signing_secret"], &["incoming_webhook_url"]);
+    let email = redact("email", &[], &["smtp_url"]);
     Json(json!({ "webhook": webhook, "slack": slack, "email": email }))
 }
 
@@ -742,6 +736,52 @@ mod tests {
         // No `://` separator — return as-is. Defensive: callers should
         // pass a real URL, but the helper shouldn't panic on garbage.
         assert_eq!(redact_url("just-a-token"), "just-a-token");
+    }
+
+    #[test]
+    fn redact_notifier_config_strips_url_borne_secrets_for_every_driver() {
+        // Regression for the secret-leak: webhook `url` and slack
+        // `incoming_webhook_url` are bearer credentials and MUST NOT survive
+        // into the GET response — only the redacted twin may. Mirrors the
+        // already-correct email `smtp_url` handling.
+        let webhook = redact_notifier_config(
+            &json!({"url": "https://hooks.example.com/x?token=SECRET", "hmac_key": "deadbeef"}),
+            &["hmac_key"],
+            &["url"],
+        );
+        assert!(webhook.get("url").is_none(), "cleartext webhook url leaked");
+        assert!(webhook.get("hmac_key").is_none(), "hmac_key leaked");
+        assert_eq!(webhook["hmac_key_set"], json!(true));
+        assert_eq!(
+            webhook["url_redacted"],
+            json!("https://hooks.example.com/...")
+        );
+        assert!(
+            !webhook.to_string().contains("SECRET"),
+            "the secret token must not appear anywhere in the output"
+        );
+
+        let slack = redact_notifier_config(
+            &json!({"incoming_webhook_url": "https://hooks.slack.com/services/T/B/SECRET", "user_map": {"U1": "a@b.c"}}),
+            &["signing_secret"],
+            &["incoming_webhook_url"],
+        );
+        assert!(
+            slack.get("incoming_webhook_url").is_none(),
+            "cleartext slack url leaked"
+        );
+        assert_eq!(slack["signing_secret_set"], json!(false));
+        // Non-secret fields (user_map) pass through untouched.
+        assert_eq!(slack["user_map"], json!({"U1": "a@b.c"}));
+        assert!(!slack.to_string().contains("SECRET"));
+
+        let email = redact_notifier_config(
+            &json!({"smtp_url": "smtps://user:pass@mail.example.com:465"}),
+            &[],
+            &["smtp_url"],
+        );
+        assert!(email.get("smtp_url").is_none());
+        assert!(!email.to_string().contains("pass"));
     }
 
     #[test]

@@ -2721,6 +2721,12 @@ async fn cmd_policy_simulate(
         .unwrap_or_else(|| "example.com".to_string());
 
     // 3. Page through /api/v1/actions until exhausted or the rows pre-date `since`.
+    // Clamp to the server's `1..=500` cap: a larger `--page-limit` makes the server
+    // return 500 rows AND a `next_before` cursor, but the `rows.len() < page_limit`
+    // terminator below would then fire after the FIRST page — silently replaying only
+    // 500 of potentially thousands of events and skewing the `--fail-if-delta-exceeds`
+    // CI gate. Clamping makes `rows.len() < page_limit` correctly mark the final page.
+    let page_limit = page_limit.clamp(1, 500);
     let mut before: Option<String> = None;
     let mut total: usize = 0;
     let mut would_now_block: HashMap<String, usize> = HashMap::new();

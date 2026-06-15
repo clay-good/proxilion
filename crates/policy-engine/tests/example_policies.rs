@@ -9,8 +9,11 @@ const POLICIES: &str = r#"
   vendor: google
   action: gmail.messages.send
   match:
-    body.to_domain:
-      not_in: ["${customer_domain}"]
+    # Gate on the all-recipients boolean, NOT the singular alphabetically-first
+    # `body.to_domain` — the latter fails open when an internal recipient sorts
+    # ahead of an external one. Mirrors production `config/policy.yaml`.
+    body.external_recipient:
+      equals: true
   decision: block
   override: requires_justification
   pic_mode: runtime-gate
@@ -49,11 +52,11 @@ fn drive_ctx(id: &str) -> RequestContext {
     }
 }
 
-fn gmail_ctx(to_domain: &str) -> RequestContext {
+fn gmail_ctx(external_recipient: bool) -> RequestContext {
     let mut body = HashMap::new();
     body.insert(
-        "to_domain".to_string(),
-        serde_json::Value::String(to_domain.to_string()),
+        "external_recipient".to_string(),
+        serde_json::Value::Bool(external_recipient),
     );
     RequestContext {
         vendor: "google".into(),
@@ -89,7 +92,7 @@ fn drive_get_resolves_ops_with_path_id() {
 #[test]
 fn gmail_external_send_blocks() {
     let engine = Engine::new(POLICIES).unwrap();
-    let out = engine.evaluate(&gmail_ctx("external.example")).unwrap();
+    let out = engine.evaluate(&gmail_ctx(true)).unwrap();
     assert_eq!(
         out.matched_policy_id.as_deref(),
         Some("gmail-external-send-gate")
@@ -108,7 +111,7 @@ fn gmail_external_send_blocks() {
 #[test]
 fn gmail_internal_send_does_not_match() {
     let engine = Engine::new(POLICIES).unwrap();
-    let out = engine.evaluate(&gmail_ctx("acme.com")).unwrap();
+    let out = engine.evaluate(&gmail_ctx(false)).unwrap();
     assert!(
         out.matched_policy_id.is_none(),
         "internal sends should not match the gate"

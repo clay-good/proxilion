@@ -210,6 +210,68 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **`GET /api/v1/notifier/config` leaked the cleartext webhook / Slack
+  incoming-webhook URL to `notifier:read` operators** (a fourth-audit-pass
+  finding, 2026-06-15). The handler
+  ([api/notifier.rs](crates/proxy/src/api/notifier.rs) `get_config`) redacted
+  `smtp_url` correctly but the webhook and Slack branches *inserted* the
+  redacted twin (`url_redacted` / `incoming_webhook_url_redacted`) while
+  leaving the original cleartext key in the response. A Slack incoming-webhook
+  URL and a `?token=`-bearing generic webhook URL are themselves bearer
+  credentials — possession alone lets you post into the customer's alert
+  channel — so a read-only operator was handed a postable secret. The three
+  hand-rolled redaction branches (whose divergence caused the leak) are now a
+  single pure `redact_notifier_config(cfg, secret_fields, url_fields)` helper
+  that removes every secret-bearing field. Pinned by
+  `redact_notifier_config_strips_url_borne_secrets_for_every_driver`.
+- **Env-var-unset silently clobbered file-configured SIEM / NATS / blocked-webhook
+  settings.** In [config.rs](crates/proxy/src/config.rs) `from_env_layer`, five
+  `Option`-valued fields (`nats_url`, `siem_webhook_url`, `siem_hmac_key_hex`,
+  `blocked_webhook_url`, `blocked_webhook_hmac_key_hex`) used an *unconditional*
+  `self.x = env::var(..).ok().filter(..)`, which evaluates to `None` when the
+  env var is unset. Because the TOML file is layered in **before** env, an
+  operator who configured the SIEM forwarder (or NATS, or the blocked-action
+  webhook) in their file and did not also set the matching env var had it
+  silently wiped on boot — dropping security-audit forwarding with no error.
+  Fixed to the guarded `if let Ok(v) = env::var(..)` pattern every other field
+  already uses (env still overrides, an explicit empty `VAR=` still means unset).
+  The same change leaves a file-set `siem_batch_size` intact on a malformed
+  `PROXILION_SIEM_BATCH_SIZE` instead of downgrading to per-event delivery.
+  Pinned by `from_env_layer_does_not_clobber_file_set_optional_fields_when_env_unset`.
+- **`GET /api/v1/notifier/config` was unintentionally gated on `notifier:write`.**
+  The route chained `get(get_config).route_layer("notifier:read").post(set_config).route_layer("notifier:write")`
+  on one `MethodRouter`; axum applies the *second* `route_layer` over the whole
+  router, so GET ended up wrapped by **both** scopes and a `notifier:read`-only
+  token got 403 — defeating least-privilege read access (load-bearing now that
+  the redacted read path above is safe to expose). Split into two same-path
+  `.route()` calls, one per method, matching every sibling module.
+- **`SiemHmacKey::from_hex` / `WebhookSecret::from_hex` panicked on a non-ASCII
+  HMAC key.** The length guards are byte-based but the parse loop sliced
+  `&hex[i..i+2]` by byte index; a multibyte codepoint (e.g. an emoji) straddling
+  an even offset slices off a char boundary and panics instead of returning the
+  graceful `KeyError` / `NotifierBuildError` every sibling malformed-input test
+  expects. Operator-config-triggered (a stray non-ASCII char in a pasted key),
+  not request-reachable. Fixed with an `is_ascii()` guard up front (valid hex is
+  ASCII anyway). Pinned by `hmac_key_rejects_non_ascii_without_panicking` and
+  `secret_rejects_non_ascii_without_panicking`.
+- **The documented `gmail-external-send-gate` example was fail-open.** The
+  canonical Layer-B example in [spec.md §9](docs/specs/spec.md) and the
+  `example_policies.rs` integration test gated on `body.to_domain` — the
+  *alphabetically-first* recipient domain. A send to `[bob@acme.com,
+  eve@evil.example]` sorts `acme.com` first, so `to_domain not_in [acme.com]`
+  evaluates false and the external recipient slips through. Production
+  `config/policy.yaml` already used the correct `body.external_recipient: { equals: true }`
+  boolean (computed over *all* recipients); the examples and the adapter's
+  field comment (which pointed operators *at* the dangerous pattern) are now
+  aligned to it. The singular `to_domain` field stays as a display/single-domain
+  narrowing value with an explicit "do not gate on this" security comment.
+- **`proxilion-cli policy simulate --page-limit > 500` silently truncated the
+  replay to the first 500 events.** The server clamps `/api/v1/actions` `limit`
+  to `1..=500` and returns a `next_before` cursor when more rows exist, but the
+  CLI's `rows.len() < page_limit` page terminator then fired after the first
+  page for any `--page-limit` above the cap — under-counting the replay and
+  skewing the `--fail-if-delta-exceeds` CI gate. Fixed by clamping `page_limit`
+  to `1..=500` so the terminator correctly identifies the final short page.
 - **Gmail external-send gate failed open on an RFC-5322-malformed recipient
   header.** `split_addresses`
   ([adapters/google_gmail.rs](crates/proxy/src/adapters/google_gmail.rs))

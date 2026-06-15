@@ -38,6 +38,12 @@ impl WebhookSecret {
                 "hmac secret must be at least 16 bytes (32 hex chars)".into(),
             ));
         }
+        // Byte-length guards above + a byte-index `&hex[i..i+2]` slice below would
+        // PANIC on a multibyte codepoint straddling an even offset. Reject non-ASCII
+        // up front so a stray emoji / accented char yields a graceful error.
+        if !hex.is_ascii() {
+            return Err(NotifierBuildError("hmac secret hex must be ASCII".into()));
+        }
         let mut out = Vec::with_capacity(hex.len() / 2);
         for i in (0..hex.len()).step_by(2) {
             let b = u8::from_str_radix(&hex[i..i + 2], 16)
@@ -314,6 +320,15 @@ mod tests {
         assert!(WebhookSecret::from_hex("").is_err());
         assert!(WebhookSecret::from_hex("aaa").is_err());
         assert!(WebhookSecret::from_hex("dead").is_err());
+    }
+
+    #[test]
+    fn secret_rejects_non_ascii_without_panicking() {
+        // Regression: a multibyte codepoint at an even byte offset would slice
+        // off a char boundary in `&hex[i..i+2]` and PANIC. 30 ASCII + '🔥'
+        // (4 bytes) clears the even-length / ≥32-byte guards; must Err, not panic.
+        let hex = format!("{}🔥", "a".repeat(30));
+        assert!(WebhookSecret::from_hex(&hex).is_err());
     }
 
     #[test]

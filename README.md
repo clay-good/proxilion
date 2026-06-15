@@ -292,9 +292,18 @@ the right-hand side of any clause may interpolate `${path.id}`,
 | `all` / `any` / `not` | combinators over sub-expressions | — |
 | `exists` | field is present | — |
 
-List-valued set semantics let a recipient-domain gate match directly on the
-array the adapter exposes, e.g. `body.to_domains: { not_in: ["${customer_domain}"] }`
-fires when every recipient is external.
+**Authoring an external-send gate — gate on the boolean, not a domain field.**
+The adapter computes `body.external_recipient` over **all** recipients
+(to + cc + bcc), so `body.external_recipient: { equals: true }` blocks a send
+the moment *any* recipient is external — the gate the example above uses.
+Do **not** gate on `body.to_domain` (the alphabetically-first recipient domain):
+a send to `[bob@acme.com, eve@evil.example]` sorts `acme.com` first, so a
+`to_domain not_in [acme.com]` clause never fires and the external recipient
+slips through — a fail-open hole. Note too that the list form
+`body.to_domains: { not_in: ["${customer_domain}"] }` fires only when *every*
+recipient is external (`not_in` = "no element in set"), so it also misses a
+mixed internal+external send; reach for it only when you genuinely mean
+"all-external," and use `external_recipient` for "any-external."
 
 ## CLI cheat sheet
 

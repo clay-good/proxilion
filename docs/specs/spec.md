@@ -509,8 +509,13 @@ Two complementary layers:
   vendor: google
   action: gmail.messages.send
   match:
-    to_domain:
-      not_in: ["${customer_domain}"]
+    # Gate on the boolean the adapter computes over ALL recipients (to+cc+bcc).
+    # Do NOT gate on the singular `body.to_domain` (the alphabetically-first
+    # recipient domain): a send to `[bob@acme.com, eve@evil.com]` sorts
+    # `acme.com` first, so a `to_domain not_in [acme.com]` gate would NOT fire
+    # and the external recipient slips through — a fail-open hole.
+    body.external_recipient:
+      equals: true
   decision: block
   override: requires_justification
   pic_mode: runtime-gate
@@ -1143,7 +1148,7 @@ Acceptance:
 
 **Pitfalls:** The federation_token from federation-bridge MUST be validated against the bridge's public key, fetched from its JWKS endpoint and cached. Skipping this is a critical vuln. Forgetting to intersect requested scope with PCA_0.ops before redirecting to Google means the agent could obtain a Google token broader than Alice's authority — Trust Plane will catch it at PCA_1 issuance but you should not even try.
 
-**Status:** Structurally complete; not yet end-to-end runnable. `cargo build --workspace` and `cargo test --workspace` both green with zero warnings. **Delivered:**
+**Status:** Done. Originally "structurally complete; not yet end-to-end runnable"; as of 2026-06-11 the postgres + wiremock harness exists and the §1.1 paths are exercised end-to-end in the CI `integration` job (real Postgres service) via the `db_backed_*` tests — `db_backed_bridge_callback_binds_session_on_match_and_rejects_replay` (federation state-binding + replay rejection), `db_backed_refresh_coalesces_50_concurrent_into_one_google_call` (the §1.1 deviation-3 concurrent-refresh count against a wiremock'd token endpoint), and `db_backed_operator_auth_boundary_enforces_token_and_scope`. `cargo build --workspace` and `cargo test --workspace` are green with zero warnings. **Delivered:**
 - [migrations/0001_oauth_pic.sql](../../migrations/0001_oauth_pic.sql) — six tables (`oauth_clients`, `oauth_sessions`, `google_tokens`, `pca_cache`, `agent_bearers`, `auth_codes`) plus a seeded `anthropic-managed-claude` client. One schema deviation: `auth_codes` carries `bearer_ciphertext` + `bearer_nonce` columns so the agent can fetch its `pxl_live_*` on the `/token` exchange without us storing the plaintext anywhere persistent. Single-use, 30s TTL.
 - [crates/proxy/src/crypto/](../../crates/proxy/src/crypto/) — AES-256-GCM `TokenCipher`, PKCE S256 verifier (constant-time via `subtle`, RFC 7636 §B vector test passes), `Bearer` with `Debug` that scrubs the token.
 - [crates/proxy/src/pic/](../../crates/proxy/src/pic/) — `PicExecutor` holds the proxy's Ed25519 executor key, lazily registers it with Trust Plane (`POST /v1/keys/executor`), mints successors via signed PoCs (`POST /v1/poc/process`). `PcaCache` is the postgres-backed leaf cache.
@@ -1347,7 +1352,7 @@ Acceptance:
 
 **Pitfalls:** Filtering binary file exports is meaningless — gate on content-type. Buffer responses with a 10MB cap; reject larger.
 
-**Status:** Structurally complete; not yet end-to-end live (same blocker as §1.1 — no postgres + wiremock harness in CI yet). `cargo build --workspace` is clean; 31 unit tests pass (12 new in this step). **Delivered:**
+**Status:** Done. Originally "structurally complete; not yet end-to-end live"; the postgres + wiremock harness landed 2026-06-11 (see deviation #1 below) and the full Drive `proxy_request` branch matrix now runs end-to-end in the CI `integration` job. `cargo build --workspace` is clean. **Delivered:**
 - [crates/proxy/src/adapters/action_stream.rs](../../crates/proxy/src/adapters/action_stream.rs) — `ActionEvent` schema + `ActionStream` async trait + `LoggingStream` (writes structured JSON to `tracing::info!`). NATS impl lands in §3.1.
 - [crates/proxy/src/adapters/read_filter.rs](../../crates/proxy/src/adapters/read_filter.rs) — `apply()` does per-pattern scan (literal + regex), supports `ReplaceWithMarker` / `StripSilently` / `BlockRequest`, gates on content-type (skips `application/octet-stream`, scans `application/json|text/*|application/xml`, conservatively scans when content-type is absent). Five-pattern unit tests cover all three actions plus the binary-skip and no-content-type cases. §1.4 will swap the per-pattern loop for a `RegexSet` with a criterion bench; the public shape stays.
 - [crates/proxy/src/adapters/error.rs](../../crates/proxy/src/adapters/error.rs) — `AppError` with structured `{ error, code, policy_id?, detail?, override_allowed }` JSON body. Codes: `policy_blocked` (403), `pic_invariant_violation` (403), `require_confirmation` (428), `rate_limited` (429), `upstream_too_large` / `upstream_unavailable` (502), `read_filter_blocked` (403), `policy_engine_error` (500), `internal_error` (500). The canonical, always-current catalogue (every code, default status, when it fires, suggested operator action) lives in [docs/error-codes.md](../error-codes.md) and is the source of truth — this inline list is a milestone summary.
@@ -1652,7 +1657,7 @@ Testing:
 
 ---
 
-**Status:** Done (structurally; live SaaS call deferred for the same reason as §1.3). `cargo build --workspace` clean; 58 unit + integration tests pass (11 new in `adapters::google_gmail::tests`, 3 new in `policy-engine/tests/gmail_external_send.rs`). **Delivered:**
+**Status:** Done. The flagship §9 external-send gate is integration-covered end-to-end in the CI `integration` job (`db_backed_gmail_send_external_recipient_is_blocked_403`, via the postgres + wiremock harness that landed 2026-06-11); only the live-Workspace **wire format** (that our send shaping matches Google's actual API) remains on manual verification — a wiremock can't prove it. `cargo build --workspace` clean. **Delivered:**
 - [crates/proxy/src/adapters/google_gmail.rs](../../crates/proxy/src/adapters/google_gmail.rs) — three routes (`POST /google/gmail/v1/users/me/messages/send`, `GET …/messages`, `GET …/messages/{id}`). The send path: base64url-decodes the `{ raw }` payload, parses RFC 2822 with `mailparse`, and surfaces structured fields under `body.*` (`to`, `cc`, `bcc`, `to_domain` (first unique recipient domain), `to_domains` (sorted unique list), `external_recipient` (bool), `recipient_count`, `attachment_count`, `subject_present`, `from_p0`). The same `proxy_request` template the Drive adapter uses (Layer-B policy → PCA_2 successor with narrowed ops → upstream → action event) flows through; reads also pick up the read filter when content-type is appropriate. Forwarded body is the agent's original raw payload, never the mailparse round-trip.
 - Body-field exposure follows the §5.4 default-deny rule: list/get expose nothing, send opts in to the recipient/subject fields explicitly. The Gmail send Google bearer remains adapter-internal.
 - [crates/proxy/Cargo.toml](../../crates/proxy/Cargo.toml) + [Cargo.toml](../../Cargo.toml) workspace add `mailparse = "0.15"`.
@@ -1997,7 +2002,7 @@ Tests:
 
 *(Same as v0 spec; ops template `calendar:read:${user.email}/event/${path.eid}` etc.)*
 
-**Status:** Done (structurally; live SaaS round-trip deferred for the same reason as §1.3 / §2.1 — no wiremock'd Google harness in CI). `cargo test --workspace` is green at 69 passing (6 new tests in this step). **Delivered:**
+**Status:** Done. The wiremock'd Google harness now exists in the CI `integration` job; the Calendar write-gate is integration-covered end-to-end (`db_backed_calendar_insert_external_attendee_is_blocked_403`). Only the live-Workspace **wire format** against a real account remains on manual verification (same as §2.1). `cargo test --workspace` is green. **Delivered:**
 
 - [crates/proxy/src/adapters/google_calendar.rs](../../crates/proxy/src/adapters/google_calendar.rs) — four routes sharing the `proxy_request` template established by Drive (§1.3) and Gmail (§2.1):
   - `GET  /google/calendar/v3/calendars/{calendarId}/events`            → `calendar.events.list`

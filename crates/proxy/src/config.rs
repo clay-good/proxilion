@@ -254,32 +254,44 @@ impl ConfigBuilder {
         if let Ok(v) = env::var("PROXILION_CUSTOMER_DOMAIN") {
             self.customer_domain = v;
         }
-        self.nats_url = env::var("PROXILION_NATS_URL")
-            .ok()
-            .filter(|s| !s.is_empty());
+        // These five are `Option`/`Some`-valued *and* settable from the TOML file,
+        // which is layered in BEFORE this env layer (see `Config::load`). They MUST
+        // use the same `if let Ok` guard as every other field: an unconditional
+        // `self.x = env::var(..).ok()...` evaluates to `None` when the var is unset
+        // and silently clobbers a file-configured value — disabling SIEM forwarding,
+        // NATS streaming, or blocked-action webhooks that the operator set in their
+        // file and reasonably believes are active. The empty-string filter is kept
+        // so an explicit `VAR=` still means "unset".
+        if let Ok(v) = env::var("PROXILION_NATS_URL") {
+            self.nats_url = Some(v).filter(|s| !s.is_empty());
+        }
         if let Ok(v) = env::var("PROXILION_NATS_SUBJECT_PREFIX") {
             self.nats_subject_prefix = v;
         }
-        self.siem_webhook_url = env::var("PROXILION_SIEM_WEBHOOK_URL")
-            .ok()
-            .filter(|s| !s.is_empty());
-        self.siem_hmac_key_hex = env::var("PROXILION_SIEM_HMAC_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
+        if let Ok(v) = env::var("PROXILION_SIEM_WEBHOOK_URL") {
+            self.siem_webhook_url = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("PROXILION_SIEM_HMAC_KEY") {
+            self.siem_hmac_key_hex = Some(v).filter(|s| !s.is_empty());
+        }
         if let Ok(v) = env::var("PROXILION_SIEM_BATCH_SIZE") {
-            self.siem_batch_size = v.parse::<usize>().ok().filter(|n| *n > 1);
+            // Leave the prior (file/default) value intact on a malformed value rather
+            // than silently downgrading to per-event delivery.
+            if let Ok(n) = v.parse::<usize>() {
+                self.siem_batch_size = Some(n).filter(|n| *n > 1);
+            }
         }
         if let Ok(v) = env::var("PROXILION_SIEM_BATCH_MAX_AGE_SECS") {
             if let Ok(n) = v.parse::<u64>() {
                 self.siem_batch_max_age_secs = n.max(1);
             }
         }
-        self.blocked_webhook_url = env::var("PROXILION_BLOCKED_WEBHOOK_URL")
-            .ok()
-            .filter(|s| !s.is_empty());
-        self.blocked_webhook_hmac_key_hex = env::var("PROXILION_BLOCKED_WEBHOOK_HMAC_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
+        if let Ok(v) = env::var("PROXILION_BLOCKED_WEBHOOK_URL") {
+            self.blocked_webhook_url = Some(v).filter(|s| !s.is_empty());
+        }
+        if let Ok(v) = env::var("PROXILION_BLOCKED_WEBHOOK_HMAC_KEY") {
+            self.blocked_webhook_hmac_key_hex = Some(v).filter(|s| !s.is_empty());
+        }
         if matches!(
             env::var("PROXILION_DISABLE_OPERATOR_AUTH").as_deref(),
             Ok("1") | Ok("true")
@@ -624,6 +636,69 @@ operator_auth_enforced = false
         assert_eq!(c.customer_domain, "acme.example");
         assert!(c.dev_mode);
         assert!(!c.operator_auth_enforced);
+    }
+
+    #[test]
+    fn from_env_layer_does_not_clobber_file_set_optional_fields_when_env_unset() {
+        // Regression: nats_url / siem_webhook_url / siem_hmac_key_hex /
+        // blocked_webhook_url / blocked_webhook_hmac_key_hex are Option-valued
+        // AND settable from the TOML file, which is layered BEFORE env. An
+        // unconditional `self.x = env::var(..).ok().filter(..)` would wipe the
+        // file value to None when the env var is unset — silently disabling SIEM
+        // forwarding / NATS streaming / blocked-action webhooks the operator
+        // configured in their file. Skip (don't mutate process-global env) on the
+        // rare chance these vars are set in this process, so we exercise exactly
+        // the "env unset" path.
+        for v in [
+            "PROXILION_NATS_URL",
+            "PROXILION_SIEM_WEBHOOK_URL",
+            "PROXILION_SIEM_HMAC_KEY",
+            "PROXILION_BLOCKED_WEBHOOK_URL",
+            "PROXILION_BLOCKED_WEBHOOK_HMAC_KEY",
+        ] {
+            if std::env::var(v).is_ok() {
+                return;
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("proxilion-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxilion.toml");
+        std::fs::write(
+            &path,
+            r#"
+dev_mode = true
+nats_url = "nats://nats.internal:4222"
+siem_webhook_url = "https://siem.internal/ingest"
+siem_hmac_key_hex = "00112233445566778899aabbccddeeff"
+blocked_webhook_url = "https://soc.internal/blocked"
+blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
+"#,
+        )
+        .unwrap();
+        let c = ConfigBuilder::defaults()
+            .from_file(&path)
+            .unwrap()
+            .from_env_layer()
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(c.nats_url.as_deref(), Some("nats://nats.internal:4222"));
+        assert_eq!(
+            c.siem_webhook_url.as_deref(),
+            Some("https://siem.internal/ingest")
+        );
+        assert_eq!(
+            c.siem_hmac_key_hex.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(
+            c.blocked_webhook_url.as_deref(),
+            Some("https://soc.internal/blocked")
+        );
+        assert_eq!(
+            c.blocked_webhook_hmac_key_hex.as_deref(),
+            Some("ffeeddccbbaa99887766554433221100")
+        );
     }
 
     #[test]

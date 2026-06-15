@@ -40,6 +40,13 @@ impl SiemHmacKey {
                 "HMAC key must be at least 16 bytes (32 hex chars)".into(),
             ));
         }
+        // The length guards above are byte-based; `&hex[i..i+2]` below is a byte-index
+        // slice. A non-ASCII (multibyte) codepoint straddling an even offset would slice
+        // off a char boundary and PANIC instead of returning a graceful `KeyError`.
+        // Reject non-ASCII up front (valid hex is ASCII-only anyway).
+        if !hex.is_ascii() {
+            return Err(KeyError("HMAC key hex must be ASCII".into()));
+        }
         let mut out = Vec::with_capacity(hex.len() / 2);
         for i in (0..hex.len()).step_by(2) {
             let byte = u8::from_str_radix(&hex[i..i + 2], 16)
@@ -421,6 +428,17 @@ mod tests {
     fn hmac_key_rejects_short() {
         assert!(SiemHmacKey::from_hex("dead").is_err());
         assert!(SiemHmacKey::from_hex("abc").is_err()); // odd length
+    }
+
+    #[test]
+    fn hmac_key_rejects_non_ascii_without_panicking() {
+        // Regression: the byte-length guards + the byte-index `&hex[i..i+2]`
+        // slice would PANIC ("byte index N is not a char boundary") on a
+        // multibyte codepoint straddling an even offset. Must be a graceful
+        // Err. 30 ASCII chars + a 4-byte '🔥' = even byte length ≥ 32, so it
+        // clears the length guards and would reach the slice.
+        let hex = format!("{}🔥", "a".repeat(30));
+        assert!(SiemHmacKey::from_hex(&hex).is_err());
     }
 
     #[test]

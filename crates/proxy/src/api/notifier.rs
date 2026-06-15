@@ -5,7 +5,9 @@
 //!   GET  /api/v1/notifier/show — current webhook + burst-suppressor state
 //!   POST /api/v1/notifier/test — send a synthetic BlockedNotification
 //!
-//! Scope-gated: `notifier:read` for `show`, `notifier:test` for `test`.
+//! Scope-gated: `notifier:read` for `show`, `notifier:write` for `test`
+//! (the catalogue groups `/test` under `notifier:write` — see
+//! `shared_types::operator_scopes` and `ui-less-surfaces.md` §8.3).
 //! Until per-policy notifier config lands (§8.4 `notifier_config` table),
 //! the actual webhook URL + HMAC key remain env-driven; this API just
 //! reflects what the proxy booted with.
@@ -36,17 +38,30 @@ pub struct NotifierApiState {
     pub proxy_base_url: String,
 }
 
+// Scope gates for this router's routes. Every value MUST be a member of the
+// canonical operator-scope catalogue (`shared_types::operator_scopes`) — a gate
+// keyed on a non-catalogue string is unreachable for any least-privilege
+// operator (the CLI only ever mints catalogued scopes) and only a wildcard `*`
+// admin token can satisfy it, defeating least privilege. Pinned by the
+// `router_scope_gates_are_all_catalogued` test below. (`/test` is grouped under
+// `notifier:write` per the catalogue + ui-less-surfaces.md §8.3, NOT a bespoke
+// `notifier:test` scope.)
+const SHOW_SCOPE: &str = "notifier:read";
+const TEST_SCOPE: &str = "notifier:write";
+const CONFIG_READ_SCOPE: &str = "notifier:read";
+const CONFIG_WRITE_SCOPE: &str = "notifier:write";
+
 pub fn router(state: NotifierApiState) -> Router {
     use crate::operator_auth::scope_check;
     use axum::middleware::from_fn_with_state;
     Router::new()
         .route(
             "/api/v1/notifier/show",
-            get(show).route_layer(from_fn_with_state("notifier:read", scope_check)),
+            get(show).route_layer(from_fn_with_state(SHOW_SCOPE, scope_check)),
         )
         .route(
             "/api/v1/notifier/test",
-            post(test).route_layer(from_fn_with_state("notifier:test", scope_check)),
+            post(test).route_layer(from_fn_with_state(TEST_SCOPE, scope_check)),
         )
         // Each method gets its OWN `.route()` call so its scope layer wraps only
         // that method. Chaining `get(..).route_layer(read).post(..).route_layer(write)`
@@ -56,11 +71,11 @@ pub fn router(state: NotifierApiState) -> Router {
         // same-path MethodRouters since the methods don't overlap.
         .route(
             "/api/v1/notifier/config",
-            get(get_config).route_layer(from_fn_with_state("notifier:read", scope_check)),
+            get(get_config).route_layer(from_fn_with_state(CONFIG_READ_SCOPE, scope_check)),
         )
         .route(
             "/api/v1/notifier/config",
-            post(set_config).route_layer(from_fn_with_state("notifier:write", scope_check)),
+            post(set_config).route_layer(from_fn_with_state(CONFIG_WRITE_SCOPE, scope_check)),
         )
         .with_state(state)
 }
@@ -688,6 +703,36 @@ fn redact_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: every scope this router gates a route on must be a member
+    /// of the canonical operator-scope catalogue. The `/test` route previously
+    /// gated on an orphaned `notifier:test` string that existed nowhere in the
+    /// catalogue, CLI, or spec — so a least-privilege `notifier:write` operator
+    /// (the scope the catalogue documents for `/test`) got 403, and only a
+    /// wildcard `*` admin token could reach the endpoint. The gate now uses
+    /// `notifier:write`; this test fails if any gate drifts off-catalogue again.
+    #[test]
+    fn router_scope_gates_are_all_catalogued() {
+        let catalogue = shared_types::operator_scopes::scope_strings();
+        for scope in [
+            SHOW_SCOPE,
+            TEST_SCOPE,
+            CONFIG_READ_SCOPE,
+            CONFIG_WRITE_SCOPE,
+        ] {
+            assert!(
+                catalogue.contains(&scope),
+                "router gates on `{scope}`, which is not in the operator-scope \
+                 catalogue — no least-privilege operator can reach it"
+            );
+        }
+        // `/test` belongs to `notifier:write` per the catalogue + §8.3 mapping,
+        // not a bespoke `notifier:test` scope.
+        assert_eq!(TEST_SCOPE, "notifier:write");
+        assert_eq!(CONFIG_WRITE_SCOPE, "notifier:write");
+        assert_eq!(SHOW_SCOPE, "notifier:read");
+        assert_eq!(CONFIG_READ_SCOPE, "notifier:read");
+    }
 
     #[test]
     fn redacts_query_and_deep_path() {

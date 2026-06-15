@@ -210,6 +210,25 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **`POST /api/v1/notifier/test` gated on an orphaned, off-catalogue scope**
+  (an eighth-audit-pass finding, 2026-06-15). [api/notifier.rs](crates/proxy/src/api/notifier.rs)
+  `router` gated the notifier-test route on the string `"notifier:test"`, which
+  exists **nowhere** in the canonical operator-scope catalogue
+  ([shared-types/src/operator_scopes.rs](crates/shared-types/src/operator_scopes.rs)),
+  the CLI, or the spec — the catalogue and `ui-less-surfaces.md` §8.3 both
+  document `/test` as covered by `notifier:write`. `scope_check`
+  ([operator_auth.rs](crates/proxy/src/operator_auth.rs)) passes only on an exact
+  scope match or the `*` wildcard, and `tokens issue` only ever mints catalogued
+  scopes, so the effect was a **least-privilege inversion**: an operator holding
+  the documented `notifier:write` scope got **403** on the flagship
+  "verify-your-wiring" endpoint, while the only principals that could reach it
+  were wildcard `*` admin tokens — the opposite of least privilege. Fixed by
+  gating `/test` on `notifier:write` (matching the catalogue) and routing all
+  four notifier-router gates through named `*_SCOPE` constants. New regression
+  test `router_scope_gates_are_all_catalogued` fails if any gate drifts off the
+  canonical catalogue again. The other three sweep lanes (crypto/auth/oauth,
+  adapters/MIME/policy-engine, notifiers/forwarders/PIC/operator-API) were
+  re-audited and cleared with no findings. MEDIUM (authz / least-privilege).
 - **Silently-disabled numeric deny gate when a `greater_than`/`less_than`
   threshold is YAML-quoted** (a seventh-audit-pass finding, 2026-06-15).
   [match_expr.rs](crates/policy-engine/src/match_expr.rs) `apply_op` read the

@@ -409,7 +409,7 @@ async fn refresh_with_coalescing(
         .map(|s| state.cipher.encrypt(s.as_bytes()))
         .transpose()
         .map_err(|_| AuthFail::Decrypt)?;
-    let new_expires = Utc::now() + chrono::Duration::seconds(new.expires_in.max(0));
+    let new_expires = crate::oauth::token_expiry(new.expires_in);
 
     let span = info_span!("token_refresh_persist", token_id = %google_tokens_id);
     let _e = span.enter();

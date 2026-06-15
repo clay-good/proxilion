@@ -401,7 +401,7 @@ async fn google_callback_inner(
         &access_ct,
         refresh_ct.as_ref(),
         &token_resp.scope,
-        Utc::now() + Duration::seconds(token_resp.expires_in.max(0)),
+        crate::oauth::token_expiry(token_resp.expires_in),
     )
     .await?;
 

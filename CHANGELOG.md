@@ -210,6 +210,47 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Gmail external-send gate failed open on an RFC-5322-malformed recipient
+  header.** `split_addresses`
+  ([adapters/google_gmail.rs](crates/proxy/src/adapters/google_gmail.rs))
+  parsed `To`/`Cc`/`Bcc` values with `mailparse::addrparse` and, on a parse
+  **error**, silently returned an empty list — dropping every recipient in
+  that header. Because the adapter forwards `body.raw` to Gmail verbatim and
+  Gmail's parser is more lenient than `addrparse` (an unbalanced quote like
+  `"unterminated <bob@evil.example>` errors in `addrparse` but Gmail may still
+  route it), the dropped recipients collapsed `body.external_recipient` to
+  `false` and the flagship §9 `gmail-external-send-gate` let an external send
+  through unblocked — a fail-open in a security gate. Fixed to fail **closed**:
+  on a parse error, fall back to a permissive split that still surfaces any
+  `@`-bearing token so domain extraction keeps flagging external recipients.
+  Pinned by `split_addresses_fails_closed_on_unparseable_header` and
+  `external_send_gate_is_fail_closed_on_unparseable_recipient_header`.
+- **Hostile/buggy OAuth token endpoint could panic the callback/refresh task
+  via `expires_in` overflow.** Both the OAuth callback
+  ([oauth/routes.rs](crates/proxy/src/oauth/routes.rs)) and the token-refresh
+  path ([auth_middleware.rs](crates/proxy/src/auth_middleware.rs)) computed
+  expiry as `Utc::now() + Duration::seconds(expires_in.max(0))`, where
+  `expires_in` is an `i64` straight off untrusted upstream JSON. `.max(0)`
+  clamped only the negative side; a large positive value (e.g. `i64::MAX`)
+  panics `Duration::seconds`, and even a representable-but-huge duration panics
+  the `DateTime + Duration` add. Reachable because `GOOGLE_TOKEN_URL` is
+  operator-overridable to arbitrary hosts. Fixed with a shared
+  [`oauth::token_expiry`](crates/proxy/src/oauth/mod.rs) helper that clamps
+  `expires_in` into `[0, 1 year]` (over-estimating is harmless — Google rejects
+  a truly-expired access token at use time, handled by the near-expiry path).
+  Pinned by `token_expiry_does_not_panic_on_i64_max_and_clamps_to_one_year`
+  (+ negative-clamp and normal-TTL passthrough tests).
+- **Slack request signature verified over the re-serialized timestamp, not the
+  raw header.** `SlackSigningSecret::verify`
+  ([notifier/slack.rs](crates/proxy/src/notifier/slack.rs)) rebuilt the HMAC
+  base string from the *parsed* `u64` timestamp (`format!("v0:{ts}:")`), but
+  Slack's scheme signs `v0:` + the exact header bytes + `:` + body. Any
+  non-canonical-but-parseable header (e.g. a leading zero) round-trips to a
+  different string, so a legitimately-signed inbound interaction would fail to
+  verify (fail-closed, no security weakening, but a latent fragility). Fixed to
+  sign over the raw `timestamp` header; the parsed integer is used only for the
+  5-minute skew check. Pinned by
+  `verify_signs_over_raw_timestamp_header_not_reparsed_u64`.
 - **SMTP credentials leaked through the notifier-config "redaction".**
   `GET /api/v1/notifier/config` (scope `notifier:read`) returns
   `smtp_url_redacted = redact_url(smtp_url)`, and the spec

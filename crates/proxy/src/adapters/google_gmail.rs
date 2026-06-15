@@ -797,9 +797,9 @@ fn count_parts(part: &mailparse::ParsedMail<'_>, out: &mut ParsedSend) {
 /// Split a comma-separated address list into bare email addresses.
 /// Handles `"Name" <addr@host>` and bare `addr@host` and groups (`undisclosed:;`).
 fn split_addresses(value: &str) -> Vec<String> {
-    let mut out = Vec::new();
     // mailparse::addrparse handles RFC 5322 properly.
     if let Ok(list) = mailparse::addrparse(value) {
+        let mut out = Vec::new();
         for info in list.iter() {
             match info {
                 mailparse::MailAddr::Single(s) => out.push(s.addr.clone()),
@@ -810,8 +810,24 @@ fn split_addresses(value: &str) -> Vec<String> {
                 }
             }
         }
+        return out;
     }
-    out
+    // Fail-closed on a parse error. `addrparse` rejects RFC-5322-malformed
+    // header values (unbalanced quotes, dangling angle brackets, unterminated
+    // groups), but Gmail's own parser is more lenient and may still *route*
+    // such a header. We forward `body.raw` to Gmail verbatim, so if we drop
+    // the recipients here the §9 `gmail-external-send-gate` — decided on
+    // `body.external_recipient`, derived from these addresses — sees an empty
+    // set and fails OPEN (an external send slips through unblocked). Instead,
+    // fall back to a permissive split that still surfaces any `@`-bearing
+    // token, stripping address-syntax noise, so domain extraction keeps
+    // flagging external recipients.
+    value
+        .split([',', ' ', '\t', '\r', '\n', ';', '<', '>', '"', '(', ')'])
+        .map(str::trim)
+        .filter(|t| t.contains('@'))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn domain_of(email: &str) -> Option<String> {
@@ -1125,6 +1141,45 @@ mod tests {
         // pre-emptively errored on empty would surface here as a missing
         // "no recipients" passthrough through `build_send_body_ctx`.
         assert!(split_addresses("").is_empty());
+    }
+
+    #[test]
+    fn split_addresses_fails_closed_on_unparseable_header() {
+        // An unbalanced-quote header value makes mailparse::addrparse return
+        // Err. Gmail's parser is more lenient and may still route it, so the
+        // helper must NOT silently drop the recipient (which would let the
+        // external-send gate fail open). Confirm the precondition (addrparse
+        // really errors) and that the permissive fallback still surfaces the
+        // `@`-bearing address so its domain can be extracted.
+        let weird = "\"unterminated <bob@evil.example>";
+        assert!(
+            mailparse::addrparse(weird).is_err(),
+            "precondition: addrparse must reject this header"
+        );
+        let out = split_addresses(weird);
+        assert!(
+            out.iter().any(|a| a == "bob@evil.example"),
+            "fallback must surface the @-token, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn external_send_gate_is_fail_closed_on_unparseable_recipient_header() {
+        // End-to-end of the §9 gmail-external-send-gate input: a To header
+        // that addrparse rejects but that names an external recipient must
+        // still set `external_recipient = true`. Before the fail-closed fix
+        // the dropped recipient collapsed `external_recipient` to false and
+        // the gate let the external send through.
+        let p = ParsedSend {
+            to: split_addresses("\"unterminated <bob@evil.example>"),
+            ..Default::default()
+        };
+        let ctx = build_send_body_ctx(&p, "acme.com", "alice@acme.com");
+        assert_eq!(
+            ctx.get("external_recipient"),
+            Some(&Value::Bool(true)),
+            "unparseable external recipient must fail closed"
+        );
     }
 
     #[test]

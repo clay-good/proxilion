@@ -63,7 +63,13 @@ impl SlackSigningSecret {
         if now.abs_diff(ts) > 300 {
             return false;
         }
-        let mut basestring = format!("v0:{ts}:").into_bytes();
+        // Sign over the *raw* timestamp header, not the re-serialized `ts`.
+        // Slack's scheme HMACs `v0:` + the exact header bytes + `:` + body;
+        // re-deriving the timestamp from the parsed `u64` would diverge for
+        // any non-canonical-but-parseable header (e.g. a leading zero), so a
+        // legitimate request would fail to verify. The skew check above is the
+        // only thing that needs the parsed integer.
+        let mut basestring = format!("v0:{timestamp}:").into_bytes();
         basestring.extend_from_slice(body);
         let mut mac = HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length");
         mac.update(&basestring);
@@ -570,6 +576,38 @@ mod tests {
             write!(&mut sig, "{:02x}", b).unwrap();
         }
         assert!(secret.verify(&sig, &ts, body));
+    }
+
+    #[test]
+    fn verify_signs_over_raw_timestamp_header_not_reparsed_u64() {
+        // Slack HMACs the raw header bytes. A non-canonical-but-parseable
+        // timestamp (here a leading zero) must still verify when the caller
+        // signed over the raw form. The previous implementation re-derived the
+        // base string from the parsed `u64`, dropping the leading zero, so a
+        // legitimately-signed request would have failed to verify.
+        let secret = SlackSigningSecret::new("8f742231b10e8888abcd99e1b18bf76c");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let raw_ts = format!("0{now}"); // leading zero: parses to the same u64
+        assert_eq!(raw_ts.parse::<u64>().unwrap(), now, "precondition");
+        let body = b"action=approve";
+        let basestring = format!("v0:{raw_ts}:"); // sign over the RAW header
+        let mut mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(b"8f742231b10e8888abcd99e1b18bf76c").unwrap();
+        mac.update(basestring.as_bytes());
+        mac.update(body);
+        let tag = mac.finalize().into_bytes();
+        let mut sig = String::from("v0=");
+        for b in tag {
+            use std::fmt::Write;
+            write!(&mut sig, "{:02x}", b).unwrap();
+        }
+        assert!(
+            secret.verify(&sig, &raw_ts, body),
+            "must verify over the raw timestamp header, not the reparsed u64"
+        );
     }
 
     #[test]

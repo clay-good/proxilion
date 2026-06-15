@@ -1232,6 +1232,42 @@ fn parse_since(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     Ok(chrono::Utc::now() - chrono_dur)
 }
 
+/// Append the longest valid-UTF-8 prefix of `pending` to `out`, draining the
+/// bytes consumed. Bytes that form an *incomplete* trailing multibyte sequence
+/// are retained in `pending` for the next chunk — so a codepoint split across a
+/// TCP fragment boundary is decoded once both halves arrive instead of being
+/// dropped. Genuinely invalid bytes (not a fragmentation artifact) are skipped
+/// so the decoder can never stall on them.
+fn decode_utf8_streaming(pending: &mut Vec<u8>, out: &mut String) {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                return;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    // SAFETY-by-contract: `valid_up_to()` guarantees this slice is valid UTF-8.
+                    out.push_str(std::str::from_utf8(&pending[..valid]).unwrap());
+                }
+                match e.error_len() {
+                    // Real invalid bytes: drop them and keep decoding the rest.
+                    Some(bad) => {
+                        pending.drain(..valid + bad);
+                    }
+                    // Incomplete trailing sequence: keep it for the next chunk.
+                    None => {
+                        pending.drain(..valid);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn actions_tail(
     http: &reqwest::Client,
     url: &str,
@@ -1249,10 +1285,11 @@ async fn actions_tail(
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
     let mut buf = String::new();
+    let mut pending: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("SSE chunk")?;
-        let text = std::str::from_utf8(&chunk).unwrap_or("");
-        buf.push_str(text);
+        pending.extend_from_slice(&chunk);
+        decode_utf8_streaming(&mut pending, &mut buf);
         while let Some(idx) = buf.find("\n\n") {
             let frame: String = buf.drain(..idx + 2).collect();
             let mut data = String::new();
@@ -3481,6 +3518,53 @@ mod pure_helper_tests {
         assert!(!p2.active, "non-TTY stderr must disable progress in tests");
         p2.tick(1);
         p2.finish(1);
+    }
+
+    #[test]
+    fn decode_utf8_streaming_reassembles_codepoint_split_across_chunks() {
+        // A live `actions tail` SSE chunk can end mid-codepoint when a TCP
+        // fragment boundary splits a multibyte UTF-8 char — exactly the
+        // international filenames/subjects this proxy gates. The old
+        // `from_utf8(&chunk).unwrap_or("")` dropped the *whole* chunk on any
+        // such split. The streaming decoder must retain the partial tail and
+        // emit the full text once the second half arrives.
+        let full = "subject: 日本語の件名\n\n"; // multibyte payload + frame end
+        let bytes = full.as_bytes();
+        // Split mid-codepoint: the first multibyte char ('日') starts at the
+        // ASCII run's end; cut one byte into it.
+        let cut = "subject: ".len() + 1;
+        assert!(
+            std::str::from_utf8(&bytes[..cut]).is_err(),
+            "split must be mid-codepoint"
+        );
+
+        let mut pending: Vec<u8> = Vec::new();
+        let mut out = String::new();
+        pending.extend_from_slice(&bytes[..cut]);
+        decode_utf8_streaming(&mut pending, &mut out);
+        // Only the clean ASCII prefix is emitted; the partial char is held back.
+        assert_eq!(out, "subject: ");
+        assert!(
+            !pending.is_empty(),
+            "incomplete tail retained for next chunk"
+        );
+
+        pending.extend_from_slice(&bytes[cut..]);
+        decode_utf8_streaming(&mut pending, &mut out);
+        assert_eq!(out, full, "full text reassembled, nothing dropped");
+        assert!(pending.is_empty(), "all bytes consumed once complete");
+    }
+
+    #[test]
+    fn decode_utf8_streaming_skips_genuinely_invalid_bytes_without_stalling() {
+        // A truly invalid byte (not a fragmentation artifact) must be skipped so
+        // the decoder never spins forever on it, while valid text either side
+        // still comes through.
+        let mut pending: Vec<u8> = vec![b'a', 0xFF, b'b'];
+        let mut out = String::new();
+        decode_utf8_streaming(&mut pending, &mut out);
+        assert_eq!(out, "ab");
+        assert!(pending.is_empty());
     }
 
     #[test]

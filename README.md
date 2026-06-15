@@ -453,6 +453,20 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
+**Verification posture.** The shipped code has been through nine rounds of
+adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
+policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
+each pass sweeping every lane in parallel for reachable panics, fail-open gates,
+authz inversions, secret leaks, and DoS amplification. Every finding landed with
+a regression test that fails if the defect returns; the full ledger — defect,
+root cause, trigger, fix, and pinning test — is in the
+[`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
+addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The most recent pass came back clean across all but one low-severity
+display-correctness item (an SSE multibyte-codepoint reassembly fix in the CLI
+live-tail). This is a track record, not a guarantee — the threat-model table
+above states the honest ceiling of an interception proxy.
+
 ## The Skill Overreach problem
 
 The agent platforms now ship "skills." You train one agent for the whole

@@ -210,6 +210,28 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **`proxilion-cli actions tail` dropped a whole SSE chunk on a multibyte
+  codepoint split across a TCP fragment boundary** (a ninth-audit-pass finding,
+  2026-06-15). The live-tail loop in [cli/src/main.rs](crates/cli/src/main.rs)
+  `actions_tail` decoded each `bytes_stream()` chunk with
+  `std::str::from_utf8(&chunk).unwrap_or("")` — so whenever a chunk *ended*
+  mid-codepoint (which TCP fragmentation does at arbitrary byte offsets) the
+  **entire chunk** decoded to `""` and every SSE frame's worth of bytes in it
+  was silently discarded, not just the split character. The trigger is exactly
+  the international content this proxy gates: an action event whose filename,
+  subject, or attendee name contains a multibyte UTF-8 char (`日本語`, `café`,
+  emoji) garbles or vanishes from the operator's live tail. Fixed by buffering
+  raw bytes across chunks and decoding only the longest valid-UTF-8 *prefix* via
+  the new pure `decode_utf8_streaming` helper, which retains an incomplete
+  trailing sequence for the next chunk and skips genuinely-invalid bytes without
+  stalling. Display-only (the `--format json|ndjson` pipe paths and all
+  persisted data are unaffected), so LOW severity — but a real correctness loss
+  on the human-facing surface. New regression tests
+  `decode_utf8_streaming_reassembles_codepoint_split_across_chunks` and
+  `decode_utf8_streaming_skips_genuinely_invalid_bytes_without_stalling`. The
+  other three sweep lanes (crypto/auth/oauth, adapters/MIME/policy-engine,
+  notifiers/forwarders/PIC/operator-API) were re-audited and cleared with no
+  findings. LOW (display correctness).
 - **`POST /api/v1/notifier/test` gated on an orphaned, off-catalogue scope**
   (an eighth-audit-pass finding, 2026-06-15). [api/notifier.rs](crates/proxy/src/api/notifier.rs)
   `router` gated the notifier-test route on the string `"notifier:test"`, which

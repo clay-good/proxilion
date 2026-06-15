@@ -13,6 +13,15 @@ use regex::{Regex, RegexSet};
 /// action is `ReplaceWithMarker`.
 pub const MARKER: &str = "[redacted by proxilion read-filter]";
 
+/// Upper bound on retained [`QuarantineSample`]s per filtered body. The match
+/// *count* (`FilterOutcome::matches`) stays exact, but the persisted samples —
+/// which each allocate a pattern + snippet string and become one
+/// `quarantined_payloads` INSERT downstream — are capped at a representative
+/// subset. Without this, a short operator pattern (e.g. `\bpassword\b`) against
+/// a cap-compliant 10MB JSON body the agent can influence could fan out into
+/// millions of allocations and serial DB inserts (resource-exhaustion DoS).
+pub const MAX_SAMPLES: usize = 100;
+
 #[derive(Debug, Default)]
 pub struct FilterOutcome {
     pub matches: usize,
@@ -103,10 +112,13 @@ pub fn apply(
         for m in re.find_iter(&text) {
             all_ranges.push((m.start(), m.end()));
             out.matches += 1;
-            out.samples.push(QuarantineSample {
-                pattern: src.clone(),
-                snippet: text[m.start()..m.end()].chars().take(200).collect(),
-            });
+            // Keep the count exact but cap retained samples — see MAX_SAMPLES.
+            if out.samples.len() < MAX_SAMPLES {
+                out.samples.push(QuarantineSample {
+                    pattern: src.clone(),
+                    snippet: text[m.start()..m.end()].chars().take(200).collect(),
+                });
+            }
         }
     }
     out.triggered = !all_ranges.is_empty();
@@ -205,6 +217,25 @@ mod tests {
         assert_eq!(o.samples.len(), 1);
         assert!(o.samples[0].pattern.starts_with("literal:"));
         assert!(String::from_utf8_lossy(&out).contains(MARKER));
+    }
+
+    #[test]
+    fn samples_are_capped_while_match_count_stays_exact() {
+        // A short pattern that matches many times in a large body — the
+        // resource-amplification shape the MAX_SAMPLES cap defends against.
+        let f = build(
+            QuarantineAction::ReplaceWithMarker,
+            vec![Pattern::Literal("x".into())],
+        );
+        let body = "x".repeat(10_000); // 10k matches
+        let (_out, o) = apply(body.as_bytes(), &f, Some("application/json"));
+        assert_eq!(o.matches, 10_000, "match tally must remain exact");
+        assert_eq!(
+            o.samples.len(),
+            MAX_SAMPLES,
+            "samples must be capped at MAX_SAMPLES"
+        );
+        assert!(o.triggered);
     }
 
     #[test]

@@ -289,7 +289,15 @@ async fn show(
 #[derive(Debug, Deserialize)]
 pub struct ApproveBody {
     pub justification: String,
-    /// Optional override; default 30m from now. Caps at 24h.
+    /// Requested override lifetime, in minutes. **Currently bounds-validated
+    /// (1..=1440) but not yet applied** — `mint_successor` takes no expiry and
+    /// `pca_cache` has no `expires_at` column, so the override's real lifetime
+    /// is governed by the PCA chain, not this value. Proxy-side enforcement of
+    /// the requested TTL is tracked as an open item (see
+    /// `surface-delight-and-correctness.md` §10 and `spec.md` §6.6 — same
+    /// upstream `successor-with-attestation` blocker as the override branch).
+    /// The field is accepted now so the wire contract is stable for when
+    /// enforcement lands.
     pub ttl_minutes: Option<i64>,
     /// Approver identity (in v1: free-text; in v2: extracted from operator
     /// token / Slack user id mapping). For now we record whatever the caller
@@ -841,13 +849,14 @@ mod tests {
     }
 
     #[test]
-    fn approve_body_accepts_zero_ttl_minutes_as_explicit_no_ttl_marker() {
-        // `ttl_minutes: Option<i64>` accepts 0 — the handler later
-        // interprets 0 as "no TTL", distinct from `None` which falls
-        // through to the default. Pin the deserialization of the 0
-        // sentinel so a refactor to `Option<u32>` (which would still
-        // accept 0) AND a refactor to `i64` with NonZero would both
-        // surface here.
+    fn approve_body_accepts_zero_ttl_minutes_at_parse_then_rejected_by_validation() {
+        // `ttl_minutes: Option<i64>` accepts 0 at the *parse* boundary
+        // (distinct from `None`); the handler then rejects it at the
+        // *semantic* boundary — `approve_inner` validates `1..=1440`, so 0 is a
+        // `BadRequest`, not a sentinel. (`ttl_minutes` is not yet applied to
+        // the override lifetime at all — see the field docstring.) Pin the
+        // deserialization so a refactor to `Option<u32>`/`NonZero` surfaces
+        // here as a parse-time change of behavior.
         let b: ApproveBody =
             serde_json::from_str(r#"{"justification":"reviewed","ttl_minutes":0}"#).unwrap();
         assert_eq!(b.ttl_minutes, Some(0));

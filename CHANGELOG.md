@@ -210,6 +210,53 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **CLI `urlencode` mis-encoded every non-ASCII character, silently breaking
+  `killswitch user <p_0>` for internationalized principals** (a fifth-audit-pass
+  finding, 2026-06-15). [crates/cli/src/main.rs](crates/cli/src/main.rs)
+  `urlencode` emitted `format!("%{:02X}", c as u32)` — the Unicode *scalar
+  value* rather than the UTF-8 *bytes* RFC 3986 requires. `é` (U+00E9) became the
+  lone invalid byte `%E9`; `日` (U+65E5) became the malformed four-hex-digit
+  `%65E5`. The proxy decodes these with axum's standard `Path<String>`/query
+  extractors, so a non-ASCII `p_0` either 400'd or matched no principal — meaning
+  a `killswitch user` against an internationalized principal (the project's own
+  `session.rs` ships tests for `日本語ユーザー@example.co.jp`) **silently did
+  nothing**, with the same hazard on every other id/query path
+  (`actions list --p_0`, `pca`, `verify`, `blocked show/approve/reject`, …).
+  Fixed to percent-encode the UTF-8 bytes. Pinned by
+  `urlencode_encodes_utf8_bytes_not_scalar_value` (the prior test only exercised
+  ASCII). HIGH.
+- **Read-filter quarantine samples grew without bound, one DB INSERT per match.**
+  [adapters/read_filter.rs](crates/proxy/src/adapters/read_filter.rs) `apply`
+  pushed a `QuarantineSample` (cloned pattern + snippet string) per regex match
+  with no cap, and each sample becomes one serial `quarantined_payloads` INSERT
+  in the Drive/Gmail/Calendar `persist_quarantine_samples` loops. `should_scan`
+  deliberately scans `application/json` — exactly what every Google API returns —
+  so a short operator pattern (e.g. `\bpassword\b`) against a cap-compliant 10MB
+  body the agent can influence could fan out into millions of allocations and
+  serial inserts (resource-exhaustion DoS). Capped retained samples at
+  `MAX_SAMPLES = 100` while keeping `FilterOutcome::matches` exact for the audit
+  roll-up. Pinned by `samples_are_capped_while_match_count_stays_exact`. MEDIUM.
+- **CLI `policy simulate --against last-<N><unit>` panicked on an overflowing
+  magnitude.** [crates/cli/src/main.rs](crates/cli/src/main.rs) `parse_window`
+  built durations with `chrono::Duration::days`/`hours`/`minutes`/`seconds`,
+  which *panic* on internal overflow — so an i64-parseable but absurd value
+  (`last-200000000000000d`) crashed the CLI instead of returning the helpful
+  error the function otherwise produces. Switched to the checked `try_*`
+  constructors, mirroring the sibling `parse_since`'s `Duration::from_std` guard.
+  Pinned by `parse_window_rejects_overflowing_magnitude_without_panicking`. LOW.
+- **`POST /api/v1/blocked/{id}/approve` documented a `ttl_minutes` override
+  lifetime it never applied — made the contract honest.**
+  [api/blocked.rs](crates/proxy/src/api/blocked.rs) `ApproveBody.ttl_minutes` was
+  documented "default 30m from now, caps at 24h" and bounds-validated `1..=1440`,
+  but `mint_successor` takes no expiry and `pca_cache` has no `expires_at` column,
+  so the value was a no-op — an operator who set a TTL to bound an override got
+  one whose real lifetime is governed by the PCA chain, not their request.
+  Rather than ship a half-wired security control, the field docstring now states
+  it is accepted-but-not-yet-enforced and points at the tracking item; the
+  misleading unit test (which claimed the handler "interprets 0 as no TTL" — it
+  actually *rejects* 0) was corrected. Proxy-side TTL enforcement is tracked in
+  surface-delight-and-correctness.md §10 (same upstream
+  `successor-with-attestation` blocker as the spec.md §6.6 override branch).
 - **`GET /api/v1/notifier/config` leaked the cleartext webhook / Slack
   incoming-webhook URL to `notifier:read` operators** (a fourth-audit-pass
   finding, 2026-06-15). The handler

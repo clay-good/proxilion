@@ -2115,15 +2115,23 @@ fn field_diff(
 }
 
 fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect()
+    // Percent-encode the UTF-8 *bytes*, not the Unicode scalar value. Encoding
+    // `c as u32` (the scalar) is wrong for any non-ASCII char: `é` (U+00E9)
+    // would emit `%E9` (a lone, invalid-UTF-8 byte) and `日` (U+65E5) would emit
+    // `%65E5` (four hex digits — not a valid escape at all). The server decodes
+    // these with axum's `Path<String>`/query extractors, which expect standard
+    // UTF-8 percent-encoding (RFC 3986 §2.1), so a scalar-encoded non-ASCII
+    // principal would 400 or silently target the wrong principal — e.g.
+    // `killswitch user <p_0>` would no-op for an internationalized p_0.
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2971,6 +2979,14 @@ mod simulate_tests {
     fn parse_window_accepts_rfc3339() {
         parse_window("2026-01-01T00:00:00Z").unwrap();
     }
+
+    #[test]
+    fn parse_window_rejects_overflowing_magnitude_without_panicking() {
+        // i64-parseable but overflows chrono's internal nanosecond math; must
+        // return an error, not panic inside `Duration::days`.
+        assert!(parse_window("last-200000000000000d").is_err());
+        assert!(parse_window("last-9223372036854775807s").is_err());
+    }
 }
 
 #[cfg(test)]
@@ -3042,11 +3058,17 @@ fn parse_window(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
         let n: i64 = num
             .parse()
             .map_err(|e| anyhow!("invalid window number `{num}`: {e}"))?;
+        // Use the checked `try_*` constructors: `chrono::Duration::days` (etc.)
+        // *panics* on internal overflow, so an absurd-but-i64-parseable
+        // magnitude (e.g. `last-200000000000000d`) would crash the CLI instead
+        // of returning the helpful error below. Mirrors `parse_since`'s
+        // `Duration::from_std(..).map_err(..)` guard.
+        let overflow = || anyhow!("window `{num}{unit}` is too large");
         let dur = match unit {
-            "d" => chrono::Duration::days(n),
-            "h" => chrono::Duration::hours(n),
-            "m" => chrono::Duration::minutes(n),
-            "s" => chrono::Duration::seconds(n),
+            "d" => chrono::Duration::try_days(n).ok_or_else(overflow)?,
+            "h" => chrono::Duration::try_hours(n).ok_or_else(overflow)?,
+            "m" => chrono::Duration::try_minutes(n).ok_or_else(overflow)?,
+            "s" => chrono::Duration::try_seconds(n).ok_or_else(overflow)?,
             other => return Err(anyhow!("unknown window unit `{other}` (use d|h|m|s)")),
         };
         return Ok(chrono::Utc::now() - dur);
@@ -3530,6 +3552,19 @@ mod pure_helper_tests {
         assert_eq!(urlencode("/"), "%2F");
         assert_eq!(urlencode("&=?"), "%26%3D%3F");
         assert_eq!(urlencode("a b"), "a%20b");
+    }
+
+    #[test]
+    fn urlencode_encodes_utf8_bytes_not_scalar_value() {
+        // 2-byte char: é = U+00E9 = UTF-8 0xC3 0xA9 (scalar-encoding would emit
+        // the invalid lone byte "%E9").
+        assert_eq!(urlencode("é"), "%C3%A9");
+        // 3-byte char: 日 = U+65E5 = UTF-8 0xE6 0x97 0xA5 (scalar-encoding would
+        // emit the malformed 4-hex-digit "%65E5").
+        assert_eq!(urlencode("日"), "%E6%97%A5");
+        // A realistic internationalized principal: unreserved ASCII passes
+        // through, every other byte is a well-formed two-hex-digit escape.
+        assert_eq!(urlencode("u:é"), "u%3A%C3%A9");
     }
 
     #[test]

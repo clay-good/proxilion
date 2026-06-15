@@ -669,13 +669,24 @@ async fn persist_config(
 }
 
 fn redact_url(url: &str) -> String {
-    // Strip query + path beyond first segment so /siem/v1/ingest?token=...
-    // becomes /siem/...
+    // Two secrets can hide in a notifier URL: (1) a token in the query/deep
+    // path (`/siem/v1/ingest?token=…`), and (2) `user:pass@` userinfo in the
+    // authority — the SMTP `smtps://user:pass@host:465` shape (spec
+    // ui-less-surfaces.md §5.5: redact to `scheme://host/...`). Strip BOTH:
+    // truncate to the first path segment AND drop any userinfo so a
+    // `notifier:read` operator never sees the SMTP password in
+    // `smtp_url_redacted`.
+    fn host_only(authority: &str) -> &str {
+        // Userinfo is everything before the LAST `@` in the authority.
+        authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host)
+    }
     if let Some((scheme, rest)) = url.split_once("://") {
-        if let Some((host, _)) = rest.split_once('/') {
-            return format!("{scheme}://{host}/...");
+        if let Some((authority, _)) = rest.split_once('/') {
+            return format!("{scheme}://{}/...", host_only(authority));
         }
-        return format!("{scheme}://{rest}");
+        return format!("{scheme}://{}", host_only(rest));
     }
     url.to_string()
 }
@@ -795,17 +806,29 @@ mod tests {
     }
 
     #[test]
-    fn redact_url_handles_userinfo_segment_without_panic() {
-        // `https://user:pass@host/path` puts a `@` in `rest`'s
-        // pre-first-`/` segment. The current split-on-`/` helper
-        // treats the entire `user:pass@host` as the host and emits
-        // `https://user:pass@host/...`. Pin this so a future
-        // tightening that explicitly stripped userinfo (the
-        // operator-facing improvement) is a conscious wire-shape
-        // change.
+    fn redact_url_strips_userinfo_credentials() {
+        // `scheme://user:pass@host` carries a secret in the authority — the
+        // SMTP `smtps://user:pass@host:465` shape. The helper must drop the
+        // userinfo so `smtp_url_redacted` never leaks the password to a
+        // `notifier:read` operator (spec ui-less-surfaces.md §5.5).
         assert_eq!(
             redact_url("https://user:pass@host.example/path/to/thing"),
-            "https://user:pass@host.example/...",
+            "https://host.example/...",
+        );
+        // SMTP, with a port, no deep path.
+        assert_eq!(
+            redact_url("smtps://relay-user:s3cret@smtp.example.com:465"),
+            "smtps://smtp.example.com:465",
+        );
+        // SMTP submission path — port preserved, path truncated, creds gone.
+        assert_eq!(
+            redact_url("smtps://relay-user:s3cret@smtp.example.com:587/submit"),
+            "smtps://smtp.example.com:587/...",
+        );
+        // No userinfo present → host[:port] untouched (the @-split is a no-op).
+        assert_eq!(
+            redact_url("https://host.example/x"),
+            "https://host.example/..."
         );
     }
 

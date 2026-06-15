@@ -418,8 +418,8 @@ enum PolicyCmd {
         /// Output format. `pretty` (default) | `json`.
         #[arg(long, default_value = "pretty")]
         format: String,
-        /// Exit code 2 when any policy's delta exceeds this percentage
-        /// of replayed events. Useful in CI gates.
+        /// Exit non-zero (code 1) when any policy's delta exceeds this
+        /// percentage of replayed events. Useful in CI gates.
         #[arg(long)]
         fail_if_delta_exceeds: Option<f64>,
     },
@@ -2485,11 +2485,14 @@ async fn cmd_policy(http: &reqwest::Client, url: &str, token: &str, sub: PolicyC
                     "mode must be one of: enforce | observe | disabled (got `{mode}`)"
                 ));
             }
-            let resp = auth_header(http.post(format!("{url}/api/v1/policy/{id}/mode")), token)
-                .json(&json!({"mode": mode}))
-                .send()
-                .await
-                .context("POST /api/v1/policy/{id}/mode")?;
+            let resp = auth_header(
+                http.post(format!("{url}/api/v1/policy/{}/mode", urlencode(&id))),
+                token,
+            )
+            .json(&json!({"mode": mode}))
+            .send()
+            .await
+            .context("POST /api/v1/policy/{id}/mode")?;
             let status = resp.status();
             let body: Value = resp.json().await.unwrap_or(json!({}));
             println!("{}", serde_json::to_string_pretty(&body)?);
@@ -3097,7 +3100,10 @@ async fn cmd_blocked(
                 println!("{}", "─".repeat(120));
                 for r in &rows {
                     let id = r["id"].as_str().unwrap_or("");
-                    let id_short = format!("{}…", &id[..id.len().min(36)]);
+                    // char-safe: byte-slicing `&id[..36]` would panic if the
+                    // server ever returned an id with a multibyte char straddling
+                    // byte 36. Every other truncation here is char-counted too.
+                    let id_short = format!("{}…", id.chars().take(36).collect::<String>());
                     println!(
                         "{:<38} {:<11} {:<22} {:<22} {}",
                         id_short,
@@ -3112,12 +3118,15 @@ async fn cmd_blocked(
             Ok(())
         }
         BlockedCmd::Show { id, format } => {
-            let resp = auth_header(http.get(format!("{url}/api/v1/blocked/{id}")), token)
-                .send()
-                .await
-                .context("GET /api/v1/blocked/{id}")?
-                .error_for_status()
-                .context("/api/v1/blocked/{id} returned an error")?;
+            let resp = auth_header(
+                http.get(format!("{url}/api/v1/blocked/{}", urlencode(&id))),
+                token,
+            )
+            .send()
+            .await
+            .context("GET /api/v1/blocked/{id}")?
+            .error_for_status()
+            .context("/api/v1/blocked/{id} returned an error")?;
             let body: Value = resp.json().await?;
             if format == "json" {
                 println!("{}", serde_json::to_string_pretty(&body)?);
@@ -3142,7 +3151,7 @@ async fn cmd_blocked(
                 body["ttl_minutes"] = json!(t);
             }
             let resp = auth_header(
-                http.post(format!("{url}/api/v1/blocked/{id}/approve")),
+                http.post(format!("{url}/api/v1/blocked/{}/approve", urlencode(&id))),
                 token,
             )
             .json(&body)
@@ -3163,7 +3172,7 @@ async fn cmd_blocked(
                 None => json!({}),
             };
             let resp = auth_header(
-                http.post(format!("{url}/api/v1/blocked/{id}/reject")),
+                http.post(format!("{url}/api/v1/blocked/{}/reject", urlencode(&id))),
                 token,
             )
             .json(&body)

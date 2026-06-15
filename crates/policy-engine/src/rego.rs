@@ -367,16 +367,24 @@ fn parse_decision(p: &PolicyDoc) -> Result<Decision, Error> {
         },
         Yaml::Mapping(m) => {
             if let Some(rl) = m.get(Yaml::String("rate_limit".into())) {
+                // `as u32` would silently wrap a value ≥ 2^32 (`burst: 4294967296`
+                // → `0`, an accidental block-everything limit). The serde/JSON
+                // path already rejects this (decision.rs
+                // `decision_rate_limit_rejects_negative_or_overflow_values_on_deserialize`);
+                // the YAML path must too — fail loudly on overflow.
                 let burst = rl
                     .get("burst")
                     .and_then(|v| v.as_u64())
-                    .ok_or_else(|| Error::BadDecision("rate_limit.burst missing".into()))?
-                    as u32;
+                    .ok_or_else(|| Error::BadDecision("rate_limit.burst missing".into()))?;
+                let burst = u32::try_from(burst)
+                    .map_err(|_| Error::BadDecision("rate_limit.burst exceeds u32::MAX".into()))?;
                 let per_seconds = rl
                     .get("per_seconds")
                     .and_then(|v| v.as_u64())
-                    .ok_or_else(|| Error::BadDecision("rate_limit.per_seconds missing".into()))?
-                    as u32;
+                    .ok_or_else(|| Error::BadDecision("rate_limit.per_seconds missing".into()))?;
+                let per_seconds = u32::try_from(per_seconds).map_err(|_| {
+                    Error::BadDecision("rate_limit.per_seconds exceeds u32::MAX".into())
+                })?;
                 return Ok(Decision::RateLimit { burst, per_seconds });
             }
             if let Some(b) = m.get(Yaml::String("block".into())) {
@@ -537,6 +545,24 @@ mod helper_tests {
             }
             other => panic!("expected RateLimit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_decision_rate_limit_rejects_u32_overflow() {
+        // `burst: 2^32` must error, not silently wrap to 0 (a block-everything
+        // limit). Mirrors the serde-path guard on the JSON side.
+        let y = "id: p1\nvendor: v\naction: a\ndecision:\n  rate_limit:\n    burst: 4294967296\n    per_seconds: 10\nrequired_ops: []\n";
+        let p: PolicyDoc = serde_yaml::from_str(y).unwrap();
+        let err = parse_decision(&p).unwrap_err();
+        assert!(err.to_string().contains("burst exceeds"), "got {err}");
+        // per_seconds overflow is likewise rejected.
+        let y2 = "id: p1\nvendor: v\naction: a\ndecision:\n  rate_limit:\n    burst: 5\n    per_seconds: 4294967296\nrequired_ops: []\n";
+        let p2: PolicyDoc = serde_yaml::from_str(y2).unwrap();
+        let err2 = parse_decision(&p2).unwrap_err();
+        assert!(
+            err2.to_string().contains("per_seconds exceeds"),
+            "got {err2}"
+        );
     }
 
     #[test]

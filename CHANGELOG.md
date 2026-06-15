@@ -210,6 +210,40 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **SMTP credentials leaked through the notifier-config "redaction".**
+  `GET /api/v1/notifier/config` (scope `notifier:read`) returns
+  `smtp_url_redacted = redact_url(smtp_url)`, and the spec
+  (ui-less-surfaces.md §5.5) mandates redacting `smtps://user:pass@host:465`
+  down to `scheme://host/...`. But `redact_url`
+  ([api/notifier.rs](crates/proxy/src/api/notifier.rs)) only truncated the
+  path/query — it treated the entire `user:pass@host` as the host and echoed
+  it verbatim, so the SMTP **password** was exposed to any operator holding
+  only read scope (and to any log that records the redacted form). The existing
+  test even pinned the leak as a known behavior deferred for "a future
+  tightening." Fixed by stripping userinfo (everything before the last `@` in
+  the authority) in addition to the path/query; webhook/SIEM redaction (tokens
+  live in the path/query) is unchanged. Pinned by
+  `redact_url_strips_userinfo_credentials`.
+- **`rate_limit` policy values silently wrapped on `u32` overflow.** The YAML
+  decision parser ([policy-engine/src/rego.rs](crates/policy-engine/src/rego.rs)
+  `parse_decision`) read `burst` / `per_seconds` as `u64` then cast `as u32`,
+  so `burst: 4294967296` became `burst: 0` — an accidental block-everything
+  rate limit — with no error. The serde/JSON decision path already rejects this
+  (`decision.rs` has a dedicated overflow-rejection test); the YAML path now
+  matches it via `u32::try_from`, failing loudly. Pinned by
+  `parse_decision_rate_limit_rejects_u32_overflow`.
+- **`proxilion-cli`: three operator-surface robustness fixes.** (1) The
+  `policy simulate --fail-if-delta-exceeds` `--help` text claimed "Exit code 2"
+  while the implementation exits 1 (matching the spec, ui-less-surfaces.md
+  §3.5) — a CI author gating on exit 2 would silently treat a threshold breach
+  as a pass; corrected the help to state exit 1. (2) `blocked list` byte-sliced
+  the server-supplied `id` (`&id[..36]`), which would panic on a multibyte
+  char straddling byte 36; switched to the char-safe `chars().take(36)` used
+  everywhere else in the file. (3) `blocked show/approve/reject` and
+  `policy set-mode` interpolated the operator-supplied id into the request path
+  without `urlencode()`, unlike every other path-segment site in the CLI;
+  routed all four through `urlencode` so an id containing `/ ? # %` stays an
+  opaque segment. [crates/cli/src/main.rs](crates/cli/src/main.rs)
 - **CSV/spreadsheet formula injection (CWE-1236) in the audit-action export.**
   `GET /api/v1/actions/export?format=csv` rendered rows through `esc()`
   ([api/actions.rs](crates/proxy/src/api/actions.rs) `row_to_csv_line`), which

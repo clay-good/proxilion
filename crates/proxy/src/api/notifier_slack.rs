@@ -356,6 +356,25 @@ fn slack_ok_message(text: &str) -> Response {
         .into_response()
 }
 
+/// Defense-in-depth hard cap on the request snapshot embedded in the [Why?]
+/// message — keep the §5.3 dev 2 "4 KB" adapter-side cap from filling a Slack
+/// channel even if `canonical_request_json` ever grows. Truncates on a UTF-8
+/// **char boundary**, not a raw byte index: the snapshot is the agent's own
+/// (attacker-influenced) request body, so byte `SLACK_REQ_CAP` routinely lands
+/// mid-codepoint (any non-ASCII filename / subject / calendar title) and a raw
+/// `&s[..2048]` would panic, aborting the handler future on every such row.
+fn cap_request_snippet(s: &str) -> String {
+    const SLACK_REQ_CAP: usize = 2048;
+    if s.len() <= SLACK_REQ_CAP {
+        return s.to_string();
+    }
+    let mut end = SLACK_REQ_CAP;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Render the forensic-context ephemeral message (ui-less-surfaces.md
 /// §5.3 dev 2). Returns the blocked row's policy_id / detail / path /
 /// requested_ops as Slack mrkdwn, visible only to the clicker
@@ -408,16 +427,8 @@ async fn handle_why(db: &PgPool, blocked_id: uuid::Uuid) -> Response {
             // adapter side (canonical_request_json already truncates);
             // we hard-cap here at 2 KB as a defense-in-depth so a
             // pre-truncation column can't fill a Slack channel.
-            const SLACK_REQ_CAP: usize = 2048;
             let request_block = match request_canonical_json {
-                Some(s) => {
-                    let snippet = if s.len() > SLACK_REQ_CAP {
-                        format!("{}…", &s[..SLACK_REQ_CAP])
-                    } else {
-                        s
-                    };
-                    format!("\n*Request:*\n```\n{snippet}\n```")
-                }
+                Some(s) => format!("\n*Request:*\n```\n{}\n```", cap_request_snippet(&s)),
                 None => String::new(),
             };
             format!(
@@ -705,6 +716,34 @@ mod tests {
         h.insert("x-slack-signature", HeaderValue::from_static("v0=abc"));
         assert_eq!(header_str(&h, "x-slack-signature"), Some("v0=abc"));
         assert_eq!(header_str(&h, "x-slack-timestamp"), None);
+    }
+
+    // ─── [Why?] request-snapshot cap (char-boundary safety) ───
+
+    #[test]
+    fn cap_request_snippet_truncates_multibyte_without_panicking() {
+        // Force byte 2048 to land mid-codepoint: 2047 ASCII bytes then a 2-byte
+        // `é` straddles the cap. A raw `&s[..2048]` would panic here; the
+        // char-boundary backoff must instead drop the partial codepoint.
+        let s = format!("{}{}", "a".repeat(2047), "é".repeat(50));
+        let out = cap_request_snippet(&s);
+        assert!(out.ends_with('…'), "over-cap input gets an ellipsis");
+        // Truncated at the boundary *before* the straddling `é` → 2047 'a' + '…'.
+        assert_eq!(out, format!("{}…", "a".repeat(2047)));
+        // Sanity: result is valid UTF-8 (constructing the String already proves
+        // it, but assert the byte length is the boundary we expect).
+        assert_eq!(out.len(), 2047 + "…".len());
+    }
+
+    #[test]
+    fn cap_request_snippet_passes_short_input_through_unchanged() {
+        let s = "{\"k\":\"naïve\"}";
+        assert_eq!(cap_request_snippet(s), s);
+        // A 4-byte codepoint right at the boundary is handled too.
+        let s = format!("{}{}", "x".repeat(2046), "𝛂");
+        let out = cap_request_snippet(&s);
+        assert!(out.ends_with('…'));
+        assert_eq!(out, format!("{}…", "x".repeat(2046)));
     }
 
     // ─── §4.1 justification modal ───

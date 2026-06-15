@@ -210,6 +210,41 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Reachable panic in the Slack `[Why?]` handler on attacker-influenced
+  multibyte request snapshots** (a sixth-audit-pass finding, 2026-06-15).
+  [api/notifier_slack.rs](crates/proxy/src/api/notifier_slack.rs) `handle_why`
+  capped the embedded request snapshot with a raw byte slice
+  `&s[..SLACK_REQ_CAP]` (2 KB). The snapshot is `blocked_actions
+  .request_canonical_json` — the agent's own request body (a Drive filename,
+  Gmail subject, calendar title, …), capped at 4 KB so it routinely exceeds the
+  2 KB Slack cap and carries arbitrary UTF-8. Whenever byte 2048 fell
+  mid-codepoint the slice panicked (`byte index … is not a char boundary`),
+  aborting the handler future (no `CatchPanicLayer`, so the connection is reset)
+  on every affected blocked row — an operator gets a request with non-ASCII
+  content blocked, then a reviewer clicking **[Why?]** breaks the button. Fixed
+  by truncating on a char boundary via a pure, unit-tested `cap_request_snippet`
+  helper (matching the char-safe `truncate` already in `notifier/slack.rs`).
+  Pinned by `cap_request_snippet_truncates_multibyte_without_panicking` (+ the
+  short-input passthrough). MEDIUM.
+- **Unbounded `multipart/*` recursion in Gmail send could overflow a worker
+  stack** (a sixth-audit-pass finding, 2026-06-15).
+  [adapters/google_gmail.rs](crates/proxy/src/adapters/google_gmail.rs)
+  `parse_mime` handed the agent-supplied `raw` MIME straight to
+  `mailparse::parse_mail`, whose `parse_mail_recursive` descends into every
+  `multipart/*` subpart with no depth bound. A payload nesting containers tens of
+  thousands deep (well within axum's 2 MB body limit at ~40 bytes/level)
+  overflows the tokio worker thread's stack *during parsing* — before our own
+  `count_parts` walk — crashing the worker and dropping its in-flight
+  connections (DoS-of-degree). Added a cheap single-scan guard
+  (`count_multipart_markers`): every container the parser recurses into carries a
+  `Content-Type: multipart/...` marker, so the marker count upper-bounds the
+  recursion depth; we reject past `MAX_MIME_MULTIPART = 100` (far above any real
+  message — mixed › alternative › related is depth 3) **before** invoking the
+  recursive parser. Fails closed, the safe direction for a gating proxy; mirrors
+  the existing `MAX_SAMPLES` / `MAX_CHAIN_HOPS` bounds. Pinned by
+  `parse_mime_rejects_pathologically_nested_multipart_before_overflow` (+ a
+  realistically-nested accept test and `count_multipart_markers` unit coverage).
+  LOW/MEDIUM.
 - **CLI `urlencode` mis-encoded every non-ASCII character, silently breaking
   `killswitch user <p_0>` for internationalized principals** (a fifth-audit-pass
   finding, 2026-06-15). [crates/cli/src/main.rs](crates/cli/src/main.rs)

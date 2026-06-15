@@ -40,6 +40,18 @@ const MAX_BODY: usize = 10 * 1024 * 1024;
 /// Hard cap on the raw RFC2822 payload from agents. Gmail itself caps at
 /// 35MB with attachments; we refuse anything past 10MB at the proxy.
 const MAX_RAW_MIME: usize = 10 * 1024 * 1024;
+/// Upper bound on `multipart/*` containers in an agent-supplied MIME payload.
+/// `mailparse::parse_mail` descends into every `multipart/*` subpart with no
+/// recursion bound, so a payload nesting containers tens of thousands deep
+/// overflows the worker thread's stack *during parsing* (before our own
+/// `count_parts` walk). Each level that recurses carries its own
+/// `Content-Type: multipart/...` marker, so the marker count is a cheap
+/// (single-scan) upper bound on the parser's recursion depth; we reject past
+/// this cap before handing the bytes to the recursive parser. The cap is far
+/// above any realistic agent-composed message (mixed › alternative › related
+/// is depth 3) and fails *closed* — the safe direction for a gating proxy.
+/// Mirrors the `MAX_SAMPLES` / `MAX_CHAIN_HOPS` bounds elsewhere.
+const MAX_MIME_MULTIPART: usize = 100;
 
 pub fn router(state: AdapterState) -> Router {
     Router::new()
@@ -747,7 +759,34 @@ fn decode_b64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     B64URL.decode(s).or_else(|_| B64URL_NP.decode(s))
 }
 
+/// Cheap single-pass upper bound on `mailparse`'s recursion depth: count the
+/// case-insensitive `multipart/` markers in the raw MIME. Every `multipart/*`
+/// container the parser recurses into carries one in its `Content-Type`, so
+/// `depth ≤ marker_count`. Used to reject pathologically-nested bodies before
+/// they can overflow the stack (see `MAX_MIME_MULTIPART`).
+fn count_multipart_markers(raw: &[u8]) -> usize {
+    const NEEDLE: &[u8] = b"multipart/";
+    let mut count = 0;
+    let mut i = 0;
+    while i + NEEDLE.len() <= raw.len() {
+        if raw[i].eq_ignore_ascii_case(&b'm')
+            && raw[i..i + NEEDLE.len()].eq_ignore_ascii_case(NEEDLE)
+        {
+            count += 1;
+            i += NEEDLE.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
 fn parse_mime(raw: &[u8]) -> Result<ParsedSend, mailparse::MailParseError> {
+    if count_multipart_markers(raw) > MAX_MIME_MULTIPART {
+        return Err(mailparse::MailParseError::Generic(
+            "MIME multipart nesting exceeds bound",
+        ));
+    }
     let parsed = mailparse::parse_mail(raw)?;
     let mut out = ParsedSend::default();
     for header in parsed.get_headers() {
@@ -982,6 +1021,56 @@ mod tests {
     fn malformed_b64url_is_rejected() {
         let err = decode_b64url("not-base64!@#$").unwrap_err();
         assert!(format!("{err}").contains("Invalid"));
+    }
+
+    // ─── MIME nesting bound (stack-overflow DoS guard) ───
+
+    /// Build a `multipart/mixed` body nested `depth` levels deep — the shape an
+    /// attacker uses to drive `mailparse::parse_mail`'s unbounded recursion
+    /// into a worker-stack overflow.
+    fn nested_multipart(depth: usize) -> String {
+        let mut inner = String::from("leaf body");
+        for i in 0..depth {
+            let b = format!("b{i}");
+            inner = format!(
+                "Content-Type: multipart/mixed; boundary={b}\r\n\r\n--{b}\r\n{inner}\r\n--{b}--\r\n"
+            );
+        }
+        inner
+    }
+
+    #[test]
+    fn count_multipart_markers_bounds_recursion_depth() {
+        assert_eq!(count_multipart_markers(b"text/plain"), 0);
+        assert_eq!(count_multipart_markers(b"multipart/mixed"), 1);
+        // Case-insensitive, and overlapping is impossible for this needle.
+        assert_eq!(
+            count_multipart_markers(b"MULTIPART/mixed multipart/alternative"),
+            2
+        );
+        assert_eq!(
+            count_multipart_markers(&nested_multipart(7).into_bytes()),
+            7
+        );
+    }
+
+    #[test]
+    fn parse_mime_rejects_pathologically_nested_multipart_before_overflow() {
+        // Past the cap → rejected by the cheap pre-scan, never reaching the
+        // recursive parser. This input is intentionally only modestly deep so
+        // the test itself can't overflow if the guard regresses; the marker
+        // count alone trips the bound.
+        let deep = nested_multipart(MAX_MIME_MULTIPART + 25);
+        let err = parse_mime(deep.as_bytes()).unwrap_err();
+        assert!(format!("{err}").contains("multipart nesting exceeds bound"));
+    }
+
+    #[test]
+    fn parse_mime_accepts_realistically_nested_multipart() {
+        // mixed › alternative › related is depth 3 — comfortably under the cap
+        // and must still parse cleanly (no false rejection of real mail).
+        let ok = nested_multipart(3);
+        assert!(parse_mime(ok.as_bytes()).is_ok());
     }
 
     #[test]

@@ -210,6 +210,37 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable defects from the **twenty-sixth multi-subsystem audit pass**
+  (2026-06-16). Five general-purpose auditors swept the lanes in parallel —
+  OAuth/federation/session + PIC/crypto, adapters/forwarders/filtering,
+  policy-engine, and notifier/approvals/operator-API/CLI — each re-tracing its
+  highest-risk surfaces with the same **sibling-drift** focus that produced the
+  17th/18th approval-wedge fixes. All cleared; the ledger below is unchanged. This
+  is the **eighth consecutive clean security sweep** (19th–26th) and the seventh
+  fully-clean pass in that run (only the 23rd carried a documentation-accuracy fix,
+  not a security defect). Crypto/auth re-confirmed the three hex decoders
+  (`server.rs` token-encryption key, `forwarder/siem.rs` SIEM HMAC,
+  `notifier/webhook.rs` webhook HMAC) all carry the `is_ascii()` char-boundary
+  guard before the byte-slice `from_str_radix` — no N-1-of-N drift — the
+  AES-256-GCM envelope validates key (32) and nonce (12) lengths before
+  `from_slice`, PKCE-S256 compares with `subtle::ct_eq`, the bearer/auth-code path
+  consumes single-use under `FOR UPDATE`, and `pic/violations.rs::parse_missing_atoms`
+  slices on ASCII bracket offsets (boundary-safe regardless of multibyte content).
+  Adapters re-confirmed every interpolated Drive/Gmail/Calendar path segment routes
+  through `encoded_segment`, the Gmail external-send gate computes
+  `external_recipient` over all of to+cc+bcc and `split_addresses` fails closed, the
+  multipart-marker recursion cap guards `parse_mail` against stack-overflow DoS, and
+  the NATS `sanitize_token` allow-list strips subject-injection chars. Policy-engine
+  re-confirmed every `MatchError` propagates via `?` into a denial, non-numeric
+  thresholds fail closed via `BadShape` on both gt/lt, `#[serde(deny_unknown_fields)]`
+  forecloses typo'd-key fail-open, and `OpsExpression::is_satisfied_by` uses strict
+  atom equality. Notifier/approvals re-confirmed the burn-before-commit class closed
+  on all three surfaces (email `consumed_at` gated on `is_ok()`, Slack
+  `release_trigger_id` guarded by `status = 'pending'`, operator-API single-transaction
+  rollback) with no fourth claim site. CI gate green: `cargo fmt --check`,
+  `clippy -D warnings`, `cargo test --workspace --locked` (2324 tests), and
+  `RUSTFLAGS=-D warnings cargo build --release --locked`.*
+
 - *No new reachable defects from the **twenty-fifth multi-subsystem audit pass**
   (2026-06-16). All six lanes — crypto/auth/oauth, PIC/proxy-core,
   adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —

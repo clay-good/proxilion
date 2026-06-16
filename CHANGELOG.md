@@ -210,6 +210,38 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable **security** defects from the **twenty-seventh multi-subsystem
+  audit pass** (2026-06-16). Four general-purpose auditors swept the lanes in
+  parallel — OAuth/federation/session + PIC/crypto, adapters/forwarders/filtering,
+  policy-engine, and notifier/approvals/operator-API/CLI — each re-tracing its
+  highest-risk surfaces with the same **sibling-drift** focus. All cleared; the
+  ledger below is unchanged. This is the **ninth consecutive clean security sweep**
+  (19th–27th). PIC/crypto re-confirmed the four hex decoders carry the `is_ascii()`
+  char-boundary guard with no N-1-of-N drift, the chain walk is fail-closed and
+  cyclic-bound at `MAX_CHAIN_HOPS=64` (via `checked_add` hop overflow), PKCE-S256
+  compares with `subtle::ct_eq`, and the federation callback enforces both the
+  cross-session state binding and the same-session idempotency guard. Adapters
+  re-confirmed every interpolated Drive/Gmail/Calendar path segment routes through
+  `encoded_segment`, the read-filter `merge_overlapping` leaves no matched span
+  unredacted and all body slices land on UTF-8 boundaries, the 10 MiB streaming body
+  cap is a true chunk-accumulation bound, and the SIEM forwarder never drops an event
+  without a `proxilion_siem_forward_failures_total` increment. Policy-engine
+  re-confirmed match-result gating is fail-closed (`?`-propagated `MatchError` → deny),
+  the `matches` interpreter is linear-time (ReDoS-immune), quoted-threshold `BadShape`
+  fails closed on **both** `greater_than`/`less_than`, and `expand_template`'s
+  two-list-var path is `Malformed` (fail-closed). Notifier/approvals re-confirmed the
+  burn-before-commit class closed on all three surfaces, every mutating operator-API
+  route carries its `SCOPE_CATALOGUE` gate, and Slack signature verification uses
+  `ct_eq` over a 300s skew window. Folded in one **documentation-only** cleanup (like
+  the 23rd pass, not a security defect): twelve stale "dashboard" comments in
+  [policy-engine `trace.rs`](crates/policy-engine/src/trace.rs) referenced the
+  React/Next.js dashboard dropped in the 2026-05-11 UI pivot
+  ([ui-less-surfaces.md](docs/specs/ui-less-surfaces.md)); they were re-pointed at the
+  actual trace consumers — `proxilion-cli` and the embedded `/admin` chain inspector.
+  No runtime change, no new test (count held at 2324). CI gate green: `cargo fmt
+  --check`, `clippy -D warnings`, `cargo test --workspace --locked`, and `RUSTFLAGS=-D
+  warnings cargo build --release --locked`.*
+
 - *No new reachable defects from the **twenty-sixth multi-subsystem audit pass**
   (2026-06-16). Five general-purpose auditors swept the lanes in parallel —
   OAuth/federation/session + PIC/crypto, adapters/forwarders/filtering,

@@ -457,7 +457,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through twenty-six rounds of
+**Verification posture.** The shipped code has been through twenty-seven rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -466,6 +466,18 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The twenty-seventh pass (2026-06-16) swept all lanes in parallel with the same
+**sibling-drift** focus and surfaced **no new reachable defects** — the **ninth
+consecutive clean security sweep** (19th–27th). It re-confirmed the four hex
+decoders' `is_ascii()` char-boundary guards, the fail-closed `MAX_CHAIN_HOPS=64`
+chain walk, the linear-time (ReDoS-immune) `matches` interpreter with both
+`greater_than`/`less_than` quoted-threshold `BadShape` fail-closed, and the
+burn-before-commit approval class closed on all three surfaces. It folded in one
+documentation-only cleanup (like the 23rd pass): twelve stale "dashboard" comments
+in [policy-engine `trace.rs`](crates/policy-engine/src/trace.rs) — referencing the
+React/Next.js dashboard dropped in the 2026-05-11 UI pivot — were re-pointed at the
+actual trace consumers (the `proxilion-cli` and the embedded `/admin` chain
+inspector). No runtime change.
 The twenty-sixth pass (2026-06-16) swept the lanes in parallel with the same
 **sibling-drift** focus and surfaced **no new reachable defects** — the **eighth
 consecutive clean security sweep** (19th–26th); it re-confirmed that all three hex

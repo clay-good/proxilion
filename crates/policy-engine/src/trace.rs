@@ -2,8 +2,8 @@
 //!
 //! Per qiuth-patterns.md §3 — the policy decision is a *structure*, not a
 //! verdict. Operators inspecting a denied call learn which layer tripped
-//! without reading application logs, and the dashboard / CLI can render
-//! "why" alongside "what."
+//! without reading application logs, and the CLI / `/admin` inspector can
+//! render "why" alongside "what."
 //!
 //! The trace is produced by [`crate::Engine::evaluate_with_trace`]. The
 //! existing [`crate::Engine::evaluate`] continues to return `Outcome`
@@ -92,8 +92,8 @@ impl LayerOutcome {
 
 /// Whether the engine stops at the first deny or continues evaluating
 /// later layers/rules for diagnostic completeness. The production hot
-/// path uses [`PolicyEvalMode::FailFast`]; the dashboard's "explain this
-/// denial" replay uses [`PolicyEvalMode::Comprehensive`]. Per
+/// path uses [`PolicyEvalMode::FailFast`]; the `/admin` inspector's "explain
+/// this denial" replay uses [`PolicyEvalMode::Comprehensive`]. Per
 /// qiuth-patterns.md §3.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PolicyEvalMode {
@@ -289,7 +289,7 @@ mod tests {
         // `allowed()` is true. Pin this so a refactor that added a
         // "must have at least one layer" guard surfaces here. The
         // engine path always emits Layer A + Layer B stubs, but
-        // mocks / dashboard replay paths sometimes construct empty
+        // mocks / inspector replay paths sometimes construct empty
         // traces.
         let t = PolicyTrace::new(vec![], Decision::Allow, vec![]);
         assert!(t.allowed());
@@ -356,7 +356,7 @@ mod tests {
     fn policy_eval_mode_comprehensive_variant_compares_distinct_from_fail_fast() {
         // The existing `policy_eval_mode_default_is_fail_fast` test pins
         // the Default value only — but the `Comprehensive` variant
-        // (used by the dashboard's "explain this denial" replay per
+        // (used by the `/admin` inspector's "explain this denial" replay per
         // qiuth-patterns.md §3.3) was never directly compared against
         // its sibling. A regression that collapsed the two variants
         // into one (in the name of "Comprehensive is the only path that
@@ -477,10 +477,10 @@ mod tests {
     #[test]
     fn policy_trace_new_assigns_fresh_unique_trace_id_per_call() {
         // `PolicyTrace::new` stamps `trace_id: Uuid::new_v4()` per call
-        // — the dashboard's per-request panel and the
+        // — the `/admin` inspector's per-request panel and the
         // `X-Proxilion-Trace-Id` response header BOTH depend on every
         // engine eval producing a distinct id (operators paste the id
-        // into the dashboard's lookup endpoint to recover the trace).
+        // into the request-detail lookup endpoint to recover the trace).
         // A refactor that swapped `Uuid::new_v4()` for a once-cell
         // static (or for a hash of the layers — both are plausible
         // "deterministic id" cleanups) would silently start collapsing
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn ops_atom_view_clone_independence_after_field_mutation() {
         // `OpsAtomView` derives `Clone` — the trace's `required_ops` Vec
-        // is cloned by both the dashboard's wire-serialize path and the
+        // is cloned by both the inspector's wire-serialize path and the
         // adapter's Trust-Plane request builder. Pin that the clone is
         // a deep copy across all three String fields (a refactor that
         // switched to `Cow<'static, str>` or `Arc<str>` for "cheaper
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn layer_outcome_serde_round_trip_with_failed_shape_preserves_all_named_fields() {
         // The wire shape of `LayerOutcome` is consumed verbatim by the
-        // dashboard's per-request panel — pin a full-info `failed()`
+        // `/admin` inspector's per-request panel — pin a full-info `failed()`
         // round-trip through `serde_json::Value` so any field rename
         // (matched_rule_id → matched_id, detail → message — both
         // tempting "tidy up" refactors) surfaces on both directions.
@@ -584,7 +584,7 @@ mod tests {
         // `policy_trace_json_carries_trace_id_and_layers`). A
         // `#[serde(skip)]` 7th field (e.g. `request_id: Option<Uuid>` for
         // a future "join traces to requests by id" panel, or
-        // `engine_version: &'static str` for the dashboard's
+        // `engine_version: &'static str` for the inspector's
         // "which engine produced this trace" header) would silently
         // satisfy the existing serde key-count check while quietly
         // bloating every in-memory trace clone on the hot path.
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn layer_outcome_field_count_pinned_at_exactly_five_via_exhaustive_destructure() {
         // Symmetric to the PolicyTrace pin above. `LayerOutcome` is the
-        // per-layer record the dashboard's "explain this denial" panel
+        // per-layer record the `/admin` inspector's "explain this denial" panel
         // iterates — a `#[serde(skip)]` 6th field (e.g.
         // `evaluated_at: DateTime<Utc>` for per-layer latency
         // attribution, or `evaluator_kind: &'static str` to distinguish
@@ -631,7 +631,7 @@ mod tests {
         // surfaced in `PolicyTrace.required_ops` — the Trust Plane's
         // adapter request builder parses the 3-key shape verbatim. A
         // 4th field landing (e.g. `display_label: String` for the
-        // dashboard's "human-readable atom" panel, or
+        // inspector's "human-readable atom" panel, or
         // `policy_id: Option<String>` for back-attribution from atom to
         // the rule that emitted it) would silently bloat every required
         // ops Vec on the hot path without surfacing through the
@@ -701,7 +701,7 @@ mod tests {
         // static initializer ("share the trace timestamp across all
         // engine calls for deterministic snapshot replay") would
         // silently collapse every per-request timestamp onto the
-        // engine's first-call time and break the dashboard's
+        // engine's first-call time and break the inspector's
         // chronological replay. 1s window is wide enough to survive
         // CI's stop-the-world GC ticks but tight enough to catch a
         // static initializer's hour-scale drift across a long test

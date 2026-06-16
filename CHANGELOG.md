@@ -210,6 +210,27 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Boot-time char-boundary panic on a non-ASCII token-encryption key** (a
+  fourteenth-audit-pass finding, 2026-06-15). `hex_decode_32`
+  ([crates/proxy/src/server.rs](crates/proxy/src/server.rs)) — the decoder for the
+  operator-supplied `PROXILION_TOKEN_ENCRYPTION_KEY` (the AES-GCM key that wraps every
+  stored Google access/refresh token) — guarded only on **byte length**
+  (`hex.len() != 64`) and then indexed the string with a **byte-offset** slice
+  `&hex[i * 2..i * 2 + 2]`. A 64-*byte* value containing any multibyte UTF-8
+  codepoint (e.g. a 3-byte `→` plus 61 ASCII chars) clears the length guard, then
+  `&hex[0..2]` slices mid-codepoint and panics (`byte index 2 is not a char
+  boundary`) — crashing startup with a confusing message instead of the intended
+  graceful "must be 64 hex chars" error. This is the **third `from_hex` sibling**;
+  the 4th audit pass added the identical `if !hex.is_ascii()` guard to
+  [`WebhookSecret::from_hex`](crates/proxy/src/notifier/webhook.rs) and
+  [`SiemHmacKey::from_hex`](crates/proxy/src/forwarder/siem.rs), but `hex_decode_32`
+  lives in the boot path (not the notifier/forwarder modules) and was missed — its
+  large existing test suite exercised wrong-length and non-hex-ASCII (`ZZ`) input but
+  never a non-ASCII *byte*. Fixed by adding the same ASCII guard immediately after the
+  length check (graceful `Err`, not a crash). Pinned by
+  `hex_decode_32_rejects_non_ascii_64_byte_input_without_char_boundary_panic`.
+  LOW/MEDIUM (operator-local, boot-only — no remote reachability — matching the rating
+  of the two sibling fixes).
 - **OAuth callback orphaned an encrypted-credential row on any post-persist
   failure** (a thirteenth-audit-pass finding, 2026-06-15). `google_callback_inner`
   ([crates/proxy/src/oauth/routes.rs](crates/proxy/src/oauth/routes.rs)) INSERTed

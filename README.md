@@ -455,7 +455,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through thirteen rounds of
+**Verification posture.** The shipped code has been through fourteen rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -464,6 +464,12 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The fourteenth pass swept the PIC/crypto lane and found one: `hex_decode_32`, the
+decoder for the operator-supplied `PROXILION_TOKEN_ENCRYPTION_KEY`, guarded only on
+byte length before slicing the string at byte offsets, so a 64-*byte* key carrying
+any multibyte codepoint panicked the boot path on a char boundary — the third
+`from_hex` sibling to need the ASCII guard the 4th pass added to the two HMAC-key
+decoders (now fixed and pinned). The five other lanes cleared with no findings.
 The thirteenth pass swept the OAuth/federation lane and found two: the Google
 callback persisted its AES-GCM-encrypted `google_tokens` row on the bare pool
 *before* the fallible Trust Plane mint and the bearer transaction, so any failure

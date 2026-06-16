@@ -1125,6 +1125,15 @@ fn hex_decode_32(hex: &str) -> Result<[u8; 32]> {
     if hex.len() != 64 {
         anyhow::bail!("expected 64 hex chars, got {}", hex.len());
     }
+    // The byte-length guard above + the byte-index `&hex[i * 2..i * 2 + 2]` slice
+    // below would PANIC on a multibyte codepoint straddling an even offset (e.g. a
+    // 3-byte `→` + 61 ASCII chars is 64 bytes, and `&hex[0..2]` lands mid-`→`).
+    // Reject non-ASCII up front so a stray emoji / accented char in the operator's
+    // PROXILION_TOKEN_ENCRYPTION_KEY yields a graceful boot error, not a crash.
+    // Mirrors WebhookSecret::from_hex / SiemHmacKey::from_hex (the two HMAC-key siblings).
+    if !hex.is_ascii() {
+        anyhow::bail!("token encryption key hex must be ASCII");
+    }
     let mut out = [0u8; 32];
     for i in 0..32 {
         out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
@@ -1192,6 +1201,22 @@ mod tests {
         let mut s = "0".repeat(62);
         s.push_str("ZZ");
         assert!(hex_decode_32(&s).is_err());
+    }
+
+    #[test]
+    fn hex_decode_32_rejects_non_ascii_64_byte_input_without_char_boundary_panic() {
+        // A 3-byte `→` + 61 ASCII chars is exactly 64 *bytes*, so the `len() != 64`
+        // guard passes, but `&hex[0..2]` slices mid-codepoint and would panic
+        // ("byte index 2 is not a char boundary") absent the ASCII guard. This is the
+        // third `from_hex` sibling that the 4th-pass non-ASCII fix must cover — the
+        // operator-supplied PROXILION_TOKEN_ENCRYPTION_KEY boot path. Must Err, not panic.
+        let hex = format!("{}{}", "\u{2192}", "0".repeat(61));
+        assert_eq!(
+            hex.len(),
+            64,
+            "fixture must be 64 bytes to clear the length guard"
+        );
+        assert!(hex_decode_32(&hex).is_err());
     }
 
     fn unique_tmp_subdir(label: &str) -> std::path::PathBuf {

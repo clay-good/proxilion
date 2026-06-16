@@ -95,6 +95,35 @@ async fn claim_trigger_id(db: &PgPool, blocked_id: uuid::Uuid, trigger_id: &str)
     }
 }
 
+/// Release a `slack_trigger_id` claim previously taken by
+/// [`claim_trigger_id`] when the subsequent approve/reject failed. Without
+/// this, a transient `approve_inner`/`reject_inner` error after a successful
+/// claim wedges the row: the claim stays stamped on the still-`pending` row,
+/// so Slack's automatic retry hits the `Retry` branch and reports a *false*
+/// success (the override was never minted), while a fresh click gets a new
+/// trigger_id that the partial-unique index rejects as `Conflict` — the
+/// action can no longer be approved from Slack at all. The `status = 'pending'`
+/// guard makes this a no-op if the approve actually committed (the row is no
+/// longer pending), so it can never un-claim a row that did mutate.
+async fn release_trigger_id(db: &PgPool, blocked_id: uuid::Uuid, trigger_id: &str) {
+    let res = sqlx::query(
+        "UPDATE blocked_actions
+            SET slack_trigger_id = NULL
+          WHERE id = $1
+            AND slack_trigger_id = $2
+            AND status = 'pending'",
+    )
+    .bind(blocked_id)
+    .bind(trigger_id)
+    .execute(db)
+    .await;
+    if let Err(e) = res {
+        // Best-effort: a failed release just leaves the row in the wedged
+        // state it was already in, recoverable via the API/CLI approve path.
+        warn!(blocked_id = %blocked_id, error = %e, "failed to release slack trigger_id claim after approve/reject error");
+    }
+}
+
 pub fn router(state: SlackInteractState) -> Router {
     Router::new()
         .route("/api/v1/notifier/slack/interact", post(interact))
@@ -219,9 +248,12 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
     // claim, a retry would attempt a second approve_inner call against
     // an already-overridden row and return 409 to the Slack user.
     let trigger_id = payload["trigger_id"].as_str().unwrap_or("").to_string();
+    let mut claimed_trigger_id = false;
     if !trigger_id.is_empty() {
         match claim_trigger_id(&state.db, blocked_id, &trigger_id).await {
-            TriggerClaim::Fresh => {}
+            TriggerClaim::Fresh => {
+                claimed_trigger_id = true;
+            }
             TriggerClaim::Retry => {
                 metrics::counter!(
                     "proxilion_slack_interact_total",
@@ -316,6 +348,14 @@ async fn interact(State(state): State<SlackInteractState>, req: Request<Body>) -
         Ok(t) => ("ok", t.clone()),
         Err(t) => ("error", t.clone()),
     };
+
+    // If we claimed the trigger_id but the approve/reject failed, release the
+    // claim so Slack's retry (or a fresh click) re-attempts cleanly instead of
+    // hitting the idempotent-Retry false-success / Conflict wedge.
+    if outcome.is_err() && claimed_trigger_id {
+        release_trigger_id(&state.db, blocked_id, &trigger_id).await;
+    }
+
     metrics::counter!(
         "proxilion_slack_interact_total",
         "result" => label,
@@ -1440,5 +1480,108 @@ mod tests {
         // silently change the boot path's ownership AND
         // error-handling shape.
         let _f: fn(SlackInteractState) -> Router = router;
+    }
+
+    /// Insert a `pending` blocked_actions row, returning its id. Mirrors the
+    /// minimal seed in `api::blocked` tests but scoped to this module's DB
+    /// trigger_id test.
+    async fn seed_pending_blocked(pool: &PgPool, tag: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO blocked_actions
+               (id, request_id, vendor, action, layer, policy_id, p_0, status, expires_at)
+             VALUES ($1, $2, 'google', 'gmail.messages.send', 'policy', $3, $4, 'pending', now() + interval '1 hour')",
+        )
+        .bind(id)
+        .bind(Uuid::new_v4())
+        .bind(format!("gate-{tag}"))
+        .bind(format!("alice-{tag}@acme.com"))
+        .execute(pool)
+        .await
+        .expect("seed blocked_actions");
+        id
+    }
+
+    #[tokio::test]
+    async fn db_backed_release_trigger_id_unwedges_row_after_failed_approve() {
+        // Regression for the trigger_id wedge: `claim_trigger_id` stamps the
+        // claim on the still-`pending` row BEFORE approve_inner runs, so a
+        // transient approve failure must release the claim — otherwise Slack's
+        // retry hits `Retry` (false success) and a fresh click hits `Conflict`,
+        // permanently wedging the Slack approval path for that row.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        let tag = Uuid::new_v4().simple().to_string();
+        let id = seed_pending_blocked(&pool, &tag).await;
+
+        // 1. First click claims the trigger_id.
+        assert!(
+            matches!(
+                claim_trigger_id(&pool, id, "trigger-A").await,
+                TriggerClaim::Fresh
+            ),
+            "first claim of trigger-A must be Fresh"
+        );
+        // Same delivery retried → idempotent Retry (Slack's timeout retry).
+        assert!(
+            matches!(
+                claim_trigger_id(&pool, id, "trigger-A").await,
+                TriggerClaim::Retry
+            ),
+            "retry of the same trigger_id must be Retry"
+        );
+
+        // 2. approve_inner failed (transient) → we release the claim.
+        release_trigger_id(&pool, id, "trigger-A").await;
+        let after_release: Option<String> =
+            sqlx::query_scalar("SELECT slack_trigger_id FROM blocked_actions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after_release, None,
+            "release must clear the claim on the still-pending row"
+        );
+
+        // 3. A fresh click (new trigger_id) can now re-claim — NOT a Conflict.
+        // Without the release this would be `Conflict` (row already carried
+        // trigger-A) and the action could never be approved from Slack.
+        assert!(
+            matches!(
+                claim_trigger_id(&pool, id, "trigger-B").await,
+                TriggerClaim::Fresh
+            ),
+            "after release, a fresh trigger_id must re-claim cleanly (was wedged before the fix)"
+        );
+
+        // 4. Release is a no-op once the row is no longer pending — it must
+        // never un-claim a row whose approve actually committed.
+        sqlx::query("UPDATE blocked_actions SET status = 'approved' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        release_trigger_id(&pool, id, "trigger-B").await;
+        let after_commit: Option<String> =
+            sqlx::query_scalar("SELECT slack_trigger_id FROM blocked_actions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after_commit.as_deref(),
+            Some("trigger-B"),
+            "release must NOT clear the claim once the row left 'pending' (approve committed)"
+        );
+
+        // Cleanup this test's row from the shared DB.
+        sqlx::query("DELETE FROM blocked_actions WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }

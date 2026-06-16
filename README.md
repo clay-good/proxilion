@@ -426,6 +426,7 @@ properties end-to-end:
 | Operator-auth boundary (the gate for all `/api/v1/*`) | the real `middleware` + `scope_check` composition, driven via `tower::oneshot` against seeded `operator_tokens`: valid+scope → 200, wildcard → 200, revoked → 401, unknown → 401, wrong scope → 403, missing/malformed → 401, and a successful auth touches `last_used_at` |
 | OAuth federation callback (replay binding) | a federation token whose `state` matches the callback session establishes it (`pca_0_id`/`p_0` written); a token minted for a *different* session is rejected (`BridgeRejected`, 401) and the target session stays untouched — session-fixation defense (§6.4); a *second* token naming the **same** already-bound session is rejected (`SessionGone`) without overwriting its identity — same-session re-bind defense (thirteenth-audit fix) |
 | OAuth Google callback (atomic credential persist) | the encrypted `google_tokens` row commits or rolls back atomically with the `agent_bearers` row that references it — a rolled-back transaction leaves **zero** rows, a committed one leaves exactly one (thirteenth-audit fix — the row was once written on the bare pool before the fallible Trust Plane mint, orphaning encrypted credentials on any failure) |
+| Slack approval `trigger_id` release | after a Slack approve/reject `Fresh`-claims the `trigger_id` on a `pending` row, a **failed** commit releases the claim so a fresh click re-claims cleanly (the action isn't wedged), while a release *after* the row committed is a no-op — the `status='pending'` guard never un-claims a row that did mutate (seventeenth-audit fix) |
 
 These run in the CI `integration` job (postgres service) on every push, against
 in-process wiremock Trust Plane + Google. The shared scaffolding lives in
@@ -455,7 +456,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through sixteen rounds of
+**Verification posture.** The shipped code has been through seventeen rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -464,6 +465,17 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The seventeenth pass (2026-06-16) — after two consecutive clean sweeps — re-ran
+all six lanes in parallel and surfaced **one** defect, in the notifier/approvals
+lane: a Slack-approval **wedge** where the interaction handler claimed the inbound
+`trigger_id` on the still-`pending` blocked row *before* the override commit, and
+the direct-commit path never released that claim when the commit failed for a
+reachable transient reason — so Slack's automatic retry reported a false success
+(no override minted) and a fresh click hit a `Conflict`, permanently wedging that
+action's Slack approval path (default-deny held throughout; an availability bug,
+not authz). Fixed with a `release_trigger_id` that clears the claim on the
+approve/reject error path, guarded so it can never un-claim a row that did commit,
+and pinned by a db-backed regression test. The other five lanes cleared.
 The sixteenth pass (2026-06-15) — the second consecutive fully-clean sweep —
 re-ran all six lanes in parallel with an explicit sibling-drift focus and
 surfaced **no new reachable defects**: the chain-walk was re-confirmed fail-closed

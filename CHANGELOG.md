@@ -210,6 +210,41 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Slack approval wedged after a transient approve/reject failure** (a
+  seventeenth-audit-pass finding, 2026-06-16). The Slack interaction handler
+  ([crates/proxy/src/api/notifier_slack.rs](crates/proxy/src/api/notifier_slack.rs))
+  claims the inbound `trigger_id` on the still-`pending` `blocked_actions` row
+  (`claim_trigger_id`, the §5.3 idempotency layer that absorbs Slack's automatic
+  delivery retries) **before** running `approve_inner`/`reject_inner`. On the
+  direct-commit path (incoming-webhook install, no bot token), if that inner
+  commit then failed for a genuinely reachable transient reason — predecessor PCA
+  missing from `pca_cache` (`Internal`) or a Trust-Plane transport blip during the
+  override mint — the claim stayed stamped while the row stayed `pending`. Slack's
+  retry of the same delivery then matched the `Retry` branch and returned a
+  **false success** ("Already processed (retry).") though no override PCA was ever
+  minted, and a fresh operator click drew a new `trigger_id` that the partial-unique
+  `blocked_actions_slack_trigger_id_uniq` index rejected as `Conflict` (409 "already
+  approved or rejected") — permanently wedging that action's Slack approval path.
+  Default-deny held throughout (nothing was wrongly approved; the row expires on
+  schedule), so this is an availability/correctness defect, not an authz one — the
+  human-in-the-loop release was silently lost and the operator had to fall back to
+  the API/CLI. Fix: a new `release_trigger_id` clears the claim on the `Err` arm of
+  the approve/reject dispatch, guarded `WHERE … AND status = 'pending'` so it is a
+  no-op once the approve actually committed (the row left `pending`) and can never
+  un-claim a row that did mutate. `approve_inner`'s `FOR UPDATE` + status guard
+  remains the canonical double-execution protection, so moving the claim is safe.
+  The modal (`view_submission`) path was already correct — it never claims a
+  trigger_id, deferring the mutation to the modal submit. Pinned by the new
+  db-backed `db_backed_release_trigger_id_unwedges_row_after_failed_approve` (CI
+  `integration` job, real Postgres): claim → retry-is-Retry → release → a fresh
+  trigger_id re-claims cleanly (the wedge is gone), and release-after-commit is a
+  no-op. The other five lanes (OAuth/federation/session, PIC/crypto,
+  adapters/forwarders, policy-engine, operator-API/CLI) re-swept in parallel and
+  cleared with no new findings. CI gate green: `cargo fmt --check`, `clippy -D
+  warnings`, 2323 workspace tests, and the `RUSTFLAGS=-D warnings` release build.
+  See [README §Verification posture](README.md) and
+  [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md)
+  Addendum 2026-06-16.
 - _**Sixteenth audit pass (2026-06-15) — no new findings.** Another fresh
   parallel multi-subsystem sweep across all six lanes (OAuth/federation/session,
   PIC/crypto, adapters/forwarders, policy-engine, notifier/approvals,

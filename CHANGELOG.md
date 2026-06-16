@@ -210,6 +210,53 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable defects from the **twenty-first multi-subsystem audit pass**
+  (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
+  adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —
+  were swept in parallel and cleared; the ledger above is unchanged. This is the
+  third consecutive fully-clean pass (19th, 20th, 21st), and the fourth clean
+  result in the last five passes. Each lane re-traced its highest-risk surfaces
+  with an explicit **sibling-drift** focus (the finding class that produced the
+  17th/18th-pass approval-wedge fixes): the OAuth lane re-confirmed
+  `persist_google_tokens` runs inside the caller transaction (no orphaned
+  ciphertext), the one-shot `pca_0_id IS NULL` federation establish, auth-code
+  single-spend via `FOR UPDATE`+`consumed_at`, constant-time PKCE-S256, and that
+  the empty-scope-intersection reject precedes any `google_tokens` persist (no
+  orphan rows); the candidate `serde_json::to_value(&claims.ops).unwrap()` in
+  [oauth/routes.rs](crates/proxy/src/oauth/routes.rs) was re-confirmed infallible
+  (`Vec<String>` serialization cannot fail) — the same site the 16th pass already
+  cleared, left unchanged. PIC/crypto re-confirmed the chain-walk fails closed at
+  every link (Ed25519/continuity/identity/ops-subset) against the
+  signature-covered CBOR, bounds a crafted cyclic chain at `MAX_CHAIN_HOPS=64`
+  (→ `ChainTooLong`), uses `checked_add` for hop ordering, per-message random
+  AES-256-GCM nonces, and keeps all three `from_hex`/`hex_decode_32` siblings
+  `is_ascii()`-guarded and non-ASCII-tested. Adapters re-confirmed every
+  interpolated upstream path segment routes through `encoded_segment` (Drive,
+  Gmail `msg_id`, all six Calendar sites — no bypass), the `split_addresses`
+  external-send gate fails closed on RFC-5322-malformed recipients, the
+  `persists_blocked_action` predicate is shared across all three Google adapters
+  (Drive/Gmail/Calendar — the 12th-pass consolidation that prevents
+  require-confirmation rows going unpersisted on one adapter), and the
+  `MAX_MIME_MULTIPART`/`MAX_SAMPLES`/`read_bounded`/10MB caps hold. policy-engine
+  re-confirmed no `apply_op` error arm fails open to `Ok(false)`, the
+  quoted-threshold `BadShape` covers **both** `greater_than` and `less_than` (no
+  N-1 gap), all four list-valued operators (`in`/`not_in`/`equals`/`not_equals`)
+  implement correct set membership, and `deny_unknown_fields` spans
+  `PolicyDoc`/`ReadFilterCfg`/`RecipientsCfg`/`BurstCfg`. notifier/approvals
+  re-confirmed all three approval surfaces gate their single-use claim/consume on
+  the commit outcome — Slack `release_trigger_id` on the err arm, email
+  `consumed_at` on `action_outcome.is_ok()`, operator-API claims nothing and rolls
+  back the whole override in one transaction — and that the webhook HMAC inbound
+  check uses `subtle::ConstantTimeEq`, not `==`. operator-API/CLI re-confirmed
+  every mutating route gates on a catalogued `operator_scopes` entry,
+  `scope_check` is exact-match-or-`*`, the `actions`/`blocked` list limits clamp
+  to `1..=500` consistently across CLI help, CLI clamp, and server, the CSV export
+  defangs every string column against formula injection, and the destructive
+  `actions purge` / `killswitch` dry-runs use the exact same predicate as the real
+  mutation. CI gate green end-to-end: `cargo fmt --check`, `clippy -D warnings`,
+  the full workspace test suite, and the `RUSTFLAGS=-D warnings` release build.
+  §10 open question #5 (proxy-side override-TTL enforcement) remains deliberately
+  deferred on the spec.md §6.6 upstream branch as recorded.*
 - *No new reachable defects from the **twentieth multi-subsystem audit pass**
   (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
   adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —

@@ -210,6 +210,32 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Corrected the stale operator-scope list in the
+  [operator_auth.rs](crates/proxy/src/operator_auth.rs) module docstring**
+  (surfaced by the **twenty-third multi-subsystem audit pass**, 2026-06-16).
+  The hand-maintained docstring enumerated a `tokens:admin` scope that does **not**
+  exist in the canonical catalogue and omitted three scopes that do —
+  `actions:purge`, `notifier:read`, and `notifier:write`. The single source of
+  truth is [`shared_types::operator_scopes::SCOPE_CATALOGUE`](crates/shared-types/src/operator_scopes.rs)
+  (re-exported here and rendered by `proxilion-cli tokens scopes`), so the fix
+  replaces the drift-prone duplicate list with a pointer to that catalogue plus an
+  accurate enumeration. No runtime behavior changed — scope enforcement already
+  reads the catalogue, not the comment — so this is a documentation-accuracy fix in
+  the same vein as the 19th pass's `blocked list --limit` help-text correction.
+  This was the **only** finding: all six lanes — OAuth/federation/session,
+  PIC/crypto, adapters/forwarders, policy-engine, notifier/approvals, and
+  operator-API/CLI — were otherwise swept in parallel and cleared, the **fifth
+  consecutive clean security sweep** (19th–23rd). Re-confirmed with the same
+  **sibling-drift** focus: all four hex decoders carry the `!is_ascii()`
+  char-boundary guard, the chain-walk fails closed and bounds a crafted cycle at
+  `MAX_CHAIN_HOPS=64`, every interpolated upstream path segment routes through
+  `encoded_segment`, the `greater_than`/`less_than` quoted-threshold `BadShape`
+  shares one fail-closed `rhs_as_number` arm, the burn-before-commit class stays
+  closed on all three approval surfaces (Slack `release_trigger_id`, email
+  `consumed_at` gated on `is_ok()`, operator-API single-transaction rollback), and
+  every protected `/api/v1/*` route carries a `scope_check` bound to a catalogued
+  scope.
+
 - *No new reachable defects from the **twenty-second multi-subsystem audit pass**
   (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
   adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —

@@ -457,7 +457,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through twenty-two rounds of
+**Verification posture.** The shipped code has been through twenty-three rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -466,6 +466,16 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The twenty-third pass (2026-06-16) re-ran all six lanes in parallel; the security
+sweep was clean — the **fifth consecutive clean security sweep** (19th–23rd) — with
+exactly one documentation-accuracy fix: the `operator_auth` module docstring had
+drifted from the canonical scope catalogue (it listed a non-existent `tokens:admin`
+scope and omitted `actions:purge`, `notifier:read`, `notifier:write`) and now points
+at [`SCOPE_CATALOGUE`](crates/shared-types/src/operator_scopes.rs), the runtime
+source of truth, instead of a duplicate list. No runtime behavior changed. The
+sibling-drift re-confirmations (hex-decode guards, fail-closed chain-walk,
+`encoded_segment`, quoted-threshold `BadShape`, commit-gated approval claims) all
+held.
 The twenty-second pass (2026-06-16) re-ran all six lanes in parallel and surfaced
 **no new reachable defects** — the **fourth consecutive fully-clean pass** (19th,
 20th, 21st, 22nd). Each lane re-traced its highest-risk surfaces with the same

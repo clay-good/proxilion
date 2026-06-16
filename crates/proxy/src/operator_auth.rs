@@ -5,16 +5,14 @@
 //! to the operator exactly once at issue time via `proxilion-cli tokens
 //! issue` and stored hashed in `operator_tokens`.
 //!
-//! Scopes are a curated string set:
-//!   * `policy:read`           — `GET /api/v1/policy`
-//!   * `policy:write`          — `POST /api/v1/policy/reload`, `…/mode`
-//!   * `blocks:read`           — `GET /api/v1/blocked` + `GET /…/{id}`
-//!   * `blocks:approve`        — `POST /api/v1/blocked/{id}/approve|reject`
-//!   * `killswitch:revoke`     — `POST /api/v1/killswitch/*`
-//!   * `actions:read`          — `GET /api/v1/actions*`
-//!   * `actions:export`        — `GET /api/v1/actions/export`
-//!   * `pca:read`              — `GET /api/v1/pca/*`
-//!   * `tokens:admin`          — manage other tokens (future)
+//! Scopes are a curated string set. The canonical `(scope, description,
+//! endpoints)` catalogue is the single source of truth in
+//! [`shared_types::operator_scopes::SCOPE_CATALOGUE`] (re-exported here);
+//! render the live set with `proxilion-cli tokens scopes`. Current
+//! members: `policy:read`, `policy:write`, `blocks:read`,
+//! `blocks:approve`, `killswitch:revoke`, `actions:read`,
+//! `actions:export`, `actions:purge`, `pca:read`, `notifier:read`,
+//! `notifier:write` (plus the `*` wildcard below).
 //!
 //! Wildcard `*` matches every scope; useful for a single bootstrap admin
 //! token. Otherwise scopes are exact-match.

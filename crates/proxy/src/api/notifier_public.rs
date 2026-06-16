@@ -164,20 +164,29 @@ async fn submit(
         other => return render_error(&format!("Unknown action `{other}`")),
     };
 
-    // Mark consumed regardless of outcome — the token has been spent.
-    // Worth doing in the same tx as the operation? Approve does its
-    // own transactional work in `approve_inner` (commits on success).
-    // Consuming the token after-the-fact is acceptable because the
-    // OUTER lock here (FOR UPDATE on notifier_tokens row) means another
-    // concurrent click sees consumed_at=NULL+row-locked and blocks
-    // until we mark it.
-    if let Err(e) =
-        sqlx::query("UPDATE notifier_tokens SET consumed_at = now() WHERE token_id = $1")
-            .bind(form.t)
-            .execute(&mut *tx)
-            .await
-    {
-        tracing::warn!(error = %e, "notifier_token: failed to mark consumed");
+    // Consume the token ONLY when the decision actually committed.
+    // `approve_inner`/`reject_inner` do their own transactional work and
+    // leave the `blocked_actions` row `pending` on any `Err` (a reachable
+    // transient class: predecessor PCA absent from `pca_cache`, a Trust-
+    // Plane blip during `mint_successor`, a pool error). Burning the single-
+    // use token on such a failure would permanently wedge the email link —
+    // the row still needs a decision but the link is dead, forcing an
+    // operator to mint a fresh one. This is the email sibling of the §5.3
+    // Slack-wedge the 17th audit closed with `release_trigger_id`. Leaving
+    // the token un-consumed on failure cannot cause a double-approve: the
+    // OUTER `FOR UPDATE` lock serializes concurrent clicks, and
+    // `approve_inner`'s own `SELECT … FOR UPDATE` + `status='pending'` guard
+    // is the canonical double-execution protection, so a retry re-locks,
+    // re-checks pending, and re-attempts cleanly.
+    if action_outcome.is_ok() {
+        if let Err(e) =
+            sqlx::query("UPDATE notifier_tokens SET consumed_at = now() WHERE token_id = $1")
+                .bind(form.t)
+                .execute(&mut *tx)
+                .await
+        {
+            tracing::warn!(error = %e, "notifier_token: failed to mark consumed");
+        }
     }
     if let Err(e) = tx.commit().await {
         tracing::warn!(error = %e, "notifier_token: commit failed");
@@ -1227,6 +1236,99 @@ mod tests {
         assert!(
             html.contains("already") || html.to_lowercase().contains("used"),
             "a consumed token must render the already-used page, got: {}",
+            &html[..html.len().min(300)],
+        );
+    }
+
+    #[tokio::test]
+    async fn db_backed_failed_approve_does_not_consume_token_so_link_is_retryable() {
+        // 18th-audit regression (email sibling of the 17th-pass Slack
+        // `release_trigger_id` wedge): a single-use email approval link must
+        // survive a TRANSIENT `approve_inner` failure. Here the blocked row is
+        // `pending` and names a `predecessor_pca_id` that is NOT in `pca_cache`,
+        // so `approve_inner` returns `Err` (predecessor PCA unrecoverable) and
+        // leaves the row `pending`. The token MUST remain un-consumed so the
+        // human can retry the same link rather than being permanently wedged.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        let blocked_id = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let missing_pred = Uuid::new_v4(); // never inserted into pca_cache
+        sqlx::query(
+            "INSERT INTO blocked_actions
+                (id, request_id, vendor, action, layer, policy_id, detail,
+                 status, predecessor_pca_id, requested_ops)
+             VALUES ($1, $2, 'google', 'gmail.messages.send', 'policy',
+                     'gmail-ext', 'external recipient', 'pending', $3,
+                     ARRAY['gmail.messages.send'])",
+        )
+        .bind(blocked_id)
+        .bind(Uuid::new_v4())
+        .bind(missing_pred)
+        .execute(&pool)
+        .await
+        .expect("seed blocked_actions");
+        sqlx::query(
+            "INSERT INTO notifier_tokens (token_id, blocked_id, action, expires_at)
+             VALUES ($1, $2, 'approve', now() + interval '30 minutes')",
+        )
+        .bind(token_id)
+        .bind(blocked_id)
+        .execute(&pool)
+        .await
+        .expect("seed notifier_tokens");
+
+        let state = public_state(pool.clone()).await;
+
+        // POST a valid (≥20-char) justification — passes validation, then
+        // `approve_inner` fails on the absent predecessor PCA.
+        let resp = submit(
+            State(state.clone()),
+            Form(SubmitForm {
+                t: token_id,
+                justification: Some(
+                    "approving this external send after manual verification".into(),
+                ),
+                reason: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_str(resp).await;
+        assert!(
+            html.contains("not in cache") || html.to_lowercase().contains("unrecoverable"),
+            "expected a failure result page, got: {}",
+            &html[..html.len().min(300)],
+        );
+
+        // The row is still pending (no override committed) ...
+        let status: String = sqlx::query_scalar("SELECT status FROM blocked_actions WHERE id = $1")
+            .bind(blocked_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "failed approve must leave row pending");
+
+        // ... AND the single-use token is NOT consumed, so the link is retryable.
+        let consumed: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT consumed_at FROM notifier_tokens WHERE token_id = $1")
+                .bind(token_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            consumed.is_none(),
+            "WEDGE: a transient approve failure burned the single-use token",
+        );
+
+        // A subsequent GET still renders the live form (not the already-used page).
+        let resp = landing(State(state), Query(TokenQ { t: token_id })).await;
+        let html = body_str(resp).await;
+        assert!(
+            html.contains("name=\"justification\""),
+            "after a failed approve the link must still render the form, got: {}",
             &html[..html.len().min(300)],
         );
     }

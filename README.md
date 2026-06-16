@@ -427,6 +427,7 @@ properties end-to-end:
 | OAuth federation callback (replay binding) | a federation token whose `state` matches the callback session establishes it (`pca_0_id`/`p_0` written); a token minted for a *different* session is rejected (`BridgeRejected`, 401) and the target session stays untouched — session-fixation defense (§6.4); a *second* token naming the **same** already-bound session is rejected (`SessionGone`) without overwriting its identity — same-session re-bind defense (thirteenth-audit fix) |
 | OAuth Google callback (atomic credential persist) | the encrypted `google_tokens` row commits or rolls back atomically with the `agent_bearers` row that references it — a rolled-back transaction leaves **zero** rows, a committed one leaves exactly one (thirteenth-audit fix — the row was once written on the bare pool before the fallible Trust Plane mint, orphaning encrypted credentials on any failure) |
 | Slack approval `trigger_id` release | after a Slack approve/reject `Fresh`-claims the `trigger_id` on a `pending` row, a **failed** commit releases the claim so a fresh click re-claims cleanly (the action isn't wedged), while a release *after* the row committed is a no-op — the `status='pending'` guard never un-claims a row that did mutate (seventeenth-audit fix) |
+| Email approval link survives a failed commit | the public approval `submit` form runs `approve_inner` against a `pending` row naming an **absent** predecessor PCA → the commit fails, the row stays `pending`, and the single-use `notifier_tokens` row is **not** consumed (`consumed_at IS NULL`) so a fresh GET still renders the live form — the email sibling of the Slack-wedge fix (eighteenth-audit fix — the token was once burned regardless of outcome, wedging the link on any transient failure) |
 
 These run in the CI `integration` job (postgres service) on every push, against
 in-process wiremock Trust Plane + Google. The shared scaffolding lives in
@@ -456,7 +457,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through seventeen rounds of
+**Verification posture.** The shipped code has been through eighteen rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -465,6 +466,19 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The eighteenth pass (2026-06-16) re-ran all six lanes in parallel and surfaced
+**one** defect, in the notifier/approvals lane: the **email/public-landing sibling
+of the seventeenth-pass Slack wedge** — a textbook sibling-drift miss where the
+prior fix hardened one approval surface and left the symmetric hole on the other.
+The public approval `submit` handler consumed the single-use `notifier_tokens` row
+**unconditionally**, so a genuinely reachable *transient* approve/reject failure
+(predecessor PCA absent from `pca_cache`, a Trust-Plane blip, or a pool error — all
+of which leave the blocked row `pending`) still burned the link, leaving the action
+unreviewable and forcing an operator to mint a fresh one (default-deny held; an
+availability bug, not authz). Fixed by consuming the token only when the decision
+actually committed — the outer `FOR UPDATE` token lock plus `approve_inner`'s own
+`FOR UPDATE` + `status='pending'` guard keep a retry from ever double-approving —
+pinned by a db-backed regression test. The other five lanes cleared.
 The seventeenth pass (2026-06-16) — after two consecutive clean sweeps — re-ran
 all six lanes in parallel and surfaced **one** defect, in the notifier/approvals
 lane: a Slack-approval **wedge** where the interaction handler claimed the inbound

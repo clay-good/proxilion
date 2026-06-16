@@ -210,6 +210,42 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Email approval link wedged after a transient approve/reject failure** (an
+  eighteenth-audit-pass finding, 2026-06-16) — the **email/public-landing sibling**
+  of the seventeenth-pass Slack wedge below; the prior fix landed on one surface and
+  left the symmetric hole on the other. The public approval `submit` handler
+  ([crates/proxy/src/api/notifier_public.rs](crates/proxy/src/api/notifier_public.rs))
+  ran `approve_inner`/`reject_inner`, captured the outcome, and then marked the
+  single-use `notifier_tokens` row consumed **unconditionally** ("regardless of
+  outcome — the token has been spent"). That reasoning holds for a *committed*
+  decision but is wrong for a genuinely reachable transient failure: predecessor PCA
+  missing from `pca_cache` (`Internal`, the same trigger as the Slack case), a
+  Trust-Plane transport blip during `mint_successor`, or a pool error — all leave the
+  `blocked_actions` row `pending` (their inner transaction rolls back) while the
+  outer handler still burned the token. Result: the action still needs a decision but
+  the link is dead — the next GET renders "Link already used" and the approver cannot
+  retry; an operator must mint a fresh link via `issue-link`. Default-deny held
+  throughout (nothing was wrongly approved; the row expires on schedule), so this is
+  an availability/correctness defect, not an authz one. The short-justification /
+  empty-reason validation path returns **before** the consume block, so it already
+  (correctly) did not burn the token — the leak was specific to post-validation,
+  attempted-but-failed commits. Fix: the consume `UPDATE … SET consumed_at` now runs
+  only when `action_outcome.is_ok()`. Leaving the token un-consumed on failure cannot
+  cause a double-approve — the outer `SELECT … FOR UPDATE` on the token row serializes
+  concurrent clicks, and `approve_inner`'s own `SELECT … FOR UPDATE` + `status =
+  'pending'` guard is the canonical double-execution protection, so a retry re-locks,
+  re-checks pending, and re-attempts cleanly (the exact invariant the Slack
+  `release_trigger_id` fix relies on). Pinned by the new db-backed
+  `db_backed_failed_approve_does_not_consume_token_so_link_is_retryable` (CI
+  `integration` job, real Postgres): a `pending` row naming an absent predecessor PCA
+  → failed approve → row stays `pending` AND `consumed_at IS NULL` → a fresh GET still
+  renders the live form. The other five lanes (OAuth/federation/session, PIC/crypto,
+  adapters/forwarders, policy-engine, operator-API/CLI) were re-swept in parallel and
+  cleared with no new findings. CI gate green: `cargo fmt --check`, `clippy -D
+  warnings`, 2324 workspace tests, and the `RUSTFLAGS=-D warnings` release build. See
+  [README §Verification posture](README.md) and
+  [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md)
+  Addendum 2026-06-16b.
 - **Slack approval wedged after a transient approve/reject failure** (a
   seventeenth-audit-pass finding, 2026-06-16). The Slack interaction handler
   ([crates/proxy/src/api/notifier_slack.rs](crates/proxy/src/api/notifier_slack.rs))

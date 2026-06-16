@@ -210,6 +210,41 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable defects from the **twenty-fifth multi-subsystem audit pass**
+  (2026-06-16). All six lanes — crypto/auth/oauth, PIC/proxy-core,
+  adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —
+  were swept in parallel and cleared; the ledger below is unchanged. This is the
+  **seventh consecutive clean security sweep** (19th–25th) and the **sixth
+  fully-clean pass** in that run (the 23rd carried one documentation-accuracy fix,
+  not a security defect). Each lane re-traced its highest-risk surfaces with the
+  same **sibling-drift** focus that produced the 17th/18th approval-wedge fixes.
+  Crypto/auth re-confirmed the AES-256-GCM envelope pre-checks `nonce.len() == 12`
+  before `Nonce::from_slice` (no panic on a corrupt row), PKCE-S256 verifies length
+  before SHA-256 and compares with `subtle::ct_eq`, the auth-code exchange consumes
+  single-use inside one `SELECT … FOR UPDATE` transaction, and every secret
+  (`bearer`, Google access token, `bearer_hash`, `leaf_pca_cbor`) is redacted in its
+  `Debug` impl. PIC/proxy-core re-verified cryptographic chain continuity
+  (`child.cat_sig == parent.signature()`, so a forged `predecessor_id` pointer is
+  rejected), root-spoof cross-checks (`predecessor_id IS NULL ⇒ hop == 0 &&
+  provenance.is_none()`), the `MAX_CHAIN_HOPS=64` cycle bound with `checked_add` hop
+  arithmetic, and the per-bearer `Arc<Mutex>` re-read-after-lock that collapses 50
+  concurrent refreshes into one Google call. Adapters re-confirmed every read-filter
+  slice index derives from `regex` match offsets (guaranteed UTF-8 boundaries), the
+  Gmail multipart-marker recursion cap guards `parse_mail` against stack-overflow
+  DoS, and the external-send gate fails closed on an unparseable recipient header.
+  Policy-engine re-confirmed every `MatchError` propagates via `?` into a denial
+  (no error is swallowed into a silent allow), non-numeric thresholds fail closed
+  via `BadShape` while non-numeric runtime LHS degrades to no-match, and the
+  linear-time `regex` engine forecloses ReDoS. Notifier/approvals re-confirmed the
+  burn-before-commit class closed on all three surfaces (Slack `release_trigger_id`
+  guarded by `status = 'pending'`, email `consumed_at` gated on
+  `action_outcome.is_ok()`, operator-API single-transaction rollback) and the
+  constant-time Slack `v0=` signature verify. Operator-API/CLI re-confirmed every
+  protected `/api/v1/*` route carries a `scope_check` bound to a catalogued scope and
+  the public tier is mounted outside `operator_auth` by design. CI gate green:
+  `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --locked`
+  (2324 tests), and `RUSTFLAGS=-D warnings cargo build --release --locked`.*
+
 - *No new reachable defects from the **twenty-fourth multi-subsystem audit pass**
   (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
   adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —

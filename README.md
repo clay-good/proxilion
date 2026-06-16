@@ -457,7 +457,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through twenty-three rounds of
+**Verification posture.** The shipped code has been through twenty-four rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -466,6 +466,19 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The twenty-fourth pass (2026-06-16) re-ran all six lanes in parallel and surfaced
+**no new reachable defects** — the **sixth consecutive clean security sweep**
+(19th–24th), and the fifth fully-clean pass in that run (the 23rd carried a
+documentation-only fix). Each lane re-traced its highest-risk surfaces with the
+same **sibling-drift** focus: PIC/crypto re-confirmed the fail-closed,
+`MAX_CHAIN_HOPS=64`-bounded chain walk terminates a crafted A→B→A cycle with
+`ChainTooLong` (never a loop or a "valid" result) and that all four hex decoders
+carry the `!is_ascii()` char-boundary guard; the flagship Gmail external-send gate
+stays fail-closed on an unparseable recipient header (the permissive fallback can
+only over-count external recipients, never drop one Gmail would route); the
+burn-before-commit class stays closed on all three approval surfaces; and every
+protected `/api/v1/*` route is bound to a catalogued `scope_check`. No runtime
+behavior changed.
 The twenty-third pass (2026-06-16) re-ran all six lanes in parallel; the security
 sweep was clean — the **fifth consecutive clean security sweep** (19th–23rd) — with
 exactly one documentation-accuracy fix: the `operator_auth` module docstring had

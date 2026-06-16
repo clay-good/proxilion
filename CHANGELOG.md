@@ -210,6 +210,44 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable defects from the **twenty-fourth multi-subsystem audit pass**
+  (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
+  adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —
+  were swept in parallel and cleared; the ledger below is unchanged. This is the
+  **sixth consecutive clean security sweep** (19th–24th) and the **fifth
+  fully-clean pass** in that run (the 23rd carried one documentation-accuracy fix,
+  not a security defect). Each lane re-traced its highest-risk surfaces with the
+  same explicit **sibling-drift** focus that produced the 17th/18th approval-wedge
+  fixes. OAuth/session re-confirmed auth-code single-spend (`SELECT … FOR UPDATE`
+  → PKCE-S256 constant-time verify → `consumed_at`, with the consume rolling back
+  on a transient failure so a code stays retryable), the one-shot
+  `pca_0_id IS NULL` federation establish, and the atomic `google_tokens` +
+  `agent_bearers` persist. PIC/crypto re-verified the fail-closed,
+  `MAX_CHAIN_HOPS=64`-bounded chain walk (a crafted A→B→A cycle terminates with
+  `ChainTooLong`, never a loop or a "valid" result), `checked_add` hop arithmetic,
+  fresh-per-`encrypt` AES-256-GCM nonces with key/nonce length guards, and all
+  four `!is_ascii()`-guarded hex decoders. Adapters re-confirmed the flagship
+  Gmail external-send gate is fail-closed on an unparseable recipient header (the
+  permissive fallback can only **over**-count external recipients, never drop one
+  Gmail would still route), every interpolated upstream path routes through
+  `encoded_segment`, and the multipart-marker recursion cap guards `parse_mail`
+  against a stack-overflow DoS. Policy-engine re-confirmed first-match-wins with an
+  `Allow` fallback only on a genuinely omitted `decision:` (guarded by
+  `deny_unknown_fields`), `${var}` substitution failing closed on unknown/unclosed
+  vars, and the `greater_than`/`less_than` quoted-threshold `BadShape` sharing one
+  fail-closed `rhs_as_number` arm. Notifier/approvals re-confirmed the
+  burn-before-commit class closed on all three surfaces (Slack `release_trigger_id`
+  guarded by `status = 'pending'`, email `consumed_at` gated on
+  `action_outcome.is_ok()`, operator-API single-transaction rollback) and the
+  constant-time Slack `v0=` signature verify over the raw timestamp bytes.
+  Operator-API/CLI re-confirmed every protected `/api/v1/*` route carries a
+  `scope_check` bound to a catalogued scope, the public tier (setup-status,
+  healthz, notifier_public, notifier_slack, oauth) is mounted outside
+  `operator_auth` by design, and the CLI parses attacker-controlled server
+  responses without an indexing or multibyte-boundary panic. CI gate green:
+  `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --locked`
+  (2324 tests), and `RUSTFLAGS=-D warnings cargo build --release --locked`.*
+
 - **Corrected the stale operator-scope list in the
   [operator_auth.rs](crates/proxy/src/operator_auth.rs) module docstring**
   (surfaced by the **twenty-third multi-subsystem audit pass**, 2026-06-16).

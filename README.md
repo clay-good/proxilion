@@ -458,7 +458,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through twenty-eight rounds of
+**Verification posture.** The shipped code has been through twenty-nine rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -467,6 +467,19 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The twenty-ninth pass (2026-06-16) ran five parallel auditors over the same lanes
+with the same **sibling-drift** focus and surfaced **no new reachable security
+defects** — the **eleventh consecutive clean security sweep** (19th–29th). It
+folded in one documentation-only fix (like the 19th/23rd/27th/28th): the
+`observe` mode pipeline note in [ui-less-surfaces.md](docs/specs/ui-less-surfaces.md)
+§2.5 enumerated a non-existent `observe_quarantine` decision label and omitted the
+real `observe_rate_limit`, drifting from the authoritative three-label set emitted
+by [`observe_demote`](crates/policy-engine/src/rego.rs) (`observe_block` /
+`observe_require_confirmation` / `observe_rate_limit`) — the same set already
+correct in `schema-v1.md` and the §3.2 metric contract. Quarantine is a read-filter
+response-body outcome, never a Layer-B `Decision`, so it never flows through
+`observe_demote`; both the enumeration and the prose above it were corrected. No
+runtime change; the test count held.
 The twenty-eighth pass (2026-06-16) ran four parallel auditors over the same lanes
 and surfaced **no new reachable security defects** — the **tenth consecutive clean
 security sweep** (19th–28th). It finished the sibling-drift cleanup the 27th pass

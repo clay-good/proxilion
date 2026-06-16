@@ -194,11 +194,11 @@ hot-reload path as a manual edit.
 
 In `observe` mode, the decision pipeline runs identically:
 
-1. Layer-B policy evaluates → would-have-blocked / would-have-quarantined / etc.
+1. Layer-B policy evaluates → would-have-blocked / would-have-rate-limited / etc.
 2. PIC required-ops template computed → would-have-been-rejected by Trust Plane.
 3. The `action_events` row is persisted with `decision = "observe_$X"` where
-   `$X` is the would-have decision (`observe_block`, `observe_quarantine`,
-   `observe_require_confirmation`).
+   `$X` is the would-have decision (`observe_block`,
+   `observe_require_confirmation`, `observe_rate_limit`).
 4. The request continues to the upstream as if nothing happened.
 5. `proxilion_observe_would_have_blocked_total{policy_id,reason}` ticks.
 

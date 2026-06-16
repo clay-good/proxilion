@@ -210,6 +210,39 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable **security** defects from the **twenty-ninth multi-subsystem
+  audit pass** (2026-06-16). Five general-purpose auditors swept the lanes in
+  parallel — OAuth/federation/session+PIC-crypto, adapters/forwarders/audit-body,
+  policy-engine, notifier/approvals/operator-API/CLI, and a README/docs accuracy
+  lane — with the same **sibling-drift** focus. All cleared on security; this is
+  the **eleventh consecutive clean security sweep** (19th–29th). The productive
+  output was **one code-vs-doc fix** (like the 19th/23rd/27th/28th passes, a
+  documentation-accuracy correction, not a security defect): the `observe`-mode
+  pipeline note in [ui-less-surfaces.md](docs/specs/ui-less-surfaces.md) §2.5
+  enumerated a **non-existent `observe_quarantine` decision label** and **omitted
+  the real `observe_rate_limit`**, drifting from the authoritative three-label set
+  that [`observe_demote`](crates/policy-engine/src/rego.rs) actually emits
+  (`observe_block` / `observe_require_confirmation` / `observe_rate_limit`) — the
+  same set already stated correctly in three other places (`observe_demote` itself,
+  [`docs/audit/schema-v1.md`](docs/audit/schema-v1.md) `decision` column, and the
+  §3.2 `proxilion_adapter_requests_total` metric contract at ui-less-surfaces.md
+  §3.2). Quarantine is a read-filter **response-body** outcome and is never a
+  Layer-B `Decision`, so it never flows through `observe_demote`; both the
+  enumeration and the conceptual prose line above it ("would-have-quarantined" →
+  "would-have-rate-limited") were corrected to match the code. **Lesson (extends
+  the 23rd/27th): when a doc enumerates a label/scope set with a `const`/`match`
+  source of truth elsewhere, it WILL drift — point at the canonical source or keep
+  every copy in lockstep; here three copies were right and the fourth had rotted.**
+  Verifications re-confirmed this pass (no churn): the four hex decoders' char-
+  boundary guards, fail-closed `MAX_CHAIN_HOPS=64` chain walk, all interpolated
+  Drive/Gmail/Calendar path segments via `encoded_segment`, both `greater_than`/
+  `less_than` quoted-threshold `BadShape`, and the burn-before-commit approval class
+  closed on all three surfaces (Slack `trigger_id`, email `consumed_at`, operator-API
+  single-tx). README "Verification posture" bumped to twenty-nine rounds. No runtime
+  change, no new test (count held at 2328). CI gate green: `cargo fmt --check`,
+  `clippy -D warnings`, `cargo test --workspace --locked`, and the
+  `RUSTFLAGS="-D warnings"` release build.*
+
 - *No new reachable **security** defects from the **twenty-eighth multi-subsystem
   audit pass** (2026-06-16). Four general-purpose auditors swept the lanes in
   parallel — OAuth/api/notifier, adapters/PIC/read-filter, policy-engine/CLI/shared-types,

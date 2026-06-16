@@ -424,7 +424,8 @@ properties end-to-end:
 | Calendar `events.insert`, external attendee | the write gate (the Calendar adapter's distinguishing path) blocks before any mint/upstream — `PolicyBlocked` (403) + a `layer='policy'` blocked row; completes the Drive/Gmail/Calendar trio |
 | Google token refresh, 50 concurrent | the per-bearer mutex coalesces a stampede: with an expired token, **50 concurrent** refreshers hit Google **exactly once** (asserted via wiremock's `received_requests`) and all see the fresh token |
 | Operator-auth boundary (the gate for all `/api/v1/*`) | the real `middleware` + `scope_check` composition, driven via `tower::oneshot` against seeded `operator_tokens`: valid+scope → 200, wildcard → 200, revoked → 401, unknown → 401, wrong scope → 403, missing/malformed → 401, and a successful auth touches `last_used_at` |
-| OAuth federation callback (replay binding) | a federation token whose `state` matches the callback session establishes it (`pca_0_id`/`p_0` written); a token minted for a *different* session is rejected (`BridgeRejected`, 401) and the target session stays untouched — session-fixation defense (§6.4) |
+| OAuth federation callback (replay binding) | a federation token whose `state` matches the callback session establishes it (`pca_0_id`/`p_0` written); a token minted for a *different* session is rejected (`BridgeRejected`, 401) and the target session stays untouched — session-fixation defense (§6.4); a *second* token naming the **same** already-bound session is rejected (`SessionGone`) without overwriting its identity — same-session re-bind defense (thirteenth-audit fix) |
+| OAuth Google callback (atomic credential persist) | the encrypted `google_tokens` row commits or rolls back atomically with the `agent_bearers` row that references it — a rolled-back transaction leaves **zero** rows, a committed one leaves exactly one (thirteenth-audit fix — the row was once written on the bare pool before the fallible Trust Plane mint, orphaning encrypted credentials on any failure) |
 
 These run in the CI `integration` job (postgres service) on every push, against
 in-process wiremock Trust Plane + Google. The shared scaffolding lives in
@@ -454,7 +455,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through twelve rounds of
+**Verification posture.** The shipped code has been through thirteen rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -463,6 +464,15 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The thirteenth pass swept the OAuth/federation lane and found two: the Google
+callback persisted its AES-GCM-encrypted `google_tokens` row on the bare pool
+*before* the fallible Trust Plane mint and the bearer transaction, so any failure
+in that window orphaned an encrypted credential no bearer could reference (now
+persisted inside the same transaction, atomic with the bearer); and the
+federation bridge's establish UPDATE lacked a `pca_0_id IS NULL` guard, so a
+replayed token could re-bind an already-established session's identity (now a
+one-shot establish — defense-in-depth ahead of the JWKS signature swap). The five
+other lanes cleared with no findings.
 The twelfth pass added a dedicated logic-correctness lane (hunting wrong-*decision*
 bugs, not crashes or leaks) and found one: the Drive adapter's Layer-B denial
 guard had drifted from its Gmail/Calendar siblings and matched only a hard

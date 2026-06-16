@@ -235,10 +235,19 @@ async fn bridge_callback_body(
             .map_err(|e| OAuthError::Internal(e.to_string()))?;
     }
 
+    // OAuth audit (13th) — same-session idempotency, the sibling of the §6.4
+    // cross-session binding above. `pca_0_id IS NULL` makes the establish a
+    // one-shot: a federation token (even one with the correct `state`) may bind
+    // a session exactly once. Without it, a second token naming an
+    // already-established session would silently overwrite its identity
+    // (pca_0_id / p_0 / granted_ops) — a replay/rebind primitive that matters
+    // the moment `validate_federation_token`'s signature check stops being
+    // stubbed. A zero-row result means the session was already established (or
+    // is gone/expired) → reject, leaving the bound identity untouched.
     let session = sqlx::query_as::<_, (String,)>(
         "UPDATE oauth_sessions
             SET pca_0_id = $1, p_0 = $2, granted_ops = $3
-          WHERE id = $4 AND expires_at > now()
+          WHERE id = $4 AND expires_at > now() AND pca_0_id IS NULL
         RETURNING agent_requested_scope",
     )
     .bind(claims.pca_0_id)
@@ -384,7 +393,12 @@ async fn google_callback_inner(
         ));
     }
 
-    // Encrypt + persist Google tokens.
+    // Encrypt the Google tokens now (no DB side effect), but defer the
+    // `google_tokens` INSERT until the bearer/auth_code transaction below so
+    // the ciphertext row commits atomically with the `agent_bearers` row that
+    // references it. Persisting here — before the fallible `mint_successor`
+    // and PCA_1 cache insert — would orphan the encrypted credentials on any
+    // failure between this point and the commit.
     let access_ct = state
         .cipher
         .encrypt(token_resp.access_token.as_bytes())
@@ -395,15 +409,6 @@ async fn google_callback_inner(
         .map(|t| state.cipher.encrypt(t.as_bytes()))
         .transpose()
         .map_err(|_| OAuthError::Crypto)?;
-    let google_tokens_id = persist_google_tokens(
-        &state.db,
-        params.state,
-        &access_ct,
-        refresh_ct.as_ref(),
-        &token_resp.scope,
-        crate::oauth::token_expiry(token_resp.expires_in),
-    )
-    .await?;
 
     // Load PCA_0 CBOR from cache and mint PCA_1.
     let cache = crate::pic::PcaCache::new(state.db.clone());
@@ -455,6 +460,15 @@ async fn google_callback_inner(
     let scope = token_resp.scope.clone();
 
     let mut tx = state.db.begin().await?;
+    let google_tokens_id = persist_google_tokens(
+        &mut *tx,
+        params.state,
+        &access_ct,
+        refresh_ct.as_ref(),
+        &token_resp.scope,
+        crate::oauth::token_expiry(token_resp.expires_in),
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO agent_bearers
             (bearer_sha256, session_id, pca_1_id, google_tokens_id, scope)
@@ -518,14 +532,23 @@ fn narrowed_ops_for_pca1(pca0_ops: &[String], granted_scope: &str) -> Vec<String
         .collect()
 }
 
-async fn persist_google_tokens(
-    db: &sqlx::PgPool,
+// Generic over the executor so the caller can run this INSERT *inside* the
+// bearer/auth_code transaction. The encrypted `google_tokens` row must commit
+// or roll back atomically with the `agent_bearers` row that references it —
+// persisting it on the bare pool (as this did originally) orphaned the
+// ciphertext whenever a later step (Trust Plane `mint_successor`, PCA_1 cache
+// insert, or the tx itself) failed. See `google_callback_inner`.
+async fn persist_google_tokens<'e, E>(
+    executor: E,
     session_id: Uuid,
     access: &Ciphertext,
     refresh: Option<&Ciphertext>,
     scope: &str,
     expires_at: DateTime<Utc>,
-) -> Result<Uuid, OAuthError> {
+) -> Result<Uuid, OAuthError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let (refresh_bytes, refresh_nonce) = match refresh {
         Some(c) => (Some(c.bytes.as_slice()), Some(c.nonce.as_slice())),
         None => (None, None),
@@ -546,7 +569,7 @@ async fn persist_google_tokens(
     .bind(refresh_nonce)
     .bind(scope)
     .bind(expires_at)
-    .fetch_one(db)
+    .fetch_one(executor)
     .await?;
     Ok(row.0)
 }
@@ -1636,6 +1659,41 @@ mod tests {
             "p_0 must be written"
         );
 
+        // 1b. OAuth audit (13th) — same-session idempotency. A SECOND token
+        // with the correct `state` for the same (already-bound) session must
+        // be rejected without overwriting the established identity.
+        let rebind = bridge_callback_body(
+            oauth_state_for(pool.clone()),
+            BridgeCallback {
+                state: sid,
+                federation_token: String::new(),
+            },
+            {
+                let mut c = claims_for(sid.to_string());
+                c.pca_0_id = Uuid::new_v4();
+                c.p_0 = "mallory@evil.com".into();
+                c
+            },
+        )
+        .await
+        .expect_err("a second establish of an already-bound session must be rejected");
+        assert!(
+            matches!(rebind, OAuthError::SessionGone),
+            "expected SessionGone on re-bind, got: {rebind:?}",
+        );
+        let (still_pca, still_p0): (Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT pca_0_id, p_0 FROM oauth_sessions WHERE id = $1")
+                .bind(sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_pca, Some(pca_0), "re-bind must not change pca_0_id");
+        assert_eq!(
+            still_p0.as_deref(),
+            Some("alice@acme.com"),
+            "re-bind must not change p_0",
+        );
+
         // 2. Mismatched state → replay rejected, target session untouched.
         let victim = Uuid::new_v4();
         seed_session(&pool, victim).await;
@@ -1668,5 +1726,63 @@ mod tests {
             victim_pca.is_none(),
             "replay must not establish/modify the target session",
         );
+    }
+
+    #[tokio::test]
+    async fn db_backed_persist_google_tokens_is_atomic_with_caller_tx() {
+        // OAuth audit (13th): the encrypted `google_tokens` row must commit or
+        // roll back atomically with the `agent_bearers` row that references it.
+        // The INSERT used to run on the bare pool, *before* the fallible
+        // `mint_successor` / PCA_1 cache insert, so any later failure orphaned
+        // an undereferenced AES-GCM ciphertext row. `persist_google_tokens` is
+        // now generic over the executor and runs inside the caller's tx; this
+        // test pins that property directly: a rolled-back tx leaves NO row, a
+        // committed tx leaves exactly one.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+
+        let ct = Ciphertext {
+            nonce: vec![0u8; 12],
+            bytes: vec![1u8; 16],
+        };
+        let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        // 1. Rolled-back tx → the INSERT is undone (simulates a failure
+        //    anywhere between persist and commit).
+        let rolled_sid = Uuid::new_v4();
+        seed_session(&pool, rolled_sid).await;
+        let mut tx = pool.begin().await.unwrap();
+        let id = persist_google_tokens(&mut *tx, rolled_sid, &ct, None, "drive.readonly", expires)
+            .await
+            .expect("persist inside tx");
+        tx.rollback().await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM google_tokens WHERE session_id = $1")
+                .bind(rolled_sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 0,
+            "a rolled-back tx must leave no orphaned google_tokens row (got id {id})",
+        );
+
+        // 2. Committed tx → exactly one row persists.
+        let kept_sid = Uuid::new_v4();
+        seed_session(&pool, kept_sid).await;
+        let mut tx = pool.begin().await.unwrap();
+        persist_google_tokens(&mut *tx, kept_sid, &ct, None, "drive.readonly", expires)
+            .await
+            .expect("persist inside tx");
+        tx.commit().await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM google_tokens WHERE session_id = $1")
+                .bind(kept_sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "a committed tx must persist exactly one row");
     }
 }

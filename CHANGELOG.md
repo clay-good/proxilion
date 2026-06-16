@@ -210,6 +210,50 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **OAuth callback orphaned an encrypted-credential row on any post-persist
+  failure** (a thirteenth-audit-pass finding, 2026-06-15). `google_callback_inner`
+  ([crates/proxy/src/oauth/routes.rs](crates/proxy/src/oauth/routes.rs)) INSERTed
+  the AES-GCM-encrypted `google_tokens` row on the bare pool *before* — and
+  outside the transaction of — the fallible steps that must succeed for any
+  bearer to ever reference it: the Trust Plane `mint_successor` network call, the
+  PCA_1 base64 decode + cache insert, and the bearer/`auth_code` transaction
+  itself. A failure anywhere in that window (a slow or erroring Trust Plane is
+  the common one) returned an error and left an encrypted Google access/refresh
+  token persisted with **no `agent_bearers` row pointing at it** and nothing to
+  sweep it — turning every in-flight OAuth callback that races a Trust Plane
+  hiccup into a permanent orphaned-ciphertext row. The twelfth-pass §6.8 note
+  had hoisted only the *empty-scope-intersection* orphan path above the persist;
+  every other failure between persist and commit still orphaned. Fixed by making
+  [`persist_google_tokens`](crates/proxy/src/oauth/routes.rs) generic over the
+  executor and moving its INSERT *into* the same transaction that writes
+  `agent_bearers` + `auth_codes`, so the ciphertext row commits or rolls back
+  atomically with the bearer that references it. New DB-backed regression test
+  `db_backed_persist_google_tokens_is_atomic_with_caller_tx` (a rolled-back tx
+  leaves zero rows; a committed tx leaves exactly one). MEDIUM (undereferenced
+  encrypted-credential rows accumulate without bound on a flaky Trust Plane).
+- **Federation bridge could re-bind an already-established session** (a
+  thirteenth-audit-pass finding, 2026-06-15; the same-session sibling of the
+  §6.4 cross-session state-binding fix). `bridge_callback_body`
+  ([crates/proxy/src/oauth/routes.rs](crates/proxy/src/oauth/routes.rs)) bound a
+  session's identity with `UPDATE oauth_sessions SET pca_0_id=…, p_0=…,
+  granted_ops=… WHERE id=$4 AND expires_at > now()` — no `pca_0_id IS NULL`
+  guard. §6.4 already blocks presenting a token minted for session A on session
+  B's callback, but a *second* token naming session A (a replay onto its own
+  session) would silently overwrite A's bound `pca_0_id` / `p_0` / `granted_ops`
+  with the replayed token's claims. With `validate_federation_token`'s signature
+  check still stubbed (spec.md §0.4) this is only exploitable once signatures
+  land, which is exactly why the defense-in-depth guard should land *first*.
+  Fixed by adding `AND pca_0_id IS NULL` to the UPDATE so an establish is
+  one-shot; a zero-row result (already-established / gone / expired) is rejected
+  as `SessionGone`, leaving the bound identity untouched. The PCA-cache insert
+  on that path is already idempotent (`ON CONFLICT (pca_id) DO NOTHING`), so the
+  guard introduces no half-written state. Pinned by extending
+  `db_backed_bridge_callback_binds_session_on_match_and_rejects_replay` with a
+  same-session re-bind case asserting the second token is rejected and the
+  identity is unchanged. LOW/MEDIUM (gated by the documented signature stub;
+  defense-in-depth before the JWKS swap). The other five sweep lanes — PIC,
+  adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —
+  were re-audited and cleared with no findings.
 - **Drive adapter dropped the review row + notifier on a `require_confirmation`
   policy** (a twelfth-audit-pass finding, 2026-06-15). All three Google adapters'
   `proxy_request` share a Layer-B denial template that persists a

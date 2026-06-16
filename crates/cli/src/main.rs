@@ -438,7 +438,7 @@ enum BlockedCmd {
         /// Filter by policy_id.
         #[arg(long)]
         policy_id: Option<String>,
-        /// Per-page limit (1..=200, default 50).
+        /// Per-page limit (1..=500, default 50).
         #[arg(long, default_value_t = 50)]
         limit: u32,
         /// Output: pretty | json.

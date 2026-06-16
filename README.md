@@ -457,7 +457,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through eighteen rounds of
+**Verification posture.** The shipped code has been through nineteen rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -466,6 +466,19 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The nineteenth pass (2026-06-16) re-ran all six lanes in parallel and surfaced
+**no new reachable defects**. After two consecutive single-finding passes (17th
+and 18th) that were sibling-drift misses across the three approval surfaces, this
+pass scrutinized the **third** surface hardest and confirmed the operator-API
+`approve`/`reject` path carries **no** burn-before-commit sibling of the
+Slack/email wedge: it claims no single-use trigger or token and runs the entire
+override inside one transaction that rolls back cleanly on any pre-commit error,
+so a retry re-locks and re-checks `pending` with nothing consumed. The chain-walk,
+the quoted-threshold fail-closed across both comparison operators, the
+`encoded_segment` path-encoding across all three adapters, and the catalogued
+operator-scope gates were all re-confirmed intact. A stale CLI help string (the
+`blocked list --limit` ceiling read `1..=200` while both the CLI and the server
+clamp to `1..=500`) was corrected alongside the pass.
 The eighteenth pass (2026-06-16) re-ran all six lanes in parallel and surfaced
 **one** defect, in the notifier/approvals lane: the **email/public-landing sibling
 of the seventeenth-pass Slack wedge** — a textbook sibling-drift miss where the

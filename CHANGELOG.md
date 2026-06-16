@@ -210,6 +210,29 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable defects from the **nineteenth multi-subsystem audit pass**
+  (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
+  adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —
+  were swept in parallel and cleared. The notifier/approvals lane (which produced
+  the sole finding on each of the seventeenth and eighteenth passes) was scrutinized
+  hardest: the third approval surface, the **operator API** `approve`/`reject`
+  ([api/blocked.rs](crates/proxy/src/api/blocked.rs)), was confirmed to carry **no**
+  burn-before-commit sibling of the Slack/email wedge — it claims no single-use
+  trigger/token, runs `approve_inner` entirely inside one transaction (`SELECT …
+  FOR UPDATE` + `status='pending'` → mint/cache → `UPDATE … 'overridden'` →
+  `commit`), and any pre-commit `Err` rolls the whole transaction back with nothing
+  consumed. The two single-use consume/claim sites (email `consumed_at`, Slack
+  `release_trigger_id`) both still gate on the commit outcome. The PIC chain-walk
+  was re-confirmed fail-closed at every link and bounded at `MAX_CHAIN_HOPS=64`;
+  all three `from_hex`/`hex_decode_32` siblings remain `is_ascii()`-guarded; the
+  quoted-threshold `BadShape` fail-closed still covers **both** `greater_than` and
+  `less_than`; every interpolated adapter path segment still routes through
+  `encoded_segment`; and `persists_blocked_action` is still shared across all three
+  Google adapters. One **documentation-accuracy** correction landed alongside the
+  pass: the `proxilion-cli blocked list --limit` help text claimed a `1..=200`
+  per-page ceiling, but both the CLI's own clamp and the server cap the value at
+  `1..=500` (matching the sibling `actions list --limit` help) — the stale `200` is
+  now `500`. No behavior change; the clamp logic was already correct and tested.*
 - **Email approval link wedged after a transient approve/reject failure** (an
   eighteenth-audit-pass finding, 2026-06-16) — the **email/public-landing sibling**
   of the seventeenth-pass Slack wedge below; the prior fix landed on one surface and

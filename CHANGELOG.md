@@ -210,6 +210,29 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **Drive adapter dropped the review row + notifier on a `require_confirmation`
+  policy** (a twelfth-audit-pass finding, 2026-06-15). All three Google adapters'
+  `proxy_request` share a Layer-B denial template that persists a
+  `blocked_actions` row and fires the human-in-the-loop notifier, but the guard
+  was inlined in each copy and drifted: Gmail and Calendar matched both
+  `PolicyBlocked` *and* `RequireConfirmation`, while the Drive copy matched only
+  `PolicyBlocked`. So a `decision: require_confirmation` policy on a Drive read
+  (`drive.files.list` / `get` / `export`) denied the agent correctly (428) but
+  wrote **no** reviewable row and fired **no** email/Slack notification — there
+  was nothing for an operator to approve, and the action went uncounted — while
+  the identical rule on Gmail or Calendar produced the full pending-block record.
+  The decision was right; the audit/operator surface was wrong-by-adapter. Fixed
+  by extracting the guard into one shared
+  [`adapters::persists_blocked_action`](crates/proxy/src/adapters/mod.rs) predicate
+  that all three `proxy_request` bodies now call, so the three can no longer
+  diverge (the same consolidation the read-filter `read_bounded` fix used). New
+  regression tests: a context-free unit test
+  (`persists_blocked_action_covers_both_layer_b_denials_and_nothing_else`) pinning
+  the predicate across every `AppError` variant, and a DB-backed integration test
+  (`db_backed_drive_get_require_confirmation_persists_pending_blocked_row`)
+  asserting a `require_confirmation` Drive read writes exactly one `status='pending'`,
+  `layer='policy'` row end-to-end (it fails on the pre-fix guard). MEDIUM (a
+  human-in-the-loop gate on Drive reads was silently unreviewable and uncounted).
 - **Read-filter `quarantine_action` could silently fail open** (an
   eleventh-audit-pass finding, 2026-06-15). `PolicyDoc` carries
   `#[serde(deny_unknown_fields)]` (so a typo'd top-level key fails loudly), but

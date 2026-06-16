@@ -419,6 +419,7 @@ properties end-to-end:
 | Drive adapter, runtime-gate (mint refused) | the same 422 is **not** passed through — `proxy_request` returns `PicInvariantViolation` (403), never calls upstream, and persists a `layer='pic_invariant'` blocked row (prevention by construction) |
 | Drive adapter, runtime-gate (valid mint, happy path) | Trust Plane *issues* a successor → the PCA_2 is cached at `hop=2` with the leaf as predecessor (the chain grows a hop) and a clean upstream body passes through untouched |
 | Drive adapter, read-filter `block_request` | a matched pattern quarantines the **whole** response → `ReadFilterBlocked` (403) + a `layer='read_filter'` blocked row (vs the `replace_with_marker` row above, which lets the request proceed) |
+| Drive adapter, `require_confirmation` | the human-in-the-loop gate on a Drive read denies the agent (428) **and** persists exactly one `status='pending'`, `layer='policy'` blocked row (the twelfth-audit fix — the guard once matched only a hard `block`, so the row was silently skipped) |
 | Gmail send, external recipient | the flagship Layer-B gate blocks before any mint/upstream — `PolicyBlocked` (403) + a `layer='policy'` blocked row carrying `policy_id` + `override_allowed` |
 | Calendar `events.insert`, external attendee | the write gate (the Calendar adapter's distinguishing path) blocks before any mint/upstream — `PolicyBlocked` (403) + a `layer='policy'` blocked row; completes the Drive/Gmail/Calendar trio |
 | Google token refresh, 50 concurrent | the per-bearer mutex coalesces a stampede: with an expired token, **50 concurrent** refreshers hit Google **exactly once** (asserted via wiremock's `received_requests`) and all see the fresh token |
@@ -453,7 +454,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through eleven rounds of
+**Verification posture.** The shipped code has been through twelve rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -462,6 +463,13 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The twelfth pass added a dedicated logic-correctness lane (hunting wrong-*decision*
+bugs, not crashes or leaks) and found one: the Drive adapter's Layer-B denial
+guard had drifted from its Gmail/Calendar siblings and matched only a hard
+`block`, so a `require_confirmation` policy on a Drive read denied the agent
+correctly but persisted no review row and fired no notifier — the
+human-in-the-loop gate was silently unreviewable. The fix folds the guard into a
+single shared predicate so the three adapters can't diverge again.
 The eleventh pass extended the tenth's `deny_unknown_fields` hardening to the
 *nested* policy-config structs — a typo'd `quarantine_actoin: block_request`
 under a `read_filter:` block had silently fallen back to the marker-splice

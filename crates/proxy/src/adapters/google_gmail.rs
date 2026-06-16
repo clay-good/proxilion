@@ -244,10 +244,7 @@ async fn proxy_request(
             AppError::RequireConfirmation(_) => ("policy", "require_confirmation".to_string()),
             _ => ("policy", format!("{e}")),
         };
-        if matches!(
-            e,
-            AppError::PolicyBlocked { .. } | AppError::RequireConfirmation(_)
-        ) {
+        if super::persists_blocked_action(&e) {
             crate::blocked::persist_and_notify(
                 &state.auth.db,
                 &state.notifier,

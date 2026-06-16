@@ -357,10 +357,7 @@ async fn proxy_request(
     // Layer B.
     if let Err(e) = enforce_pre_request_decision(&outcome) {
         super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
-        if matches!(
-            e,
-            AppError::PolicyBlocked { .. } | AppError::RequireConfirmation(_)
-        ) {
+        if super::persists_blocked_action(&e) {
             let detail = format!("{e}");
             crate::blocked::persist_and_notify(
                 &state.auth.db,

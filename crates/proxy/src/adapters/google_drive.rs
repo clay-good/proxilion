@@ -181,7 +181,7 @@ async fn proxy_request(
     // Layer B: policy.
     if let Err(e) = enforce_pre_request_decision(&outcome) {
         super::policy_trace::emit(&policy_trace, request_id, "google", &req.action);
-        if matches!(e, AppError::PolicyBlocked { .. }) {
+        if super::persists_blocked_action(&e) {
             crate::blocked::persist_and_notify(
                 &state.auth.db,
                 &state.notifier,
@@ -1564,5 +1564,96 @@ mod tests {
             before + 1,
             "a read_filter blocked_actions row must be persisted",
         );
+    }
+
+    #[tokio::test]
+    async fn db_backed_drive_get_require_confirmation_persists_pending_blocked_row() {
+        // Regression for the twelfth-audit finding: a `require_confirmation`
+        // Layer-B decision on a Drive read must enqueue a reviewable
+        // `blocked_actions` row (layer='policy', the same as a hard block) so an
+        // operator can approve it via the human-in-the-loop queue. The Drive
+        // adapter's persist guard once matched only `PolicyBlocked`, so a
+        // `require_confirmation` policy denied the agent (correct 428) but wrote
+        // no row and fired no notifier — while the identical rule on Gmail and
+        // Calendar did. Both `proxy_request` decisions now route through the
+        // shared `super::persists_blocked_action` predicate; this pins the
+        // end-to-end behavior so the divergence can't silently return.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        use std::collections::HashMap;
+
+        let leaf_pca_id = Uuid::new_v4();
+        crate::test_support::seed_pca_cache(&pool, leaf_pca_id, "carol@acme.com").await;
+
+        // A `require_confirmation` gate on a Drive read. The decision is made on
+        // request context alone, so dead Trust Plane / Google URLs are never hit
+        // (the gate fires before any mint or upstream call).
+        let policy_yaml = r#"
+- id: drive-get-confirm-gate
+  vendor: google
+  action: drive.files.get
+  decision: require_confirmation
+  override: requires_justification
+  pic_mode: runtime-gate
+"#;
+        let state = crate::test_support::adapter_state(
+            pool.clone(),
+            policy_yaml,
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+        );
+        let session = crate::test_support::mock_session(leaf_pca_id, "carol@acme.com");
+
+        let before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM blocked_actions WHERE layer = 'policy' AND policy_id = 'drive-get-confirm-gate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let mut policy_path = HashMap::new();
+        policy_path.insert("id".to_string(), "abc".to_string());
+        let err = proxy_request(
+            &state,
+            &session,
+            DriveRequest {
+                action: "drive.files.get".into(),
+                upstream_path: "/drive/v3/files/abc".into(),
+                policy_path,
+                query: HashMap::new(),
+                body_for_policy: HashMap::new(),
+            },
+        )
+        .await
+        .expect_err("require_confirmation must deny the agent");
+
+        assert!(
+            matches!(err, AppError::RequireConfirmation(_)),
+            "expected RequireConfirmation, got: {err:?}",
+        );
+
+        let after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM blocked_actions WHERE layer = 'policy' AND policy_id = 'drive-get-confirm-gate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "a require_confirmation Drive read must persist exactly one pending blocked_actions row",
+        );
+
+        // The row is `pending` (awaiting an operator) — the queue's auto-expire
+        // and approve paths both key on this status.
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM blocked_actions WHERE policy_id = 'drive-get-confirm-gate' ORDER BY at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "pending", "the new row must await operator review");
     }
 }

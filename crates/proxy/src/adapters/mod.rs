@@ -56,6 +56,29 @@ pub(crate) fn encoded_segment(vendor: &'static str, s: &str) -> String {
     path_segment(s)
 }
 
+/// Whether a Layer-B denial should be persisted to `blocked_actions` and
+/// fan out to the notifier, shared by every Google adapter's `proxy_request`.
+///
+/// Both `PolicyBlocked` (a hard deny) and `RequireConfirmation` (a
+/// human-in-the-loop gate) enqueue a pending review row — the latter is the
+/// *whole point* of the confirmation queue, since an operator must be able to
+/// approve it. Every other `AppError` (upstream/transport/PIC/internal) is not
+/// a Layer-B policy outcome and is returned to the agent without a queue row.
+///
+/// This predicate exists so the three adapters can't drift: a previous version
+/// inlined the `matches!` guard in each `proxy_request`, and the Drive copy was
+/// never widened to include `RequireConfirmation` — so a `require_confirmation`
+/// policy on a Drive read denied the agent correctly but wrote no reviewable
+/// row and fired no notification, while the identical rule on Gmail/Calendar
+/// did. Routing all three through one function makes that divergence
+/// impossible.
+pub(crate) fn persists_blocked_action(e: &AppError) -> bool {
+    matches!(
+        e,
+        AppError::PolicyBlocked { .. } | AppError::RequireConfirmation(_)
+    )
+}
+
 /// Read an upstream response body into memory under a hard `max`-byte cap,
 /// shared by every Google adapter.
 ///
@@ -112,8 +135,34 @@ mod tests {
         assert_eq!(path_segment("me"), "me");
     }
 
-    use super::{AppError, read_bounded};
+    use super::{AppError, persists_blocked_action, read_bounded};
     use bytes::Bytes;
+
+    #[test]
+    fn persists_blocked_action_covers_both_layer_b_denials_and_nothing_else() {
+        // The two Layer-B outcomes that must enqueue a reviewable
+        // `blocked_actions` row + fire the notifier. `RequireConfirmation` is
+        // the regression guard: the Drive adapter's inlined `matches!` once
+        // omitted it, so a `require_confirmation` policy on a Drive read denied
+        // the agent but left no row for an operator to approve.
+        assert!(persists_blocked_action(&AppError::PolicyBlocked {
+            policy_id: Some("p".into()),
+            reason: "blocked".into(),
+            override_allowed: true,
+        }));
+        assert!(persists_blocked_action(&AppError::RequireConfirmation(
+            "external recipient".into()
+        )));
+
+        // Every non-Layer-B error is returned to the agent without a queue row.
+        assert!(!persists_blocked_action(&AppError::RateLimit));
+        assert!(!persists_blocked_action(&AppError::PicInvariantViolation(
+            "ops not subset".into()
+        )));
+        assert!(!persists_blocked_action(&AppError::UpstreamTooLarge));
+        assert!(!persists_blocked_action(&AppError::ReadFilterBlocked));
+        assert!(!persists_blocked_action(&AppError::Internal("boom".into())));
+    }
 
     /// Build a `reqwest::Response` whose body is an unsized stream — so it
     /// carries **no** `Content-Length` and `read_bounded` is forced down the

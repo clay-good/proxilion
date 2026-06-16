@@ -210,6 +210,46 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable defects from the **twentieth multi-subsystem audit pass**
+  (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
+  adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —
+  were swept in parallel and cleared; the ledger above is unchanged. The
+  operator-API/CLI lane surfaced **one candidate** that was investigated and
+  confirmed **intentional, not a defect**: `GET /api/v1/setup/status`
+  ([api/setup.rs](crates/proxy/src/api/setup.rs)) is mounted **outside** the
+  `operator_auth` layer ([server.rs](crates/proxy/src/server.rs) — "a checklist
+  for an operator who hasn't issued a token yet"), so it is reachable without an
+  operator token. This is by design and correct: it is the pre-token onboarding
+  readiness probe (the chicken-and-egg surface that tells a fresh operator how to
+  configure the system so they *can* mint their first token), in the same public
+  tier as `/healthz` and the `/admin/setup` HTML page. It returns only
+  booleans and counts (DB reachable?, Google creds present?, `N` policies loaded,
+  `N` OAuth clients, `N` PCAs cached) plus the plain `federation_bridge_url`
+  **config** endpoint — no secrets, no token values, and **not** a capability URL
+  (those are the notifier webhook/Slack URLs already redacted by the tenth-pass
+  `redact_notifier_config`/`without_url` work). Gating it on a new `setup:read`
+  scope would break the documented onboarding flow for zero confidentiality gain.
+  The five other lanes re-traced their highest-risk surfaces and cleared:
+  OAuth confirmed `persist_google_tokens` runs inside the caller tx (no orphan
+  ciphertext), the one-shot `pca_0_id IS NULL` federation establish, auth-code
+  single-spend via `FOR UPDATE`+`consumed_at`, and constant-time PKCE-S256;
+  PIC/crypto re-confirmed the chain-walk fails closed at every link against the
+  signature-covered CBOR, bounds a cyclic chain at `MAX_CHAIN_HOPS=64`, uses
+  per-message random AES-256-GCM nonces, and keeps all three
+  `from_hex`/`hex_decode_32` siblings `is_ascii()`-guarded; adapters re-confirmed
+  every interpolated upstream path segment routes through `encoded_segment`
+  (Drive/Gmail/all six Calendar sites), `split_addresses` fails closed, and the
+  `MAX_MIME_MULTIPART`/`MAX_SAMPLES`/`read_bounded` caps hold; policy-engine
+  re-confirmed no `apply_op` error arm fails open to `Ok(false)`, the
+  quoted-threshold `BadShape` covers both `greater_than`/`less_than`, and
+  `deny_unknown_fields` spans `PolicyDoc`/`ReadFilterCfg`/`RecipientsCfg`/`BurstCfg`;
+  and notifier/approvals re-confirmed all three approval surfaces gate their
+  single-use claim/consume on the commit outcome (Slack `release_trigger_id` on
+  the err arm, email `consumed_at` on `is_ok()`, operator-API claims nothing and
+  rolls back cleanly). CI gate green end-to-end: `cargo fmt --check`,
+  `clippy -D warnings`, 2324 workspace tests, and the `RUSTFLAGS=-D warnings`
+  release build. §10 open question #5 (proxy-side override-TTL enforcement)
+  remains deliberately deferred on the spec.md §6.6 upstream branch as recorded.*
 - *No new reachable defects from the **nineteenth multi-subsystem audit pass**
   (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
   adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —

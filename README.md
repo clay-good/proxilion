@@ -457,7 +457,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through nineteen rounds of
+**Verification posture.** The shipped code has been through twenty rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -466,6 +466,18 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The twentieth pass (2026-06-16) re-ran all six lanes in parallel and surfaced
+**no new reachable defects**. The one candidate raised — that `GET /api/v1/setup/status`
+answers without an operator token — was investigated and confirmed **intentional**:
+it is the pre-token onboarding readiness probe (the chicken-and-egg surface that
+tells a fresh operator how to configure the system so they *can* mint their first
+token), mounted outside `operator_auth` by design in the same public tier as
+`/healthz`, and it discloses only booleans and counts — no secrets, no token
+values, no capability URLs. Gating it would break onboarding for zero
+confidentiality gain. All five other lanes re-confirmed their prior fixes intact
+(fail-closed chain-walk, `encoded_segment` path encoding, quoted-threshold
+`BadShape`, the three `is_ascii()`-guarded hex decoders, and commit-gated
+single-use approval claims across Slack/email/operator-API).
 The nineteenth pass (2026-06-16) re-ran all six lanes in parallel and surfaced
 **no new reachable defects**. After two consecutive single-finding passes (17th
 and 18th) that were sibling-drift misses across the three approval surfaces, this

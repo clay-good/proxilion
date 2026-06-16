@@ -210,6 +210,34 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- _**Sixteenth audit pass (2026-06-15) — no new findings.** Another fresh
+  parallel multi-subsystem sweep across all six lanes (OAuth/federation/session,
+  PIC/crypto, adapters/forwarders, policy-engine, notifier/approvals,
+  operator-API/CLI) surfaced **no new reachable defects**; this ledger is
+  unchanged from the fifteenth pass. Each lane independently re-traced its
+  highest-risk surfaces and confirmed the prior fixes intact and free of
+  sibling-drift: the OAuth lane re-verified that the only non-test `unwrap` is
+  the infallible `serde_json::to_value(&Vec<String>)` and that the lone
+  `unreachable!` is correctly gated by `has_refresh`; the PIC lane re-confirmed
+  the chain-walk fails closed at every link (Ed25519/continuity/identity/ops-subset),
+  bounds cyclic chains at `MAX_CHAIN_HOPS = 64` (→ `ChainTooLong`, no unbounded
+  loop), and uses `checked_add` for hop ordering; the adapters lane re-confirmed
+  all interpolated upstream path segments route through `encoded_segment` (Drive,
+  Gmail `msg_id`, all six Calendar sites) and that `TeeStream` fan-out can't be
+  aborted by a single failing sink; the policy-engine lane re-confirmed the
+  quoted-threshold fail-closed (`rhs_as_number` → `BadShape`) covers **both**
+  `greater_than` and `less_than` (no N-1 gap) and that `deny_unknown_fields`
+  closes the typo'd-key permissive-default family; and the notifier/operator-API/CLI
+  lane re-confirmed the single-use `notifier_tokens` `FOR UPDATE` + status-guard
+  defeats replay even if the best-effort `consumed_at` write fails, every
+  protected subrouter's scope maps to a catalogued `operator_scopes` entry, and
+  the CLI SSE reassembly retains incomplete trailing multibyte sequences. A
+  coverage check re-confirmed all three `from_hex`/`hex_decode_32` siblings carry
+  dedicated non-ASCII regression tests. CI gate green: `cargo fmt --check`,
+  `clippy -D warnings`, 2322 workspace tests, and the `RUSTFLAGS=-D warnings`
+  release build. See [README §Verification posture](README.md) and
+  [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md)
+  Addendum 2026-06-15n._
 - _**Fifteenth audit pass (2026-06-15) — no new findings.** A fresh parallel
   multi-subsystem sweep across all six lanes (OAuth/federation/session,
   PIC/crypto, adapters/forwarders, policy-engine, notifier/approvals,

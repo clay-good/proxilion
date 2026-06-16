@@ -455,7 +455,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through fifteen rounds of
+**Verification posture.** The shipped code has been through sixteen rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -464,6 +464,16 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The sixteenth pass (2026-06-15) — the second consecutive fully-clean sweep —
+re-ran all six lanes in parallel with an explicit sibling-drift focus and
+surfaced **no new reachable defects**: the chain-walk was re-confirmed fail-closed
+at every link and bounded against cyclic chains (`MAX_CHAIN_HOPS = 64` →
+`ChainTooLong`), the quoted-threshold `BadShape` fail-closed was re-confirmed
+across **both** `greater_than` and `less_than`, every interpolated adapter path
+segment was re-confirmed to route through `encoded_segment`, and the single-use
+`notifier_tokens` `FOR UPDATE` + status guard was re-confirmed to defeat replay
+even when the best-effort `consumed_at` write fails — so the ledger is unchanged
+from the fourteenth pass.
 The fifteenth pass (2026-06-15) re-swept all six lanes in parallel and surfaced
 **no new reachable defects** — each lane re-traced its highest-risk surfaces and
 confirmed the prior fixes intact (a coverage check also confirmed all three

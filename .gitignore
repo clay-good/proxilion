@@ -171,3 +171,6 @@ test-results/
 # --------------------
 .fastembed_cache/
 */.fastembed_cache/
+
+# openlore analysis artifacts
+.openlore/

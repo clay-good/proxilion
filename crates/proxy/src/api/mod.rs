@@ -1,10 +1,12 @@
-//! Management/observability HTTP API consumed by the dashboard.
+//! Management/observability HTTP API consumed by `proxilion-cli`, the Slack
+//! interaction webhook, the email signed-URL landing page, and the embedded
+//! `/admin` inspector (the React dashboard is dropped per the ui-less pivot —
+//! ui-less-surfaces.md §0).
 //!
-//! Authority: spec.md §1.5 + §1.6. M1 mounts these routes *unauthenticated*
-//! on the same axum app as the agent OAuth endpoints — the assumption is
-//! that operator traffic terminates at the proxy from inside a trust
-//! boundary (compose network, k8s service). §1.6 will revisit when the
-//! dashboard's auth story lands.
+//! Authority: spec.md §1.5 + §1.6. These `/api/v1/*` routes are mounted
+//! behind the `operator_auth` middleware (see `server.rs` — enforced by
+//! default; disabled only via `PROXILION_DISABLE_OPERATOR_AUTH=1` for dev).
+//! That closes the §1.6 auth question the dropped dashboard left open.
 
 pub mod actions;
 pub mod blocked;

@@ -215,8 +215,8 @@ impl Engine {
     /// `LayerB` [`LayerOutcome`] per policy that *would* also have matched
     /// (with `matched_rule_id` set and `detail` prefixed `would_also_match:`).
     /// The `final_decision` is still authoritative from the first match —
-    /// this is purely diagnostic. Use from the dashboard "explain this
-    /// denial" replay path, never the hot path. Per qiuth-patterns.md §3.3.
+    /// this is purely diagnostic. Use from the `/admin` inspector's "explain
+    /// this denial" replay path, never the hot path. Per qiuth-patterns.md §3.3.
     pub fn evaluate_with_trace_mode(
         &self,
         ctx: &RequestContext,

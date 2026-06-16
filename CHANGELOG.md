@@ -210,6 +210,38 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable **security** defects from the **twenty-eighth multi-subsystem
+  audit pass** (2026-06-16). Four general-purpose auditors swept the lanes in
+  parallel — OAuth/api/notifier, adapters/PIC/read-filter, policy-engine/CLI/shared-types,
+  and a docs/config/ops code-vs-doc lane — with the same **sibling-drift** focus.
+  All cleared on security; this is the **tenth consecutive clean security sweep**
+  (19th–28th). The productive output **completed the sibling-drift dashboard-comment
+  cleanup the 27th pass opened**: the same dropped-React/Next.js-dashboard drift the
+  27th fixed in `trace.rs` was re-pointed across the remaining **production** doc-comments
+  and inline production code — [`pic/verifier.rs`](crates/proxy/src/pic/verifier.rs)
+  (module doc + `pic_profile` field doc + `err_to_result` partial-walk comment),
+  [`api/mod.rs`](crates/proxy/src/api/mod.rs), [`policy-engine/rego.rs`](crates/policy-engine/src/rego.rs)
+  (`evaluate_with_trace_mode` doc), and the [`BurstSummary`](crates/proxy/src/notifier/burst.rs)
+  flush-path docstring — at the `proxilion-cli` / `/admin` inspector / `GET
+  /api/v1/pca/{id}/verify` consumers that actually read them (test-module `// pin …`
+  prose left untouched, matching the 27th's scope). **Two were genuine code-vs-doc
+  contradictions, not cosmetic:** `api/mod.rs` documented the `/api/v1/*` routes as
+  *unauthenticated* though they now sit behind the `operator_auth` middleware (enforced
+  by default; `PROXILION_DISABLE_OPERATOR_AUTH=1` for dev) — closing the §1.6 auth
+  question the dropped dashboard left open; and an [`oauth/routes.rs`](crates/proxy/src/oauth/routes.rs)
+  comment claimed the federation `bridge_callback` was "skipped for metric simplicity"
+  when it already emits `proxilion_oauth_callback_total` with an `infer_idp`-derived
+  `idp`. Also corrected a stale `~line 169` cross-reference in the Drive adapter, a
+  non-existent compose path in `scripts/smoke-pic.sh`, and three function-signature
+  drifts in [ui-less-surfaces.md](docs/specs/ui-less-surfaces.md)
+  (`blocked_expiry::spawn` arity, `build_notifier_handle`→`build_notifiers`, and the
+  now-metered bridge callback). The docs/ops auditor verified `docs/error-codes.md`
+  matches `error_code.rs` exactly, every Grafana/Prometheus metric resolves to a real
+  emission, and `config/policy.yaml` keys all map to parsed fields. No runtime change,
+  no new test (count held at 2324). CI gate green: `cargo fmt --check`, `clippy -D
+  warnings`, and `cargo test --workspace --locked`. Housekeeping: `.gitignore` now
+  ignores the `.openlore/` analysis cache.*
+
 - *No new reachable **security** defects from the **twenty-seventh multi-subsystem
   audit pass** (2026-06-16). Four general-purpose auditors swept the lanes in
   parallel — OAuth/federation/session + PIC/crypto, adapters/forwarders/filtering,

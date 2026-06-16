@@ -321,10 +321,9 @@ async fn google_callback(
 ) -> Result<Redirect, OAuthError> {
     let result = google_callback_inner(state, params).await;
     // spec.md §3.2 — `proxilion_oauth_callback_total{idp,result}`.
-    // `idp="google"` here (the other handler `bridge_callback` carries the
-    // upstream IdP claim and could ride the same metric with idp="okta|azure|…"
-    // once federation-bridge-bin ships; today the bridge callback is a thin
-    // pass-through and skipped for metric simplicity).
+    // `idp="google"` here; the other handler `bridge_callback` emits the same
+    // metric with `idp` inferred from the federation JWT `iss` via
+    // `bridge::infer_idp` (okta|azure|google|oidc|unknown).
     let label = match &result {
         Ok(_) => "ok",
         Err(e) => oauth_error_class(e),

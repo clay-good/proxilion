@@ -39,9 +39,10 @@ original Proxilion work:
   (`views.open`, when a bot token is set) or the email confirmation form — so
   the audit row records *why*, not just *who*. The email link lands on a form
   and consumes its single-use token on **POST**, not GET (prefetch-safe).
-- **Real-time action stream + killswitch.** Every agent action streams to an
-  operator dashboard and your SIEM the moment it happens. One click revokes
-  every capability tied to that agent or user within one request cycle.
+- **Real-time action stream + killswitch.** Every agent action streams to the
+  `/admin` SSE tail and your SIEM the moment it happens. One `proxilion-cli`
+  call (or `/admin` click) revokes every capability tied to that agent or user
+  within one request cycle.
 - **YAML policy engine.** A compiled match-expression engine for rules like
   "this agent can read engineering docs but never finance," with hot-reload.
 - **SaaS adapters.** Google Drive, Gmail, and Calendar at launch, each one
@@ -457,7 +458,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through twenty-seven rounds of
+**Verification posture.** The shipped code has been through twenty-eight rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -466,6 +467,22 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The twenty-eighth pass (2026-06-16) ran four parallel auditors over the same lanes
+and surfaced **no new reachable security defects** — the **tenth consecutive clean
+security sweep** (19th–28th). It finished the sibling-drift cleanup the 27th pass
+opened: the same dropped-dashboard drift the 27th fixed in `trace.rs` was re-pointed
+across the remaining **production** doc-comments — [`pic/verifier.rs`](crates/proxy/src/pic/verifier.rs)
+(×3), [`api/mod.rs`](crates/proxy/src/api/mod.rs), [`policy-engine/rego.rs`](crates/policy-engine/src/rego.rs),
+and the `BurstSummary` flush-path docstring — at the `proxilion-cli` / `/admin`
+inspector that actually consumes them. Two of those were genuine **code-vs-doc
+contradictions**, not cosmetic: `api/mod.rs` still documented the `/api/v1/*` routes
+as *unauthenticated* even though they now sit behind the `operator_auth` middleware
+(enforced by default), and a comment in [`oauth/routes.rs`](crates/proxy/src/oauth/routes.rs)
+claimed the federation `bridge_callback` was "skipped for metric simplicity" when it
+already emits `proxilion_oauth_callback_total` with an `infer_idp`-derived label. Also
+corrected a stale `~line 169` cross-reference in the Drive adapter and three function-
+signature drifts in [ui-less-surfaces.md](docs/specs/ui-less-surfaces.md). No runtime
+change; the test count held.
 The twenty-seventh pass (2026-06-16) swept all lanes in parallel with the same
 **sibling-drift** focus and surfaced **no new reachable defects** — the **ninth
 consecutive clean security sweep** (19th–27th). It re-confirmed the four hex

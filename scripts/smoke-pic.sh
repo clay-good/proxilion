@@ -6,7 +6,7 @@
 # salient fields. Documented in spec.md §0.4 acceptance.
 #
 # Prerequisites:
-#   docker compose -f proxilion/docker-compose.yml --project-directory . up -d
+#   docker compose up -d   # run from the repo root
 #
 # The federation-bridge wrapper is deferred (upstream provenance-bridge is
 # library-only). Trust Plane's issue handler currently accepts JWTs directly,

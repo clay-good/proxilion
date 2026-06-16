@@ -16,7 +16,9 @@
 //!      `predecessor_id` chain terminates at a node whose `hop == 0`.
 //!
 //! Results are cached for 60s by leaf id (moka). Persistent caching to
-//! `pca_verification_results` is the dashboard's job (§1.6).
+//! `pca_verification_results` is the API/CLI consumer's job
+//! (`GET /api/v1/pca/{id}/verify` + `proxilion-cli pic verify`); the verifier
+//! itself only caches in-process.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,8 +77,9 @@ pub struct VerificationResult {
     /// `None` only when the chain is broken before any link was loaded.
     /// `mismatch_at` is set when a chain mixes profiles — strict
     /// enforcement of "all links share one profile" is a v2 hardening;
-    /// today the verifier surfaces the field so dashboards / audits can
-    /// detect drift without us bumping the rejection-rate on day one.
+    /// today the verifier surfaces the field so the `/admin` inspector /
+    /// CLI / audits can detect drift without us bumping the rejection-rate
+    /// on day one.
     pub pic_profile: Option<String>,
     pub pic_profile_mismatch_at: Option<Uuid>,
 }
@@ -354,8 +357,9 @@ fn err_to_result(leaf_id: Uuid, e: &VerifierError, progress: &WalkProgress) -> V
         intact: false,
         // §6.8 — carry the partial walk progress rather than zeroing it. A
         // break 3 hops deep reports `links_verified: 3` + the discovered `p_0`,
-        // so the dashboard chain-walker shows how much of the chain was sound
-        // before the failed link, not a misleading "nothing verified."
+        // so the `/admin` chain inspector (and `proxilion-cli pic verify`)
+        // shows how much of the chain was sound before the failed link, not
+        // a misleading "nothing verified."
         links_verified: progress.links_verified,
         p_0: progress.p_0.clone(),
         broken_at,

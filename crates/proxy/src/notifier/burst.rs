@@ -76,8 +76,9 @@ impl Bucket {
 }
 
 /// A summary the suppressor hands back to the caller when a burst flush
-/// is due. The caller (`WebhookNotifier::flush_summaries`) translates
-/// this into a single envelope-style notification per bucket.
+/// is due. The flush loop (`spawn_flush_loop` → `BurstSuppressor::drain_summaries`)
+/// hands each summary to the driver's `notify_summary` (webhook + Slack),
+/// which translates it into a single envelope-style notification per bucket.
 #[derive(Debug, Clone, Serialize)]
 pub struct BurstSummary {
     pub schema: &'static str,

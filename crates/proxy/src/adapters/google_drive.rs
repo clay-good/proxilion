@@ -535,8 +535,9 @@ async fn proxy_request(
     }
     // spec.md §3.2 — `proxilion_adapter_requests_total{vendor,action,decision,mode}`.
     // Emitted on every completed adapter request (happy path + audit-fallback +
-    // observe demotion). The Layer-B block path takes the early-return at
-    // line ~169 and is covered by `proxilion_blocks_total` instead.
+    // observe demotion). The Layer-B block path takes the
+    // `enforce_pre_request_decision` early-return above and is covered by
+    // `proxilion_blocks_total` instead.
     metrics::counter!(
         "proxilion_adapter_requests_total",
         "vendor" => "google",

@@ -455,7 +455,7 @@ response SLAs (72 hours to acknowledge, scaled by severity to patch),
 in-scope / out-of-scope surfaces, and what we already defend against
 so you can lead with where you got past it.
 
-**Verification posture.** The shipped code has been through fourteen rounds of
+**Verification posture.** The shipped code has been through fifteen rounds of
 adversarial multi-subsystem auditing (crypto/auth/oauth · adapters/MIME ·
 policy-engine · notifiers/forwarders/PIC · operator-API · CLI/config/server),
 each pass sweeping every lane in parallel for reachable panics, fail-open gates,
@@ -464,6 +464,11 @@ a regression test that fails if the defect returns; the full ledger — defect,
 root cause, trigger, fix, and pinning test — is in the
 [`[Unreleased] → Fixed`](CHANGELOG.md) section of the changelog and the audit
 addenda in [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md).
+The fifteenth pass (2026-06-15) re-swept all six lanes in parallel and surfaced
+**no new reachable defects** — each lane re-traced its highest-risk surfaces and
+confirmed the prior fixes intact (a coverage check also confirmed all three
+`from_hex`/`hex_decode_32` siblings carry dedicated non-ASCII regression tests),
+so the ledger is unchanged from the fourteenth pass.
 The fourteenth pass swept the PIC/crypto lane and found one: `hex_decode_32`, the
 decoder for the operator-supplied `PROXILION_TOKEN_ENCRYPTION_KEY`, guarded only on
 byte length before slicing the string at byte offsets, so a 64-*byte* key carrying

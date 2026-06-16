@@ -210,6 +210,22 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- _**Fifteenth audit pass (2026-06-15) — no new findings.** A fresh parallel
+  multi-subsystem sweep across all six lanes (OAuth/federation/session,
+  PIC/crypto, adapters/forwarders, policy-engine, notifier/approvals,
+  operator-API/CLI) surfaced **no new reachable defects**; this ledger is
+  unchanged. Each lane re-traced its highest-risk surfaces and confirmed the
+  prior fixes intact (TTL-clamped `token_expiry`, one-shot federation establish,
+  `FOR UPDATE` single-spend auth codes, fail-closed PIC invariant walking over
+  signature-covered CBOR, `read_bounded`/`MAX_MIME_MULTIPART` caps, default-deny
+  policy `?`-propagation + `deny_unknown_fields`, per-route `scope_check`,
+  single-use `notifier_tokens`, constant-time Slack inbound-HMAC), and a coverage
+  check confirmed all three `from_hex`/`hex_decode_32` siblings carry dedicated
+  non-ASCII regression tests. CI gate green: `cargo fmt --check`, `clippy -D
+  warnings`, 2322 workspace tests, and the `RUSTFLAGS=-D warnings` release
+  build. See [README §Verification posture](README.md) and
+  [surface-delight-and-correctness.md](docs/specs/surface-delight-and-correctness.md)
+  Addendum 2026-06-15m._
 - **Boot-time char-boundary panic on a non-ASCII token-encryption key** (a
   fourteenth-audit-pass finding, 2026-06-15). `hex_decode_32`
   ([crates/proxy/src/server.rs](crates/proxy/src/server.rs)) — the decoder for the

@@ -210,6 +210,50 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- *No new reachable defects from the **twenty-second multi-subsystem audit pass**
+  (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
+  adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —
+  were swept in parallel and cleared; the ledger above is unchanged. This is the
+  **fourth consecutive fully-clean pass** (19th, 20th, 21st, 22nd). Each lane
+  re-traced its highest-risk surfaces with the same explicit **sibling-drift**
+  focus that produced the 17th/18th approval-wedge fixes. OAuth/session
+  re-confirmed auth-code single-spend (`SELECT … FOR UPDATE` → PKCE-S256
+  constant-time verify → `consumed_at`, rolling back the consume on a transient
+  failure so a code stays retryable), the one-shot `pca_0_id IS NULL` federation
+  establish backed by the `ON CONFLICT … DO NOTHING` PCA_0 cache insert, and
+  AES-256-GCM with 12-byte-nonce and key-length guards. PIC/crypto re-verified
+  all **four** hex decoders carry the `!is_ascii()` char-boundary guard
+  ([webhook.rs](crates/proxy/src/notifier/webhook.rs),
+  [siem.rs](crates/proxy/src/forwarder/siem.rs),
+  [server.rs](crates/proxy/src/server.rs) `hex_decode_32`, and
+  [config.rs](crates/proxy/src/config.rs) via the char-iterator path — the family
+  is closed), the chain-walk fails closed at every link and bounds a crafted
+  cycle at `MAX_CHAIN_HOPS=64` with `checked_add` hop ordering. Adapters
+  re-confirmed every interpolated upstream segment (Drive, Gmail `msg_id`, all
+  five Calendar sites including both segments of `{calendarId}/events/{eventId}`)
+  routes through `encoded_segment`, the shared `persists_blocked_action`
+  predicate covers all three Google adapters, and `read_bounded` enforces the
+  10MB cap on both the Content-Length pre-check and the streaming chunk loop.
+  policy-engine re-confirmed the `greater_than`/`less_than` quoted-threshold
+  `BadShape` shares a single fail-closed arm (`rhs_as_number`), that the
+  `equals`/`in`/`matches` operators carry no parallel numeric-coercion hole, that
+  `apply_op` and `validate_op` dispatch a symmetric operator set, and that the
+  rate-limit `u32::try_from` overflow guard holds. notifier/approvals re-verified
+  the burn-before-commit class is closed on all three surfaces — Slack
+  `release_trigger_id` on the err arm (17th), email/public-landing `consumed_at`
+  gated on `action_outcome.is_ok()` (18th), and the operator-API path holding no
+  single-use claim and rolling back cleanly in one transaction (19th) — and that
+  the Slack `view_submission` modal path is structurally immune (it holds no
+  single-use claim to wedge). operator-API/CLI re-confirmed every protected
+  `/api/v1/*` route carries a `scope_check` route-layer bound to a catalogued
+  scope (no orphans), the CLI-vs-server `--limit` clamps agree at `1..=500`, and
+  the public tier (setup-status + healthz + notifier_public + notifier_slack +
+  oauth) leaks no secrets or capability URLs. The lone non-test `unwrap`
+  (`serde_json::to_value(&Vec<String>)` in
+  [oauth/routes.rs](crates/proxy/src/oauth/routes.rs)) is again confirmed
+  infallible and left unchanged. No code changed; this is a documentation-only
+  record of the pass.*
+
 - *No new reachable defects from the **twenty-first multi-subsystem audit pass**
   (2026-06-16). All six lanes — OAuth/federation/session, PIC/crypto,
   adapters/forwarders, policy-engine, notifier/approvals, and operator-API/CLI —

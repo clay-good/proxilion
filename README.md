@@ -363,7 +363,11 @@ Two lower-traffic confidence counters round out the set:
 `proxilion_adapter_path_encoded_total{vendor}` proves the §6.1 path-encode
 (confused-deputy) fix is exercised in prod, and
 `proxilion_policy_list_match_total{op,result}` proves list-valued policy gates
-(e.g. the external-send gate) actually fire post-§6.2-fix.
+(e.g. the external-send gate) actually fire post-§6.2-fix. The edge resource
+caps (production-readiness.md PR-2) add
+`proxilion_ingress_rejections_total{reason="body_limit"|"timeout"}` — requests
+shed at the ingress before policy runs (oversize body → `413`, wedged adapter
+request → `408`).
 
 Pull them with `proxilion-cli metrics sample` (top series by sample count) or
 scrape into Prometheus; the bundled Grafana dashboard lives in
@@ -676,6 +680,20 @@ the proxy emits a loud `warn!` at boot whenever the OAuth router is mounted and
 the route must not be exposed in production until the JWKS-backed
 `jsonwebtoken::decode` swap lands. The smoke/CI/demo flows use the stub
 deliberately.
+
+**Path to production (M5).** The full hardening breakdown to close that gap and
+make Proxilion safe to expose — federation signature verification (the P0
+above), edge DoS controls, key rotation, SLOs + runbooks, HA + DR, and a
+signed/SBOM'd `v0.1.0` — lives in
+[docs/specs/production-readiness.md](docs/specs/production-readiness.md) (PR-1
+… PR-13) with a Go-Live Gate checklist. First increment landed: **edge ingress
+resource caps** — a global request-body cap (`PROXILION_MAX_REQUEST_BODY_BYTES`,
+default 10 MiB, → `413` before any body is buffered) and a per-request timeout
+on the agent-facing adapter routes (`PROXILION_REQUEST_TIMEOUT_SECS`, default
+30 s, → `408`; the long-lived SSE/streaming routes are exempt by design). Both
+are operator-tunable (`0` disables), and both rejections increment
+`proxilion_ingress_rejections_total{reason}`. Per-IP rate limiting and a global
+concurrency limit + load-shed are the remaining PR-2 work.
 
 ## The Skill Overreach problem
 

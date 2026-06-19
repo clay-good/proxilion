@@ -102,6 +102,23 @@ pub struct Config {
     /// bearer. Set `PROXILION_DISABLE_OPERATOR_AUTH=1` to bypass for local
     /// dev. ui-less-surfaces.md §4.4.
     pub operator_auth_enforced: bool,
+    /// Max accepted request body size, in bytes, for the agent-facing
+    /// ingress (production-readiness.md PR-2). Applied as a global
+    /// `axum::extract::DefaultBodyLimit` so a body bomb is rejected with
+    /// `413 Payload Too Large` *before* any adapter or policy code reads it.
+    /// Defaults to 10 MiB to match the adapter response cap (`read_bounded`,
+    /// spec.md §15.6). `0` disables the limit (dev escape hatch).
+    /// `PROXILION_MAX_REQUEST_BODY_BYTES`.
+    pub max_request_body_bytes: usize,
+    /// Per-request wall-clock timeout, in seconds, for the agent-facing
+    /// adapter routes (Drive/Gmail/Calendar) — a `tower_http` `TimeoutLayer`
+    /// distinct from the upstream-call timeout (production-readiness.md PR-2).
+    /// A request exceeding it gets `408 Request Timeout` so a slow or wedged
+    /// upstream can't pin a connection (and its memory) open indefinitely.
+    /// NOT applied to the SSE/streaming-export routes, which are long-lived
+    /// by design. Defaults to 30 s. `0` disables the timeout.
+    /// `PROXILION_REQUEST_TIMEOUT_SECS`.
+    pub request_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +194,8 @@ pub struct ConfigBuilder {
     blocked_webhook_url: Option<String>,
     blocked_webhook_hmac_key_hex: Option<String>,
     operator_auth_enforced: bool,
+    max_request_body_bytes: usize,
+    request_timeout_secs: u64,
 }
 
 impl Default for ConfigBuilder {
@@ -214,6 +233,10 @@ impl ConfigBuilder {
             blocked_webhook_url: None,
             blocked_webhook_hmac_key_hex: None,
             operator_auth_enforced: true,
+            // 10 MiB — matches the adapter response cap (read_bounded,
+            // spec.md §15.6) and production-readiness.md PR-2.
+            max_request_body_bytes: 10 * 1024 * 1024,
+            request_timeout_secs: 30,
         }
     }
 
@@ -322,6 +345,19 @@ impl ConfigBuilder {
         ) {
             self.operator_auth_enforced = false;
         }
+        if let Ok(v) = env::var("PROXILION_MAX_REQUEST_BODY_BYTES") {
+            // Leave the prior (file/default) value intact on a malformed
+            // value rather than silently disabling the body cap. `0` is a
+            // valid explicit "disable" sentinel.
+            if let Ok(n) = v.parse::<usize>() {
+                self.max_request_body_bytes = n;
+            }
+        }
+        if let Ok(v) = env::var("PROXILION_REQUEST_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.request_timeout_secs = n;
+            }
+        }
         Ok(self)
     }
 
@@ -416,6 +452,12 @@ impl ConfigBuilder {
         }
         if let Some(v) = file.operator_auth_enforced {
             self.operator_auth_enforced = v;
+        }
+        if let Some(v) = file.max_request_body_bytes {
+            self.max_request_body_bytes = v;
+        }
+        if let Some(v) = file.request_timeout_secs {
+            self.request_timeout_secs = v;
         }
         Ok(self)
     }
@@ -524,6 +566,8 @@ impl ConfigBuilder {
             blocked_webhook_url: self.blocked_webhook_url,
             blocked_webhook_hmac_key_hex: self.blocked_webhook_hmac_key_hex,
             operator_auth_enforced: self.operator_auth_enforced,
+            max_request_body_bytes: self.max_request_body_bytes,
+            request_timeout_secs: self.request_timeout_secs,
         })
     }
 }
@@ -558,6 +602,8 @@ struct FileConfig {
     blocked_webhook_url: Option<String>,
     blocked_webhook_hmac_key_hex: Option<String>,
     operator_auth_enforced: Option<bool>,
+    max_request_body_bytes: Option<usize>,
+    request_timeout_secs: Option<u64>,
 }
 
 fn check_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
@@ -612,6 +658,59 @@ mod tests {
         assert_eq!(c.trust_plane_url, "http://trust-plane:8080");
         assert!(c.operator_auth_enforced);
         assert_eq!(c.customer_domain, "example.com");
+        // PR-2 edge limits default to 10 MiB body cap + 30 s timeout.
+        assert_eq!(c.max_request_body_bytes, 10 * 1024 * 1024);
+        assert_eq!(c.request_timeout_secs, 30);
+    }
+
+    #[test]
+    fn pr2_edge_limits_round_trip_through_file_including_zero_disable_sentinel() {
+        // production-readiness.md PR-2: the body cap + per-request timeout
+        // are operator-tunable and `0` is the explicit "disable" sentinel
+        // (DefaultBodyLimit::disable() / no TimeoutLayer). Pin both the
+        // numeric override and the zero sentinel round-trip through the
+        // file layer (env parse is the same field via the same `if let
+        // Some` shape as siem_batch_size, which is independently covered).
+        let dir = std::env::temp_dir().join(format!("proxilion-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Non-zero override.
+        let path = dir.join("limits.toml");
+        std::fs::write(
+            &path,
+            r#"
+dev_mode = true
+max_request_body_bytes = 1048576
+request_timeout_secs = 5
+"#,
+        )
+        .unwrap();
+        let c = ConfigBuilder::defaults()
+            .from_file(&path)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(c.max_request_body_bytes, 1_048_576);
+        assert_eq!(c.request_timeout_secs, 5);
+
+        // Zero sentinel — disables each control; must survive verbatim
+        // (not get clamped back to a default).
+        let path0 = dir.join("limits-off.toml");
+        std::fs::write(
+            &path0,
+            r#"
+dev_mode = true
+max_request_body_bytes = 0
+request_timeout_secs = 0
+"#,
+        )
+        .unwrap();
+        let c0 = ConfigBuilder::defaults()
+            .from_file(&path0)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(c0.max_request_body_bytes, 0);
+        assert_eq!(c0.request_timeout_secs, 0);
     }
 
     #[test]
@@ -1295,9 +1394,9 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
     // ─── round 289 (2026-05-26): Config/ConfigBuilder/ConfigError variant + Clone pins ───
 
     #[test]
-    fn config_field_count_pinned_at_exactly_twenty_three_via_exhaustive_destructure_no_rest_pattern()
-     {
-        // `Config` carries EXACTLY 23 fields — every one of them is
+    fn config_field_count_pinned_at_exactly_twenty_five_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // `Config` carries EXACTLY 25 fields — every one of them is
         // operator-load-bearing (env-var-driven, surfaced in the
         // `/api/v1/setup/status` panel, OR consumed at boot by the
         // server.rs wiring). Pin the field count via exhaustive
@@ -1340,25 +1439,27 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             blocked_webhook_url: _,
             blocked_webhook_hmac_key_hex: _,
             operator_auth_enforced: _,
+            max_request_body_bytes: _,
+            request_timeout_secs: _,
         } = c;
     }
 
     #[test]
-    fn config_builder_field_count_pinned_at_exactly_twenty_three_via_exhaustive_destructure_no_rest()
-     {
-        // `ConfigBuilder` MUST carry the SAME 23 fields as `Config`
+    fn config_builder_field_count_pinned_at_exactly_twenty_five_via_exhaustive_destructure_no_rest()
+    {
+        // `ConfigBuilder` MUST carry the SAME 25 fields as `Config`
         // — the builder→config conversion in `ConfigBuilder::build`
         // does a 1:1 field move, so an asymmetric refactor that
         // added a field to one side and not the other would either
         // (a) compile-fail at the build site if added to Config, OR
         // (b) silently strip the new builder-side field at build
-        // time if added to ConfigBuilder. Pin EXACTLY 23 via
+        // time if added to ConfigBuilder. Pin EXACTLY 25 via
         // exhaustive destructure to anchor BOTH sides in lockstep
         // with the sibling `Config` field-count pin. A refactor that
         // extended ConfigBuilder without matching Config (the more
         // dangerous direction — silently drops the operator's value)
         // surfaces here at compile time. Symmetric to the Config
-        // 23-field pin in this same round.
+        // 25-field pin in this same round.
         let b = ConfigBuilder::defaults();
         let ConfigBuilder {
             bind_addr: _,
@@ -1384,6 +1485,8 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             blocked_webhook_url: _,
             blocked_webhook_hmac_key_hex: _,
             operator_auth_enforced: _,
+            max_request_body_bytes: _,
+            request_timeout_secs: _,
         } = b;
     }
 
@@ -1477,7 +1580,7 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
         // pin walks Send+Sync+'static only; pin the Clone trait-bound
         // axis here so a refactor that dropped `#[derive(Clone)]`
         // from EITHER struct "for explicit Arc-management of the
-        // 23-field shape" surfaces here at the type boundary rather
+        // 25-field shape" surfaces here at the type boundary rather
         // than as a confusing tower::Service trait cascade. Pin
         // BOTH simultaneously so a one-side drift surfaces. Symmetric
         // to round-279/281/285/286/287 Clone witnesses extended to

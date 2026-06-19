@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderName, HeaderValue, Request},
     middleware::{self, Next},
     response::Response,
@@ -16,6 +16,7 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use serde::Serialize;
 use tokio::signal;
+use tower_http::timeout::TimeoutLayer;
 use tracing::{Instrument, info, info_span, warn};
 use uuid::Uuid;
 
@@ -293,7 +294,22 @@ pub async fn run(cfg: Config) -> Result<()> {
                      forgeable p_0/ops. Dev/CI/smoke only; never use in production."
                 );
                 app = app.merge(protected_router(auth_state.clone()));
-                app = app.merge(adapter_router(adapter_state, auth_state));
+                // production-readiness.md PR-2 — per-request timeout on the
+                // agent-facing adapter routes. Scoped HERE (not globally) so
+                // it never wraps the long-lived SSE / streaming-export routes
+                // under /api/v1/*, which are intentionally open-ended. A wedged
+                // upstream call gets `408 Request Timeout` instead of pinning a
+                // connection (and its buffered memory) open. `0` disables it.
+                let adapters = adapter_router(adapter_state, auth_state);
+                let adapters = if cfg.request_timeout_secs > 0 {
+                    adapters.layer(TimeoutLayer::with_status_code(
+                        axum::http::StatusCode::REQUEST_TIMEOUT,
+                        Duration::from_secs(cfg.request_timeout_secs),
+                    ))
+                } else {
+                    adapters
+                };
+                app = app.merge(adapters);
                 info!("full set mounted (OAuth + adapters + admin + actions + PCA APIs)");
             } else {
                 info!(
@@ -306,6 +322,20 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let app = app.layer(middleware::from_fn(request_span));
+
+    // production-readiness.md PR-2 — global ingress body cap. Rejects a body
+    // bomb with `413 Payload Too Large` before any adapter/policy code reads
+    // it (length-limited extractors honor this extension). GET/SSE responses
+    // are unaffected — the limit applies to inbound request bodies only.
+    // `0` disables it (dev escape hatch).
+    let app = if cfg.max_request_body_bytes > 0 {
+        app.layer(DefaultBodyLimit::max(cfg.max_request_body_bytes))
+    } else {
+        app.layer(DefaultBodyLimit::disable())
+    };
+    // Outermost: count edge rejections (413 body cap / 408 adapter timeout)
+    // into a labelled metric so the PR-5 burn-rate alerts can watch them.
+    let app = app.layer(middleware::from_fn(count_edge_rejections));
 
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
@@ -534,6 +564,24 @@ async fn admin_page() -> Response {
         .header(axum::http::header::CACHE_CONTROL, "no-store")
         .body(axum::body::Body::from(HTML))
         .expect("static admin response builds")
+}
+
+/// Outermost edge middleware: count the two ingress rejections PR-2 adds —
+/// `413 Payload Too Large` (body cap) and `408 Request Timeout` (adapter
+/// per-request timeout) — into a single labelled counter. In this app those
+/// two statuses originate only from the PR-2 controls, so the `reason` label
+/// is unambiguous. Feeds the PR-5 burn-rate alerts.
+async fn count_edge_rejections(req: Request<axum::body::Body>, next: Next) -> Response {
+    let resp = next.run(req).await;
+    let reason = match resp.status() {
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE => Some("body_limit"),
+        axum::http::StatusCode::REQUEST_TIMEOUT => Some("timeout"),
+        _ => None,
+    };
+    if let Some(reason) = reason {
+        metrics::counter!("proxilion_ingress_rejections_total", "reason" => reason).increment(1);
+    }
+    resp
 }
 
 async fn request_span(mut req: Request<axum::body::Body>, next: Next) -> Response {
@@ -1525,5 +1573,113 @@ mod tests {
             db_idx < fb_idx && fb_idx < tp_idx,
             "BTreeMap must serialize keys in alphabetical order: {s}",
         );
+    }
+
+    // ─── production-readiness.md PR-2 — edge resource caps ───
+
+    #[tokio::test]
+    async fn pr2_ingress_body_limit_rejects_oversize_413_and_allows_under_limit() {
+        use axum::body::{Body, Bytes};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        async fn sink(_b: Bytes) -> &'static str {
+            "ok"
+        }
+        // Same layer shape as the production wiring: a 16-byte body cap with
+        // the edge-rejection counter outermost.
+        let make = || {
+            Router::new()
+                .route("/x", post(sink))
+                .layer(DefaultBodyLimit::max(16))
+                .layer(middleware::from_fn(count_edge_rejections))
+        };
+
+        // 64 bytes > 16-byte cap → 413 before the handler runs.
+        let resp = make()
+            .oneshot(
+                Request::post("/x")
+                    .body(Body::from(vec![b'a'; 64]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 8 bytes ≤ cap → handler runs, 200.
+        let resp = make()
+            .oneshot(Request::post("/x").body(Body::from(vec![b'a'; 8])).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pr2_disabled_body_limit_accepts_large_body() {
+        use axum::body::{Body, Bytes};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        async fn sink(_b: Bytes) -> &'static str {
+            "ok"
+        }
+        // `0` → DefaultBodyLimit::disable(): a large body is accepted (the
+        // operator escape hatch). Mirrors the `cfg.max_request_body_bytes == 0`
+        // branch in `run`.
+        let app = Router::new()
+            .route("/x", post(sink))
+            .layer(DefaultBodyLimit::disable());
+        let resp = app
+            .oneshot(
+                Request::post("/x")
+                    .body(Body::from(vec![b'a'; 4096]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pr2_adapter_timeout_returns_408_on_slow_handler_and_200_when_fast() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        async fn slow() -> &'static str {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            "done"
+        }
+        // 20 ms budget vs a 250 ms handler → 408 (same TimeoutLayer the
+        // adapter routes are wrapped with). The edge counter sits outermost,
+        // as in production.
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_millis(20),
+            ))
+            .layer(middleware::from_fn(count_edge_rejections));
+        let resp = app
+            .oneshot(Request::get("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+
+        // A generous budget lets the same handler complete → 200.
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_secs(30),
+            ));
+        let resp = app
+            .oneshot(Request::get("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

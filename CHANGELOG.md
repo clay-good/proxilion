@@ -16,6 +16,35 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Edge ingress resource caps (production-readiness.md PR-2, first slice).**
+  The agent-facing ingress now has two of PR-2's resource-exhaustion controls,
+  both operator-tunable: a **global request-body cap** and a **per-request
+  timeout on the adapter routes**. Previously the proxy sat in the synchronous
+  hot path of every agent request with *no* ingress body cap and *no* blanket
+  request timeout — an attacker could POST an unbounded body (buffered into
+  memory before policy ran) or wedge a connection open against a slow upstream.
+  - **Body cap:** a global `axum::extract::DefaultBodyLimit`
+    ([server.rs](crates/proxy/src/server.rs)), default **10 MiB** (matches the
+    adapter response cap `read_bounded`, spec.md §15.6), set via
+    `PROXILION_MAX_REQUEST_BODY_BYTES`. Oversize → `413 Payload Too Large`
+    *before* any adapter/policy code reads the body. `0` disables it. GET/SSE
+    responses are unaffected (the limit is request-body-only, so the long-lived
+    `/api/v1/actions/stream` and streaming-export routes keep working).
+  - **Per-request timeout:** a `tower_http` `TimeoutLayer` scoped to the
+    agent-facing Drive/Gmail/Calendar adapter routes (NOT the SSE/streaming
+    routes, which are open-ended by design), default **30 s**, set via
+    `PROXILION_REQUEST_TIMEOUT_SECS`. A wedged request → `408 Request Timeout`.
+    `0` disables it. Distinct from the upstream-call timeout.
+  - **Metric:** both rejections increment
+    `proxilion_ingress_rejections_total{reason="body_limit"|"timeout"}` via an
+    outermost edge middleware, feeding the future PR-5 burn-rate alerts.
+  - Two new `Config` knobs (defaults + env + TOML-file layers, with the `0`
+    disable sentinel pinned), regression tests for the 413/408/200 paths, and
+    the `Config`/`ConfigBuilder` field-count pins bumped 23 → 25.
+  - **Still open in PR-2** (tracked, not yet built): per-IP rate limiting
+    (`429`+`Retry-After`) with trusted-proxy `X-Forwarded-For` handling, and a
+    global concurrency limit + load-shed (`503`). These need a new rate-limit
+    dependency and `ConnectInfo`/`HandleErrorLayer` plumbing and land next.
 - **Wired the three declared-but-missing §7 observability series** (completes
   surface-delight-and-correctness.md §7 / §9 Phase 5 step 15). An audit found
   that of the five metrics that spec declares, only `proxilion_forwarder_retry_total`

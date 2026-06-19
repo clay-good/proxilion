@@ -585,7 +585,14 @@ Operationally, distribution rests on three things: (1) the README and `docs/` ge
 | M2 — Gmail write gate + override | 5–6 | Block + justified-override loop closed, override creates attested PCA branch |
 | M3 — Killswitch + stream + invariant enforcement | 7 | Runtime-gate mode enforces; NATS stream; killswitch revokes session's PCA issuance right |
 | M4 — Calendar + harden | 8 | Helm chart, marketing site, public repo, recorded demo |
-| M5 — First design partner | 9+ | One real org running Proxilion in front of Claude managed agents, Okta-federated |
+| M5 — Production hardening | 9+ | Federation token signatures verified, edge DoS controls, key rotation, SLOs + runbooks, HA + DR, signed/SBOM'd `v0.1.0` release — the prerequisites to a production deploy. **Full spec: [`production-readiness.md`](./production-readiness.md).** |
+| M6 — First design partner | 10+ | One real org running Proxilion in front of Claude managed agents, Okta-federated |
+
+> **Path to production.** The detailed M5 work breakdown — every spec
+> required to make Proxilion safe to expose in production, including the P0
+> federation-signature fix (§0.4) — lives in the companion
+> [`production-readiness.md`](./production-readiness.md), with a Go-Live Gate
+> checklist.
 
 ---
 

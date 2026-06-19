@@ -365,9 +365,10 @@ Two lower-traffic confidence counters round out the set:
 `proxilion_policy_list_match_total{op,result}` proves list-valued policy gates
 (e.g. the external-send gate) actually fire post-§6.2-fix. The edge resource
 caps (production-readiness.md PR-2) add
-`proxilion_ingress_rejections_total{reason="body_limit"|"timeout"}` — requests
-shed at the ingress before policy runs (oversize body → `413`, wedged adapter
-request → `408`).
+`proxilion_ingress_rejections_total{reason="body_limit"|"timeout"|"rate_limit"|"load_shed"}`
+— requests shed at the ingress before policy runs (oversize body → `413`,
+wedged adapter request → `408`, over-quota source IP → `429`, server at its
+concurrency ceiling → `503`).
 
 Pull them with `proxilion-cli metrics sample` (top series by sample count) or
 scrape into Prometheus; the bundled Grafana dashboard lives in
@@ -686,14 +687,24 @@ make Proxilion safe to expose — federation signature verification (the P0
 above), edge DoS controls, key rotation, SLOs + runbooks, HA + DR, and a
 signed/SBOM'd `v0.1.0` — lives in
 [docs/specs/production-readiness.md](docs/specs/production-readiness.md) (PR-1
-… PR-13) with a Go-Live Gate checklist. First increment landed: **edge ingress
-resource caps** — a global request-body cap (`PROXILION_MAX_REQUEST_BODY_BYTES`,
-default 10 MiB, → `413` before any body is buffered) and a per-request timeout
-on the agent-facing adapter routes (`PROXILION_REQUEST_TIMEOUT_SECS`, default
-30 s, → `408`; the long-lived SSE/streaming routes are exempt by design). Both
-are operator-tunable (`0` disables), and both rejections increment
-`proxilion_ingress_rejections_total{reason}`. Per-IP rate limiting and a global
-concurrency limit + load-shed are the remaining PR-2 work.
+… PR-13) with a Go-Live Gate checklist. **PR-2 (edge DoS controls) is complete
+at the application layer** — four operator-tunable controls on the agent-facing
+ingress, each rejection feeding `proxilion_ingress_rejections_total{reason}`:
+
+| Control | Env var (default) | Reject |
+|---|---|---|
+| Request-body cap (before any body is buffered) | `PROXILION_MAX_REQUEST_BODY_BYTES` (10 MiB) | `413` |
+| Per-request timeout (adapter routes; SSE/streaming exempt) | `PROXILION_REQUEST_TIMEOUT_SECS` (30 s) | `408` |
+| Per-IP rate limit (token bucket) | `PROXILION_RATE_LIMIT_PER_SEC` (50) / `PROXILION_RATE_LIMIT_BURST` (100) | `429` + `Retry-After` |
+| Global concurrency limit + load-shed | `PROXILION_MAX_CONCURRENT_REQUESTS` (1024) | `503` |
+
+Each takes `0` to disable. The rate limiter keys on a **trusted-proxy-aware**
+client IP: `X-Forwarded-For` is believed only when the TCP peer is in
+`PROXILION_TRUSTED_PROXIES` (default empty = trust nothing), walked
+right-to-left so a spoofed prefix is ignored. Rate-limit and load-shed are
+implemented dependency-free (token bucket on `moka`, semaphore on `tokio`).
+Remaining PR-2 work (interlinks PR-7): the L4 connection/handshake cap,
+FD-ulimit deployment docs, and the at-scale overload load test.
 
 ## The Skill Overreach problem
 

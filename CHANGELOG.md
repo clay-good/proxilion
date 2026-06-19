@@ -16,13 +16,17 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
-- **Edge ingress resource caps (production-readiness.md PR-2, first slice).**
-  The agent-facing ingress now has two of PR-2's resource-exhaustion controls,
-  both operator-tunable: a **global request-body cap** and a **per-request
-  timeout on the adapter routes**. Previously the proxy sat in the synchronous
-  hot path of every agent request with *no* ingress body cap and *no* blanket
-  request timeout — an attacker could POST an unbounded body (buffered into
-  memory before policy ran) or wedge a connection open against a slow upstream.
+- **Edge ingress resource caps (production-readiness.md PR-2 — complete).**
+  The agent-facing ingress now has all four of PR-2's resource-exhaustion
+  controls, every one operator-tunable: a **global request-body cap**, a
+  **per-request timeout on the adapter routes**, a **per-IP rate limit**, and a
+  **global concurrency limit + load-shed**. Previously the proxy sat in the
+  synchronous hot path of every agent request with *no* ingress body cap, *no*
+  blanket request timeout, *no* edge rate limit, and *no* load-shed — an
+  attacker could POST an unbounded body (buffered into memory before policy
+  ran), wedge a connection open against a slow upstream, flood the policy/adapter
+  hot path from one source, or open unbounded concurrent requests until the
+  process OOMed.
   - **Body cap:** a global `axum::extract::DefaultBodyLimit`
     ([server.rs](crates/proxy/src/server.rs)), default **10 MiB** (matches the
     adapter response cap `read_bounded`, spec.md §15.6), set via
@@ -35,16 +39,41 @@ Until v0.1.0, the canonical reference is the most recent commit on
     routes, which are open-ended by design), default **30 s**, set via
     `PROXILION_REQUEST_TIMEOUT_SECS`. A wedged request → `408 Request Timeout`.
     `0` disables it. Distinct from the upstream-call timeout.
-  - **Metric:** both rejections increment
-    `proxilion_ingress_rejections_total{reason="body_limit"|"timeout"}` via an
-    outermost edge middleware, feeding the future PR-5 burn-rate alerts.
-  - Two new `Config` knobs (defaults + env + TOML-file layers, with the `0`
-    disable sentinel pinned), regression tests for the 413/408/200 paths, and
-    the `Config`/`ConfigBuilder` field-count pins bumped 23 → 25.
-  - **Still open in PR-2** (tracked, not yet built): per-IP rate limiting
-    (`429`+`Retry-After`) with trusted-proxy `X-Forwarded-For` handling, and a
-    global concurrency limit + load-shed (`503`). These need a new rate-limit
-    dependency and `ConnectInfo`/`HandleErrorLayer` plumbing and land next.
+  - **Per-IP rate limit:** an in-house token bucket
+    ([edge.rs](crates/proxy/src/edge.rs)) keyed by the *trusted-proxy-resolved*
+    client IP, default **50 req/s** steady-state with a **100-request burst**,
+    set via `PROXILION_RATE_LIMIT_PER_SEC` / `PROXILION_RATE_LIMIT_BURST`.
+    Over-quota → `429 Too Many Requests` + `Retry-After`. The IP is read from
+    `X-Forwarded-For` **only** when the direct TCP peer is a configured trusted
+    proxy (`PROXILION_TRUSTED_PROXIES`, comma-separated IPs; default empty =
+    trust nothing) — walking the forwarded chain right-to-left and ignoring any
+    attacker-spoofed prefix (production-readiness.md PR-2/PR-4: never trust
+    `X-Forwarded-For` blindly). `0` disables it. Bucket table bounded
+    (100k-entry cap, 10-min idle eviction) so the limiter's own state can't be
+    a DoS vector.
+  - **Concurrency limit + load-shed:** a `Semaphore`-backed global in-flight
+    ceiling ([edge.rs](crates/proxy/src/edge.rs)), default **1024**, set via
+    `PROXILION_MAX_CONCURRENT_REQUESTS`. At capacity a new request is shed
+    immediately with `503 Service Unavailable` (`try_acquire`, never a queue),
+    so overload fails fast instead of buffering into memory exhaustion. `0`
+    disables it.
+  - **Metric:** all four rejections increment
+    `proxilion_ingress_rejections_total{reason="body_limit"|"timeout"|"rate_limit"|"load_shed"}`,
+    feeding the future PR-5 burn-rate alerts. The `body_limit`/`timeout`
+    rejections are counted by the outermost edge middleware (their statuses are
+    edge-unique); the `rate_limit`/`load_shed` rejections are counted at their
+    own shed site (their `429`/`503` statuses are shared with upstream-rate-limit
+    and `/healthz`-readiness responses, so a reverse status map would conflate
+    them).
+  - **Dependency-free:** the rate limiter (token bucket) and load-shed
+    (`tokio::sync::Semaphore`) reuse crates already in the tree (`moka`,
+    `tokio`) — no new supply-chain surface, `cargo deny`/`cargo audit` untouched.
+  - Four new `Config` knobs (defaults + env + TOML-file layers, with the `0`
+    disable sentinel pinned for the rate/concurrency limits), unit tests for the
+    trusted-proxy IP resolution / token-bucket refill / Retry-After rounding,
+    router-level integration tests for the wired `429`+`Retry-After` and `503`
+    load-shed paths, and the `Config`/`ConfigBuilder` field-count pins bumped
+    25 → 29.
 - **Wired the three declared-but-missing §7 observability series** (completes
   surface-delight-and-correctness.md §7 / §9 Phase 5 step 15). An audit found
   that of the five metrics that spec declares, only `proxilion_forwarder_retry_total`

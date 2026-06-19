@@ -157,3 +157,24 @@
 # subject to it. Default: 30. Set to 0 to disable.
 # PROXILION_REQUEST_TIMEOUT_SECS.
 # request_timeout_secs = 30
+
+# Per-client-IP rate limit (token bucket). Over-quota requests get 429 +
+# Retry-After. `rate_limit_per_sec` is the steady-state requests/second;
+# `rate_limit_burst` is the bucket capacity (max instantaneous burst before
+# the steady rate applies). Defaults: 50 / 100. Set rate_limit_per_sec to 0
+# to disable rate limiting. PROXILION_RATE_LIMIT_PER_SEC / _BURST.
+# rate_limit_per_sec = 50
+# rate_limit_burst = 100
+
+# Direct-peer IPs trusted to set X-Forwarded-For. When the TCP peer is one of
+# these, the rate limiter reads the real client IP from the forwarded chain
+# (walked right-to-left, ignoring any spoofed prefix); otherwise X-Forwarded-For
+# is ignored and the socket peer is used. Default: empty (trust nothing — never
+# trust X-Forwarded-For blindly). PROXILION_TRUSTED_PROXIES (env: comma-separated).
+# trusted_proxies = ["10.0.0.1", "10.0.0.2"]
+
+# Global in-flight concurrency ceiling across all agent-facing routes. At
+# capacity, a new request is shed immediately with 503 (load-shed, never a
+# queue) so overload fails fast instead of exhausting memory. Default: 1024.
+# Set to 0 to disable. PROXILION_MAX_CONCURRENT_REQUESTS.
+# max_concurrent_requests = 1024

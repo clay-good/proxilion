@@ -12,6 +12,7 @@ mod blocked_expiry;
 mod config;
 mod crypto;
 mod demo;
+mod edge;
 mod error_envelope;
 mod forwarder;
 mod kill_cache;

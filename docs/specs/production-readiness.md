@@ -11,11 +11,15 @@ suite is green (DB-backed lane runs in CI). The advertised M0–M4 surface (OAut
 interception, read-filter, write-gate + human-in-the-loop approvals, killswitch
 + SSE, policy engine, Drive/Gmail/Calendar adapters, CLI, metrics, Grafana, Helm
 chart, marketing site, demo) is shipped. **The deliberate federation-signature
-gap (PR-1) still blocks production.** First M5 increment landed: **PR-2's
-dependency-free ingress resource caps** (request-body cap + per-request adapter
-timeout — see PR-2's Status below). The rest of the operational/release surface
-below remains open. Each work item carries its own `Status:` line; update it in
-place as work lands, same convention as `spec.md`'s playbook.
+gap (PR-1) still blocks production.** **PR-2 is now complete at the application
+layer** — all four edge resource-exhaustion controls (request-body cap,
+per-request adapter timeout, per-IP rate limit, global concurrency limit +
+load-shed) are live and dependency-free (see PR-2's Status below); the
+remaining PR-2 surface is the L4 connection cap, FD-ulimit docs, and the
+at-scale overload load test, all interlinked with PR-7. The rest of the
+operational/release surface below remains open. Each work item carries its own
+`Status:` line; update it in place as work lands, same convention as
+`spec.md`'s playbook.
 
 This spec follows the project's documentation convention: when a work item
 ships, record it in the three canonical places (`CHANGELOG.md` `[Unreleased]`,
@@ -174,21 +178,49 @@ RFC 7515 (JWS); upstream `provenance-bridge/src/handlers/jwt.rs`;
 
 **Priority:** P0. **Effort:** 2–3 days.
 
-**Status (2026-06-19): partially implemented.** The two resource-exhaustion
-controls that need no new dependency are live: a global ingress **body cap**
-(`axum::extract::DefaultBodyLimit`, default 10 MiB,
-`PROXILION_MAX_REQUEST_BODY_BYTES`, → `413`) applied before any adapter/policy
-code reads the body, and a **per-request timeout** (`tower_http::TimeoutLayer`,
-default 30 s, `PROXILION_REQUEST_TIMEOUT_SECS`, → `408`) scoped to the
-agent-facing Drive/Gmail/Calendar adapter routes (deliberately NOT the
-long-lived SSE/streaming-export routes). Both are operator-tunable with a `0`
-disable sentinel; both rejections increment
-`proxilion_ingress_rejections_total{reason}`. See
-[server.rs](../../crates/proxy/src/server.rs) and
-[config.rs](../../crates/proxy/src/config.rs). **Still open:** per-IP rate
-limiting (`429`+`Retry-After`, trusted-proxy `X-Forwarded-For` handling) and the
-global concurrency limit + load-shed (`503`) — these need a rate-limit crate and
-`ConnectInfo`/`HandleErrorLayer` wiring and are the remaining PR-2 work.
+**Status (2026-06-19): implemented (application-layer controls).** All four
+edge resource-exhaustion controls are live and operator-tunable (each with a
+`0` disable sentinel):
+
+1. **Body cap** — `axum::extract::DefaultBodyLimit`, default 10 MiB,
+   `PROXILION_MAX_REQUEST_BODY_BYTES`, → `413`, applied before any
+   adapter/policy code reads the body.
+2. **Per-request timeout** — `tower_http::TimeoutLayer`, default 30 s,
+   `PROXILION_REQUEST_TIMEOUT_SECS`, → `408`, scoped to the agent-facing
+   Drive/Gmail/Calendar adapter routes (deliberately NOT the long-lived
+   SSE/streaming-export routes).
+3. **Per-IP rate limit** — an in-house token bucket
+   ([edge.rs](../../crates/proxy/src/edge.rs)), default 50 req/s + 100 burst,
+   `PROXILION_RATE_LIMIT_PER_SEC` / `PROXILION_RATE_LIMIT_BURST`, →
+   `429`+`Retry-After`. Keyed on a **trusted-proxy-aware** client IP: the
+   `X-Forwarded-For` chain is believed *only* when the direct TCP peer is a
+   configured trusted proxy (`PROXILION_TRUSTED_PROXIES`, default empty =
+   trust nothing), walked right-to-left so an attacker-spoofed prefix is
+   ignored. Bucket table bounded (100k cap, 10-min idle eviction).
+4. **Concurrency limit + load-shed** — a `tokio::sync::Semaphore`-backed global
+   in-flight ceiling ([edge.rs](../../crates/proxy/src/edge.rs)), default 1024,
+   `PROXILION_MAX_CONCURRENT_REQUESTS`, → `503` via `try_acquire` (fail-fast,
+   never a queue).
+
+All four rejections increment `proxilion_ingress_rejections_total{reason}`
+(`body_limit`/`timeout` counted at the outermost edge middleware;
+`rate_limit`/`load_shed` counted at their shed site because their statuses are
+shared with upstream-rate-limit / `/healthz`-readiness responses). The
+rate-limit and load-shed controls were implemented **dependency-free** (token
+bucket on `moka`, semaphore on `tokio` — both already in the tree) rather than
+pulling `tower_governor`; the security-critical trusted-proxy keying is cleaner
+to own than to bend a third-party key extractor around. See
+[server.rs](../../crates/proxy/src/server.rs),
+[edge.rs](../../crates/proxy/src/edge.rs), and
+[config.rs](../../crates/proxy/src/config.rs).
+
+**Still open (deferred to PR-7 / PR-13):** per-principal/per-session rate
+limiting (a documented fast-follow; per-IP is the P0), the L4 connection /
+TLS-handshake cap at the `axum-server` layer, the FD-ulimit deployment
+documentation, and the overload-shedding **load test** that exercises these
+controls at scale (PR-7's acceptance gate). The concurrency limit is
+per-replica; whether per-IP rate state must be centralized across replicas is
+the PR-7 statelessness-audit decision.
 
 **Goal.** A single agent, tenant, or unauthenticated caller cannot exhaust
 the proxy's CPU, memory, file descriptors, or upstream/IdP quota.
@@ -688,8 +720,10 @@ satisfied:
 - [ ] **PR-1** Federation token signatures verified; no payload-only trust;
       production boot refuses the insecure stub; `alg:none`/confusion
       rejected.
-- [ ] **PR-2** Ingress body cap, per-request timeout, IP+global rate limit,
-      concurrency limit + load-shed all active.
+- [~] **PR-2** Ingress body cap, per-request timeout, per-IP rate limit
+      (`429`+`Retry-After`, trusted-proxy XFF), concurrency limit + load-shed
+      (`503`) all active at the application layer. Remaining: L4 connection cap
+      + FD-ulimit docs + at-scale overload load test (interlinks PR-7).
 - [ ] **PR-3** Keys `zeroize`-wrapped; documented, tested zero-downtime
       rotation; production secret sourcing.
 - [ ] **PR-4** TLS ≥ 1.2 enforced; outbound cert verification proven (CI

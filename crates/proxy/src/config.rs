@@ -119,6 +119,30 @@ pub struct Config {
     /// by design. Defaults to 30 s. `0` disables the timeout.
     /// `PROXILION_REQUEST_TIMEOUT_SECS`.
     pub request_timeout_secs: u64,
+    /// Per-client-IP steady-state request rate, in requests/second, for the
+    /// agent-facing ingress (production-readiness.md PR-2). Enforced by an
+    /// in-house token bucket ([`crate::edge`]); over-quota → `429 Too Many
+    /// Requests` + `Retry-After`. The IP is resolved trusted-proxy-aware (see
+    /// `trusted_proxies`). Defaults to 50. `0` disables rate limiting.
+    /// `PROXILION_RATE_LIMIT_PER_SEC`.
+    pub rate_limit_per_sec: u32,
+    /// Token-bucket burst capacity (max requests admitted instantaneously
+    /// before the steady-state `rate_limit_per_sec` applies). Defaults to 100.
+    /// Ignored when rate limiting is disabled. `PROXILION_RATE_LIMIT_BURST`.
+    pub rate_limit_burst: u32,
+    /// Global in-flight concurrency ceiling across all agent-facing routes
+    /// (production-readiness.md PR-2). A `Semaphore`-backed load-shed: at
+    /// capacity, a new request is shed with `503 Service Unavailable`
+    /// immediately rather than queueing into memory exhaustion. Defaults to
+    /// 1024. `0` disables the limit. `PROXILION_MAX_CONCURRENT_REQUESTS`.
+    pub max_concurrent_requests: usize,
+    /// Direct-peer IPs that are trusted to set `X-Forwarded-For`. When the TCP
+    /// peer is one of these, the rate limiter reads the real client IP from
+    /// the forwarded chain; otherwise the forwarded header is ignored and the
+    /// socket peer is used (production-readiness.md PR-2/PR-4 — never trust
+    /// `X-Forwarded-For` blindly). Defaults to empty (trust nothing).
+    /// `PROXILION_TRUSTED_PROXIES` (comma-separated IPs).
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -196,6 +220,10 @@ pub struct ConfigBuilder {
     operator_auth_enforced: bool,
     max_request_body_bytes: usize,
     request_timeout_secs: u64,
+    rate_limit_per_sec: u32,
+    rate_limit_burst: u32,
+    max_concurrent_requests: usize,
+    trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for ConfigBuilder {
@@ -237,6 +265,13 @@ impl ConfigBuilder {
             // spec.md §15.6) and production-readiness.md PR-2.
             max_request_body_bytes: 10 * 1024 * 1024,
             request_timeout_secs: 30,
+            // PR-2 edge rate limit / load-shed. 50 req/s steady with a
+            // 100-request burst is generous for a single agent yet caps a
+            // flood; 1024 in-flight matches a comfortable connection budget.
+            rate_limit_per_sec: 50,
+            rate_limit_burst: 100,
+            max_concurrent_requests: 1024,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -358,6 +393,30 @@ impl ConfigBuilder {
                 self.request_timeout_secs = n;
             }
         }
+        if let Ok(v) = env::var("PROXILION_RATE_LIMIT_PER_SEC") {
+            // `0` is a valid explicit "disable rate limiting" sentinel; a
+            // malformed value leaves the prior limit intact.
+            if let Ok(n) = v.parse::<u32>() {
+                self.rate_limit_per_sec = n;
+            }
+        }
+        if let Ok(v) = env::var("PROXILION_RATE_LIMIT_BURST") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.rate_limit_burst = n;
+            }
+        }
+        if let Ok(v) = env::var("PROXILION_MAX_CONCURRENT_REQUESTS") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.max_concurrent_requests = n;
+            }
+        }
+        if let Ok(v) = env::var("PROXILION_TRUSTED_PROXIES") {
+            // Comma-separated IPs. Malformed entries are dropped (logged
+            // nowhere — boot validation surfaces an all-empty result as the
+            // secure default of trusting nothing). An empty var clears the
+            // list back to the secure default.
+            self.trusted_proxies = parse_trusted_proxies(&v);
+        }
         Ok(self)
     }
 
@@ -458,6 +517,18 @@ impl ConfigBuilder {
         }
         if let Some(v) = file.request_timeout_secs {
             self.request_timeout_secs = v;
+        }
+        if let Some(v) = file.rate_limit_per_sec {
+            self.rate_limit_per_sec = v;
+        }
+        if let Some(v) = file.rate_limit_burst {
+            self.rate_limit_burst = v;
+        }
+        if let Some(v) = file.max_concurrent_requests {
+            self.max_concurrent_requests = v;
+        }
+        if let Some(v) = file.trusted_proxies {
+            self.trusted_proxies = v.iter().filter_map(|s| s.parse().ok()).collect();
         }
         Ok(self)
     }
@@ -568,8 +639,21 @@ impl ConfigBuilder {
             operator_auth_enforced: self.operator_auth_enforced,
             max_request_body_bytes: self.max_request_body_bytes,
             request_timeout_secs: self.request_timeout_secs,
+            rate_limit_per_sec: self.rate_limit_per_sec,
+            rate_limit_burst: self.rate_limit_burst,
+            max_concurrent_requests: self.max_concurrent_requests,
+            trusted_proxies: self.trusted_proxies,
         })
     }
+}
+
+/// Parse a comma-separated `X-Forwarded-For` trusted-proxy IP list. Blank
+/// entries and unparseable tokens are dropped; the result may be empty (the
+/// secure default of trusting no forwarded headers).
+fn parse_trusted_proxies(raw: &str) -> Vec<std::net::IpAddr> {
+    raw.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
 }
 
 /// On-disk TOML schema. Every field is optional — operators only set
@@ -604,6 +688,10 @@ struct FileConfig {
     operator_auth_enforced: Option<bool>,
     max_request_body_bytes: Option<usize>,
     request_timeout_secs: Option<u64>,
+    rate_limit_per_sec: Option<u32>,
+    rate_limit_burst: Option<u32>,
+    max_concurrent_requests: Option<usize>,
+    trusted_proxies: Option<Vec<String>>,
 }
 
 fn check_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
@@ -658,9 +746,15 @@ mod tests {
         assert_eq!(c.trust_plane_url, "http://trust-plane:8080");
         assert!(c.operator_auth_enforced);
         assert_eq!(c.customer_domain, "example.com");
-        // PR-2 edge limits default to 10 MiB body cap + 30 s timeout.
+        // PR-2 edge limits default to 10 MiB body cap + 30 s timeout +
+        // 50 req/s (burst 100) per-IP rate limit + 1024 in-flight concurrency
+        // load-shed, and trust no forwarded headers by default.
         assert_eq!(c.max_request_body_bytes, 10 * 1024 * 1024);
         assert_eq!(c.request_timeout_secs, 30);
+        assert_eq!(c.rate_limit_per_sec, 50);
+        assert_eq!(c.rate_limit_burst, 100);
+        assert_eq!(c.max_concurrent_requests, 1024);
+        assert!(c.trusted_proxies.is_empty());
     }
 
     #[test]
@@ -681,6 +775,10 @@ mod tests {
 dev_mode = true
 max_request_body_bytes = 1048576
 request_timeout_secs = 5
+rate_limit_per_sec = 200
+rate_limit_burst = 400
+max_concurrent_requests = 4096
+trusted_proxies = ["10.0.0.1", "10.0.0.2"]
 "#,
         )
         .unwrap();
@@ -691,6 +789,16 @@ request_timeout_secs = 5
             .unwrap();
         assert_eq!(c.max_request_body_bytes, 1_048_576);
         assert_eq!(c.request_timeout_secs, 5);
+        assert_eq!(c.rate_limit_per_sec, 200);
+        assert_eq!(c.rate_limit_burst, 400);
+        assert_eq!(c.max_concurrent_requests, 4096);
+        assert_eq!(
+            c.trusted_proxies,
+            vec![
+                "10.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+                "10.0.0.2".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
 
         // Zero sentinel — disables each control; must survive verbatim
         // (not get clamped back to a default).
@@ -701,6 +809,8 @@ request_timeout_secs = 5
 dev_mode = true
 max_request_body_bytes = 0
 request_timeout_secs = 0
+rate_limit_per_sec = 0
+max_concurrent_requests = 0
 "#,
         )
         .unwrap();
@@ -711,6 +821,8 @@ request_timeout_secs = 0
             .unwrap();
         assert_eq!(c0.max_request_body_bytes, 0);
         assert_eq!(c0.request_timeout_secs, 0);
+        assert_eq!(c0.rate_limit_per_sec, 0);
+        assert_eq!(c0.max_concurrent_requests, 0);
     }
 
     #[test]
@@ -1394,14 +1506,14 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
     // ─── round 289 (2026-05-26): Config/ConfigBuilder/ConfigError variant + Clone pins ───
 
     #[test]
-    fn config_field_count_pinned_at_exactly_twenty_five_via_exhaustive_destructure_no_rest_pattern()
+    fn config_field_count_pinned_at_exactly_twenty_nine_via_exhaustive_destructure_no_rest_pattern()
     {
-        // `Config` carries EXACTLY 25 fields — every one of them is
+        // `Config` carries EXACTLY 29 fields — every one of them is
         // operator-load-bearing (env-var-driven, surfaced in the
         // `/api/v1/setup/status` panel, OR consumed at boot by the
         // server.rs wiring). Pin the field count via exhaustive
         // destructure with NO `..` rest pattern: a refactor that
-        // landed a 24th field (e.g. `pub kill_switch_path:
+        // landed a 30th field (e.g. `pub kill_switch_path:
         // Option<PathBuf>` OR `pub admin_email: Option<String>`)
         // without matching `ConfigBuilder` AND the from_env_layer
         // mapping would silently leave the new field at its
@@ -1441,25 +1553,29 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             operator_auth_enforced: _,
             max_request_body_bytes: _,
             request_timeout_secs: _,
+            rate_limit_per_sec: _,
+            rate_limit_burst: _,
+            max_concurrent_requests: _,
+            trusted_proxies: _,
         } = c;
     }
 
     #[test]
-    fn config_builder_field_count_pinned_at_exactly_twenty_five_via_exhaustive_destructure_no_rest()
+    fn config_builder_field_count_pinned_at_exactly_twenty_nine_via_exhaustive_destructure_no_rest()
     {
-        // `ConfigBuilder` MUST carry the SAME 25 fields as `Config`
+        // `ConfigBuilder` MUST carry the SAME 29 fields as `Config`
         // — the builder→config conversion in `ConfigBuilder::build`
         // does a 1:1 field move, so an asymmetric refactor that
         // added a field to one side and not the other would either
         // (a) compile-fail at the build site if added to Config, OR
         // (b) silently strip the new builder-side field at build
-        // time if added to ConfigBuilder. Pin EXACTLY 25 via
+        // time if added to ConfigBuilder. Pin EXACTLY 29 via
         // exhaustive destructure to anchor BOTH sides in lockstep
         // with the sibling `Config` field-count pin. A refactor that
         // extended ConfigBuilder without matching Config (the more
         // dangerous direction — silently drops the operator's value)
         // surfaces here at compile time. Symmetric to the Config
-        // 25-field pin in this same round.
+        // 29-field pin in this same round.
         let b = ConfigBuilder::defaults();
         let ConfigBuilder {
             bind_addr: _,
@@ -1487,6 +1603,10 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             operator_auth_enforced: _,
             max_request_body_bytes: _,
             request_timeout_secs: _,
+            rate_limit_per_sec: _,
+            rate_limit_burst: _,
+            max_concurrent_requests: _,
+            trusted_proxies: _,
         } = b;
     }
 

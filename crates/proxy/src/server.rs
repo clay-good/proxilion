@@ -1,6 +1,7 @@
 //! axum server: TLS termination, /healthz, graceful shutdown, request-id span.
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -333,8 +334,49 @@ pub async fn run(cfg: Config) -> Result<()> {
     } else {
         app.layer(DefaultBodyLimit::disable())
     };
-    // Outermost: count edge rejections (413 body cap / 408 adapter timeout)
-    // into a labelled metric so the PR-5 burn-rate alerts can watch them.
+    // production-readiness.md PR-2 — per-IP rate limit (`429` + `Retry-After`).
+    // Outer to the body cap so a flood of oversize bodies is shed before
+    // extraction. Trusted-proxy-aware IP keying (see crate::edge). `0` disables.
+    let app = if cfg.rate_limit_per_sec > 0 {
+        let limiter = Arc::new(crate::edge::RateLimiter::new(
+            cfg.rate_limit_per_sec,
+            cfg.rate_limit_burst,
+            cfg.trusted_proxies.clone(),
+        ));
+        info!(
+            per_sec = cfg.rate_limit_per_sec,
+            burst = cfg.rate_limit_burst,
+            trusted_proxies = cfg.trusted_proxies.len(),
+            "per-IP ingress rate limit active"
+        );
+        app.layer(middleware::from_fn_with_state(
+            limiter,
+            crate::edge::rate_limit,
+        ))
+    } else {
+        warn!("per-IP ingress rate limit DISABLED (PROXILION_RATE_LIMIT_PER_SEC=0)");
+        app
+    };
+    // production-readiness.md PR-2 — global concurrency limit + load-shed
+    // (`503`). Outermost control layer: shed under overload before any
+    // per-request work (rate-limit lookup, extraction) runs. `0` disables.
+    let app = if cfg.max_concurrent_requests > 0 {
+        let limit = crate::edge::ConcurrencyLimit::new(cfg.max_concurrent_requests);
+        info!(
+            max_in_flight = cfg.max_concurrent_requests,
+            "global concurrency limit + load-shed active"
+        );
+        app.layer(middleware::from_fn_with_state(
+            limit,
+            crate::edge::concurrency_limit,
+        ))
+    } else {
+        warn!("global concurrency limit DISABLED (PROXILION_MAX_CONCURRENT_REQUESTS=0)");
+        app
+    };
+    // Outermost: count edge rejections (413 body cap / 408 adapter timeout /
+    // 429 rate limit / 503 load-shed) into a labelled metric so the PR-5
+    // burn-rate alerts can watch them.
     let app = app.layer(middleware::from_fn(count_edge_rejections));
 
     let handle = axum_server::Handle::new();
@@ -348,7 +390,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     info!(bind = %cfg.bind_addr, "proxy listening");
     axum_server::bind_rustls(cfg.bind_addr, tls)
         .handle(handle)
-        .serve(app.into_make_service())
+        // `with_connect_info` so the PR-2 rate-limit middleware can read the
+        // real TCP peer (the trusted-proxy-aware key source) from
+        // `ConnectInfo<SocketAddr>`.
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("axum_server::serve failed")?;
     Ok(())
@@ -566,11 +611,17 @@ async fn admin_page() -> Response {
         .expect("static admin response builds")
 }
 
-/// Outermost edge middleware: count the two ingress rejections PR-2 adds —
-/// `413 Payload Too Large` (body cap) and `408 Request Timeout` (adapter
-/// per-request timeout) — into a single labelled counter. In this app those
-/// two statuses originate only from the PR-2 controls, so the `reason` label
-/// is unambiguous. Feeds the PR-5 burn-rate alerts.
+/// Outermost edge middleware: count the two *status-unambiguous* ingress
+/// rejections PR-2 adds — `413 Payload Too Large` (body cap) and `408 Request
+/// Timeout` (adapter per-request timeout) — into the labelled
+/// `proxilion_ingress_rejections_total` counter. Those two statuses originate
+/// only from the PR-2 controls, so the `reason` label is unambiguous here. The
+/// other two PR-2 controls — `429` rate-limit and `503` concurrency load-shed
+/// — share their status code with legitimate non-edge responses (upstream
+/// Google `429`, `/healthz` readiness `503`), so they increment the *same*
+/// counter at their own shed site in [`crate::edge`] instead of being
+/// reverse-mapped from the status here. All four feed the PR-5 burn-rate
+/// alerts through one metric.
 async fn count_edge_rejections(req: Request<axum::body::Body>, next: Next) -> Response {
     let resp = next.run(req).await;
     let reason = match resp.status() {
@@ -1681,5 +1732,109 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pr2_rate_limit_sheds_over_burst_with_429_and_retry_after_through_wired_middleware() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        // Burst of 2 at 1 req/s, no trusted proxies. Drive the real
+        // `from_fn_with_state` + ConnectInfo wiring, not the pure helper.
+        let limiter = Arc::new(crate::edge::RateLimiter::new(1, 2, vec![]));
+        let make =
+            || {
+                Router::new().route("/", get(|| async { "ok" })).layer(
+                    middleware::from_fn_with_state(limiter.clone(), crate::edge::rate_limit),
+                )
+            };
+        let peer: SocketAddr = "203.0.113.5:51000".parse().unwrap();
+        let req = || {
+            let mut r = Request::get("/").body(Body::empty()).unwrap();
+            r.extensions_mut().insert(ConnectInfo(peer));
+            r
+        };
+
+        // First two within burst → 200; third shed → 429 + Retry-After.
+        assert_eq!(
+            make().oneshot(req()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            make().oneshot(req()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let resp = make().oneshot(req()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "429 must carry Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr2_concurrency_limit_sheds_to_503_when_all_permits_in_flight() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use tokio::sync::oneshot;
+        use tower::ServiceExt;
+
+        // One permit. A request that parks inside the handler holds it; a
+        // concurrent second request finds no permit and is shed with 503.
+        let limit = crate::edge::ConcurrencyLimit::new(1);
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let app = Router::new()
+            .route(
+                "/hold",
+                get(move || {
+                    let release = release.clone();
+                    async move {
+                        if let Some(rx) = release.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                        "done"
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                limit,
+                crate::edge::concurrency_limit,
+            ));
+
+        // Park the first request mid-handler so it holds the only permit.
+        let app1 = app.clone();
+        let first = tokio::spawn(async move {
+            app1.oneshot(Request::get("/hold").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        });
+        // Wait until the permit is actually held before probing.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/hold").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "second concurrent request must be shed"
+        );
+
+        // Release the first; it completes 200 and frees the permit.
+        let _ = release_tx.send(());
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        let resp = app
+            .oneshot(Request::get("/hold").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "permit freed after release");
     }
 }

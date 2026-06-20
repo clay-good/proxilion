@@ -69,6 +69,18 @@ spec:
               value: /tls/tls.crt
             - name: PROXILION_TLS_KEY
               value: /tls/tls.key
+            {{- if .Values.proxy.tls.minVersion }}
+            # Minimum negotiated ingress TLS version (PR-4). rustls never
+            # negotiates below 1.2; set "1.3" to additionally refuse 1.2.
+            - name: PROXILION_TLS_MIN_VERSION
+              value: {{ .Values.proxy.tls.minVersion | quote }}
+            {{- end }}
+            {{- if .Values.proxy.trustedProxies }}
+            # CIDR/IP allow-list of front proxies trusted to set
+            # X-Forwarded-For (PR-2/PR-4). Empty = trust nothing.
+            - name: PROXILION_TRUSTED_PROXIES
+              value: {{ join "," .Values.proxy.trustedProxies | quote }}
+            {{- end }}
             {{- if .Values.proxy.devCert }}
             - name: PROXILION_DEV
               value: "1"

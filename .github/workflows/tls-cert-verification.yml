@@ -1,0 +1,64 @@
+name: tls-cert-verification
+
+# production-readiness.md PR-4 (Transport & trust-boundary hardening) —
+# the proxy terminates TLS for untrusted callers and makes outbound TLS
+# calls to Trust Plane, upstream SaaS, IdP JWKS, NATS, SIEM, Slack and
+# SMTP. Full certificate verification on every one of those outbound
+# clients is a P0 invariant: a single `danger_accept_invalid_certs(true)`
+# would silently turn an authority-issuing hop into an unauthenticated
+# one and reopen the confused-deputy boundary the product exists to close.
+#
+# This gate forbids cert/hostname verification from being disabled in any
+# production crate, and forbids an unconditionally-hardcoded disable
+# (`(true)`) anywhere — including the CLI debug tool, where the ONLY
+# permitted form is the explicit operator opt-in `--insecure` flag
+# (`.danger_accept_invalid_certs(cli.insecure)`, like `curl -k`).
+#
+# Cheap shell check; runs on every PR. Acceptance criterion for PR-4.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  no-disabled-cert-verification:
+    name: outbound TLS cert verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: forbid disabled cert verification in production crates
+        run: |
+          set -euo pipefail
+          # The runtime crates that sit on the production request path.
+          # crates/cli is intentionally excluded — it is an operator debug
+          # tool whose `--insecure` flag is a documented, opt-in escape
+          # hatch (checked separately below).
+          PROD_CRATES="crates/proxy crates/policy-engine crates/shared-types"
+          PATTERN='danger_accept_invalid_certs|danger_accept_invalid_hostnames'
+
+          hits=$(grep -RInE "$PATTERN" $PROD_CRATES --include='*.rs' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::a production crate disables TLS certificate/hostname verification (PR-4 forbids this on every outbound client):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "ok: no production crate disables outbound TLS verification"
+
+      - name: forbid unconditionally-hardcoded cert-verification disable
+        run: |
+          set -euo pipefail
+          # Even in the CLI, the disable MUST stay gated behind the
+          # operator's `--insecure` flag. A literal `(true)` would make it
+          # unconditional. Tolerate whitespace inside the parens.
+          PATTERN='danger_accept_invalid_(certs|hostnames)\s*\(\s*true\s*\)'
+
+          hits=$(grep -RInE "$PATTERN" crates --include='*.rs' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::cert verification is hardcoded-disabled (must stay gated behind an explicit operator opt-in flag):"
+            echo "$hits"
+            exit 1
+          fi
+          echo "ok: no unconditional cert-verification disable in the tree"

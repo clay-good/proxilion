@@ -706,6 +706,18 @@ implemented dependency-free (token bucket on `moka`, semaphore on `tokio`).
 Remaining PR-2 work (interlinks PR-7): the L4 connection/handshake cap,
 FD-ulimit deployment docs, and the at-scale overload load test.
 
+**PR-4 (transport & trust-boundary hardening) is complete.** Ingress TLS is
+terminated by rustls/aws-lc-rs, which never negotiates below **TLS 1.2**;
+`PROXILION_TLS_MIN_VERSION=1.3` (Helm `proxy.tls.minVersion`) pins 1.3-only
+for a hardened deploy, and cipher suites are rustls defaults (AEAD-only, no
+CBC/RC4/3DES). Full certificate verification on every outbound client
+(Trust Plane, upstream SaaS, IdP JWKS, NATS, SIEM, Slack, SMTP) is enforced
+in CI by the [`tls-cert-verification`](.github/workflows/tls-cert-verification.yml)
+gate, which forbids any production crate from disabling cert/hostname
+verification. The per-hop TLS/mTLS matrix, cipher posture, public-route
+surface, and the staging `testssl`/`nmap` go-live check live in
+[docs/ops/tls-mtls-matrix.md](docs/ops/tls-mtls-matrix.md).
+
 ## The Skill Overreach problem
 
 The agent platforms now ship "skills." You train one agent for the whole

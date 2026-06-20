@@ -16,6 +16,34 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Transport & trust-boundary hardening (production-readiness.md PR-4 —
+  complete).** Made the proxy's TLS posture explicit and regression-proof
+  across every hop.
+  - **Ingress TLS min-version is now configurable and enforced.** A new
+    `build_tls_config` ([server.rs](crates/proxy/src/server.rs)) builds the
+    rustls listener with an explicit protocol-version floor instead of the
+    library default. `PROXILION_TLS_MIN_VERSION` (Helm `proxy.tls.minVersion`,
+    `"1.2"` | `"1.3"`, default `1.2`) pins the floor; rustls/aws-lc-rs already
+    cannot negotiate below 1.2, so `1.3` additionally refuses 1.2 for a
+    hardened deploy. The crypto provider is selected explicitly (aws-lc-rs),
+    so the builder is independent of process-default registration. ALPN
+    (`h2`, `http/1.1`) and cert/key PEM loading are preserved.
+  - **CI gate forbids disabled cert verification.** A new
+    [`tls-cert-verification`](.github/workflows/tls-cert-verification.yml)
+    workflow fails the build if any production crate (`crates/proxy`,
+    `crates/policy-engine`, `crates/shared-types`) disables TLS
+    certificate/hostname verification, or if the disable is hardcoded
+    unconditionally anywhere. The only permitted use of
+    `danger_accept_invalid_certs` is the `proxilion-cli --insecure` debug flag
+    (an explicit operator opt-in, like `curl -k`).
+  - **Helm exposes the TLS floor and trusted proxies.**
+    `proxy.tls.minVersion` and `proxy.trustedProxies` are wired through the
+    proxy Deployment to `PROXILION_TLS_MIN_VERSION` / `PROXILION_TRUSTED_PROXIES`.
+  - **Per-hop TLS/mTLS matrix documented.** New
+    [docs/ops/tls-mtls-matrix.md](docs/ops/tls-mtls-matrix.md) states, per
+    hop, the minimum version, who terminates, whether the cert is verified,
+    and the mTLS recommendation; plus the rustls cipher posture, the
+    public-tier route list, and the staging `testssl`/`nmap` go-live check.
 - **Edge ingress resource caps (production-readiness.md PR-2 — complete).**
   The agent-facing ingress now has all four of PR-2's resource-exhaustion
   controls, every one operator-tunable: a **global request-body cap**, a

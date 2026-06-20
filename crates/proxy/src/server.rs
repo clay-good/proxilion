@@ -25,7 +25,7 @@ use crate::adapters::action_stream::{ActionStream, BroadcastingActionStream};
 use crate::adapters::{AdapterState, google_calendar, google_drive, google_gmail};
 use crate::api::{self, ApiState};
 use crate::auth_middleware::{AuthState, RefreshCoordinator, auth_middleware};
-use crate::config::Config;
+use crate::config::{Config, TlsMinVersion};
 use crate::crypto::TokenCipher;
 use crate::forwarder::{NatsBridge, SiemForwarder, SiemHmacKey, TeeStream};
 use crate::notifier::{BurstConfig, BurstSuppressor, WebhookNotifier, WebhookSecret};
@@ -58,14 +58,17 @@ pub async fn run(cfg: Config) -> Result<()> {
         ensure_dev_cert(&cfg.tls_cert_path, &cfg.tls_key_path).context("generating dev cert")?;
     }
 
-    let tls = RustlsConfig::from_pem_file(&cfg.tls_cert_path, &cfg.tls_key_path)
-        .await
+    let tls = build_tls_config(&cfg.tls_cert_path, &cfg.tls_key_path, cfg.tls_min_version)
         .with_context(|| {
             format!(
                 "loading TLS material from {:?} / {:?}",
                 cfg.tls_cert_path, cfg.tls_key_path
             )
         })?;
+    info!(
+        tls_min_version = cfg.tls_min_version.label(),
+        "ingress TLS configured"
+    );
 
     let readiness = Arc::new(std::sync::OnceLock::<ReadinessProbe>::new());
     let state = AppState {
@@ -1265,6 +1268,51 @@ fn ensure_dev_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Build the agent-facing ingress rustls config from PEM cert/key,
+/// pinning the minimum negotiated TLS version (production-readiness.md
+/// PR-4). rustls (aws-lc-rs) never negotiates below TLS 1.2 — there is
+/// no code path that re-enables 1.0/1.1 — so the 1.2 floor holds
+/// structurally; `TlsMinVersion::V1_3` additionally refuses 1.2 for a
+/// hardened deployment. ALPN advertises `h2` + `http/1.1` to preserve
+/// the HTTP/2 negotiation that axum-server's `from_pem_file` enables by
+/// default. The crypto provider is selected explicitly (aws-lc-rs) so
+/// this is independent of any process-default registration.
+fn build_tls_config(
+    cert_path: &Path,
+    key_path: &Path,
+    min_version: TlsMinVersion,
+) -> Result<RustlsConfig> {
+    let cert_pem = std::fs::read(cert_path).with_context(|| format!("reading {cert_path:?}"))?;
+    let key_pem = std::fs::read(key_path).with_context(|| format!("reading {key_path:?}"))?;
+
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parsing TLS certificate chain")?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {cert_path:?}");
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .context("parsing TLS private key")?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path:?}"))?;
+
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match min_version {
+        // rustls::ALL_VERSIONS is [TLS13, TLS12] — the 1.2 floor.
+        TlsMinVersion::V1_2 => rustls::ALL_VERSIONS,
+        TlsMinVersion::V1_3 => &[&rustls::version::TLS13],
+    };
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions)
+        .context("selecting TLS protocol versions")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("installing TLS cert/key")?;
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(RustlsConfig::from_config(Arc::new(server_config)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1434,6 +1482,47 @@ mod tests {
         let key_pem = std::fs::read_to_string(&key).unwrap();
         assert!(cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(key_pem.contains("BEGIN PRIVATE KEY") || key_pem.contains("BEGIN EC PRIVATE KEY"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_tls_config_succeeds_for_both_min_versions() {
+        // production-readiness.md PR-4 — the version-aware ingress TLS
+        // builder must construct a usable rustls config for the default
+        // 1.2 floor AND the hardened 1.3-only floor, loading a real
+        // PEM cert/key pair (here the rcgen dev cert). This also pins
+        // that `build_tls_config` is self-contained w.r.t. the crypto
+        // provider — it selects aws-lc-rs explicitly, so it does NOT
+        // depend on `install_default()` having run (it hasn't, in the
+        // test process). A refactor back to the process-default
+        // `ServerConfig::builder()` would panic here with "no
+        // process-level CryptoProvider".
+        let dir = unique_tmp_subdir("tls-build");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        ensure_dev_cert(&cert, &key).unwrap();
+        assert!(build_tls_config(&cert, &key, TlsMinVersion::V1_2).is_ok());
+        assert!(build_tls_config(&cert, &key, TlsMinVersion::V1_3).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_tls_config_rejects_missing_and_empty_material() {
+        // A missing cert file → Err (not panic); an empty-but-present
+        // cert file → the explicit "no certificates found" bail rather
+        // than a confusing downstream rustls error. Fail-closed on bad
+        // TLS material so the proxy never boots with a half-configured
+        // listener.
+        let dir = unique_tmp_subdir("tls-bad");
+        let missing_cert = dir.join("nope.pem");
+        let missing_key = dir.join("nope.key");
+        assert!(build_tls_config(&missing_cert, &missing_key, TlsMinVersion::V1_2).is_err());
+
+        let empty_cert = dir.join("empty.pem");
+        let empty_key = dir.join("empty.key");
+        std::fs::write(&empty_cert, "").unwrap();
+        std::fs::write(&empty_key, "").unwrap();
+        assert!(build_tls_config(&empty_cert, &empty_key, TlsMinVersion::V1_2).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

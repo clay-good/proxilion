@@ -16,8 +16,13 @@ layer** — all four edge resource-exhaustion controls (request-body cap,
 per-request adapter timeout, per-IP rate limit, global concurrency limit +
 load-shed) are live and dependency-free (see PR-2's Status below); the
 remaining PR-2 surface is the L4 connection cap, FD-ulimit docs, and the
-at-scale overload load test, all interlinked with PR-7. The rest of the
-operational/release surface below remains open. Each work item carries its own
+at-scale overload load test, all interlinked with PR-7. **PR-4
+(transport & trust-boundary hardening) is now complete** — configurable
+ingress TLS floor (1.2 default, 1.3 opt-in), a CI gate proving every
+outbound client verifies certificates, trusted-proxy config, and a per-hop
+TLS/mTLS matrix doc (its remaining surface is the staging TLS scan and the
+mesh-wiring Helm path). The rest of the operational/release surface below
+remains open. Each work item carries its own
 `Status:` line; update it in place as work lands, same convention as
 `spec.md`'s playbook.
 
@@ -335,6 +340,34 @@ KMS envelope-encryption patterns.
 ### PR-4 — Transport & trust-boundary hardening
 
 **Priority:** P0. **Effort:** 1–2 days.
+
+**Status (2026-06-19): implemented.** The application-layer and CI/Helm/docs
+surface of PR-4 is complete:
+
+- **Ingress TLS floor enforced + configurable.** `build_tls_config`
+  ([server.rs](../../crates/proxy/src/server.rs)) builds the rustls listener
+  with an explicit protocol-version floor (`PROXILION_TLS_MIN_VERSION`,
+  Helm `proxy.tls.minVersion`, default `1.2`, `1.3` opt-in). rustls/aws-lc-rs
+  cannot negotiate below 1.2 structurally; cipher suites are rustls defaults
+  (AEAD-only). The crypto provider is selected explicitly so the builder is
+  self-contained and unit-tested.
+- **Outbound cert verification proven by a CI gate.** The new
+  [`tls-cert-verification`](../../.github/workflows/tls-cert-verification.yml)
+  workflow forbids any production crate from disabling cert/hostname
+  verification and forbids an unconditional hardcoded disable anywhere; the
+  lone permitted `danger_accept_invalid_certs` is the flag-gated
+  `proxilion-cli --insecure` debug opt-in.
+- **Trusted-proxy config is the single source of truth** (shared with PR-2's
+  rate-limit keying), defaulting to trust-nothing; exposed via
+  `proxy.trustedProxies` in Helm.
+- **TLS/mTLS matrix per hop, cipher posture, and the public-route list** are
+  documented in [docs/ops/tls-mtls-matrix.md](../ops/tls-mtls-matrix.md),
+  which also carries the staging `testssl`/`nmap` go-live check.
+
+**Still open:** the staging nmap/testssl scan itself (a go-live execution
+step, documented in the matrix), and the mTLS *mesh wiring* recommendation
+for proxy↔Trust-Plane / proxy↔NATS is documented but not yet shipped as a
+Helm path (interlinks PR-7/PR-11).
 
 **Goal.** Every hop in the deployment is authenticated and encrypted, and
 the proxy's own trust assumptions about its network are explicit.
@@ -726,8 +759,10 @@ satisfied:
       + FD-ulimit docs + at-scale overload load test (interlinks PR-7).
 - [ ] **PR-3** Keys `zeroize`-wrapped; documented, tested zero-downtime
       rotation; production secret sourcing.
-- [ ] **PR-4** TLS ≥ 1.2 enforced; outbound cert verification proven (CI
-      gate); trusted-proxy config explicit.
+- [~] **PR-4** TLS ≥ 1.2 enforced (1.3 opt-in); outbound cert verification
+      proven (CI gate); trusted-proxy config explicit; per-hop TLS/mTLS
+      matrix documented. Remaining: staging nmap/testssl scan + mesh-wiring
+      Helm path (interlinks PR-7/PR-11).
 - [ ] **PR-5** SLOs defined; burn-rate alerts firing correctly; every alert
       → runbook.
 - [ ] **PR-6** Runbooks for every paging alert; killswitch + DB-failover

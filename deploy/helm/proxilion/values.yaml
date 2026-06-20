@@ -72,6 +72,23 @@ proxy:
     # When set, mount cert/key from this existing Secret instead of using
     # `devCert`. The Secret must contain keys `tls.crt` and `tls.key`.
     existingSecret: ""
+    # Minimum negotiated TLS version on the agent-facing ingress
+    # (production-readiness.md PR-4). rustls/aws-lc-rs never negotiates
+    # below 1.2 — there is no path that enables 1.0/1.1 — so "1.2" is the
+    # structural floor and the default. Set "1.3" for a hardened deploy
+    # that additionally refuses TLS 1.2. Cipher suites use rustls
+    # defaults (AEAD-only: AES-GCM / ChaCha20-Poly1305); see
+    # docs/ops/tls-mtls-matrix.md.
+    minVersion: "1.2"
+  # Front proxies (LB / ingress controller / mesh sidecar) trusted to set
+  # `X-Forwarded-For`, as a list of literal peer IP addresses. The per-IP
+  # rate limiter (PR-2) believes the forwarded chain ONLY when the direct
+  # TCP peer is in this list; otherwise it keys on the socket peer.
+  # Default empty = trust nothing (the secure default — never trust XFF
+  # blindly, PR-4). NOTE: literal IPs only today (e.g. the pod IP of the
+  # ingress controller); CIDR ranges are not yet parsed and would be
+  # dropped. e.g. ["10.0.0.5", "10.0.0.6"]
+  trustedProxies: []
   env:
     # Customer's primary domain — drives `${customer_domain}` in policy.
     customerDomain: "example.com"

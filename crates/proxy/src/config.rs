@@ -143,12 +143,57 @@ pub struct Config {
     /// `X-Forwarded-For` blindly). Defaults to empty (trust nothing).
     /// `PROXILION_TRUSTED_PROXIES` (comma-separated IPs).
     pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// Minimum TLS version enforced on the agent-facing ingress
+    /// (production-readiness.md PR-4). rustls never negotiates below 1.2;
+    /// set `1.3` to additionally refuse TLS 1.2. Defaults to `1.2`.
+    /// `PROXILION_TLS_MIN_VERSION` (`"1.2"` | `"1.3"`).
+    pub tls_min_version: TlsMinVersion,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum LogFormat {
     Pretty,
     Json,
+}
+
+/// Minimum TLS protocol version accepted on the agent-facing ingress
+/// (production-readiness.md PR-4). rustls (aws-lc-rs) never negotiates
+/// below TLS 1.2 — there is no code path that enables 1.0/1.1 — so the
+/// 1.2 floor holds structurally. This setting lets an operator
+/// *additionally* pin TLS 1.3-only for a hardened deployment. Default
+/// `V1_2` (accept 1.2 + 1.3), which is byte-identical to the prior
+/// rustls-default posture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsMinVersion {
+    V1_2,
+    V1_3,
+}
+
+impl TlsMinVersion {
+    /// Parse the operator-facing string form: `"1.2"` / `"1.3"`, also
+    /// tolerating a `tls`/`v` prefix and surrounding whitespace
+    /// (`"TLSv1.3"`, `" 1.2 "`). Returns `None` on any unrecognized
+    /// value so the loader can leave the prior (file/default) value
+    /// intact rather than silently downgrading the floor — same
+    /// fail-safe shape as the numeric edge-limit parses.
+    fn parse(raw: &str) -> Option<Self> {
+        let s = raw.trim().to_ascii_lowercase();
+        let s = s.strip_prefix("tls").unwrap_or(&s);
+        let s = s.strip_prefix('v').unwrap_or(s);
+        match s {
+            "1.2" => Some(Self::V1_2),
+            "1.3" => Some(Self::V1_3),
+            _ => None,
+        }
+    }
+
+    /// Human-facing label for the boot log line and the setup panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::V1_2 => "1.2",
+            Self::V1_3 => "1.3",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -224,6 +269,7 @@ pub struct ConfigBuilder {
     rate_limit_burst: u32,
     max_concurrent_requests: usize,
     trusted_proxies: Vec<std::net::IpAddr>,
+    tls_min_version: TlsMinVersion,
 }
 
 impl Default for ConfigBuilder {
@@ -272,6 +318,9 @@ impl ConfigBuilder {
             rate_limit_burst: 100,
             max_concurrent_requests: 1024,
             trusted_proxies: Vec::new(),
+            // rustls already refuses < 1.2; default to the 1.2 floor
+            // (accept 1.2 + 1.3), the prior behavior. Operators pin 1.3.
+            tls_min_version: TlsMinVersion::V1_2,
         }
     }
 
@@ -417,6 +466,13 @@ impl ConfigBuilder {
             // list back to the secure default.
             self.trusted_proxies = parse_trusted_proxies(&v);
         }
+        if let Ok(v) = env::var("PROXILION_TLS_MIN_VERSION") {
+            // An unrecognized value leaves the prior (file/default) floor
+            // intact rather than silently weakening it.
+            if let Some(ver) = TlsMinVersion::parse(&v) {
+                self.tls_min_version = ver;
+            }
+        }
         Ok(self)
     }
 
@@ -529,6 +585,11 @@ impl ConfigBuilder {
         }
         if let Some(v) = file.trusted_proxies {
             self.trusted_proxies = v.iter().filter_map(|s| s.parse().ok()).collect();
+        }
+        if let Some(v) = file.tls_min_version {
+            if let Some(ver) = TlsMinVersion::parse(&v) {
+                self.tls_min_version = ver;
+            }
         }
         Ok(self)
     }
@@ -643,6 +704,7 @@ impl ConfigBuilder {
             rate_limit_burst: self.rate_limit_burst,
             max_concurrent_requests: self.max_concurrent_requests,
             trusted_proxies: self.trusted_proxies,
+            tls_min_version: self.tls_min_version,
         })
     }
 }
@@ -692,6 +754,7 @@ struct FileConfig {
     rate_limit_burst: Option<u32>,
     max_concurrent_requests: Option<usize>,
     trusted_proxies: Option<Vec<String>>,
+    tls_min_version: Option<String>,
 }
 
 fn check_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
@@ -1506,14 +1569,13 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
     // ─── round 289 (2026-05-26): Config/ConfigBuilder/ConfigError variant + Clone pins ───
 
     #[test]
-    fn config_field_count_pinned_at_exactly_twenty_nine_via_exhaustive_destructure_no_rest_pattern()
-    {
-        // `Config` carries EXACTLY 29 fields — every one of them is
+    fn config_field_count_pinned_at_exactly_thirty_via_exhaustive_destructure_no_rest_pattern() {
+        // `Config` carries EXACTLY 30 fields — every one of them is
         // operator-load-bearing (env-var-driven, surfaced in the
         // `/api/v1/setup/status` panel, OR consumed at boot by the
         // server.rs wiring). Pin the field count via exhaustive
         // destructure with NO `..` rest pattern: a refactor that
-        // landed a 30th field (e.g. `pub kill_switch_path:
+        // landed a 31st field (e.g. `pub kill_switch_path:
         // Option<PathBuf>` OR `pub admin_email: Option<String>`)
         // without matching `ConfigBuilder` AND the from_env_layer
         // mapping would silently leave the new field at its
@@ -1557,25 +1619,25 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             rate_limit_burst: _,
             max_concurrent_requests: _,
             trusted_proxies: _,
+            tls_min_version: _,
         } = c;
     }
 
     #[test]
-    fn config_builder_field_count_pinned_at_exactly_twenty_nine_via_exhaustive_destructure_no_rest()
-    {
-        // `ConfigBuilder` MUST carry the SAME 29 fields as `Config`
+    fn config_builder_field_count_pinned_at_exactly_thirty_via_exhaustive_destructure_no_rest() {
+        // `ConfigBuilder` MUST carry the SAME 30 fields as `Config`
         // — the builder→config conversion in `ConfigBuilder::build`
         // does a 1:1 field move, so an asymmetric refactor that
         // added a field to one side and not the other would either
         // (a) compile-fail at the build site if added to Config, OR
         // (b) silently strip the new builder-side field at build
-        // time if added to ConfigBuilder. Pin EXACTLY 29 via
+        // time if added to ConfigBuilder. Pin EXACTLY 30 via
         // exhaustive destructure to anchor BOTH sides in lockstep
         // with the sibling `Config` field-count pin. A refactor that
         // extended ConfigBuilder without matching Config (the more
         // dangerous direction — silently drops the operator's value)
         // surfaces here at compile time. Symmetric to the Config
-        // 29-field pin in this same round.
+        // 30-field pin in this same round.
         let b = ConfigBuilder::defaults();
         let ConfigBuilder {
             bind_addr: _,
@@ -1607,7 +1669,58 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             rate_limit_burst: _,
             max_concurrent_requests: _,
             trusted_proxies: _,
+            tls_min_version: _,
         } = b;
+    }
+
+    // ─── production-readiness.md PR-4: TLS min-version floor ───
+
+    #[test]
+    fn tls_min_version_defaults_to_one_two() {
+        // The default floor is 1.2 (accept 1.2 + 1.3) — byte-identical
+        // to the prior rustls-default ingress posture so the PR-4
+        // addition is a no-op for existing deployments until an operator
+        // opts into 1.3-only.
+        let c = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .build()
+            .unwrap();
+        assert_eq!(c.tls_min_version, TlsMinVersion::V1_2);
+        assert_eq!(c.tls_min_version.label(), "1.2");
+    }
+
+    #[test]
+    fn tls_min_version_parse_accepts_canonical_and_prefixed_forms() {
+        // Operators may write the version a handful of ways; pin the
+        // tolerated set so a Helm value / env var of `TLSv1.3` (the
+        // form `openssl`/`nmap` print) doesn't silently fall through to
+        // the default floor.
+        for raw in ["1.2", " 1.2 ", "tls1.2", "TLSv1.2", "v1.2"] {
+            assert_eq!(
+                TlsMinVersion::parse(raw),
+                Some(TlsMinVersion::V1_2),
+                "expected 1.2 for {raw:?}",
+            );
+        }
+        for raw in ["1.3", "tls1.3", "TLSV1.3", "V1.3"] {
+            assert_eq!(
+                TlsMinVersion::parse(raw),
+                Some(TlsMinVersion::V1_3),
+                "expected 1.3 for {raw:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn tls_min_version_parse_rejects_unknown_and_weak_values() {
+        // Anything we don't recognize — including TLS 1.0/1.1 (which
+        // rustls cannot negotiate anyway) and garbage — returns None so
+        // the loader keeps the prior floor instead of weakening it. A
+        // refactor that defaulted an unknown value to V1_2 (or, worse,
+        // accepted "1.0") would silently change the security posture.
+        for raw in ["", "1.0", "1.1", "1.4", "2", "ssl3", "garbage", "1.2.3"] {
+            assert_eq!(TlsMinVersion::parse(raw), None, "expected None for {raw:?}");
+        }
     }
 
     #[test]

@@ -148,6 +148,40 @@ pub struct Config {
     /// set `1.3` to additionally refuse TLS 1.2. Defaults to `1.2`.
     /// `PROXILION_TLS_MIN_VERSION` (`"1.2"` | `"1.3"`).
     pub tls_min_version: TlsMinVersion,
+    /// Deployment environment (`PROXILION_ENV`). Drives the PR-1
+    /// production-boot guard. Defaults to `Development`.
+    pub environment: Environment,
+    /// Whether the insecure payload-only federation bridge stub
+    /// (`oauth::bridge::validate_federation_token`, no signature check) is
+    /// active. Defaults to `true` — it is the only federation path until
+    /// PR-1's verified-issuance rewiring lands. When `true` and
+    /// `environment` is protected (staging/production), the proxy refuses
+    /// to boot (production-readiness.md PR-1). `PROXILION_INSECURE_BRIDGE_STUB`.
+    pub insecure_bridge_stub: bool,
+}
+
+impl Config {
+    /// Production-boot safety guard (production-readiness.md PR-1): refuse
+    /// to start a protected (staging/production) deployment while the
+    /// insecure payload-only federation stub is active. Returns the
+    /// operator-facing refusal reason, or `None` when boot may proceed.
+    ///
+    /// This is the hard-fail successor to the boot `warn!` — a forged
+    /// federation token can mint arbitrary authority, so an unverified
+    /// federation path must never be reachable in a protected environment.
+    pub fn federation_boot_refusal(&self) -> Option<String> {
+        if self.insecure_bridge_stub && self.environment.is_protected() {
+            Some(format!(
+                "refusing to boot: PROXILION_ENV={} forbids the insecure \
+                 payload-only federation stub (it accepts unsigned tokens and \
+                 would let any caller forge an arbitrary principal). Complete \
+                 PR-1 verified federation, or run with PROXILION_ENV=development.",
+                self.environment.label()
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +227,42 @@ impl TlsMinVersion {
             Self::V1_2 => "1.2",
             Self::V1_3 => "1.3",
         }
+    }
+}
+
+/// Deployment environment (`PROXILION_ENV`). Drives the production-boot
+/// safety guard (production-readiness.md PR-1): a `Staging`/`Production`
+/// boot refuses to start while the insecure payload-only federation stub
+/// is active. Defaults to `Development`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Environment {
+    Development,
+    Staging,
+    Production,
+}
+
+impl Environment {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "development" | "dev" | "local" => Some(Self::Development),
+            "staging" | "stage" => Some(Self::Staging),
+            "production" | "prod" => Some(Self::Production),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Staging => "staging",
+            Self::Production => "production",
+        }
+    }
+
+    /// Is this an environment where exposing the insecure federation stub
+    /// is forbidden? (staging + production)
+    pub fn is_protected(self) -> bool {
+        matches!(self, Self::Staging | Self::Production)
     }
 }
 
@@ -270,6 +340,8 @@ pub struct ConfigBuilder {
     max_concurrent_requests: usize,
     trusted_proxies: Vec<std::net::IpAddr>,
     tls_min_version: TlsMinVersion,
+    environment: Environment,
+    insecure_bridge_stub: bool,
 }
 
 impl Default for ConfigBuilder {
@@ -321,6 +393,12 @@ impl ConfigBuilder {
             // rustls already refuses < 1.2; default to the 1.2 floor
             // (accept 1.2 + 1.3), the prior behavior. Operators pin 1.3.
             tls_min_version: TlsMinVersion::V1_2,
+            // Dev by default; CI/tests never trip the production-boot guard.
+            environment: Environment::Development,
+            // The payload-only stub is the only federation path until PR-1's
+            // verified-issuance rewiring lands; default true, refused in
+            // protected environments by `federation_boot_refusal`.
+            insecure_bridge_stub: true,
         }
     }
 
@@ -473,6 +551,23 @@ impl ConfigBuilder {
                 self.tls_min_version = ver;
             }
         }
+        if let Ok(v) = env::var("PROXILION_ENV") {
+            // An unrecognized value leaves the prior (file/default) env
+            // intact — never silently downgrade a protected env to dev.
+            if let Some(e) = Environment::parse(&v) {
+                self.environment = e;
+            }
+        }
+        if let Ok(v) = env::var("PROXILION_INSECURE_BRIDGE_STUB") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.insecure_bridge_stub = true,
+                "0" | "false" | "no" | "off" => self.insecure_bridge_stub = false,
+                // Unrecognized → leave prior value (fail-safe: don't
+                // accidentally disable the only validation path nor enable
+                // the stub in a protected env).
+                _ => {}
+            }
+        }
         Ok(self)
     }
 
@@ -591,6 +686,14 @@ impl ConfigBuilder {
                 self.tls_min_version = ver;
             }
         }
+        if let Some(v) = file.environment {
+            if let Some(e) = Environment::parse(&v) {
+                self.environment = e;
+            }
+        }
+        if let Some(v) = file.insecure_bridge_stub {
+            self.insecure_bridge_stub = v;
+        }
         Ok(self)
     }
 
@@ -705,6 +808,8 @@ impl ConfigBuilder {
             max_concurrent_requests: self.max_concurrent_requests,
             trusted_proxies: self.trusted_proxies,
             tls_min_version: self.tls_min_version,
+            environment: self.environment,
+            insecure_bridge_stub: self.insecure_bridge_stub,
         })
     }
 }
@@ -755,6 +860,8 @@ struct FileConfig {
     max_concurrent_requests: Option<usize>,
     trusted_proxies: Option<Vec<String>>,
     tls_min_version: Option<String>,
+    environment: Option<String>,
+    insecure_bridge_stub: Option<bool>,
 }
 
 fn check_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
@@ -1569,13 +1676,14 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
     // ─── round 289 (2026-05-26): Config/ConfigBuilder/ConfigError variant + Clone pins ───
 
     #[test]
-    fn config_field_count_pinned_at_exactly_thirty_via_exhaustive_destructure_no_rest_pattern() {
-        // `Config` carries EXACTLY 30 fields — every one of them is
+    fn config_field_count_pinned_at_exactly_thirty_two_via_exhaustive_destructure_no_rest_pattern()
+    {
+        // `Config` carries EXACTLY 32 fields — every one of them is
         // operator-load-bearing (env-var-driven, surfaced in the
         // `/api/v1/setup/status` panel, OR consumed at boot by the
         // server.rs wiring). Pin the field count via exhaustive
         // destructure with NO `..` rest pattern: a refactor that
-        // landed a 31st field (e.g. `pub kill_switch_path:
+        // landed a 33rd field (e.g. `pub kill_switch_path:
         // Option<PathBuf>` OR `pub admin_email: Option<String>`)
         // without matching `ConfigBuilder` AND the from_env_layer
         // mapping would silently leave the new field at its
@@ -1620,12 +1728,15 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             max_concurrent_requests: _,
             trusted_proxies: _,
             tls_min_version: _,
+            environment: _,
+            insecure_bridge_stub: _,
         } = c;
     }
 
     #[test]
-    fn config_builder_field_count_pinned_at_exactly_thirty_via_exhaustive_destructure_no_rest() {
-        // `ConfigBuilder` MUST carry the SAME 30 fields as `Config`
+    fn config_builder_field_count_pinned_at_exactly_thirty_two_via_exhaustive_destructure_no_rest()
+    {
+        // `ConfigBuilder` MUST carry the SAME 32 fields as `Config`
         // — the builder→config conversion in `ConfigBuilder::build`
         // does a 1:1 field move, so an asymmetric refactor that
         // added a field to one side and not the other would either
@@ -1637,7 +1748,7 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
         // extended ConfigBuilder without matching Config (the more
         // dangerous direction — silently drops the operator's value)
         // surfaces here at compile time. Symmetric to the Config
-        // 30-field pin in this same round.
+        // 32-field pin in this same round.
         let b = ConfigBuilder::defaults();
         let ConfigBuilder {
             bind_addr: _,
@@ -1670,6 +1781,8 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             max_concurrent_requests: _,
             trusted_proxies: _,
             tls_min_version: _,
+            environment: _,
+            insecure_bridge_stub: _,
         } = b;
     }
 
@@ -1721,6 +1834,73 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
         for raw in ["", "1.0", "1.1", "1.4", "2", "ssl3", "garbage", "1.2.3"] {
             assert_eq!(TlsMinVersion::parse(raw), None, "expected None for {raw:?}");
         }
+    }
+
+    // ─── production-readiness.md PR-1: production-boot federation guard ───
+
+    #[test]
+    fn environment_defaults_to_development_and_does_not_block_boot() {
+        let c = ConfigBuilder::defaults()
+            .with_dev_mode(true)
+            .build()
+            .unwrap();
+        assert_eq!(c.environment, Environment::Development);
+        assert!(c.insecure_bridge_stub, "stub active by default today");
+        // Development is unprotected → stub is tolerated → boot proceeds.
+        assert!(
+            c.federation_boot_refusal().is_none(),
+            "dev boot must not be blocked"
+        );
+    }
+
+    #[test]
+    fn environment_parse_accepts_aliases_and_rejects_unknown() {
+        assert_eq!(Environment::parse("dev"), Some(Environment::Development));
+        assert_eq!(Environment::parse("LOCAL"), Some(Environment::Development));
+        assert_eq!(Environment::parse(" staging "), Some(Environment::Staging));
+        assert_eq!(Environment::parse("prod"), Some(Environment::Production));
+        assert_eq!(
+            Environment::parse("PRODUCTION"),
+            Some(Environment::Production)
+        );
+        for raw in ["", "qa", "preprod", "garbage"] {
+            assert_eq!(
+                Environment::parse(raw),
+                None,
+                "unexpected match for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_env_with_active_stub_refuses_boot() {
+        // The PR-1 acceptance item: staging/production must refuse to boot
+        // while the insecure payload-only federation stub is active.
+        for env in [Environment::Staging, Environment::Production] {
+            let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+            b.environment = env;
+            b.insecure_bridge_stub = true;
+            let c = b.build().unwrap();
+            let refusal = c
+                .federation_boot_refusal()
+                .unwrap_or_else(|| panic!("{} must refuse boot", env.label()));
+            assert!(refusal.contains(env.label()));
+            assert!(refusal.contains("refusing to boot"));
+        }
+    }
+
+    #[test]
+    fn protected_env_with_stub_disabled_allows_boot() {
+        // When the verified federation path is wired and the stub is turned
+        // off, a protected env boots.
+        let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+        b.environment = Environment::Production;
+        b.insecure_bridge_stub = false;
+        let c = b.build().unwrap();
+        assert!(
+            c.federation_boot_refusal().is_none(),
+            "stub-off production must boot"
+        );
     }
 
     #[test]

@@ -90,6 +90,12 @@ proxy:
   # dropped. e.g. ["10.0.0.5", "10.0.0.6"]
   trustedProxies: []
   env:
+    # Deployment environment (PROXILION_ENV): development | staging |
+    # production. In staging/production the proxy REFUSES TO BOOT while the
+    # insecure payload-only federation stub is active (production-readiness.md
+    # PR-1) — keep this "development" until PR-1's verified federation lands,
+    # then set "production". Empty = development (does not render the var).
+    environment: ""
     # Customer's primary domain — drives `${customer_domain}` in policy.
     customerDomain: "example.com"
     logFormat: "json"

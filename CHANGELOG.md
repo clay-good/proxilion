@@ -16,6 +16,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Federation production-boot guard (production-readiness.md PR-1, Approach A
+  — third slice).** A `PROXILION_ENV` setting (`development`|`staging`|
+  `production`, default `development`) plus a `Config::federation_boot_refusal`
+  predicate: in a protected (staging/production) environment the proxy now
+  **refuses to boot** while the insecure payload-only federation stub is
+  active (`server::run` fails closed before binding the listener), the
+  hard-fail successor to the prior boot `warn!`. Exposed as
+  `proxy.env.environment` in Helm. Four tests cover the default-dev
+  no-block, the staging/production refusal, the stub-off allow, and
+  `PROXILION_ENV` alias parsing.
 - **Federation JWKS resolver (production-readiness.md PR-1, Approach A —
   second slice).** A new `oauth::jwks::JwksResolver`
   ([jwks.rs](crates/proxy/src/oauth/jwks.rs)) turns an IdP `jwks_uri` + a
@@ -43,9 +53,9 @@ Until v0.1.0, the canonical reference is the most recent commit on
   `alg:none`, RS256→HS256 confusion, expired, not-yet-valid, untrusted `iss`,
   wrong `aud`, and a symmetric/empty allow-list all rejected; leeway clamped.
   **PR-1 is still open** — the OAuth callback rewiring to mint PCA_0 from the
-  verified identity via Trust Plane `POST /v1/pca/issue`, the production-boot
-  refusal of the insecure stub, the `alg:none` test-fixture replacement, and
-  the end-to-end smoke remain (the JWKS layer above is now done).
+  verified identity via Trust Plane `POST /v1/pca/issue`, the `alg:none`
+  test-fixture replacement, and the end-to-end smoke remain (the JWKS layer
+  and the production-boot stub-refusal above are now done).
 - **Transport & trust-boundary hardening (production-readiness.md PR-4 —
   complete).** Made the proxy's TLS posture explicit and regression-proof
   across every hop.

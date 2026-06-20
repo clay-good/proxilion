@@ -38,6 +38,12 @@ spec:
           env:
             - name: PROXILION_BIND_ADDR
               value: "0.0.0.0:8443"
+            {{- if .Values.proxy.env.environment }}
+            # Deployment environment; staging/production refuse to boot while
+            # the insecure federation stub is active (PR-1).
+            - name: PROXILION_ENV
+              value: {{ .Values.proxy.env.environment | quote }}
+            {{- end }}
             - name: PROXILION_LOG_FORMAT
               value: {{ .Values.proxy.env.logFormat | quote }}
             - name: PROXILION_CUSTOMER_DOMAIN

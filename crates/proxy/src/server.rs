@@ -54,6 +54,14 @@ struct ReadinessProbe {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
+    // production-readiness.md PR-1: fail closed before binding the listener
+    // if a protected (staging/production) deployment still has the insecure
+    // payload-only federation stub active. A forged unsigned token could
+    // otherwise mint arbitrary authority.
+    if let Some(reason) = cfg.federation_boot_refusal() {
+        anyhow::bail!("{reason}");
+    }
+
     if cfg.dev_mode {
         ensure_dev_cert(&cfg.tls_cert_path, &cfg.tls_key_path).context("generating dev cert")?;
     }

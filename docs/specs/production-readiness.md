@@ -81,11 +81,16 @@ resolve→verify chain. **Design note:** we verify with `jsonwebtoken` directly
 rather than calling upstream `provenance-bridge`'s `JwtHandler::validate` — at
 the SHA we pin, that handler selects the algorithm from the *token header* and
 never enforces its allow-list (the confusion pattern this PR exists to kill),
-so reusing it verbatim would be unsafe. **Still open before this P0 closes:**
-the OAuth-callback rewiring to mint PCA_0 from the verified identity via Trust
-Plane `POST /v1/pca/issue` (needs a live Trust Plane to smoke), deleting/gating
-the payload-only `validate_federation_token` path, the production-boot refusal
-of the insecure stub, replacing the `alg:none` fixtures, and `scripts/smoke-pic.sh`.
+so reusing it verbatim would be unsafe. The **production-boot guard** is also
+landed: `PROXILION_ENV` (`development`/`staging`/`production`) +
+`Config::federation_boot_refusal`; a protected env refuses to boot
+(`server::run` fails closed) while the insecure payload-only stub is active —
+the hard-fail successor to the §0.4 boot `warn!`. **Still open before this P0
+closes:** the OAuth-callback rewiring to mint PCA_0 from the verified identity
+via Trust Plane `POST /v1/pca/issue` (needs a live Trust Plane to smoke) and to
+flip `insecure_bridge_stub` off, deleting/gating the payload-only
+`validate_federation_token` path, replacing the `alg:none` fixtures, and
+`scripts/smoke-pic.sh`.
 
 **Goal.** No request may mint or carry authority on the strength of an
 **unverified** token. Every token that establishes the human principal
@@ -779,10 +784,12 @@ satisfied:
 
 - [~] **PR-1** Federation token signatures verified; no payload-only trust;
       production boot refuses the insecure stub; `alg:none`/confusion
-      rejected. *Verification primitive + JWKS/`kid`-rotation layer landed +
-      tested (`oauth::idp_verify` algorithm-pinned rejections; `oauth::jwks`
-      HTTPS-only fetch/cache/rotation/throttle); remaining: callback→Trust-Plane
-      issuance rewiring, stub-boot refusal, fixture replacement, smoke.*
+      rejected. *Verification primitive + JWKS/`kid`-rotation layer +
+      production-boot stub-refusal guard landed + tested (`oauth::idp_verify`
+      algorithm-pinned rejections; `oauth::jwks` HTTPS-only
+      fetch/cache/rotation/throttle; `PROXILION_ENV` boot refusal); remaining:
+      callback→Trust-Plane issuance rewiring, `alg:none` fixture replacement,
+      e2e smoke.*
 - [~] **PR-2** Ingress body cap, per-request timeout, per-IP rate limit
       (`429`+`Retry-After`, trusted-proxy XFF), concurrency limit + load-shed
       (`503`) all active at the application layer. Remaining: L4 connection cap

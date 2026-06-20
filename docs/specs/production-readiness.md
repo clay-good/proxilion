@@ -11,7 +11,10 @@ suite is green (DB-backed lane runs in CI). The advertised M0–M4 surface (OAut
 interception, read-filter, write-gate + human-in-the-loop approvals, killswitch
 + SSE, policy engine, Drive/Gmail/Calendar adapters, CLI, metrics, Grafana, Helm
 chart, marketing site, demo) is shipped. **The deliberate federation-signature
-gap (PR-1) still blocks production.** **PR-2 is now complete at the application
+gap (PR-1) still blocks production** — though its verification primitive
+(`oauth::idp_verify`, algorithm-pinned, fail-closed, RFC 8725/9700
+rejections tested) has now landed (Approach A); the JWKS layer + callback→
+Trust-Plane issuance rewiring remain before the P0 closes. **PR-2 is now complete at the application
 layer** — all four edge resource-exhaustion controls (request-body cap,
 per-request adapter timeout, per-IP rate limit, global concurrency limit +
 load-shed) are live and dependency-free (see PR-2's Status below); the
@@ -59,6 +62,26 @@ may be waived for a production deploy.
 ### PR-1 — Federation token signature verification (the showstopper)
 
 **Priority:** P0. **Effort:** 3–5 days.
+
+**Status (2026-06-19): in progress — verification primitive landed
+(Approach A chosen).** The cryptographic core is implemented and tested:
+`oauth::idp_verify::verify_id_token`
+([idp_verify.rs](../../crates/proxy/src/oauth/idp_verify.rs)) verifies an
+`id_token` signature with the algorithm **pinned server-side** to an operator
+allow-list (RS256/ES256 default; `none`/HS\* impossible), enforces
+`iss`/`aud`/`exp`/`nbf` with ≤ 60 s skew, fail-closed. Eleven unit tests pin
+the RFC 8725 / RFC 9700 rejections (tampered payload, `alg:none`,
+RS256→HS256 confusion, expired/`nbf`-future, unknown `iss`/`aud`, symmetric or
+empty allow-list). **Design note:** we verify with `jsonwebtoken` directly
+rather than calling upstream `provenance-bridge`'s `JwtHandler::validate` — at
+the SHA we pin, that handler selects the algorithm from the *token header* and
+never enforces its allow-list (the confusion pattern this PR exists to kill),
+so reusing it verbatim would be unsafe. **Still open before this P0 closes:**
+the JWKS fetch + `kid`-rotation layer (negative-cache + rate-limited refresh),
+the OAuth-callback rewiring to mint PCA_0 from the verified identity via Trust
+Plane `POST /v1/pca/issue` (needs a live Trust Plane to smoke), deleting/gating
+the payload-only `validate_federation_token` path, the production-boot refusal
+of the insecure stub, replacing the `alg:none` fixtures, and `scripts/smoke-pic.sh`.
 
 **Goal.** No request may mint or carry authority on the strength of an
 **unverified** token. Every token that establishes the human principal
@@ -750,9 +773,12 @@ Do **not** expose `/oauth/bridge/callback` or any IdP-facing route to an
 untrusted network until **all P0** are green and the P1 items below are
 satisfied:
 
-- [ ] **PR-1** Federation token signatures verified; no payload-only trust;
+- [~] **PR-1** Federation token signatures verified; no payload-only trust;
       production boot refuses the insecure stub; `alg:none`/confusion
-      rejected.
+      rejected. *Verification primitive landed + tested (`oauth::idp_verify`,
+      algorithm pinned, `alg:none`/confusion/expired/`iss`/`aud` rejected);
+      remaining: JWKS/`kid`-rotation layer, callback→Trust-Plane issuance
+      rewiring, stub-boot refusal, fixture replacement, smoke.*
 - [~] **PR-2** Ingress body cap, per-request timeout, per-IP rate limit
       (`429`+`Retry-After`, trusted-proxy XFF), concurrency limit + load-shed
       (`503`) all active at the application layer. Remaining: L4 connection cap

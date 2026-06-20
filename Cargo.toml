@@ -60,6 +60,11 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 regorus = "0.5"
 
 # OAuth / crypto / encoding
+# JWT/OIDC id_token verification for in-process federation (PR-1). Pinned to
+# the same major as upstream `provenance-bridge` uses; we verify with
+# server-side-pinned algorithms rather than reusing the upstream handler
+# (which selects the algorithm from the token header — see oauth/idp_verify.rs).
+jsonwebtoken = "9"
 aes-gcm = { version = "0.10", features = ["aes"] }
 sha2 = "0.10"
 base32 = "0.5"

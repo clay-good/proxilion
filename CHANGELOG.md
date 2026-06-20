@@ -16,6 +16,25 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Federation `id_token` signature-verification primitive (production-readiness.md
+  PR-1, Approach A — first slice).** The cryptographic core that closes the
+  federation showstopper: a new `oauth::idp_verify::verify_id_token`
+  ([idp_verify.rs](crates/proxy/src/oauth/idp_verify.rs)) verifies an OIDC
+  `id_token`'s **signature** against the IdP's public key with the algorithm
+  **pinned server-side** to an operator allow-list (RS256/ES256 by default;
+  `none`/HS\* can never be in it), and validates `iss`/`aud`/`exp`/`nbf` with a
+  ≤ 60 s clock-skew, **fail-closed**. This deliberately does **not** reuse
+  upstream `provenance-bridge`'s `JwtHandler::validate`, which (at our pinned
+  SHA) selects the algorithm from the *token's own header* and never enforces
+  its allow-list — the RFC 8725 / RFC 9700 algorithm-confusion pattern. Adds
+  `jsonwebtoken` (MIT) as a direct dependency. Eleven unit tests pin the
+  security-critical rejections: valid-signature accepted; tampered payload,
+  `alg:none`, RS256→HS256 confusion, expired, not-yet-valid, untrusted `iss`,
+  wrong `aud`, and a symmetric/empty allow-list all rejected; leeway clamped.
+  **PR-1 is still open** — the JWKS fetch/`kid`-rotation layer, the OAuth
+  callback rewiring to mint PCA_0 from the verified identity via Trust Plane
+  `POST /v1/pca/issue`, the production-boot refusal of the insecure stub, the
+  `alg:none` test-fixture replacement, and the end-to-end smoke remain.
 - **Transport & trust-boundary hardening (production-readiness.md PR-4 —
   complete).** Made the proxy's TLS posture explicit and regression-proof
   across every hop.

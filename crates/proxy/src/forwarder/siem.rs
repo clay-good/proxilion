@@ -27,8 +27,18 @@ use crate::adapters::action_stream::{ActionEvent, ActionStream};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// SIEM HMAC signing key. The inner bytes are wrapped in `Zeroizing` so they
+/// are scrubbed from memory on drop (production-readiness.md PR-3), and the
+/// explicit `Debug` impl below redacts them — a future `#[derive(Debug)]`
+/// would conflict with it, so the key can never be accidentally logged.
 #[derive(Clone)]
-pub struct SiemHmacKey(Vec<u8>);
+pub struct SiemHmacKey(zeroize::Zeroizing<Vec<u8>>);
+
+impl std::fmt::Debug for SiemHmacKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SiemHmacKey(<redacted {} bytes>)", self.0.len())
+    }
+}
 
 impl SiemHmacKey {
     pub fn from_hex(hex: &str) -> Result<Self, KeyError> {
@@ -53,12 +63,12 @@ impl SiemHmacKey {
                 .map_err(|e| KeyError(format!("invalid hex at {i}: {e}")))?;
             out.push(byte);
         }
-        Ok(Self(out))
+        Ok(Self(zeroize::Zeroizing::new(out)))
     }
 
     pub fn sign(&self, body: &[u8]) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.0).expect("HMAC-SHA256 accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(self.0.as_slice())
+            .expect("HMAC-SHA256 accepts any key length");
         mac.update(body);
         let tag = mac.finalize().into_bytes();
         let mut hex = String::with_capacity(tag.len() * 2);
@@ -424,6 +434,20 @@ mod tests {
         assert_eq!(sig, k.sign(b"hello"));
         // Diverges on body change.
         assert_ne!(sig, k.sign(b"hellp"));
+    }
+
+    #[test]
+    fn hmac_key_debug_redacts_material() {
+        // PR-3: the key must never surface in Debug output (logs, panics,
+        // `?key` spans). Pin the redacted shape + that no key byte leaks.
+        let hex = "00112233445566778899aabbccddeeff";
+        let k = SiemHmacKey::from_hex(hex).unwrap();
+        let dbg = format!("{k:?}");
+        assert!(dbg.contains("redacted"), "expected redaction, got {dbg}");
+        assert!(
+            !dbg.contains("0011") && !dbg.contains("eeff"),
+            "key material leaked into Debug: {dbg}"
+        );
     }
 
     #[test]

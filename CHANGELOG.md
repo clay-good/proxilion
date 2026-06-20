@@ -16,6 +16,20 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Secret memory hygiene + key inventory (production-readiness.md PR-3 —
+  first slice).** Decoded HMAC key material is now scrubbed from memory on
+  drop: `SiemHmacKey` and `WebhookSecret` wrap their bytes in
+  `zeroize::Zeroizing` and carry explicit redacting `Debug` impls (which also
+  block a future accidental `#[derive(Debug)]` from leaking them); two tests
+  pin the redaction. The token-encryption key was already scrubbed on drop
+  (held inside `Aes256Gcm`, no `Debug`). Adds a new
+  [docs/ops/key-inventory.md](docs/ops/key-inventory.md) enumerating every
+  secret the proxy holds (purpose, algorithm, blast radius, source, hygiene)
+  and clarifying what it does *not* hold (the CAT signing key lives in the
+  Trust Plane; operator bearers are stored only as truncated-`Debug` SHA-256
+  hashes). `zeroize` added as a direct dependency. **PR-3 still open** —
+  versioned keys with rotation overlap, `*_FILE`/KMS secret sourcing, and the
+  rotation runbooks remain.
 - **Federation production-boot guard (production-readiness.md PR-1, Approach A
   — third slice).** A `PROXILION_ENV` setting (`development`|`staging`|
   `production`, default `development`) plus a `Config::federation_boot_refusal`

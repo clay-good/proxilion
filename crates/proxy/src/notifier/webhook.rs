@@ -20,8 +20,17 @@ use super::{BlockedNotification, BurstSummary, BurstSuppressor};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Blocked-action webhook HMAC secret. Inner bytes wrapped in `Zeroizing`
+/// so they are scrubbed on drop (production-readiness.md PR-3); the explicit
+/// redacting `Debug` impl below prevents the secret from ever being logged.
 #[derive(Clone)]
-pub struct WebhookSecret(Vec<u8>);
+pub struct WebhookSecret(zeroize::Zeroizing<Vec<u8>>);
+
+impl std::fmt::Debug for WebhookSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WebhookSecret(<redacted {} bytes>)", self.0.len())
+    }
+}
 
 impl WebhookSecret {
     pub fn from_hex(hex: &str) -> Result<Self, NotifierBuildError> {
@@ -50,12 +59,12 @@ impl WebhookSecret {
                 .map_err(|e| NotifierBuildError(format!("invalid hex at {i}: {e}")))?;
             out.push(b);
         }
-        Ok(Self(out))
+        Ok(Self(zeroize::Zeroizing::new(out)))
     }
 
     pub fn sign(&self, body: &[u8]) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.0).expect("HMAC-SHA256 accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(self.0.as_slice())
+            .expect("HMAC-SHA256 accepts any key length");
         mac.update(body);
         let tag = mac.finalize().into_bytes();
         let mut hex = String::with_capacity(tag.len() * 2);
@@ -315,6 +324,19 @@ mod tests {
         assert_eq!(sig.len(), "sha256=".len() + 64);
         assert_eq!(sig, s.sign(b"payload"));
         assert_ne!(sig, s.sign(b"PAYLOAD"));
+    }
+
+    #[test]
+    fn secret_debug_redacts_material() {
+        // PR-3: the blocked-webhook HMAC secret must never appear in Debug.
+        let hex = "00112233445566778899aabbccddeeff";
+        let s = WebhookSecret::from_hex(hex).unwrap();
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("redacted"), "expected redaction, got {dbg}");
+        assert!(
+            !dbg.contains("0011") && !dbg.contains("eeff"),
+            "secret leaked into Debug: {dbg}"
+        );
     }
 
     #[test]

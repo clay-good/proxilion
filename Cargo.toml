@@ -65,6 +65,10 @@ regorus = "0.5"
 # server-side-pinned algorithms rather than reusing the upstream handler
 # (which selects the algorithm from the token header — see oauth/idp_verify.rs).
 jsonwebtoken = "9"
+# Scrub decoded secret key material from memory on drop (PR-3 memory hygiene).
+# Already in the tree transitively (aes-gcm/ed25519-dalek); pinned direct so
+# the HMAC-secret newtypes can wrap their bytes in `Zeroizing`.
+zeroize = "1"
 aes-gcm = { version = "0.10", features = ["aes"] }
 sha2 = "0.10"
 base32 = "0.5"

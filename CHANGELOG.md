@@ -16,6 +16,24 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **SLOs, error budgets & burn-rate alerting (production-readiness.md PR-5 —
+  first slice).** The alerting contract: [docs/ops/slos.md](docs/ops/slos.md)
+  defines five SLOs (request availability 99.9%, sub-ms added-latency,
+  federation/issuance success, approval-path liveness, killswitch
+  propagation) with rationale + measurement windows, and
+  [ops/prometheus/alerts.yml](ops/prometheus/alerts.yml) implements 16 alerts
+  + 7 recording rules — Google SRE multi-window multi-burn-rate for the
+  availability SLO (fast-burn page / slow-burn ticket) plus federation,
+  security-invariant (`pca_verify`/`pic` must read zero), and operational
+  alerts (edge load-shed, NATS/SIEM/DB-persist failures, policy-reload,
+  approval backlog, cert-expiry). Every alert carries a `runbook_url` into the
+  new [docs/ops/runbooks/](docs/ops/runbooks/README.md) index. `prometheus.yml`
+  now loads the rules, and a new
+  [`prometheus-rules`](.github/workflows/prometheus-rules.yml) CI job runs
+  `promtool check rules`/`check config` on every change. Latency SLIs read the
+  summary `{quantile="0.99"}` series (the recorder renders histograms as
+  summaries). **PR-5 still open** — the Grafana SLO/error-budget dashboard row,
+  Alertmanager routing wiring, and the staging fault-injection burn drill.
 - **Secret memory hygiene + key inventory (production-readiness.md PR-3 —
   first slice).** Decoded HMAC key material is now scrubbed from memory on
   drop: `SiemHmacKey` and `WebhookSecret` wrap their bytes in

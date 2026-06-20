@@ -9,6 +9,17 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Alerting rules + SLOs (production-readiness.md PR-5). See alerts.yml for the
+# rule set and ../../docs/ops/slos.md for the SLO definitions + rationale.
+rule_files:
+  - alerts.yml
+
+# Point this at your Alertmanager (routing/severity in docs/ops/slos.md).
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: proxilion
     metrics_path: /metrics
@@ -24,21 +35,6 @@ scrape_configs:
       # (and add more targets behind a load balancer as needed).
       - targets: ["proxy:8443"]
 
-# Alerting: the one series that must always read zero is
-# `proxilion_pca_verify_failures_total` — any increase means a tampered PCA was
-# loaded from cache or a CAT-key rotation hasn't propagated (page someone). Wire
-# it through Alertmanager with a rule like:
-#
-#   rule_files:
-#     - proxilion-alerts.yml
-#
-#   # proxilion-alerts.yml
-#   groups:
-#     - name: proxilion
-#       rules:
-#         - alert: ProxilionPcaVerifyFailure
-#           expr: increase(proxilion_pca_verify_failures_total[5m]) > 0
-#           for: 0m
-#           labels: { severity: page }
-#           annotations:
-#             summary: "PCA chain verification failed — tampered PCA or stale CAT key"
+# Alerting rules now live in alerts.yml (loaded via `rule_files` above),
+# including the `ProxilionPcaVerifyFailure` page — the one series that must
+# always read zero (a tampered PCA or stale CAT key). See docs/ops/slos.md.

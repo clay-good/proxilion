@@ -464,6 +464,21 @@ locked-down pilot.
 
 **Priority:** P1. **Effort:** 3–4 days.
 
+**Status (2026-06-20): in progress — SLOs + alert rules landed.** Five SLOs
+defined with rationale + windows in [docs/ops/slos.md](../ops/slos.md);
+[ops/prometheus/alerts.yml](../../ops/prometheus/alerts.yml) implements 16
+alerts + 7 recording rules — Google SRE multi-window multi-burn-rate for the
+99.9% availability SLO (fast-burn page / slow-burn ticket), plus federation,
+security-invariant, and operational alerts. Every alert carries a
+`runbook_url` into [docs/ops/runbooks/](../ops/runbooks/README.md) (first-pass
+content; PR-6 expands). `prometheus.yml` loads the rules and a
+[`prometheus-rules`](../../.github/workflows/prometheus-rules.yml) CI job runs
+`promtool check rules`/`check config`. Latency SLIs use the summary
+`{quantile="0.99"}` series (the recorder renders histograms as summaries, no
+`set_buckets`). **Still open:** the Grafana SLO/error-budget dashboard row,
+Alertmanager routing wiring, and the staging fault-injection burn drill (the
+"a synthetic burn fires the page within budget" acceptance check).
+
 **Goal.** Operators get paged on user-impacting conditions *before* the
 budget is exhausted, and never on noise.
 
@@ -820,8 +835,10 @@ satisfied:
       proven (CI gate); trusted-proxy config explicit; per-hop TLS/mTLS
       matrix documented. Remaining: staging nmap/testssl scan + mesh-wiring
       Helm path (interlinks PR-7/PR-11).
-- [ ] **PR-5** SLOs defined; burn-rate alerts firing correctly; every alert
-      → runbook.
+- [~] **PR-5** SLOs defined; burn-rate alerts firing correctly; every alert
+      → runbook. *SLOs + 16 alerts/7 recording rules landed (multi-window
+      multi-burn-rate), every alert links a runbook, `promtool` CI gate added;
+      remaining: Grafana SLO row, Alertmanager routing, staging burn drill.*
 - [ ] **PR-6** Runbooks for every paging alert; killswitch + DB-failover
       drills executed.
 - [ ] **PR-7** ≥ 2 replicas; statelessness audit done; killswitch propagates

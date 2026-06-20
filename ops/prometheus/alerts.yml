@@ -1,0 +1,279 @@
+# Proxilion — Prometheus alerting rules (production-readiness.md PR-5).
+#
+# SLO definitions, rationale, and the runbook mapping live in
+# ../../docs/ops/slos.md. Every alert carries a `runbook_url` annotation
+# (PR-5 requires it) pointing at ../../docs/ops/runbooks/ (authored in PR-6).
+#
+# Alerting strategy: Google SRE multi-window, multi-burn-rate. A page fires
+# only when a fast window AND a confirming short window both exceed the burn
+# threshold, so a brief blip doesn't page; a ticket fires on slow burn.
+#
+# NOTE ON HISTOGRAMS: the proxy's metrics-exporter-prometheus recorder
+# renders histograms as SUMMARIES (no `set_buckets`), so latency SLIs read
+# the `{quantile="0.99"}` series directly — `histogram_quantile`/`_bucket`
+# would not exist.
+#
+# Validate locally / in CI:  promtool check rules ops/prometheus/alerts.yml
+
+groups:
+  # ── Availability SLO: 99.9% of agent-facing adapter requests succeed (not
+  #    a 5xx/internal error; policy blocks are correct behavior, NOT errors).
+  #    Error budget = 0.1% (0.001). Burn rate = error_ratio / 0.001.
+  - name: proxilion-slo-availability-recording
+    rules:
+      - record: proxilion:adapter_availability_error_ratio:rate5m
+        expr: |
+          sum(rate(proxilion_adapter_upstream_errors_total[5m]))
+          / clamp_min(sum(rate(proxilion_adapter_requests_total[5m])), 1)
+      - record: proxilion:adapter_availability_error_ratio:rate30m
+        expr: |
+          sum(rate(proxilion_adapter_upstream_errors_total[30m]))
+          / clamp_min(sum(rate(proxilion_adapter_requests_total[30m])), 1)
+      - record: proxilion:adapter_availability_error_ratio:rate1h
+        expr: |
+          sum(rate(proxilion_adapter_upstream_errors_total[1h]))
+          / clamp_min(sum(rate(proxilion_adapter_requests_total[1h])), 1)
+      - record: proxilion:adapter_availability_error_ratio:rate2h
+        expr: |
+          sum(rate(proxilion_adapter_upstream_errors_total[2h]))
+          / clamp_min(sum(rate(proxilion_adapter_requests_total[2h])), 1)
+      - record: proxilion:adapter_availability_error_ratio:rate6h
+        expr: |
+          sum(rate(proxilion_adapter_upstream_errors_total[6h]))
+          / clamp_min(sum(rate(proxilion_adapter_requests_total[6h])), 1)
+      - record: proxilion:adapter_availability_error_ratio:rate1d
+        expr: |
+          sum(rate(proxilion_adapter_upstream_errors_total[1d]))
+          / clamp_min(sum(rate(proxilion_adapter_requests_total[1d])), 1)
+      - record: proxilion:adapter_availability_error_ratio:rate3d
+        expr: |
+          sum(rate(proxilion_adapter_upstream_errors_total[3d]))
+          / clamp_min(sum(rate(proxilion_adapter_requests_total[3d])), 1)
+
+  - name: proxilion-slo-availability-alerts
+    rules:
+      - alert: ProxilionAvailabilityFastBurn
+        # 14.4x burn over 1h (2% of the monthly budget in 1h), confirmed by a
+        # 5m window; OR 6x over 6h confirmed by 30m. Pages.
+        expr: |
+          (
+            proxilion:adapter_availability_error_ratio:rate1h > (14.4 * 0.001)
+            and
+            proxilion:adapter_availability_error_ratio:rate5m > (14.4 * 0.001)
+          )
+          or
+          (
+            proxilion:adapter_availability_error_ratio:rate6h > (6 * 0.001)
+            and
+            proxilion:adapter_availability_error_ratio:rate30m > (6 * 0.001)
+          )
+        for: 2m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: "Proxilion burning the availability error budget fast"
+          description: >-
+            Adapter upstream-error ratio is burning the 99.9% availability
+            budget at a paging rate (1h or 6h window). Current 1h ratio:
+            {{ $value | humanizePercentage }}.
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#availability-error-budget-burn"
+
+      - alert: ProxilionAvailabilitySlowBurn
+        # 3x over 1d confirmed by 2h; OR 1x over 3d confirmed by 6h. Ticket.
+        expr: |
+          (
+            proxilion:adapter_availability_error_ratio:rate1d > (3 * 0.001)
+            and
+            proxilion:adapter_availability_error_ratio:rate2h > (3 * 0.001)
+          )
+          or
+          (
+            proxilion:adapter_availability_error_ratio:rate3d > (1 * 0.001)
+            and
+            proxilion:adapter_availability_error_ratio:rate6h > (1 * 0.001)
+          )
+        for: 15m
+        labels:
+          severity: ticket
+          slo: availability
+        annotations:
+          summary: "Proxilion slowly burning the availability error budget"
+          description: >-
+            Adapter upstream-error ratio is on a slow burn of the 99.9%
+            availability budget (1d or 3d window). Current 1d ratio:
+            {{ $value | humanizePercentage }}.
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#availability-error-budget-burn"
+
+  # ── Added-latency SLO: the proxy's own policy-evaluation overhead. spec.md
+  #    §9 targets sub-ms p99; alert well above that so normal jitter is quiet.
+  - name: proxilion-slo-latency
+    rules:
+      - alert: ProxilionPolicyEvalLatencyHigh
+        expr: max(proxilion_policy_evaluation_duration_seconds{quantile="0.99"}) > 0.005
+        for: 10m
+        labels:
+          severity: ticket
+          slo: latency
+        annotations:
+          summary: "Proxilion policy-eval p99 over budget (>5ms)"
+          description: >-
+            p99 policy-evaluation overhead is {{ $value | humanizeDuration }}
+            (sub-ms target, 5ms alert threshold) for 10m.
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#added-latency-high"
+
+  # ── Federation / authority issuance.
+  - name: proxilion-federation
+    rules:
+      - alert: ProxilionFederationCallbackFailing
+        # OAuth callback (federation entry) failure ratio > 10% over 15m.
+        expr: |
+          sum(rate(proxilion_oauth_callback_total{result!="ok"}[15m]))
+          / clamp_min(sum(rate(proxilion_oauth_callback_total[15m])), 1)
+          > 0.10
+        for: 10m
+        labels:
+          severity: page
+          slo: federation
+        annotations:
+          summary: "Federation OAuth callback failing (>10%)"
+          description: "OAuth callback failure ratio {{ $value | humanizePercentage }} over 15m."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#federation-idp-jwks-outage"
+
+      - alert: ProxilionPcaIssueFailing
+        expr: |
+          sum(rate(proxilion_pca_issue_total{result!="ok"}[15m]))
+          / clamp_min(sum(rate(proxilion_pca_issue_total[15m])), 1)
+          > 0.10
+        for: 10m
+        labels:
+          severity: page
+          slo: federation
+        annotations:
+          summary: "PCA_0 issuance failing (>10%)"
+          description: "Trust Plane PCA issuance failure ratio {{ $value | humanizePercentage }} over 15m."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#trust-plane-unavailable"
+
+      - alert: ProxilionTrustPlaneDown
+        expr: min(proxilion_trust_plane_up) == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Trust Plane unreachable from a proxy replica"
+          description: "proxilion_trust_plane_up is 0 — authority issuance/verification is degraded."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#trust-plane-unavailable"
+
+      - alert: ProxilionFederationBridgeDown
+        expr: min(proxilion_federation_bridge_up) == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Federation bridge unreachable from a proxy replica"
+          description: "proxilion_federation_bridge_up is 0."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#federation-idp-jwks-outage"
+
+  # ── Security-critical invariants — these series must read zero.
+  - name: proxilion-security
+    rules:
+      - alert: ProxilionPcaVerifyFailure
+        expr: increase(proxilion_pca_verify_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "PCA chain verification FAILED — tampered PCA or stale CAT key"
+          description: >-
+            Any increase means a tampered PCA was loaded or a CAT-key rotation
+            hasn't propagated. Treat as a potential integrity incident.
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#pca-verification-failure"
+
+      - alert: ProxilionPicInvariantViolation
+        expr: increase(proxilion_pic_invariant_violations_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "PIC invariant violation detected"
+          description: "A PIC chain invariant was violated — possible authority-graph integrity issue."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#pic-invariant-violation"
+
+  # ── Operational signals.
+  - name: proxilion-operational
+    rules:
+      - alert: ProxilionEdgeLoadShedding
+        # Sustained load-shed/rate-limit rejections = the proxy is at capacity.
+        expr: sum(rate(proxilion_ingress_rejections_total{reason=~"load_shed|rate_limit"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Proxilion shedding load at the edge (429/503)"
+          description: "Sustained edge rejections ({{ $value | humanize }}/s, reason load_shed|rate_limit) — scale out or review limits."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#edge-overload"
+
+      - alert: ProxilionNatsPublishFailing
+        expr: increase(proxilion_nats_publish_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "NATS action-stream publishes failing"
+          description: "The action/killswitch stream is dropping publishes — see the fail-open/closed policy in the runbook."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#nats-siem-forwarder-backlog"
+
+      - alert: ProxilionSiemForwardFailing
+        expr: increase(proxilion_siem_forward_failures_total[15m]) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "SIEM audit forwarding failing"
+          description: "Audit events are failing to reach the SIEM — the /api/v1/blocked + audit-export pull surfaces remain authoritative."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#nats-siem-forwarder-backlog"
+
+      - alert: ProxilionAuditPersistFailing
+        # DB write failures — the audit log's durability is the product's value.
+        expr: |
+          increase(proxilion_audit_body_persist_failures_total[10m]) > 0
+          or increase(proxilion_action_events_persist_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Proxilion failing to persist audit/action rows (DB)"
+          description: "Audit/action persistence is failing — likely Postgres saturation/outage. The audit chain is at risk."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#db-failover-connection-exhaustion"
+
+      - alert: ProxilionPolicyReloadFailing
+        expr: increase(proxilion_policy_reload_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Proxilion policy hot-reload failed"
+          description: "A policy bundle reload failed — the proxy keeps the last-good bundle; fix and re-apply."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#policy-reload-failure"
+
+      - alert: ProxilionApprovalBacklogGrowing
+        expr: max(proxilion_overrides_pending) > 50
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Blocked-action approval backlog growing"
+          description: "{{ $value }} pending overrides for 30m — the approval path (Slack/email) may be wedged."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#approval-path-wedge"
+
+      - alert: ProxilionCertExpirySoon
+        # Requires cert-manager metrics (the Helm TLS path). < 14 days.
+        expr: |
+          (certmanager_certificate_expiration_timestamp_seconds - time()) < (14 * 24 * 3600)
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "TLS certificate expiring within 14 days"
+          description: "Certificate {{ $labels.name }} expires in < 14d — confirm cert-manager renewal."
+          runbook_url: "https://github.com/clay-good/proxilion/blob/main/docs/ops/runbooks/README.md#certificate-expiry"

@@ -1,0 +1,42 @@
+name: prometheus-rules
+
+# production-readiness.md PR-5 acceptance: `promtool check rules` must pass on
+# the alerting rules. Runs on any change to the Prometheus ops files so a
+# malformed rule / bad PromQL can't merge.
+
+on:
+  pull_request:
+    paths:
+      - "ops/prometheus/**"
+      - ".github/workflows/prometheus-rules.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ops/prometheus/**"
+      - ".github/workflows/prometheus-rules.yml"
+
+jobs:
+  promtool-check:
+    name: promtool check rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROM_VERSION: "2.53.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install promtool
+        run: |
+          set -euo pipefail
+          url="https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
+          curl -fsSL "$url" -o /tmp/prom.tar.gz
+          tar -xzf /tmp/prom.tar.gz -C /tmp
+          sudo install "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+
+      - name: check rules
+        run: promtool check rules ops/prometheus/alerts.yml
+
+      - name: check config
+        # Validates prometheus.yml (incl. that it references alerts.yml).
+        run: promtool check config ops/prometheus/prometheus.yml

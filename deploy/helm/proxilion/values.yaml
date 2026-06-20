@@ -26,6 +26,10 @@ proxy:
   image:
     repository: ghcr.io/clay-good/proxilion-proxy
     tag: ""                              # default: chart appVersion
+    # Digest to pin (production — supersedes `tag` when set). The image
+    # workflow prints `…/proxilion-proxy@sha256:…` on each release; paste the
+    # sha256 here for an immutable, signed (cosign keyless) deploy. PR-11.
+    digest: ""                           # e.g. sha256:abc123…
     pullPolicy: IfNotPresent
   replicaCount: 2
   resources:

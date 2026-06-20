@@ -28,7 +28,11 @@ spec:
       securityContext: {{ toYaml .Values.proxy.podSecurityContext | nindent 8 }}
       containers:
         - name: proxy
+          {{- if .Values.proxy.image.digest }}
+          image: "{{ .Values.proxy.image.repository }}@{{ .Values.proxy.image.digest }}"
+          {{- else }}
           image: "{{ .Values.proxy.image.repository }}:{{ .Values.proxy.image.tag | default .Chart.AppVersion }}"
+          {{- end }}
           imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
           securityContext: {{ toYaml .Values.proxy.containerSecurityContext | nindent 12 }}
           ports:

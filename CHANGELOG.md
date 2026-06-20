@@ -16,6 +16,19 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Proxy container image: publish, scan, sign (production-readiness.md
+  PR-11).** The proxy image is now first-class and verifiable.
+  `docker/proxy.Dockerfile` is rebuilt on a **distroless** (`distroless/cc`),
+  **non-root** (uid 65532), stripped, multi-stage base suited to a read-only
+  root filesystem (no shell / package manager / setuid). A new
+  [`image`](.github/workflows/image.yml) workflow builds it **multi-arch**
+  (amd64 + arm64) on a `v*.*.*` tag, pushes to GHCR, **Trivy-scans** it
+  (gating on fixable HIGH/CRITICAL), **cosign-keyless-signs** it, and attaches
+  **SLSA provenance + an SBOM** (buildx). The Helm chart gains
+  `proxy.image.digest` to pin the signed image by digest (supersedes `tag`),
+  and the chart README documents the `cosign verify` + SBOM-download commands.
+  **Still open (PR-10):** CLI/binary signing, SLSA for the CLI artifacts, and
+  `cargo auditable` embedding.
 - **SLOs, error budgets & burn-rate alerting (production-readiness.md PR-5 —
   first slice).** The alerting contract: [docs/ops/slos.md](docs/ops/slos.md)
   defines five SLOs (request availability 99.9%, sub-ms added-latency,

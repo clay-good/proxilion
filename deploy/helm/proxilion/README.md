@@ -73,3 +73,24 @@ kubectl apply --dry-run=client -f /tmp/proxilion.yaml
   the agent-platform ingress can reach the proxy, only the proxy can
   reach Postgres + Trust Plane, etc. The chart does not render these
   by default because every customer's cluster mesh is different.
+
+## Verifying & pinning the proxy image
+
+The proxy image is built multi-arch (amd64 + arm64) from a **distroless,
+non-root** base by the [`image`](../../../.github/workflows/image.yml) release
+workflow, which Trivy-scans it (gating on fixable HIGH/CRITICAL), signs it with
+**cosign keyless** (Sigstore), and attaches **SLSA build provenance + an SBOM**.
+The workflow prints the published digest.
+
+```sh
+# Verify the signature + provenance (keyless, bound to this repo's CI):
+cosign verify ghcr.io/clay-good/proxilion-proxy@sha256:<digest> \
+  --certificate-identity-regexp 'https://github.com/clay-good/proxilion/.github/workflows/image.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Inspect the attached SBOM / provenance attestations:
+cosign download sbom ghcr.io/clay-good/proxilion-proxy@sha256:<digest>
+```
+
+**Pin by digest in production:** set `proxy.image.digest: sha256:<digest>`
+(supersedes `proxy.image.tag`) so every replica runs the exact, signed image.

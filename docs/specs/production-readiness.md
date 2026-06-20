@@ -714,6 +714,19 @@ Rekor); CycloneDX; `slsa-github-generator`; GitHub artifact attestations;
 
 **Priority:** P1. **Effort:** 2–3 days.
 
+**Status (2026-06-20): implemented (pending a real tagged release to
+publish).** `docker/proxy.Dockerfile` is now a multi-stage build on a
+**distroless/cc** runtime, **non-root** (uid 65532), stripped, ready for a
+read-only root FS. The new [`image`](../../.github/workflows/image.yml)
+workflow builds **multi-arch** (amd64 + arm64) on a `v*.*.*` tag, pushes to
+GHCR, **Trivy-scans** (gating on fixable HIGH/CRITICAL), **cosign-keyless
+signs**, and attaches **SLSA provenance + SBOM** via buildx. The Helm chart
+gains `proxy.image.digest` for digest-pinned, signed deploys, and the chart
+README documents `cosign verify`. **Still open:** the actual publish + digest
+record happen on the first real `v0.1.0` tag (PR-9), and the local build
+couldn't be exercised in this environment (no Docker daemon) — CI is the
+verification path. The CLI-artifact half of signing/SBOM is PR-10.
+
 **Goal.** A first-class, minimal, multi-arch **proxy** container image is
 published and consumed by the Helm chart.
 
@@ -849,8 +862,11 @@ satisfied:
 - [ ] **PR-8** PITR restore drill passed; RPO/RTO met; audit-chain verified
       post-restore.
 - [ ] **PR-9** `v0.1.0` tagged; compatibility/MSRV/upgrade policy published.
-- [ ] **PR-10/11** Signed, SBOM'd, provenance-attested, scanned artifacts;
-      proxy image published + digest-pinned.
+- [~] **PR-10/11** Signed, SBOM'd, provenance-attested, scanned artifacts;
+      proxy image published + digest-pinned. *PR-11 image pipeline landed
+      (distroless non-root multi-arch + Trivy + cosign + SBOM/provenance +
+      Helm digest pin); publishes on the first `v*.*.*` tag. PR-10 (CLI
+      signing/SLSA/cargo-auditable) still open.*
 - [ ] **PR-12** Threat model refreshed; ASVS L2 zero-criticals; external
       pentest criticals/highs remediated (required for GA / first design
       partner, may trail a locked-down pilot).

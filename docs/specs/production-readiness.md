@@ -72,12 +72,16 @@ allow-list (RS256/ES256 default; `none`/HS\* impossible), enforces
 `iss`/`aud`/`exp`/`nbf` with ≤ 60 s skew, fail-closed. Eleven unit tests pin
 the RFC 8725 / RFC 9700 rejections (tampered payload, `alg:none`,
 RS256→HS256 confusion, expired/`nbf`-future, unknown `iss`/`aud`, symmetric or
-empty allow-list). **Design note:** we verify with `jsonwebtoken` directly
+empty allow-list). The **JWKS fetch + `kid`-rotation layer**
+([jwks.rs](../../crates/proxy/src/oauth/jwks.rs)) is also landed:
+`JwksResolver` resolves `jwks_uri` + `kid` → `DecodingKey` with an HTTPS-only
+fetch, TTL cache, refresh-once-on-unknown-`kid` (throttled per endpoint to
+avoid a thundering-herd DoS), fail-closed; five tests incl. the end-to-end
+resolve→verify chain. **Design note:** we verify with `jsonwebtoken` directly
 rather than calling upstream `provenance-bridge`'s `JwtHandler::validate` — at
 the SHA we pin, that handler selects the algorithm from the *token header* and
 never enforces its allow-list (the confusion pattern this PR exists to kill),
 so reusing it verbatim would be unsafe. **Still open before this P0 closes:**
-the JWKS fetch + `kid`-rotation layer (negative-cache + rate-limited refresh),
 the OAuth-callback rewiring to mint PCA_0 from the verified identity via Trust
 Plane `POST /v1/pca/issue` (needs a live Trust Plane to smoke), deleting/gating
 the payload-only `validate_federation_token` path, the production-boot refusal
@@ -775,10 +779,10 @@ satisfied:
 
 - [~] **PR-1** Federation token signatures verified; no payload-only trust;
       production boot refuses the insecure stub; `alg:none`/confusion
-      rejected. *Verification primitive landed + tested (`oauth::idp_verify`,
-      algorithm pinned, `alg:none`/confusion/expired/`iss`/`aud` rejected);
-      remaining: JWKS/`kid`-rotation layer, callback→Trust-Plane issuance
-      rewiring, stub-boot refusal, fixture replacement, smoke.*
+      rejected. *Verification primitive + JWKS/`kid`-rotation layer landed +
+      tested (`oauth::idp_verify` algorithm-pinned rejections; `oauth::jwks`
+      HTTPS-only fetch/cache/rotation/throttle); remaining: callback→Trust-Plane
+      issuance rewiring, stub-boot refusal, fixture replacement, smoke.*
 - [~] **PR-2** Ingress body cap, per-request timeout, per-IP rate limit
       (`429`+`Retry-After`, trusted-proxy XFF), concurrency limit + load-shed
       (`503`) all active at the application layer. Remaining: L4 connection cap

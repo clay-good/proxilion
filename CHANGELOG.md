@@ -16,6 +16,17 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Federation JWKS resolver (production-readiness.md PR-1, Approach A —
+  second slice).** A new `oauth::jwks::JwksResolver`
+  ([jwks.rs](crates/proxy/src/oauth/jwks.rs)) turns an IdP `jwks_uri` + a
+  token `kid` into the `DecodingKey` the verifier consumes, satisfying the
+  PR-1 JWKS-hygiene invariants: HTTPS-only fetch, TTL cache, refresh-once on
+  an unknown `kid` to follow rotation, throttled per endpoint so an
+  unknown-`kid` flood can't become a thundering-herd DoS against the IdP, and
+  fail-closed. The fetch sits behind a `JwksSource` trait so the
+  cache/rotation/throttle logic is unit-tested without a network; five tests
+  cover the end-to-end resolve→verify chain, caching, rotation pickup,
+  refresh throttling, and the plaintext-`jwks_uri` rejection.
 - **Federation `id_token` signature-verification primitive (production-readiness.md
   PR-1, Approach A — first slice).** The cryptographic core that closes the
   federation showstopper: a new `oauth::idp_verify::verify_id_token`
@@ -31,10 +42,10 @@ Until v0.1.0, the canonical reference is the most recent commit on
   security-critical rejections: valid-signature accepted; tampered payload,
   `alg:none`, RS256→HS256 confusion, expired, not-yet-valid, untrusted `iss`,
   wrong `aud`, and a symmetric/empty allow-list all rejected; leeway clamped.
-  **PR-1 is still open** — the JWKS fetch/`kid`-rotation layer, the OAuth
-  callback rewiring to mint PCA_0 from the verified identity via Trust Plane
-  `POST /v1/pca/issue`, the production-boot refusal of the insecure stub, the
-  `alg:none` test-fixture replacement, and the end-to-end smoke remain.
+  **PR-1 is still open** — the OAuth callback rewiring to mint PCA_0 from the
+  verified identity via Trust Plane `POST /v1/pca/issue`, the production-boot
+  refusal of the insecure stub, the `alg:none` test-fixture replacement, and
+  the end-to-end smoke remain (the JWKS layer above is now done).
 - **Transport & trust-boundary hardening (production-readiness.md PR-4 —
   complete).** Made the proxy's TLS posture explicit and regression-proof
   across every hop.

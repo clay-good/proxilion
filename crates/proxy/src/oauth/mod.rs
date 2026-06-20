@@ -27,6 +27,7 @@
 pub mod bridge;
 pub mod error;
 pub mod idp_verify;
+pub mod jwks;
 pub mod routes;
 pub mod state;
 

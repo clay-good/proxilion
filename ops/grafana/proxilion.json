@@ -511,6 +511,150 @@
           "custom": { "fillOpacity": 10, "lineWidth": 2 }
         }
       }
+    },
+    {
+      "id": 600,
+      "type": "row",
+      "title": "Service-level objectives (PR-5)",
+      "gridPos": { "x": 0, "y": 61, "w": 24, "h": 1 }
+    },
+    {
+      "id": 601,
+      "type": "stat",
+      "title": "Availability (1h)",
+      "description": "1 - upstream-error ratio over 1h. SLO target 99.9%. Policy blocks are NOT errors. See docs/ops/slos.md.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 62, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "1 - proxilion:adapter_availability_error_ratio:rate1h",
+          "legendFormat": "availability"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 0.999, "color": "green" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 602,
+      "type": "stat",
+      "title": "Error-budget burn (1h)",
+      "description": "Availability error ratio / 0.001. >=1 burns the 99.9% budget; >=14.4 is the fast-burn page threshold.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 6, "y": 62, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "proxilion:adapter_availability_error_ratio:rate1h / 0.001",
+          "legendFormat": "burn rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 1, "color": "orange" },
+              { "value": 14.4, "color": "red" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 603,
+      "type": "stat",
+      "title": "Policy-eval p99 (added latency)",
+      "description": "p99 policy-evaluation overhead. spec.md §9 sub-ms target; alert at 5ms.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 12, "y": 62, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "max(proxilion_policy_evaluation_duration_seconds{quantile=\"0.99\"})",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 0.001, "color": "orange" },
+              { "value": 0.005, "color": "red" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 604,
+      "type": "stat",
+      "title": "Federation success (15m)",
+      "description": "1 - OAuth callback non-ok ratio over 15m. SLO target >=99%.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 18, "y": 62, "w": 6, "h": 5 },
+      "targets": [
+        {
+          "expr": "1 - (sum(rate(proxilion_oauth_callback_total{result!=\"ok\"}[15m])) / clamp_min(sum(rate(proxilion_oauth_callback_total[15m])), 1))",
+          "legendFormat": "success"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 0.99, "color": "green" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 605,
+      "type": "timeseries",
+      "title": "Availability error-budget burn rate (multi-window)",
+      "description": "Burn rate per window (error ratio / 0.001). 1 = burning at budget; the page fires on fast-burn (14.4x/1h) or 6x/6h.",
+      "datasource": { "type": "prometheus" },
+      "gridPos": { "x": 0, "y": 67, "w": 24, "h": 7 },
+      "targets": [
+        {
+          "expr": "proxilion:adapter_availability_error_ratio:rate1h / 0.001",
+          "legendFormat": "1h burn"
+        },
+        {
+          "expr": "proxilion:adapter_availability_error_ratio:rate6h / 0.001",
+          "legendFormat": "6h burn"
+        },
+        {
+          "expr": "vector(1)",
+          "legendFormat": "budget (1x)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": { "fillOpacity": 5, "lineWidth": 2 }
+        }
+      }
     }
   ]
 }

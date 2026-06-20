@@ -475,9 +475,12 @@ content; PR-6 expands). `prometheus.yml` loads the rules and a
 [`prometheus-rules`](../../.github/workflows/prometheus-rules.yml) CI job runs
 `promtool check rules`/`check config`. Latency SLIs use the summary
 `{quantile="0.99"}` series (the recorder renders histograms as summaries, no
-`set_buckets`). **Still open:** the Grafana SLO/error-budget dashboard row,
-Alertmanager routing wiring, and the staging fault-injection burn drill (the
-"a synthetic burn fires the page within budget" acceptance check).
+`set_buckets`). The Grafana dashboard now carries an **SLO/error-budget row**
+(availability, error-budget burn, policy-eval p99, federation success, +
+multi-window burn-rate panel) in
+[ops/grafana/proxilion.json](../../ops/grafana/proxilion.json). **Still
+open:** Alertmanager routing wiring and the staging fault-injection burn
+drill (the "a synthetic burn fires the page within budget" acceptance check).
 
 **Goal.** Operators get paged on user-impacting conditions *before* the
 budget is exhausted, and never on noise.

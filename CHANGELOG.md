@@ -32,8 +32,10 @@ Until v0.1.0, the canonical reference is the most recent commit on
   [`prometheus-rules`](.github/workflows/prometheus-rules.yml) CI job runs
   `promtool check rules`/`check config` on every change. Latency SLIs read the
   summary `{quantile="0.99"}` series (the recorder renders histograms as
-  summaries). **PR-5 still open** — the Grafana SLO/error-budget dashboard row,
-  Alertmanager routing wiring, and the staging fault-injection burn drill.
+  summaries). The bundled Grafana dashboard gains an **SLO/error-budget row**
+  (availability, error-budget burn, policy-eval p99, federation success, and a
+  multi-window burn-rate panel). **PR-5 still open** — Alertmanager routing
+  wiring and the staging fault-injection burn drill.
 - **Secret memory hygiene + key inventory (production-readiness.md PR-3 —
   first slice).** Decoded HMAC key material is now scrubbed from memory on
   drop: `SiemHmacKey` and `WebhookSecret` wrap their bytes in

@@ -27,9 +27,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
   secret the proxy holds (purpose, algorithm, blast radius, source, hygiene)
   and clarifying what it does *not* hold (the CAT signing key lives in the
   Trust Plane; operator bearers are stored only as truncated-`Debug` SHA-256
-  hashes). `zeroize` added as a direct dependency. **PR-3 still open** —
-  versioned keys with rotation overlap, `*_FILE`/KMS secret sourcing, and the
-  rotation runbooks remain.
+  hashes). `zeroize` added as a direct dependency.
+  - **`*_FILE` secret sourcing.** Every secret (`PROXILION_TOKEN_ENCRYPTION_KEY`,
+    `DATABASE_URL`, `GOOGLE_CLIENT_SECRET`, `PROXILION_SIEM_HMAC_KEY`,
+    `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY`) can now be read from a mounted file
+    via `<VAR>_FILE` (Docker/K8s convention, trailing newline trimmed),
+    preferred over the direct env var — keeping secrets out of the process
+    environment and enabling External Secrets Operator / Vault / KMS-backed
+    Secret mounts.
+  - **PR-3 still open** — versioned keys with rotation overlap, KMS envelope
+    encryption, and the rotation runbooks remain.
 - **Federation production-boot guard (production-readiness.md PR-1, Approach A
   — third slice).** A `PROXILION_ENV` setting (`development`|`staging`|
   `production`, default `development`) plus a `Config::federation_boot_refusal`

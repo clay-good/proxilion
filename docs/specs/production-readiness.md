@@ -324,11 +324,15 @@ redacting `Debug` impls ([siem.rs](../../crates/proxy/src/forwarder/siem.rs),
 [webhook.rs](../../crates/proxy/src/notifier/webhook.rs)); the
 token-encryption key was already scrubbed (inside `Aes256Gcm`, no `Debug`).
 A new [docs/ops/key-inventory.md](../ops/key-inventory.md) enumerates and
-classifies every secret the proxy holds. **Still open before this P0
+classifies every secret the proxy holds. **Production secret sourcing** is
+also landed: every secret reads from `<VAR>_FILE` (Docker/K8s mounted-secret
+convention) in preference to the env var, enabling External Secrets / Vault /
+KMS-backed Secret mounts (`secret_env` in
+[config.rs](../../crates/proxy/src/config.rs)). **Still open before this P0
 closes:** versioned keys with rotation overlap (`kid`/version, add → flip →
 drain → retire; lazy/`proxilion-cli` re-wrap for the token-encryption key),
-production secret sourcing beyond env (`*_FILE` + External Secrets / KMS
-envelope), and the per-key rotation runbooks (with PR-6).
+KMS envelope encryption for the DEK, and the per-key rotation runbooks
+(with PR-6).
 
 **Goal.** Every signing/encryption secret can be rotated without downtime,
 is sourced safely in production, and does not linger in process memory longer
@@ -808,10 +812,10 @@ satisfied:
       (`503`) all active at the application layer. Remaining: L4 connection cap
       + FD-ulimit docs + at-scale overload load test (interlinks PR-7).
 - [~] **PR-3** Keys `zeroize`-wrapped; documented, tested zero-downtime
-      rotation; production secret sourcing. *Memory hygiene landed (HMAC keys
-      `Zeroizing` + redacted `Debug`; token key already scrubbed) + key
-      inventory doc; remaining: versioned-key rotation overlap, `*_FILE`/KMS
-      sourcing, rotation runbooks.*
+      rotation; production secret sourcing. *Memory hygiene (HMAC keys
+      `Zeroizing` + redacted `Debug`; token key already scrubbed), key
+      inventory doc, and `*_FILE` secret sourcing landed; remaining:
+      versioned-key rotation overlap, KMS envelope, rotation runbooks.*
 - [~] **PR-4** TLS ≥ 1.2 enforced (1.3 opt-in); outbound cert verification
       proven (CI gate); trusted-proxy config explicit; per-hop TLS/mTLS
       matrix documented. Remaining: staging nmap/testssl scan + mesh-wiring

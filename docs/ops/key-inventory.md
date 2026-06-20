@@ -38,15 +38,29 @@
 - **Transport material:** TLS private key (file/secret mount; rotated via
   cert-manager, PR-4).
 
-## Remaining PR-3 work (not in this slice)
+## Production secret sourcing (`*_FILE`)
 
-The memory-hygiene + inventory steps are done; still open before PR-3 closes:
+Every secret above can be sourced from a **mounted file** instead of an env
+var, using the Docker / Kubernetes convention: set `<VAR>_FILE` to a path and
+the proxy reads the secret from that file (trailing newline trimmed),
+preferring it over a direct `<VAR>`. This keeps the secret out of the
+process environment (where it can leak via `/proc/<pid>/environ`, crash
+dumps, or `docker inspect`) and lets an operator back it with External
+Secrets Operator / Vault / a cloud-KMS-backed Kubernetes Secret. Applies to
+`PROXILION_TOKEN_ENCRYPTION_KEY`, `DATABASE_URL`, `GOOGLE_CLIENT_SECRET`,
+`PROXILION_SIEM_HMAC_KEY`, and `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY`
+(e.g. `PROXILION_TOKEN_ENCRYPTION_KEY_FILE=/var/run/secrets/token-key`).
+
+## Remaining PR-3 work
+
+The memory-hygiene, inventory, and file-sourcing steps are done; still open
+before PR-3 closes:
 
 - **Versioned keys with overlap** (`kid`/version: active + N also-accept
   predecessors) so rotation is add → flip → drain → retire with zero rejected
   in-flight requests. Token-encryption rotation re-encrypts lazily or via a
   one-shot `proxilion-cli` re-wrap command.
-- **Production secret sourcing** beyond env: a `*_FILE` convention and
-  External Secrets Operator / Vault / cloud-KMS envelope-encryption guidance.
+- **Envelope encryption** (KMS-wrapped DEK) for the token-encryption key as
+  the recommended pattern (file/env stays the default).
 - **Rotation runbooks** (one per key; planned + emergency/compromise),
   landing with PR-6.

@@ -436,7 +436,7 @@ impl ConfigBuilder {
                 LogFormat::Json
             };
         }
-        if let Ok(v) = env::var("DATABASE_URL") {
+        if let Some(v) = secret_env("DATABASE_URL") {
             self.database_url = Some(v);
         }
         if let Ok(v) = env::var("PROXILION_TRUST_PLANE_URL") {
@@ -445,13 +445,13 @@ impl ConfigBuilder {
         if let Ok(v) = env::var("PROXILION_FEDERATION_BRIDGE_URL") {
             self.federation_bridge_url = v;
         }
-        if let Ok(v) = env::var("PROXILION_TOKEN_ENCRYPTION_KEY") {
+        if let Some(v) = secret_env("PROXILION_TOKEN_ENCRYPTION_KEY") {
             self.token_encryption_key_hex = Some(v);
         }
         if let Ok(v) = env::var("GOOGLE_CLIENT_ID") {
             self.google_client_id = Some(v);
         }
-        if let Ok(v) = env::var("GOOGLE_CLIENT_SECRET") {
+        if let Some(v) = secret_env("GOOGLE_CLIENT_SECRET") {
             self.google_client_secret = Some(v);
         }
         if let Ok(v) = env::var("PROXILION_PUBLIC_URL") {
@@ -480,7 +480,7 @@ impl ConfigBuilder {
         if let Ok(v) = env::var("PROXILION_SIEM_WEBHOOK_URL") {
             self.siem_webhook_url = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("PROXILION_SIEM_HMAC_KEY") {
+        if let Some(v) = secret_env("PROXILION_SIEM_HMAC_KEY") {
             self.siem_hmac_key_hex = Some(v).filter(|s| !s.is_empty());
         }
         if let Ok(v) = env::var("PROXILION_SIEM_BATCH_SIZE") {
@@ -498,7 +498,7 @@ impl ConfigBuilder {
         if let Ok(v) = env::var("PROXILION_BLOCKED_WEBHOOK_URL") {
             self.blocked_webhook_url = Some(v).filter(|s| !s.is_empty());
         }
-        if let Ok(v) = env::var("PROXILION_BLOCKED_WEBHOOK_HMAC_KEY") {
+        if let Some(v) = secret_env("PROXILION_BLOCKED_WEBHOOK_HMAC_KEY") {
             self.blocked_webhook_hmac_key_hex = Some(v).filter(|s| !s.is_empty());
         }
         if matches!(
@@ -862,6 +862,36 @@ struct FileConfig {
     tls_min_version: Option<String>,
     environment: Option<String>,
     insecure_bridge_stub: Option<bool>,
+}
+
+/// Read a secret from `{var}` or, preferentially, the file named by
+/// `{var}_FILE` (the Docker / Kubernetes secret-mount convention —
+/// production-readiness.md PR-3 production secret sourcing). This lets an
+/// operator mount a secret from External Secrets Operator / Vault / a
+/// cloud-KMS-backed Secret without ever placing it in an env var (which can
+/// leak via `/proc/<pid>/environ`, crash dumps, or a `docker inspect`).
+///
+/// Precedence: `{var}_FILE` wins when set and readable; otherwise the direct
+/// `{var}`. A trailing newline (the usual artifact of `echo`-ing a secret
+/// into a file) is trimmed. If `{var}_FILE` is set but unreadable, falls back
+/// to `{var}` rather than failing the whole load — the missing-secret error
+/// then surfaces at the specific consumer (e.g. `TokenCipher`), which is more
+/// actionable than a generic boot error.
+fn secret_env(var: &str) -> Option<String> {
+    if let Ok(path) = env::var(format!("{var}_FILE")) {
+        if !path.is_empty() {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                return Some(read_secret_trim(&contents));
+            }
+        }
+    }
+    env::var(var).ok()
+}
+
+/// Trim the trailing newline(s) a secret file typically carries without
+/// touching internal bytes (a key could legitimately contain spaces).
+fn read_secret_trim(contents: &str) -> String {
+    contents.trim_end_matches(['\n', '\r']).to_string()
 }
 
 fn check_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
@@ -1887,6 +1917,19 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             assert!(refusal.contains(env.label()));
             assert!(refusal.contains("refusing to boot"));
         }
+    }
+
+    #[test]
+    fn read_secret_trim_strips_trailing_newlines_only() {
+        // PR-3 `*_FILE` sourcing: a secret file written with `echo` carries a
+        // trailing newline that must not become part of the key. Internal
+        // bytes (incl. spaces) are preserved — a key could contain them.
+        assert_eq!(read_secret_trim("deadbeef\n"), "deadbeef");
+        assert_eq!(read_secret_trim("deadbeef\r\n"), "deadbeef");
+        assert_eq!(read_secret_trim("deadbeef\n\n"), "deadbeef");
+        assert_eq!(read_secret_trim("deadbeef"), "deadbeef");
+        // No leading trim, no internal trim.
+        assert_eq!(read_secret_trim("  pad ded \n"), "  pad ded ");
     }
 
     #[test]

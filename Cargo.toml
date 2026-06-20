@@ -64,7 +64,7 @@ regorus = "0.5"
 # the same major as upstream `provenance-bridge` uses; we verify with
 # server-side-pinned algorithms rather than reusing the upstream handler
 # (which selects the algorithm from the token header — see oauth/idp_verify.rs).
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 # Scrub decoded secret key material from memory on drop (PR-3 memory hygiene).
 # Already in the tree transitively (aes-gcm/ed25519-dalek); pinned direct so
 # the HMAC-secret newtypes can wrap their bytes in `Zeroizing`.

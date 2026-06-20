@@ -43,6 +43,10 @@ permissions:
   # `upload-rust-binary-action`) needs `contents: write` to create
   # the release and upload assets.
   contents: write
+  # SLSA build provenance via `actions/attest-build-provenance` (PR-10):
+  # keyless Sigstore signing bound to this workflow's OIDC identity.
+  id-token: write
+  attestations: write
 
 jobs:
   build-and-upload:
@@ -102,3 +106,13 @@ jobs:
           tar: all
           zip: none
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # SLSA build provenance for the freshly-built binary (PR-10). Produces a
+      # signed, verifiable attestation bound to this workflow's OIDC identity;
+      # operators verify with `gh attestation verify <binary> --repo
+      # clay-good/proxilion`. The binary lives at the cargo target path the
+      # upload action just built.
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/${{ matrix.target }}/release/proxilion-cli

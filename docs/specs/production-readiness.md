@@ -675,6 +675,17 @@ compatibility/MSRV/upgrade policy lands.
 
 **Priority:** P1. **Effort:** 2–3 days.
 
+**Status (2026-06-20): in progress.** The **proxy image** already carries a
+cosign-keyless signature + SLSA provenance + SBOM (PR-11). For the
+**`proxilion-cli` binaries**, [release.yml](../../.github/workflows/release.yml)
+now emits **SLSA build provenance** via `actions/attest-build-provenance`
+(keyless, verified with `gh attestation verify`), and
+[docs/install/verifying-artifacts.md](../install/verifying-artifacts.md)
+documents the verification commands for both. **Still open:** CycloneDX SBOMs
+attached to the GitHub Release (`cargo-cyclonedx`), `cargo auditable`
+dependency data embedded in the shipped binaries, and cosign signatures on the
+`.tar.gz` archives.
+
 **Goal.** Every released artifact is verifiable: an operator can confirm
 *what* is inside it and *that this project's CI built it*.
 

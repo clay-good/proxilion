@@ -16,6 +16,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Build provenance for release artifacts (production-readiness.md PR-10 —
+  first slice).** The `proxilion-cli` release binaries now carry **SLSA build
+  provenance** via GitHub artifact attestations (`actions/attest-build-provenance`
+  in [release.yml](.github/workflows/release.yml), keyless Sigstore bound to
+  the workflow's OIDC identity) — verify with `gh attestation verify ./proxilion-cli
+  --repo clay-good/proxilion`. A new
+  [docs/install/verifying-artifacts.md](docs/install/verifying-artifacts.md)
+  documents the `cosign verify` (image) and `gh attestation verify` (CLI)
+  commands. **Still open (PR-10):** CycloneDX SBOMs attached to the release,
+  `cargo auditable` embedding, and cosign signatures on the `.tar.gz` archives.
 - **Proxy container image: publish, scan, sign (production-readiness.md
   PR-11).** The proxy image is now first-class and verifiable.
   `docker/proxy.Dockerfile` is rebuilt on a **distroless** (`distroless/cc`),

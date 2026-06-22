@@ -1,15 +1,35 @@
 # Proxilion runbooks
 
 > One procedure per paging alert and per critical operation. Every alert in
-> [`ops/prometheus/alerts.yml`](../../../ops/prometheus/alerts.yml) links here
-> via its `runbook_url`. This is the **PR-5 first pass** — each entry has a
-> real detection → diagnosis → mitigation → verification → escalation
-> skeleton; **PR-6** expands them and drill-tests the killswitch and
-> DB-failover procedures in staging.
+> [`ops/prometheus/alerts.yml`](../../../ops/prometheus/alerts.yml) links to an
+> anchor in **this file** via its `runbook_url`; the deeper critical procedures
+> (killswitch, DB failover, key compromise, security incident response) live in
+> their own files, linked below. Each entry follows detection → diagnosis →
+> mitigation → verification → escalation (**PR-6**). The staging drills
+> (killswitch propagation, DB failover, PITR restore, key-rotation) are
+> documented with their acceptance criteria in the linked files and carry a
+> "drill log" placeholder until executed against a staging stand-up.
 
 General: check the Grafana dashboard ([ops/grafana/proxilion.json](../../../ops/grafana/proxilion.json))
 and `GET /healthz` (per-dependency readiness) first. Severity matrix +
 disclosure SLA: [SECURITY.md](../../../SECURITY.md).
+
+## Critical procedures (deep-dive runbooks)
+
+These are referenced from the alert sections below and from each other:
+
+- **[killswitch.md](./killswitch.md)** — deliberate revocation, the
+  one-request-cycle cross-replica propagation guarantee + its staging drill,
+  and recovery from an accidental fleet-wide kill.
+- **[db-failover.md](./db-failover.md)** — Postgres primary failover,
+  connection exhaustion, and bad-migration rollback (expand/contract);
+  interlinks PR-7/PR-8.
+- **[key-compromise.md](./key-compromise.md)** — emergency rotation per secret,
+  blast radius, and audit-chain continuity (read
+  [key-inventory.md](../key-inventory.md) first).
+- **[incident-response.md](./incident-response.md)** — security incident
+  response plan + incident-commander checklist + evidence preservation
+  (the audit log is the evidence).
 
 ## Availability error budget burn
 
@@ -59,13 +79,17 @@ disclosure SLA: [SECURITY.md](../../../SECURITY.md).
 - **Mitigate:** confirm the CAT public key matches the Trust Plane's active
   signing key; flush the PCA cache; if tampering is suspected, invoke the
   killswitch and preserve the (cryptographically verifiable) audit log.
-- **Escalate:** security incident path (SECURITY.md).
+  **Preserve before you flush** — the failing artifact is the evidence.
+- **Escalate:** security incident path — [incident-response.md](./incident-response.md)
+  (this is a Critical-severity integrity event).
 
 ## PIC invariant violation
 
 - **Detect:** `ProxilionPicInvariantViolation`. A PIC chain invariant broke.
-- **Diagnose/Escalate:** capture the offending chain from the audit log;
-  treat as an authority-graph integrity incident; escalate to security.
+- **Diagnose/Escalate:** capture the offending chain from the audit log
+  (`proxilion-cli pic show <id>`) **before** any cleanup; treat as an
+  authority-graph integrity incident; run the
+  [incident-response.md](./incident-response.md) checklist.
 
 ## Edge overload
 
@@ -92,10 +116,11 @@ disclosure SLA: [SECURITY.md](../../../SECURITY.md).
   to persist.
 - **Diagnose:** Postgres primary health, connection count vs. `max_connections`,
   failover state. The audit log's durability is the product's value.
-- **Mitigate:** fail over / restore the primary; add PgBouncer if connection
-  exhaustion (PR-7). Pre-deploy backups gate migrations (PR-8).
+- **Mitigate:** full procedure (failover / connection exhaustion / bad
+  migration) in **[db-failover.md](./db-failover.md)**. Short form: fail over or
+  restore the primary; add PgBouncer if connection-exhausted (PR-7);
+  pre-deploy backups gate migrations (PR-8).
 - **Verify:** persistence counters resume; sample `/api/v1/pca/{id}/verify`.
-- **PR-6:** this drill is executed in staging.
 
 ## Policy reload failure
 

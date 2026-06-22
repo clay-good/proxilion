@@ -16,6 +16,27 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Runbooks & incident response (production-readiness.md PR-6 — written set
+  complete).** Every PR-5 paging alert now resolves to a full detection →
+  diagnosis → mitigation → verification → escalation procedure
+  ([docs/ops/runbooks/README.md](docs/ops/runbooks/README.md)), and the deeper
+  critical procedures the spec enumerates have dedicated, source-grounded
+  runbooks: [killswitch.md](docs/ops/runbooks/killswitch.md) documents
+  deliberate revocation, the **one-request-cycle cross-replica propagation
+  guarantee** (derived from the real kill-cache — a cache miss always falls
+  through to the DB source of truth, so a kill on one replica is enforced by the
+  others on their next request), and recovery from an accidental fleet-wide
+  kill; [db-failover.md](docs/ops/runbooks/db-failover.md) covers primary
+  failover, connection exhaustion, and expand/contract bad-migration rollback;
+  [key-compromise.md](docs/ops/runbooks/key-compromise.md) gives per-secret
+  emergency rotation with blast radius and audit-chain continuity across `kid`
+  rotation; and [incident-response.md](docs/ops/runbooks/incident-response.md)
+  is the security IR plan — reusing the `SECURITY.md` severity matrix — with an
+  **incident-commander checklist** that orders evidence-preservation *before*
+  mitigation (the tamper-evident audit log is itself the evidence). **Still open
+  (PR-6):** executing the killswitch / DB-failover / PITR-restore drills in a
+  staging stand-up (interlinks PR-7/PR-8) and correcting the runbooks against
+  what they reveal — each carries a "drill log" placeholder.
 - **Authoritative configuration reference + doc-drift CI gate
   (production-readiness.md PR-13 — config-reference slice).** A new
   [docs/ops/config-reference.md](docs/ops/config-reference.md) documents every

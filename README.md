@@ -379,7 +379,11 @@ The `reason` / `code` label values on the block counters (and the `code` field
 in every 4xx/5xx response envelope) are the stable error codes catalogued in
 [docs/error-codes.md](docs/error-codes.md) — each with its default HTTP status,
 when it fires, and the suggested operator action. That table is the source of
-truth for alerting and runbooks.
+truth for alerting and runbooks. The burn-rate alert rules
+([ops/prometheus/alerts.yml](ops/prometheus/alerts.yml), `promtool`-gated in CI)
+and the on-call procedures ([docs/ops/runbooks/](docs/ops/runbooks/README.md),
+one per paging alert + the killswitch / DB-failover / key-compromise /
+incident-response deep dives) close the loop from metric to page to fix.
 
 ## Design decisions
 
@@ -718,6 +722,28 @@ gate, which forbids any production crate from disabling cert/hostname
 verification. The per-hop TLS/mTLS matrix, cipher posture, public-route
 surface, and the staging `testssl`/`nmap` go-live check live in
 [docs/ops/tls-mtls-matrix.md](docs/ops/tls-mtls-matrix.md).
+
+**PR-5 (SLOs + alerting) and PR-6 (runbooks) — the operability contract.**
+Five SLOs (99.9% request availability, sub-ms added latency, federation/issuance
+success, approval-path liveness, killswitch propagation) are defined with
+rationale and measurement windows in [docs/ops/slos.md](docs/ops/slos.md), and
+[ops/prometheus/alerts.yml](ops/prometheus/alerts.yml) implements 16 alerts +
+7 recording rules — Google-SRE multi-window multi-burn-rate for availability
+plus federation, security-invariant (`pca_verify`/`pic` must read zero), and
+operational signals — gated in CI by `promtool`
+([`prometheus-rules`](.github/workflows/prometheus-rules.yml)). **Every alert
+links to a runbook**: each paging alert resolves to a full detection →
+diagnosis → mitigation → verification → escalation procedure in
+[docs/ops/runbooks/](docs/ops/runbooks/README.md), backed by dedicated
+critical-procedure runbooks for the
+[killswitch](docs/ops/runbooks/killswitch.md) (with the one-request-cycle
+cross-replica propagation guarantee), [DB failover](docs/ops/runbooks/db-failover.md),
+[key compromise](docs/ops/runbooks/key-compromise.md), and
+[security incident response](docs/ops/runbooks/incident-response.md) (an
+incident-commander checklist that preserves the tamper-evident audit log as
+evidence *before* mitigating). Remaining PR-5/PR-6 work is staging execution:
+Alertmanager routing, the synthetic burn drill, and the killswitch / DB-failover
+/ PITR-restore drills.
 
 **Configuration is one authoritative, drift-gated reference.** Every
 operator-facing variable the proxy reads — type, default, source precedence,

@@ -523,6 +523,27 @@ multi-burn-rate); SRE Book Ch. 4 (SLOs); `promtool`.
 
 **Priority:** P1. **Effort:** 3–5 days.
 
+**Status (2026-06-22): in progress — written runbook set complete; staging
+drills pending.** Every PR-5 paging alert resolves to a full detection →
+diagnosis → mitigation → verification → escalation procedure in
+[docs/ops/runbooks/README.md](../ops/runbooks/README.md), and the deeper
+critical procedures the spec enumerates now have dedicated, technically-grounded
+runbooks: [killswitch.md](../ops/runbooks/killswitch.md) (deliberate
+revocation + the **one-request-cycle cross-replica propagation guarantee**
+derived from the real kill-cache mechanism — cache miss always falls through to
+the DB source of truth — plus accidental-fleet-kill recovery),
+[db-failover.md](../ops/runbooks/db-failover.md) (primary failover / connection
+exhaustion / expand-contract bad-migration rollback),
+[key-compromise.md](../ops/runbooks/key-compromise.md) (per-secret emergency
+rotation, blast radius, audit-chain continuity across `kid` rotation), and
+[incident-response.md](../ops/runbooks/incident-response.md) (security IR plan
+reusing the `SECURITY.md` severity matrix + an **incident-commander checklist**
+whose ordering puts evidence-preservation before mitigation — the audit log is
+tamper-evident, so a verify failure is both alert and evidence). **Still open:**
+executing the killswitch-propagation, DB-failover, and PITR-restore drills in a
+staging stand-up (interlinks PR-7/PR-8) and correcting the runbooks against
+what the drills reveal — each carries a "drill log" placeholder for that.
+
 **Goal.** An on-call engineer can resolve any paging alert from a written
 procedure, and security incidents have a defined response.
 
@@ -880,8 +901,13 @@ satisfied:
       → runbook. *SLOs + 16 alerts/7 recording rules landed (multi-window
       multi-burn-rate), every alert links a runbook, `promtool` CI gate added;
       remaining: Grafana SLO row, Alertmanager routing, staging burn drill.*
-- [ ] **PR-6** Runbooks for every paging alert; killswitch + DB-failover
-      drills executed.
+- [~] **PR-6** Runbooks for every paging alert; killswitch + DB-failover
+      drills executed. *Written runbook set complete — every alert resolves to
+      a full procedure, plus dedicated killswitch / DB-failover / key-compromise
+      / security-incident-response runbooks and an incident-commander checklist
+      ([docs/ops/runbooks/](../ops/runbooks/README.md)). Remaining: execute the
+      killswitch-propagation + DB-failover + PITR-restore drills in staging and
+      correct the runbooks against reality (interlinks PR-7/PR-8).*
 - [ ] **PR-7** ≥ 2 replicas; statelessness audit done; killswitch propagates
       across replicas within bound; capacity model published.
 - [ ] **PR-8** PITR restore drill passed; RPO/RTO met; audit-chain verified

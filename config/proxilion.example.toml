@@ -40,6 +40,12 @@
 # Default: "https://localhost:8443".
 # proxy_base_url = "https://proxy.example.com"
 
+# Minimum ingress TLS version (production-readiness.md PR-4). rustls
+# (aws-lc-rs) never negotiates below 1.2 structurally; set "1.3" to
+# additionally refuse TLS 1.2 for a hardened deployment. Default: "1.2".
+# PROXILION_TLS_MIN_VERSION (Helm proxy.tls.minVersion).
+# tls_min_version = "1.2"
+
 # ============================================================================
 # Datastore
 # ============================================================================
@@ -59,6 +65,23 @@
 # Federation bridge URL — JWKS verification + IdP-JWT decoding for the
 # bridge_callback path. Default: "http://federation-bridge:8081" (compose).
 # federation_bridge_url = "https://federation-bridge.example.com"
+
+# ============================================================================
+# Federation & boot safety — production-readiness.md PR-1
+# ============================================================================
+
+# Deployment environment: "development" | "staging" | "production".
+# A protected env (staging/production) REFUSES TO BOOT while the insecure
+# payload-only federation stub is active (a forged token could mint
+# arbitrary authority). Default: "development". PROXILION_ENV.
+# environment = "production"
+
+# Whether the insecure payload-only federation stub (no signature
+# verification) is active — the only federation path until PR-1's verified
+# issuance rewiring lands. Default: true. Leave true in dev; the
+# production-boot guard above is the safety net that refuses to start a
+# protected env while it is on. PROXILION_INSECURE_BRIDGE_STUB.
+# insecure_bridge_stub = true
 
 # ============================================================================
 # Observability

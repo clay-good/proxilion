@@ -809,6 +809,20 @@ fuzz targets in CI with no open crashers.
 
 **Priority:** P2. **Effort:** 2–3 days.
 
+**Status (2026-06-21): in progress — config reference + drift gate landed.**
+The authoritative [config reference](../ops/config-reference.md) now documents
+every operator-facing variable the proxy reads (type, default, precedence,
+security note, env⇔TOML⇔Helm mapping, the `*_FILE` secret convention, and the
+FD/ulimit deployment note). It is **machine-kept-honest**: a new integration
+test ([config_docs.rs](../../crates/proxy/tests/config_docs.rs)) scans the
+proxy source for every `env::var`/`secret_env` read and fails CI on any
+undocumented variable, and asserts every `FileConfig` field is shown in the
+example TOML — the "config reference matches `config.rs` (CI drift check)"
+acceptance criterion. Authoring it caught real drift: `tls_min_version`,
+`environment`, and `insecure_bridge_stub` were settable TOML fields missing
+from the example template (now added). **Still open:** the end-to-end
+deployment guide and the signed go-live PRR checklist.
+
 **Goal.** A new operator can stand up a production-grade Proxilion from one
 authoritative guide, and there is a formal go-live gate.
 
@@ -881,7 +895,11 @@ satisfied:
 - [ ] **PR-12** Threat model refreshed; ASVS L2 zero-criticals; external
       pentest criticals/highs remediated (required for GA / first design
       partner, may trail a locked-down pilot).
-- [ ] **PR-13** Deployment guide + config reference + signed PRR.
+- [~] **PR-13** Deployment guide + config reference + signed PRR. *Config
+      reference + CI doc-drift gate landed
+      ([config-reference.md](../ops/config-reference.md),
+      [config_docs.rs](../../crates/proxy/tests/config_docs.rs)); remaining:
+      end-to-end deployment guide + signed go-live PRR checklist.*
 
 ## Out of scope (explicitly deferred to v2)
 

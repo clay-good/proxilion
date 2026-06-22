@@ -703,8 +703,9 @@ client IP: `X-Forwarded-For` is believed only when the TCP peer is in
 `PROXILION_TRUSTED_PROXIES` (default empty = trust nothing), walked
 right-to-left so a spoofed prefix is ignored. Rate-limit and load-shed are
 implemented dependency-free (token bucket on `moka`, semaphore on `tokio`).
-Remaining PR-2 work (interlinks PR-7): the L4 connection/handshake cap,
-FD-ulimit deployment docs, and the at-scale overload load test.
+Remaining PR-2 work (interlinks PR-7): the L4 connection/handshake cap and the
+at-scale overload load test (the FD-ulimit guidance now lives in the
+[config reference](docs/ops/config-reference.md)).
 
 **PR-4 (transport & trust-boundary hardening) is complete.** Ingress TLS is
 terminated by rustls/aws-lc-rs, which never negotiates below **TLS 1.2**;
@@ -717,6 +718,25 @@ gate, which forbids any production crate from disabling cert/hostname
 verification. The per-hop TLS/mTLS matrix, cipher posture, public-route
 surface, and the staging `testssl`/`nmap` go-live check live in
 [docs/ops/tls-mtls-matrix.md](docs/ops/tls-mtls-matrix.md).
+
+**Configuration is one authoritative, drift-gated reference.** Every
+operator-facing variable the proxy reads — type, default, source precedence,
+security note, and the env ⇔ TOML ⇔ Helm mapping — is documented in
+[docs/ops/config-reference.md](docs/ops/config-reference.md), with the
+copy-and-edit template in [config/proxilion.example.toml](config/proxilion.example.toml).
+Values resolve last-writer-wins through four layers:
+
+```text
+built-in defaults  →  TOML file  →  PROXILION_* env vars  →  programmatic overrides
+                      (PROXILION_CONFIG_FILE)               (embed / tests only)
+```
+
+Secrets read from a mounted `<VAR>_FILE` in preference to the env var (the
+Vault / External-Secrets convention), and the reference is kept honest by a CI
+test ([config_docs.rs](crates/proxy/tests/config_docs.rs)) that fails the build
+if any `env::var`/`secret_env` read or any `FileConfig` field is left
+undocumented — so the config surface cannot drift from its docs. (PR-13's
+config-reference slice; the deployment guide + signed PRR remain.)
 
 ## The Skill Overreach problem
 

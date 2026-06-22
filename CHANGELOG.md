@@ -16,6 +16,23 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Authoritative configuration reference + doc-drift CI gate
+  (production-readiness.md PR-13 — config-reference slice).** A new
+  [docs/ops/config-reference.md](docs/ops/config-reference.md) documents every
+  operator-facing variable the proxy reads — type, default, source precedence,
+  security note, and the env ⇔ TOML ⇔ Helm mapping — grouped by subsystem,
+  plus the `*_FILE` secret-sourcing convention and the FD/ulimit deployment
+  note. The reference is **drift-gated**: a new integration test
+  [crates/proxy/tests/config_docs.rs](crates/proxy/tests/config_docs.rs) scans
+  the proxy source for every `env::var(...)`/`secret_env(...)` read and fails
+  the build if any is undocumented, and asserts every `FileConfig` field
+  appears in [config/proxilion.example.toml](config/proxilion.example.toml) —
+  so a config setting can no longer ship undocumented. The gate runs under the
+  existing `cargo test` CI job (no new workflow). Writing it surfaced and fixed
+  real drift: `tls_min_version` (PR-4), `environment`, and
+  `insecure_bridge_stub` (PR-1) were operator-settable TOML fields **missing
+  from the example template** — now added. **Still open (PR-13):** the
+  end-to-end production deployment guide and the signed go-live PRR checklist.
 - **Build provenance for release artifacts (production-readiness.md PR-10 —
   first slice).** The `proxilion-cli` release binaries now carry **SLSA build
   provenance** via GitHub artifact attestations (`actions/attest-build-provenance`

@@ -3,13 +3,13 @@
         xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
   <url>
     <loc>https://proxilion.com/</loc>
-    <lastmod>2026-05-20</lastmod>
+    <lastmod>2026-08-17</lastmod>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
     <image:image>
       <image:loc>https://proxilion.com/og-image.png</image:loc>
-      <image:title>Proxilion. Confused-deputy defense for managed AI agents.</image:title>
-      <image:caption>A self-hosted reverse proxy that cryptographically binds every managed-agent action to the human user it is acting for.</image:caption>
+      <image:title>Proxilion. A reverse proxy for AI agents.</image:title>
+      <image:caption>A self-hosted reverse proxy that runs in your own cloud, so every call an AI agent makes to your SaaS is checked against the real user first.</image:caption>
     </image:image>
   </url>
   <url>

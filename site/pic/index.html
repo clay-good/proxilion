@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>PIC explained: Provenance, Identity, Continuity — the primitive under Proxilion</title>
 
-<meta name="description" content="PIC (Provenance, Identity, Continuity) is an open authority protocol by Nicola Gallo. It signs cryptographic capability chains (PCAs — Proofs of Causal Authority) where the origin principal is immutable and operations can only narrow, never widen. This page explains the three invariants, what a PCA chain looks like, the Trust Plane, COSE/Ed25519 encoding, and exactly how Proxilion builds on the open-source reference implementation.">
+<meta name="description" content="PIC (Provenance, Identity, Continuity) is an open authority protocol by Nicola Gallo: signed capability chains whose permissions can only narrow, never widen.">
 <meta name="keywords" content="PIC protocol, Provenance Identity Continuity, Proof of Causal Authority, PCA, PCA chain, confused deputy, capability chain, monotonic authority, COSE Sign1, Ed25519, CBOR, Trust Plane, Nicola Gallo, pic-protocol.org, clay-good provenance, agent authority, OAuth proxy, managed AI agent security">
 <link rel="canonical" href="https://proxilion.com/pic/">
 <link rel="alternate" hreflang="en" href="https://proxilion.com/pic/">
@@ -29,7 +29,8 @@
 <meta name="format-detection" content="telephone=no">
 <meta name="application-name" content="Proxilion">
 <meta name="apple-mobile-web-app-title" content="Proxilion">
-<meta name="theme-color" content="#fcfbf8">
+<meta name="theme-color" content="#fcfbf8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#090f14" media="(prefers-color-scheme: dark)">
 <meta name="color-scheme" content="light dark">
 
 <meta property="og:type" content="article">
@@ -135,8 +136,8 @@
   --button-fg: #ffffff;
   --button-bg: linear-gradient(180deg, #1c2733 0%, #131c26 100%);
   --button-border: rgba(0,0,0,0.1);
-  --hero-grad-1: radial-gradient(1200px 700px at 80% -10%, rgba(10, 145, 122, 0.07), transparent 60%);
-  --hero-grad-2: radial-gradient(900px 500px at -10% 30%, rgba(13, 116, 173, 0.045), transparent 60%);
+  --hero-grad-1: radial-gradient(1200px 700px at 80% -10%, rgba(10, 145, 122, 0.1), transparent 62%);
+  --hero-grad-2: radial-gradient(900px 500px at -10% 25%, rgba(13, 116, 173, 0.06), transparent 62%);
   --diagram-node-bg: #ffffff;
   --diagram-node-stroke: #e6e2d7;
   --diagram-node-text: #131c26;
@@ -152,16 +153,16 @@
   --ink-soft: #c7d0d9;
   --body: #b3bcc6;
   --muted: #8a949f;
-  --line: #283139;
-  --line-soft: #1d242b;
-  --bg: #0d1217;
-  --surface: #141b22;
-  --surface-2: #1a222a;
+  --line: #26313b;
+  --line-soft: #1b232b;
+  --bg: #090f14;
+  --surface: #121a21;
+  --surface-2: #0f171e;
   --heading: #f3f6f9;
   --accent: #2fd0ad;
   --accent-strong: #45dcbb;
   --accent-soft: rgba(47, 208, 173, 0.12);
-  --accent-glow: rgba(47, 208, 173, 0.22);
+  --accent-glow: rgba(47, 208, 173, 0.24);
   --info: #4cb3e6;
   --info-soft: rgba(76, 179, 230, 0.1);
   --info-border: rgba(76, 179, 230, 0.28);
@@ -171,10 +172,10 @@
   --button-fg: #0d1217;
   --button-bg: linear-gradient(180deg, #45dcbb 0%, #2fd0ad 100%);
   --button-border: rgba(255,255,255,0.08);
-  --hero-grad-1: radial-gradient(1200px 700px at 80% -10%, rgba(47, 208, 173, 0.1), transparent 60%);
-  --hero-grad-2: radial-gradient(900px 500px at -10% 30%, rgba(76, 179, 230, 0.07), transparent 60%);
-  --diagram-node-bg: #141b22;
-  --diagram-node-stroke: #283139;
+  --hero-grad-1: radial-gradient(1200px 700px at 80% -10%, rgba(47, 208, 173, 0.16), transparent 62%);
+  --hero-grad-2: radial-gradient(900px 500px at -10% 25%, rgba(76, 179, 230, 0.1), transparent 62%);
+  --diagram-node-bg: #121a21;
+  --diagram-node-stroke: #26313b;
   --diagram-node-text: #f3f6f9;
   --diagram-node-sub: #8a949f;
   --diagram-flow-back: #5a6671;
@@ -472,8 +473,8 @@ code, .mono { font-family: var(--mono); }
     <a href="/" class="nav-logo"><span class="dot"></span> PROXILION</a>
     <div class="nav-right">
       <div class="nav-links">
-        <a href="/#what-proxilion-adds" class="nav-link">What</a>
-        <a href="/#how" class="nav-link">How</a>
+        <a href="/#where" class="nav-link">Where it sits</a>
+        <a href="/#how" class="nav-link">How it works</a>
         <a href="/pic/" class="nav-link" aria-current="page">PIC</a>
       </div>
       <a href="https://github.com/clay-good/proxilion" class="nav-cta" rel="noopener noreferrer" target="_blank">GitHub</a>

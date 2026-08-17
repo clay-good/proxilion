@@ -31,10 +31,10 @@
       </g>
       <text x="50" y="32" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="22" font-weight="800" letter-spacing="4" fill="#f5f7fa">PROXILION</text>
     </g>
-    <text x="0" y="140" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="68" font-weight="800" fill="#f5f7fa" letter-spacing="-1.5">Confused-deputy defense</text>
-    <text x="0" y="220" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="68" font-weight="800" fill="#00e5a8" letter-spacing="-1.5">for managed AI agents.</text>
-    <text x="0" y="310" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="28" font-weight="500" fill="#c8ccd4">A self-hosted reverse proxy that cryptographically binds every</text>
-    <text x="0" y="348" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="28" font-weight="500" fill="#c8ccd4">managed-agent action to the human user it is acting for.</text>
-    <text x="0" y="430" font-family="ui-monospace, monospace" font-size="22" font-weight="700" fill="#00e5a8">MIT  ·  Self-hosted  ·  Zero telemetry  ·  Prevention by construction</text>
+    <text x="0" y="140" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="68" font-weight="800" fill="#f5f7fa" letter-spacing="-1.5">A reverse proxy</text>
+    <text x="0" y="220" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="68" font-weight="800" fill="#00e5a8" letter-spacing="-1.5">for AI agents.</text>
+    <text x="0" y="310" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="28" font-weight="500" fill="#c8ccd4">Runs in your own cloud. Every call an agent makes to your SaaS</text>
+    <text x="0" y="348" font-family="ui-sans-serif, -apple-system, Inter, sans-serif" font-size="28" font-weight="500" fill="#c8ccd4">goes through it first, and gets checked against the real user.</text>
+    <text x="0" y="430" font-family="ui-monospace, monospace" font-size="22" font-weight="700" fill="#00e5a8">MIT  ·  Self-hosted  ·  No API keys  ·  Zero telemetry</text>
   </g>
 </svg>

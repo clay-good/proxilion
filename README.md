@@ -29,9 +29,12 @@ original Proxilion work:
   platform and your SaaS providers, swaps in a Proxilion-issued bearer token,
   and stays in path for every subsequent request.
 - **Read-filtering for prompt injection.** Response bodies from Drive, Gmail,
-  and other upstreams are scanned for known injection patterns (delimiter
-  confusion, hidden Unicode, base64-encoded directives, "ignore prior
-  instructions") and stripped or quarantined before the agent reads them.
+  and other upstreams are scanned against the literal and regex patterns in
+  your policy bundle (the shipped bundle carries `"ignore previous
+  instructions"`, `"system prompt:"`, and a delimiter regex) and matches are
+  stripped or quarantined before the agent reads them. Matching runs on the
+  raw body: there is no Unicode normalization or base64 decoding pass, so
+  obfuscated payloads are out of scope for this layer.
 - **Write-gating with human-in-the-loop.** External email sends, mass deletes,
   external file shares are blocked unless a real human explicitly approves
   through Slack or email. Configurable per sender, per domain, per op. Every
@@ -47,7 +50,9 @@ original Proxilion work:
   "this agent can read engineering docs but never finance," with hot-reload.
 - **SaaS adapters.** Google Drive, Gmail, and Calendar at launch, each one
   upstream-aware so policy can reason about specific files, recipients, and
-  events. Pattern is open; add Salesforce, Jira, Notion in a few hundred LOC.
+  events. The pattern is open — Salesforce, Jira, and Notion are unbuilt but
+  fit it; budget roughly the size of the shipped adapters (~1.6k lines each,
+  tests included) rather than a few hundred lines.
 - **The thesis.** That the OAuth integration boundary is the single
   preventative chokepoint for governing managed agents you don't own, and
   that prevention-by-construction is still possible there.

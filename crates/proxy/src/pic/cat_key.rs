@@ -1,18 +1,41 @@
 //! CAT (Continuity Authority Token) verifying-key cache.
 //!
 //! The Trust Plane exposes its CAT public key at `GET /v1/federation/info`.
-//! We fetch it lazily on first use and cache for the process lifetime; key
-//! rotation requires a restart for now (acceptable since CAT keys are
-//! long-lived; revocation is the proper rotation path).
+//! We fetch it lazily and cache it with a **TTL**, so a CAT key rotation is
+//! picked up within [`TTL`] on every replica without a fleet roll
+//! (production-readiness.md PR-3 / PR-7 — this used to be a process-lifetime
+//! `OnceCell`, which made a rotation a restart).
+//!
+//! Two properties beyond a plain TTL cache, both of which exist to keep the
+//! hot path from inheriting the Trust Plane's availability:
+//!
+//! * **One refresh at a time.** A `Mutex` gates the refetch, so an expiry
+//!   under load produces one request to the Trust Plane, not one per
+//!   in-flight agent request.
+//! * **Serve-stale while revalidating, with a ceiling.** A refresh failure
+//!   keeps serving the last known key for up to [`STALE_GRACE`] past the TTL
+//!   rather than failing every bearer check during a transient Trust Plane
+//!   blip. Past that ceiling it fails closed — an unbounded stale
+//!   verification key would silently keep honoring a rotated-out CAT.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde::Deserialize;
 use shared_types::provenance::crypto::PublicKey;
 use thiserror::Error;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, RwLock};
+use tracing::warn;
+
+/// How long a fetched CAT key is served before a refetch. One hour matches
+/// the JWKS cache ([`crate::oauth::jwks`]) and bounds how long a rotation
+/// takes to reach a replica.
+const TTL: Duration = Duration::from_secs(3600);
+
+/// How far past [`TTL`] a stale key may still be served when the refresh
+/// itself is failing. Beyond `TTL + STALE_GRACE` the registry fails closed.
+const STALE_GRACE: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Error)]
 pub enum CatKeyError {
@@ -32,7 +55,25 @@ pub struct CatKeyRegistry {
 struct Inner {
     trust_plane_url: String,
     http: reqwest::Client,
-    cached: OnceCell<PublicKey>,
+    cached: RwLock<Option<Cached>>,
+    /// Gates the refetch so an expiry under load is one Trust Plane request,
+    /// not one per in-flight agent request.
+    refreshing: Mutex<()>,
+}
+
+struct Cached {
+    key: Arc<PublicKey>,
+    fetched_at: Instant,
+}
+
+impl Cached {
+    fn is_fresh(&self) -> bool {
+        self.fetched_at.elapsed() < TTL
+    }
+
+    fn is_servable_while_failing(&self) -> bool {
+        self.fetched_at.elapsed() < TTL + STALE_GRACE
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,42 +91,181 @@ impl CatKeyRegistry {
                     .timeout(Duration::from_secs(5))
                     .build()
                     .expect("reqwest client builds"),
-                cached: OnceCell::new(),
+                cached: RwLock::new(None),
+                refreshing: Mutex::new(()),
             }),
         }
     }
 
-    /// Fetch (and cache) the Trust Plane's CAT verifying key.
-    pub async fn get(&self) -> Result<&PublicKey, CatKeyError> {
-        self.inner
-            .cached
-            .get_or_try_init(|| async {
-                let resp = self
-                    .inner
-                    .http
-                    .get(format!("{}/v1/federation/info", self.inner.trust_plane_url))
-                    .send()
-                    .await?;
-                if !resp.status().is_success() {
-                    return Err(CatKeyError::Status(resp.status().as_u16()));
+    /// The Trust Plane's CAT verifying key, refetched once its [`TTL`]
+    /// elapses.
+    pub async fn get(&self) -> Result<Arc<PublicKey>, CatKeyError> {
+        if let Some(c) = self.inner.cached.read().await.as_ref()
+            && c.is_fresh()
+        {
+            return Ok(c.key.clone());
+        }
+
+        // Expired (or cold). Exactly one task fetches; the rest wait here and
+        // then take the value it stored.
+        let _guard = self.inner.refreshing.lock().await;
+        if let Some(c) = self.inner.cached.read().await.as_ref()
+            && c.is_fresh()
+        {
+            return Ok(c.key.clone());
+        }
+
+        match self.fetch().await {
+            Ok(key) => {
+                let key = Arc::new(key);
+                *self.inner.cached.write().await = Some(Cached {
+                    key: key.clone(),
+                    fetched_at: Instant::now(),
+                });
+                Ok(key)
+            }
+            Err(e) => match self.inner.cached.read().await.as_ref() {
+                // Serve stale rather than failing every bearer check during a
+                // transient Trust Plane blip — but only within the ceiling.
+                Some(c) if c.is_servable_while_failing() => {
+                    warn!(
+                        error = %e,
+                        stale_secs = c.fetched_at.elapsed().as_secs(),
+                        "CAT key refresh failed; serving the last known key within the stale grace window"
+                    );
+                    Ok(c.key.clone())
                 }
-                let info: InfoResp = resp.json().await?;
-                let bytes = B64
-                    .decode(&info.public_key)
-                    .map_err(|e| CatKeyError::Decode(e.to_string()))?;
-                let arr: [u8; 32] = bytes
-                    .try_into()
-                    .map_err(|_| CatKeyError::Decode("expected 32 bytes".into()))?;
-                PublicKey::from_bytes(&info.kid, &arr)
-                    .map_err(|e| CatKeyError::Decode(e.to_string()))
-            })
-            .await
+                _ => Err(e),
+            },
+        }
+    }
+
+    async fn fetch(&self) -> Result<PublicKey, CatKeyError> {
+        let resp = self
+            .inner
+            .http
+            .get(format!("{}/v1/federation/info", self.inner.trust_plane_url))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(CatKeyError::Status(resp.status().as_u16()));
+        }
+        let info: InfoResp = resp.json().await?;
+        let bytes = B64
+            .decode(&info.public_key)
+            .map_err(|e| CatKeyError::Decode(e.to_string()))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| CatKeyError::Decode("expected 32 bytes".into()))?;
+        PublicKey::from_bytes(&info.kid, &arr).map_err(|e| CatKeyError::Decode(e.to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── PR-3/PR-7: TTL refresh, single-flight, serve-stale ────────────
+
+    /// A valid Ed25519 verifying key (the public half of the throwaway
+    /// keypair used across the PIC tests), as raw bytes and base64.
+    const TEST_PUB: [u8; 32] = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07,
+        0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+        0x51, 0x1a,
+    ];
+
+    fn test_key() -> PublicKey {
+        PublicKey::from_bytes("cat-1", &TEST_PUB).expect("valid ed25519 verifying key")
+    }
+
+    async fn mock_trust_plane(hits: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/v1/federation/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kid": "cat-1",
+                "public_key": B64.encode(TEST_PUB),
+            })))
+            .mount(hits)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fetches_once_and_serves_the_cached_key_within_the_ttl() {
+        let server = wiremock::MockServer::start().await;
+        mock_trust_plane(&server).await;
+        let reg = CatKeyRegistry::new(server.uri());
+
+        let a = reg.get().await.expect("first fetch");
+        let b = reg.get().await.expect("cached");
+        assert!(Arc::ptr_eq(&a, &b), "the second get must reuse the Arc");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "a fresh cache entry must not re-hit the Trust Plane",
+        );
+    }
+
+    #[test]
+    fn freshness_windows_are_ttl_then_ttl_plus_grace() {
+        let aged = |d: Duration| Cached {
+            key: Arc::new(test_key()),
+            fetched_at: Instant::now()
+                .checked_sub(d)
+                .expect("monotonic clock headroom"),
+        };
+        let fresh = aged(TTL / 2);
+        assert!(fresh.is_fresh());
+        assert!(fresh.is_servable_while_failing());
+
+        // Past the TTL: no longer fresh, but still servable if the refresh
+        // itself is failing.
+        let stale = aged(TTL + STALE_GRACE / 2);
+        assert!(!stale.is_fresh());
+        assert!(stale.is_servable_while_failing());
+
+        // Past the ceiling: fail closed rather than honor a rotated-out CAT.
+        let ancient = aged(TTL + STALE_GRACE + Duration::from_secs(1));
+        assert!(!ancient.is_fresh());
+        assert!(!ancient.is_servable_while_failing());
+    }
+
+    #[tokio::test]
+    async fn serves_the_stale_key_when_a_refresh_fails_inside_the_grace_window() {
+        // Trust Plane unreachable (connect-refused), but we hold a key that
+        // is expired yet inside the grace window: keep serving rather than
+        // failing every bearer check on a transient blip.
+        let reg = CatKeyRegistry::new("http://127.0.0.1:1/".into());
+        *reg.inner.cached.write().await = Some(Cached {
+            key: Arc::new(test_key()),
+            fetched_at: Instant::now()
+                .checked_sub(TTL + STALE_GRACE / 2)
+                .expect("monotonic clock headroom"),
+        });
+        let key = reg
+            .get()
+            .await
+            .expect("stale key is served inside the grace window");
+        assert_eq!(key.to_bytes(), TEST_PUB);
+    }
+
+    #[tokio::test]
+    async fn fails_closed_when_the_stale_key_is_past_the_grace_ceiling() {
+        let reg = CatKeyRegistry::new("http://127.0.0.1:1/".into());
+        *reg.inner.cached.write().await = Some(Cached {
+            key: Arc::new(test_key()),
+            fetched_at: Instant::now()
+                .checked_sub(TTL + STALE_GRACE + Duration::from_secs(1))
+                .expect("monotonic clock headroom"),
+        });
+        let err = reg
+            .get()
+            .await
+            .expect_err("past the ceiling must fail closed");
+        assert!(matches!(err, CatKeyError::Fetch(_)), "got {err:?}");
+    }
 
     #[test]
     fn cat_key_error_display_strings_are_stable() {
@@ -764,13 +944,12 @@ mod tests {
 
     #[test]
     fn cat_key_registry_inner_field_count_pinned_at_exactly_three_via_exhaustive_destructure() {
-        // `Inner { trust_plane_url, http, cached }` — exactly 3 fields.
-        // A 4th field landing (e.g. `cache_ttl: Duration` for periodic
-        // key re-fetch on rotation, OR `kid_filter: Option<String>` to
-        // pin a specific kid through development) without matching
+        // `Inner { trust_plane_url, http, cached, refreshing }` — exactly
+        // 4 fields. A 5th field landing (e.g. `kid_filter: Option<String>`
+        // to pin a specific kid through development) without matching
         // `new()` constructor wiring would silently leave the new
         // field zero-initialized. The exhaustive destructure forces a
-        // 4th field to update this site in lockstep with `new()`.
+        // 5th field to update this site in lockstep with `new()`.
         // Symmetric to the WebhookNotifier 6-field + SlackNotifier
         // 6-field + TeeStream 2-field pins extended to this sibling
         // module-private holder type.
@@ -780,6 +959,7 @@ mod tests {
             trust_plane_url: _,
             http: _,
             cached: _,
+            refreshing: _,
         } = inner;
     }
 
@@ -866,7 +1046,7 @@ mod tests {
         // Compile-time witness: `&CatKeyRegistry` method dispatch.
         fn require_borrow_get<'a>(
             r: &'a CatKeyRegistry,
-        ) -> impl std::future::Future<Output = Result<&'a PublicKey, CatKeyError>> + 'a {
+        ) -> impl std::future::Future<Output = Result<Arc<PublicKey>, CatKeyError>> + 'a {
             r.get()
         }
         let _fut = require_borrow_get(&registry);

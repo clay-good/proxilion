@@ -298,7 +298,7 @@ async fn verify_pca_signature(state: &AuthState, cbor: &[u8]) -> Result<(), Auth
         .get()
         .await
         .map_err(|e| AuthFail::CatKey(e.to_string()))?;
-    verify_with_key(cbor, key)
+    verify_with_key(cbor, &key)
 }
 
 fn verify_with_key(

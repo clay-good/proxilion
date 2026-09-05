@@ -21,7 +21,10 @@
 
 - **CAT signing key.** The proxy only fetches and caches the Trust Plane's
   CAT **public** key for *verification*
-  ([cat_key.rs](../../crates/proxy/src/pic/cat_key.rs) holds a `PublicKey`).
+  ([cat_key.rs](../../crates/proxy/src/pic/cat_key.rs) holds a `PublicKey`
+  behind a 1 h TTL, so a CAT rotation reaches every replica within the hour
+  without a fleet roll; a failing refresh serves the last key for at most one
+  more hour, then fails closed).
   The private CAT signing key (Helm `trust-plane-cat-key`, an Ed25519 seed)
   is consumed by the **Trust Plane** workload, not the proxy. Ed25519-dalek's
   `SigningKey` zeroizes on drop where it is held.

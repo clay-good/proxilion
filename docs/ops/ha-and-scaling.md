@@ -19,7 +19,7 @@ the PIC executor identity, which the boot guard now enforces (§3).
 | [`pic::cache`](../../crates/proxy/src/pic/cache.rs) `PcaCache` | PCA CBOR | **A — DB-backed** | Backed by the `pca_cache` table, not process memory. Shared by construction. |
 | [`operator_auth`](../../crates/proxy/src/operator_auth.rs) `touch_cache` (`Uuid → Instant`) | debounce for `last_used_at` writes | **A — accelerator** | Worst case N× as many `last_used_at` UPDATEs. Cosmetic. |
 | [`oauth::jwks`](../../crates/proxy/src/oauth/jwks.rs) JWKS cache + unknown-`kid` throttle | IdP verifying keys | **A — accelerator** | Independent per replica, so steady-state IdP QPS is N/hour and the unknown-`kid` refresh throttle admits at most N per minute fleet-wide. Size §5 against your IdP's rate limit. |
-| [`pic::cat_key`](../../crates/proxy/src/pic/cat_key.rs) `OnceCell<PublicKey>` | Trust Plane CAT verifying key | **C — pinned for process life** | Fetched once and never refreshed. A CAT key rotation is only picked up by a **restart**; roll the fleet as part of the rotation. Tracked under PR-3. |
+| [`pic::cat_key`](../../crates/proxy/src/pic/cat_key.rs) CAT key (1 h TTL + 1 h stale grace) | Trust Plane CAT verifying key | **A — accelerator** | Refetched once the TTL elapses, so a CAT rotation reaches every replica within an hour with no fleet roll. One refresh at a time per replica; a failing refresh keeps serving the last key for at most one more hour, then fails closed. |
 | [`edge`](../../crates/proxy/src/edge.rs) rate-limit buckets (`IpAddr → Bucket`) | per-IP token buckets | **B — per-replica limit** | Effective fleet limit is `rate_limit_per_sec × N`. See §2. |
 | [`edge`](../../crates/proxy/src/edge.rs) concurrency `Semaphore` | global in-flight ceiling | **B — per-replica limit** | Effective fleet ceiling is `max_concurrent_requests × N`. See §2. |
 | [`notifier::burst`](../../crates/proxy/src/notifier/burst.rs) `BurstSuppressor` buckets | approval-notification suppression | **B — per-replica limit** | Best-effort by design: a burst spread across replicas can emit up to N× the configured notifications. Accepted (notification noise, not an authority decision). |
@@ -98,5 +98,3 @@ governs how long the accelerator keeps saving a DB round-trip.
   enforced by the others within the §4 bound.
 - **Postgres HA** (interlocks PR-8): primary + replica with automated
   failover, and PgBouncer if `pool_size × N` outgrows `max_connections`.
-- **CAT key refresh.** Replace the process-lifetime `OnceCell` with a TTL so a
-  CAT rotation does not require a fleet roll (PR-3).

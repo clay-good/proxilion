@@ -620,9 +620,8 @@ one replica), node-level `topologySpreadConstraints`, a raw affinity
 passthrough, and a `terminationGracePeriodSeconds` that outlasts the 30 s
 in-process drain. **Remaining:** the capacity numbers (k6/vegeta at target
 load across ≥ 2 replicas), an HPA keyed on in-flight requests rather than CPU,
-the replica-loss / cross-replica revocation drill, Postgres HA + PgBouncer
-sizing (interlocks PR-8), and a TTL on the CAT-key `OnceCell` so a rotation
-does not require a fleet roll (interlocks PR-3).
+the replica-loss / cross-replica revocation drill, and Postgres HA + PgBouncer
+sizing (interlocks PR-8).
 
 **Goal.** Proxilion runs as N replicas behind a load balancer with no shared
 in-process state that breaks correctness, survives a replica loss with no

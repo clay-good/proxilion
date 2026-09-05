@@ -487,6 +487,18 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Changed
 
+- **The Trust Plane CAT verifying key is cached with a TTL instead of for the
+  process lifetime (production-readiness.md PR-3 / PR-7).** It was a
+  `OnceCell`: fetched once and never refreshed, so picking up a CAT key
+  rotation meant rolling the whole fleet. It now refetches after a 1 h TTL, so
+  a rotation reaches every replica within the hour on its own. Two properties
+  keep the hot path off the Trust Plane's availability: a mutex gates the
+  refetch, so an expiry under load is one request upstream rather than one per
+  in-flight agent request; and a *failing* refresh keeps serving the last known
+  key for at most one further hour rather than failing every bearer check
+  during a transient blip — past that ceiling it fails closed, because an
+  unbounded stale verification key would silently keep honoring a rotated-out
+  CAT.
 - **A protected `PROXILION_ENV` now also refuses to boot on an ephemeral PIC
   executor identity (production-readiness.md PR-7).** `staging`/`production`
   require `PROXILION_EXECUTOR_KID` + `PROXILION_EXECUTOR_KEY`. This is a hard

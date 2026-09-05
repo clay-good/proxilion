@@ -16,6 +16,25 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Alertmanager routing, and a CI gate that proves it routes
+  (production-readiness.md PR-5).** The alert rules said *what* fires; nothing
+  said *who wakes up*. [ops/prometheus/alertmanager.yml](ops/prometheus/alertmanager.yml)
+  now routes `severity: page` to the on-call pager, the two security
+  invariants (`ProxilionPcaVerifyFailure` / `ProxilionPicInvariantViolation`)
+  to a **separate** security receiver with no group wait and a 30-minute
+  re-notify, and everything else — including anything unlabelled — to the team
+  queue. Three decisions carry most of the value: grouping is by `alertname` +
+  `slo` and never by instance, so a fleet-wide Trust Plane outage pages once
+  rather than once per replica; the security lane skips the group wait because
+  a possible compromise must not queue behind a noisier alert, and routes to a
+  distinct receiver so it stands out in the pager timeline at incident review;
+  and two inhibition rules stop one fault paging three times (a dead Trust
+  Plane suppresses the issuance/callback failures it causes, and a fast-burn
+  page suppresses the slow-burn ticket for the same SLO). The
+  `prometheus-rules` CI job now runs `amtool check-config` **and** asserts each
+  lane resolves to the receiver the docs claim, so a config that is well-formed
+  but mis-wired cannot merge.
+
 - **Backup / restore / DR procedure and a post-restore integrity check
   (production-readiness.md PR-8).** New
   [docs/ops/runbooks/backup-restore.md](docs/ops/runbooks/backup-restore.md)

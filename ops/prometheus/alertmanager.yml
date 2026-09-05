@@ -1,0 +1,120 @@
+# Proxilion — Alertmanager routing (production-readiness.md PR-5).
+#
+# Pairs with ../prometheus/alerts.yml, which labels every alert
+# `severity: page | ticket` and (for SLO-derived alerts) `slo: <name>`. This
+# file is the other half of "operators get paged on user-impacting conditions
+# before the budget is exhausted, and never on noise": the rules decide *what*
+# fires, this decides *who* wakes up and how often.
+#
+# Drop it in as your Alertmanager config, or merge the `route` children and
+# `inhibit_rules` into an existing tree. Then point Prometheus at it — see the
+# commented `alerting:` block in prometheus.yml.
+#
+# Every receiver below is a placeholder: replace the URLs/keys, or delete the
+# receivers you don't use and repoint the routes. `amtool check-config
+# ops/prometheus/alertmanager.yml` is run in CI, so a malformed edit here
+# cannot merge.
+
+global:
+  # How long a firing alert stays firing after Prometheus stops sending it.
+  # Must exceed Prometheus' evaluation_interval by a comfortable margin (15s
+  # here) or a busy scrape cycle resolves alerts spuriously.
+  resolve_timeout: 5m
+
+# Alert-body templates. `runbook_url` is on every Proxilion alert, so the
+# notification always carries the procedure — the single highest-value thing
+# in a page at 3am.
+templates:
+  - "/etc/alertmanager/templates/*.tmpl"
+
+route:
+  # Group by alert name and SLO so one degraded SLO is one notification, not
+  # one per series. Deliberately NOT grouping by instance: a fleet-wide
+  # Trust Plane outage should page once, not once per replica.
+  group_by: ["alertname", "slo"]
+  # Wait for siblings before the first notification, so a cascade (Trust Plane
+  # down → issuance failing → availability burn) arrives as one page.
+  group_wait: 30s
+  group_interval: 5m
+  # Re-notify cadence for a still-firing group. Long enough not to be noise,
+  # short enough that a page is not silently forgotten across a shift change.
+  repeat_interval: 4h
+  receiver: proxilion-ticket
+
+  routes:
+    # ── Pages: user-impacting or security-invariant. Wake someone. ────────
+    - matchers:
+        - severity = "page"
+      receiver: proxilion-page
+      group_wait: 15s
+      repeat_interval: 1h
+
+      routes:
+        # The two invariants that must always read zero. A PCA verification
+        # failure or a PIC invariant violation is a possible compromise, not
+        # a capacity problem: notify immediately, re-notify aggressively, and
+        # never let the grouping delay it behind a noisier alert.
+        - matchers:
+            - alertname =~ "ProxilionPcaVerifyFailure|ProxilionPicInvariantViolation"
+          receiver: proxilion-security
+          group_wait: 0s
+          group_interval: 1m
+          repeat_interval: 30m
+
+    # ── Tickets: degraded but not user-impacting yet. File, don't wake. ───
+    - matchers:
+        - severity = "ticket"
+      receiver: proxilion-ticket
+
+inhibit_rules:
+  # A dead dependency explains its own downstream failures. Without these,
+  # one Trust Plane outage pages three times.
+  - source_matchers:
+      - alertname = "ProxilionTrustPlaneDown"
+    target_matchers:
+      - alertname =~ "ProxilionPcaIssueFailing|ProxilionFederationCallbackFailing"
+    equal: ["job"]
+
+  # Same alert firing at both burn rates: the fast-burn page supersedes the
+  # slow-burn ticket for the same SLO.
+  - source_matchers:
+      - severity = "page"
+    target_matchers:
+      - severity = "ticket"
+    equal: ["slo"]
+
+receivers:
+  # Paging integration (PagerDuty / Opsgenie / equivalent). Replace the key.
+  - name: proxilion-page
+    pagerduty_configs:
+      - routing_key: "<PAGERDUTY_ROUTING_KEY>"
+        description: '{{ .CommonAnnotations.summary }}'
+        details:
+          runbook: '{{ .CommonAnnotations.runbook_url }}'
+          slo: '{{ .CommonLabels.slo }}'
+          firing: '{{ .Alerts.Firing | len }}'
+
+  # Security-invariant page. Separate receiver so it can route to a different
+  # escalation policy (security on-call, not platform on-call) and so it is
+  # visibly distinct in the pager timeline during an incident review.
+  - name: proxilion-security
+    pagerduty_configs:
+      - routing_key: "<PAGERDUTY_SECURITY_ROUTING_KEY>"
+        severity: critical
+        description: 'SECURITY: {{ .CommonAnnotations.summary }}'
+        details:
+          runbook: '{{ .CommonAnnotations.runbook_url }}'
+          note: 'Preserve evidence before mitigating — see incident-response.md'
+
+  # Ticket lane. A chat channel or an issue tracker webhook; nobody is woken.
+  - name: proxilion-ticket
+    slack_configs:
+      # Replace with your real incoming-webhook URL.
+      - api_url: "https://hooks.slack.com/services/REPLACE/WITH/YOUR-WEBHOOK"
+        channel: "#proxilion-alerts"
+        title: '{{ .CommonAnnotations.summary }}'
+        text: >-
+          {{ .CommonAnnotations.description }}
+          {{ if .CommonAnnotations.runbook_url }}
+          Runbook: {{ .CommonAnnotations.runbook_url }}{{ end }}
+        send_resolved: true

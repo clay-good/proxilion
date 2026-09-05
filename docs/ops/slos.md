@@ -63,20 +63,50 @@ PR-7 (statelessness audit) follow-up.
 
 ## Routing
 
-Route by the `severity` label: `page` → the on-call pager (PagerDuty/Opsgenie),
-`ticket` → the team queue. Every alert's `runbook_url` resolves into
-[runbooks/](./runbooks/). Example Alertmanager route:
+A complete Alertmanager config ships at
+[`ops/prometheus/alertmanager.yml`](../../ops/prometheus/alertmanager.yml) —
+drop it in, or merge its `route` children and `inhibit_rules` into an existing
+tree. What it does and why:
 
-```yaml
-route:
-  receiver: team-ticket
-  routes:
-    - matchers: [severity="page"]
-      receiver: oncall-pager
-```
+| Alert | Receiver | Cadence |
+|---|---|---|
+| `severity: page` | `proxilion-page` (on-call pager) | 15 s group wait, re-notify hourly |
+| `alertname` = `ProxilionPcaVerifyFailure` or `ProxilionPicInvariantViolation` | `proxilion-security` | **no** group wait, re-notify every 30 m |
+| `severity: ticket` (and anything unlabelled) | `proxilion-ticket` (team queue) | 30 s group wait, re-notify every 4 h |
+
+Three decisions worth stating, because they are the difference between a
+useful pager and an ignored one:
+
+- **Grouping is by `alertname` + `slo`, never by instance.** A fleet-wide
+  Trust Plane outage should page once, not once per replica.
+- **The security invariants get their own receiver and skip the group wait.**
+  A PCA verification failure or a PIC invariant violation is a possible
+  compromise, not a capacity problem; it should not queue behind a noisier
+  alert, and it should be visibly distinct in the pager timeline at incident
+  review. The receiver is separate so it can route to security on-call rather
+  than platform on-call.
+- **Two inhibitions stop one fault paging three times.**
+  `ProxilionTrustPlaneDown` suppresses the issuance/callback failures it
+  causes, and a fast-burn page suppresses the slow-burn ticket for the same
+  SLO.
+
+Every alert's `runbook_url` is carried into the notification body, so a page
+at 3am arrives with its procedure attached; they resolve into
+[runbooks/](./runbooks/).
 
 ## Validation
 
-`promtool check rules ops/prometheus/alerts.yml` runs in CI
-([prometheus-rules.yml](../../.github/workflows/prometheus-rules.yml)) on
-every change to the rules.
+Both halves are gated in CI
+([prometheus-rules.yml](../../.github/workflows/prometheus-rules.yml)) on every
+change to `ops/prometheus/`:
+
+- `promtool check rules ops/prometheus/alerts.yml` + `check config`
+- `amtool check-config ops/prometheus/alertmanager.yml`
+
+The routing tree itself is checkable locally:
+
+```bash
+amtool config routes test --config.file=ops/prometheus/alertmanager.yml \
+  'severity="page"' 'alertname="ProxilionPcaVerifyFailure"'
+# → proxilion-security
+```

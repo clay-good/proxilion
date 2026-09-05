@@ -514,9 +514,21 @@ content; PR-6 expands). `prometheus.yml` loads the rules and a
 `set_buckets`). The Grafana dashboard now carries an **SLO/error-budget row**
 (availability, error-budget burn, policy-eval p99, federation success, +
 multi-window burn-rate panel) in
-[ops/grafana/proxilion.json](../../ops/grafana/proxilion.json). **Still
-open:** Alertmanager routing wiring and the staging fault-injection burn
-drill (the "a synthetic burn fires the page within budget" acceptance check).
+[ops/grafana/proxilion.json](../../ops/grafana/proxilion.json).
+**Alertmanager routing is now landed** (2026-09-05):
+[ops/prometheus/alertmanager.yml](../../ops/prometheus/alertmanager.yml)
+routes `severity: page` to the on-call pager, the two security invariants
+(`ProxilionPcaVerifyFailure` / `ProxilionPicInvariantViolation`) to a
+**separate** security receiver with no group wait and a 30 m re-notify — a
+possible compromise must not queue behind a noisier alert, and it should be
+visibly distinct in the pager timeline at incident review — and everything
+else to the team queue. Grouping is by `alertname` + `slo`, never by instance,
+so a fleet-wide Trust Plane outage pages once rather than once per replica;
+two inhibitions stop one fault paging three times. The CI job now runs
+`amtool check-config` **and** asserts each lane resolves to the receiver
+`slos.md` documents, so a well-formed but mis-wired route cannot merge.
+**Still open:** the staging fault-injection burn drill (the "a synthetic burn
+fires the page within budget" acceptance check).
 
 **Goal.** Operators get paged on user-impacting conditions *before* the
 budget is exhausted, and never on noise.
@@ -978,8 +990,10 @@ satisfied:
       Helm path (interlinks PR-7/PR-11).
 - [~] **PR-5** SLOs defined; burn-rate alerts firing correctly; every alert
       → runbook. *SLOs + 16 alerts/7 recording rules landed (multi-window
-      multi-burn-rate), every alert links a runbook, `promtool` CI gate added;
-      remaining: Grafana SLO row, Alertmanager routing, staging burn drill.*
+      multi-burn-rate), every alert links a runbook, Grafana SLO row and
+      Alertmanager routing landed, and CI gates all three (`promtool check
+      rules`/`check config`, `amtool check-config`, plus a per-lane routing
+      assertion); remaining: the staging burn drill.*
 - [~] **PR-6** Runbooks for every paging alert; killswitch + DB-failover
       drills executed. *Written runbook set complete — every alert resolves to
       a full procedure, plus dedicated killswitch / DB-failover / key-compromise

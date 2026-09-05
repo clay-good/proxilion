@@ -22,6 +22,7 @@ jobs:
     timeout-minutes: 5
     env:
       PROM_VERSION: "2.53.1"
+      ALERTMANAGER_VERSION: "0.27.0"
     steps:
       - uses: actions/checkout@v4
 
@@ -40,3 +41,40 @@ jobs:
       - name: check config
         # Validates prometheus.yml (incl. that it references alerts.yml).
         run: promtool check config ops/prometheus/prometheus.yml
+
+      - name: install amtool
+        run: |
+          set -euo pipefail
+          url="https://github.com/prometheus/alertmanager/releases/download/v${ALERTMANAGER_VERSION}/alertmanager-${ALERTMANAGER_VERSION}.linux-amd64.tar.gz"
+          curl -fsSL "$url" -o /tmp/am.tar.gz
+          tar -xzf /tmp/am.tar.gz -C /tmp
+          sudo install "/tmp/alertmanager-${ALERTMANAGER_VERSION}.linux-amd64/amtool" /usr/local/bin/amtool
+          amtool --version
+
+      - name: check alertmanager config
+        run: amtool check-config ops/prometheus/alertmanager.yml
+
+      - name: check alert routing
+        # The routing tree is the half of PR-5 that decides who wakes up.
+        # Assert the three lanes resolve to the receivers slos.md documents,
+        # so a well-formed but mis-wired route can't merge.
+        run: |
+          set -euo pipefail
+          route() {
+            amtool config routes test \
+              --config.file=ops/prometheus/alertmanager.yml "$@"
+          }
+          expect() {
+            want="$1"; shift
+            got="$(route "$@")"
+            [ "$got" = "$want" ] || {
+              echo "routing drift: $* -> $got (expected $want)" >&2
+              exit 1
+            }
+            echo "ok: $* -> $got"
+          }
+          expect proxilion-page     'severity="page"'   'alertname="ProxilionTrustPlaneDown"'
+          expect proxilion-ticket   'severity="ticket"' 'alertname="ProxilionEdgeLoadShedding"'
+          expect proxilion-security 'severity="page"'   'alertname="ProxilionPcaVerifyFailure"'
+          expect proxilion-security 'severity="page"'   'alertname="ProxilionPicInvariantViolation"'
+          expect proxilion-ticket   'alertname="SomethingUnlabelled"' 

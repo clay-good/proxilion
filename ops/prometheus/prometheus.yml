@@ -14,7 +14,10 @@ global:
 rule_files:
   - alerts.yml
 
-# Point this at your Alertmanager (routing/severity in docs/ops/slos.md).
+# Point this at your Alertmanager. A complete routing config — severity lanes,
+# a separate security receiver, and the inhibitions that stop one fault paging
+# three times — ships alongside at ./alertmanager.yml (rationale in
+# ../../docs/ops/slos.md#routing).
 # alerting:
 #   alertmanagers:
 #     - static_configs:

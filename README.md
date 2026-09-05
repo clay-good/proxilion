@@ -787,8 +787,16 @@ rationale and measurement windows in [docs/ops/slos.md](docs/ops/slos.md), and
 7 recording rules — Google-SRE multi-window multi-burn-rate for availability
 plus federation, security-invariant (`pca_verify`/`pic` must read zero), and
 operational signals — gated in CI by `promtool`
-([`prometheus-rules`](.github/workflows/prometheus-rules.yml)). **Every alert
-links to a runbook**: each paging alert resolves to a full detection →
+([`prometheus-rules`](.github/workflows/prometheus-rules.yml)).
+[ops/prometheus/alertmanager.yml](ops/prometheus/alertmanager.yml) is the other
+half: `severity: page` → the on-call pager, the two security invariants → a
+*separate* security receiver with no group wait (a possible compromise must not
+queue behind a noisier alert), everything else → the team queue. Grouping is by
+`alertname` + `slo` and never by instance, so a fleet-wide Trust Plane outage
+pages once, not once per replica, and two inhibition rules stop one fault
+paging three times. CI runs `amtool check-config` *and* asserts each lane
+resolves to the documented receiver, so a mis-wired route can't merge.
+**Every alert links to a runbook**: each paging alert resolves to a full detection →
 diagnosis → mitigation → verification → escalation procedure in
 [docs/ops/runbooks/](docs/ops/runbooks/README.md), backed by dedicated
 critical-procedure runbooks for the
@@ -797,9 +805,10 @@ cross-replica propagation guarantee), [DB failover](docs/ops/runbooks/db-failove
 [key compromise](docs/ops/runbooks/key-compromise.md), and
 [security incident response](docs/ops/runbooks/incident-response.md) (an
 incident-commander checklist that preserves the tamper-evident audit log as
-evidence *before* mitigating). Remaining PR-5/PR-6 work is staging execution:
-Alertmanager routing, the synthetic burn drill, and the killswitch / DB-failover
-/ PITR-restore drills.
+evidence *before* mitigating), and
+[backup & restore](docs/ops/runbooks/backup-restore.md). Remaining PR-5/PR-6
+work is staging execution: the synthetic burn drill and the killswitch /
+DB-failover / PITR-restore drills.
 
 **Configuration is one authoritative, drift-gated reference.** Every
 operator-facing variable the proxy reads — type, default, source precedence,

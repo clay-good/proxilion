@@ -23,6 +23,16 @@ scrape_configs:
 That file also carries an example Alertmanager rule for the one series that must
 always read zero (`proxilion_pca_verify_failures_total`).
 
+## Alertmanager
+
+[`prometheus/alertmanager.yml`](prometheus/alertmanager.yml) is a complete
+routing config for the alert set: `severity: page` → the on-call pager, the two
+security invariants → a separate security receiver with no group wait, and
+everything else → the team queue, with inhibitions so one Trust Plane outage
+pages once rather than three times. Replace the placeholder routing keys and
+webhook URL. `amtool check-config` runs on it in CI. Rationale and the routing
+table are in [docs/ops/slos.md](../docs/ops/slos.md#routing).
+
 ## Grafana
 
 [`grafana/proxilion.json`](grafana/proxilion.json) is a starter dashboard:

@@ -94,10 +94,10 @@ pub(crate) async fn read_bounded(
     mut resp: reqwest::Response,
     max: usize,
 ) -> Result<Vec<u8>, AppError> {
-    if let Some(len) = resp.content_length() {
-        if len as usize > max {
-            return Err(AppError::UpstreamTooLarge);
-        }
+    if let Some(len) = resp.content_length()
+        && len as usize > max
+    {
+        return Err(AppError::UpstreamTooLarge);
     }
     let mut buf = Vec::new();
     while let Some(chunk) = resp.chunk().await? {

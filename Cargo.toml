@@ -9,7 +9,14 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# The dependency tree's real floor, not an aspiration. `time`, `home`,
+# `async-nats` and `jsonwebtoken` all declare `rust-version = "1.88"`, so the
+# workspace has not resolved on 1.85–1.87 for a while; declaring 1.85 only
+# bought a confusing resolver error instead of a clear "requires rustc 1.88".
+# Keeping it honest also lets clippy enable its MSRV-gated lints (let-chains
+# and `is_multiple_of` both landed by 1.88), which is what surfaced the
+# collapsible_if / manual_is_multiple_of cleanups in this commit.
+rust-version = "1.88"
 license = "MIT"
 authors = ["Proxilion contributors"]
 repository = "https://github.com/clay-good/proxilion"

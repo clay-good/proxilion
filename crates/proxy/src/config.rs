@@ -286,10 +286,10 @@ impl Config {
     /// [`ConfigBuilder::build`].
     pub fn load() -> Result<Self, ConfigError> {
         let mut builder = ConfigBuilder::defaults();
-        if let Ok(path) = env::var("PROXILION_CONFIG_FILE") {
-            if !path.is_empty() {
-                builder = builder.from_file(&path)?;
-            }
+        if let Ok(path) = env::var("PROXILION_CONFIG_FILE")
+            && !path.is_empty()
+        {
+            builder = builder.from_file(&path)?;
         }
         builder.from_env_layer()?.build()
     }
@@ -490,10 +490,10 @@ impl ConfigBuilder {
                 self.siem_batch_size = Some(n).filter(|n| *n > 1);
             }
         }
-        if let Ok(v) = env::var("PROXILION_SIEM_BATCH_MAX_AGE_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
-                self.siem_batch_max_age_secs = n.max(1);
-            }
+        if let Ok(v) = env::var("PROXILION_SIEM_BATCH_MAX_AGE_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.siem_batch_max_age_secs = n.max(1);
         }
         if let Ok(v) = env::var("PROXILION_BLOCKED_WEBHOOK_URL") {
             self.blocked_webhook_url = Some(v).filter(|s| !s.is_empty());
@@ -515,10 +515,10 @@ impl ConfigBuilder {
                 self.max_request_body_bytes = n;
             }
         }
-        if let Ok(v) = env::var("PROXILION_REQUEST_TIMEOUT_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
-                self.request_timeout_secs = n;
-            }
+        if let Ok(v) = env::var("PROXILION_REQUEST_TIMEOUT_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.request_timeout_secs = n;
         }
         if let Ok(v) = env::var("PROXILION_RATE_LIMIT_PER_SEC") {
             // `0` is a valid explicit "disable rate limiting" sentinel; a
@@ -527,15 +527,15 @@ impl ConfigBuilder {
                 self.rate_limit_per_sec = n;
             }
         }
-        if let Ok(v) = env::var("PROXILION_RATE_LIMIT_BURST") {
-            if let Ok(n) = v.parse::<u32>() {
-                self.rate_limit_burst = n;
-            }
+        if let Ok(v) = env::var("PROXILION_RATE_LIMIT_BURST")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.rate_limit_burst = n;
         }
-        if let Ok(v) = env::var("PROXILION_MAX_CONCURRENT_REQUESTS") {
-            if let Ok(n) = v.parse::<usize>() {
-                self.max_concurrent_requests = n;
-            }
+        if let Ok(v) = env::var("PROXILION_MAX_CONCURRENT_REQUESTS")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.max_concurrent_requests = n;
         }
         if let Ok(v) = env::var("PROXILION_TRUSTED_PROXIES") {
             // Comma-separated IPs. Malformed entries are dropped (logged
@@ -681,15 +681,15 @@ impl ConfigBuilder {
         if let Some(v) = file.trusted_proxies {
             self.trusted_proxies = v.iter().filter_map(|s| s.parse().ok()).collect();
         }
-        if let Some(v) = file.tls_min_version {
-            if let Some(ver) = TlsMinVersion::parse(&v) {
-                self.tls_min_version = ver;
-            }
+        if let Some(v) = file.tls_min_version
+            && let Some(ver) = TlsMinVersion::parse(&v)
+        {
+            self.tls_min_version = ver;
         }
-        if let Some(v) = file.environment {
-            if let Some(e) = Environment::parse(&v) {
-                self.environment = e;
-            }
+        if let Some(v) = file.environment
+            && let Some(e) = Environment::parse(&v)
+        {
+            self.environment = e;
         }
         if let Some(v) = file.insecure_bridge_stub {
             self.insecure_bridge_stub = v;
@@ -751,13 +751,13 @@ impl ConfigBuilder {
     pub fn build(self) -> Result<Config, ConfigError> {
         // Token encryption key shape — defer key-material validation to
         // crypto::TokenCipher, but reject early on the cheap check.
-        if let Some(hex) = self.token_encryption_key_hex.as_ref() {
-            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(ConfigError::InvalidValue {
-                    field: "PROXILION_TOKEN_ENCRYPTION_KEY",
-                    reason: format!("expected 64 hex chars (32 bytes), got {} chars", hex.len()),
-                });
-            }
+        if let Some(hex) = self.token_encryption_key_hex.as_ref()
+            && (hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "PROXILION_TOKEN_ENCRYPTION_KEY",
+                reason: format!("expected 64 hex chars (32 bytes), got {} chars", hex.len()),
+            });
         }
 
         // URL shape — reject obvious typos. Allow either http:// or https://.
@@ -888,14 +888,13 @@ struct FileConfig {
 /// a variable the operator never set. Falling through keeps the direct env
 /// var usable and makes the failure name the thing that is actually missing.
 pub(crate) fn secret_env(var: &str) -> Option<String> {
-    if let Ok(path) = env::var(format!("{var}_FILE")) {
-        if !path.is_empty() {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                let secret = read_secret_trim(&contents);
-                if !secret.is_empty() {
-                    return Some(secret);
-                }
-            }
+    if let Ok(path) = env::var(format!("{var}_FILE"))
+        && !path.is_empty()
+        && let Ok(contents) = std::fs::read_to_string(&path)
+    {
+        let secret = read_secret_trim(&contents);
+        if !secret.is_empty() {
+            return Some(secret);
         }
     }
     env::var(var).ok()

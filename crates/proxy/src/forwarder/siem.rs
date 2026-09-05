@@ -42,7 +42,7 @@ impl std::fmt::Debug for SiemHmacKey {
 
 impl SiemHmacKey {
     pub fn from_hex(hex: &str) -> Result<Self, KeyError> {
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return Err(KeyError("HMAC key hex length must be even".into()));
         }
         if hex.len() < 32 {

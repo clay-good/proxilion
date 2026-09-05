@@ -850,10 +850,10 @@ async fn cmd_metrics(http: &reqwest::Client, url: &str, sub: MetricsCmd) -> Resu
                     Some(b) => &name_part[..b],
                     None => name_part,
                 };
-                if let Some(f) = filter.as_deref() {
-                    if !family.contains(f) {
-                        continue;
-                    }
+                if let Some(f) = filter.as_deref()
+                    && !family.contains(f)
+                {
+                    continue;
                 }
                 let v: f64 = value_part.parse().unwrap_or(f64::NAN);
                 let entry = by_family.entry(family.to_string()).or_insert((
@@ -1357,20 +1357,20 @@ fn matches_tail_filter(
         Err(_) => return true,
     };
     let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
-    if let Some(d) = decision {
-        if field("decision") != d {
-            return false;
-        }
+    if let Some(d) = decision
+        && field("decision") != d
+    {
+        return false;
     }
-    if let Some(d) = vendor {
-        if field("vendor") != d {
-            return false;
-        }
+    if let Some(d) = vendor
+        && field("vendor") != d
+    {
+        return false;
     }
-    if let Some(d) = action {
-        if field("action") != d {
-            return false;
-        }
+    if let Some(d) = action
+        && field("action") != d
+    {
+        return false;
     }
     true
 }
@@ -1462,10 +1462,10 @@ async fn actions_list(
                         .ok()
                         .map(|d| d.with_timezone(&chrono::Utc))
                 });
-                if let Some(t) = at {
-                    if t < s {
-                        return Ok(());
-                    }
+                if let Some(t) = at
+                    && t < s
+                {
+                    return Ok(());
                 }
             }
             match format {
@@ -2859,20 +2859,20 @@ async fn cmd_policy_simulate(
                 "visibility",
                 "summary_present",
             ] {
-                if let Some(v) = extra.get(*k) {
-                    if !v.is_null() {
-                        body.insert((*k).to_string(), v.clone());
-                    }
+                if let Some(v) = extra.get(*k)
+                    && !v.is_null()
+                {
+                    body.insert((*k).to_string(), v.clone());
                 }
             }
             // request_path_params, if present.
             let mut path = HashMap::new();
-            if let Some(p) = extra.get("request_path_params") {
-                if let Some(map) = p.as_object() {
-                    for (k, v) in map {
-                        if let Some(s) = v.as_str() {
-                            path.insert(k.clone(), s.to_string());
-                        }
+            if let Some(p) = extra.get("request_path_params")
+                && let Some(map) = p.as_object()
+            {
+                for (k, v) in map {
+                    if let Some(s) = v.as_str() {
+                        path.insert(k.clone(), s.to_string());
                     }
                 }
             }
@@ -3009,12 +3009,12 @@ async fn cmd_policy_simulate(
         }
     }
 
-    if let Some(threshold) = fail_if_delta_exceeds {
-        if max_pct_delta > threshold {
-            return Err(anyhow!(
-                "max delta {max_pct_delta:.2}% exceeds threshold {threshold:.2}% (--fail-if-delta-exceeds)"
-            ));
-        }
+    if let Some(threshold) = fail_if_delta_exceeds
+        && max_pct_delta > threshold
+    {
+        return Err(anyhow!(
+            "max delta {max_pct_delta:.2}% exceeds threshold {threshold:.2}% (--fail-if-delta-exceeds)"
+        ));
     }
     Ok(())
 }
@@ -3337,19 +3337,19 @@ fn pretty_blocked_record(v: &Value) {
         "justification",
         "reject_reason",
     ] {
-        if let Some(val) = v.get(k) {
-            if !val.is_null() {
-                println!("  {:<22} {}", k, val);
-            }
+        if let Some(val) = v.get(k)
+            && !val.is_null()
+        {
+            println!("  {:<22} {}", k, val);
         }
     }
-    if let Some(ops) = v.get("requested_ops").and_then(|v| v.as_array()) {
-        if !ops.is_empty() {
-            println!("  {}", bold("requested_ops:"));
-            for o in ops {
-                if let Some(s) = o.as_str() {
-                    println!("    {s}");
-                }
+    if let Some(ops) = v.get("requested_ops").and_then(|v| v.as_array())
+        && !ops.is_empty()
+    {
+        println!("  {}", bold("requested_ops:"));
+        for o in ops {
+            if let Some(s) = o.as_str() {
+                println!("    {s}");
             }
         }
     }

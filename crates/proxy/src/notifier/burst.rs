@@ -158,14 +158,14 @@ impl BurstSuppressor {
 
     fn config_for(&self, policy_id: &str) -> BurstConfig {
         let mut cfg = self.default_cfg.clone();
-        if let Some(r) = &self.resolver {
-            if let Some((thr, win)) = r(policy_id) {
-                if let Some(t) = thr {
-                    cfg.threshold = t;
-                }
-                if let Some(w) = win {
-                    cfg.window = Duration::from_secs(w);
-                }
+        if let Some(r) = &self.resolver
+            && let Some((thr, win)) = r(policy_id)
+        {
+            if let Some(t) = thr {
+                cfg.threshold = t;
+            }
+            if let Some(w) = win {
+                cfg.window = Duration::from_secs(w);
             }
         }
         cfg

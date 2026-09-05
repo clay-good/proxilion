@@ -681,6 +681,23 @@ Kubernetes PDB/HPA/anti-affinity docs; Patroni; PgBouncer.
 
 **Priority:** P1. **Effort:** 2–3 days.
 
+**Status (2026-09-05): in progress — written procedure + the verification
+tool landed.** [docs/ops/runbooks/backup-restore.md](../../docs/ops/runbooks/backup-restore.md)
+publishes the targets (**RPO ≤ 5 min, RTO ≤ 1 h**), the WAL-archiving +
+base-backup schedule sized for them, the PITR restore procedure, the
+forward-only migration / expand-contract rollback policy, and the DEK-vs-backup
+separation rule (a database backup plus the token-encryption key is full
+impersonation of every linked user, so the two must live in separate trust
+domains). The acceptance criterion "verify audit-chain integrity post-restore"
+now has a tool rather than a suggestion: `proxilion-cli pic verify-sample`
+samples recent action events, verifies each **distinct** chain they reference,
+and exits non-zero if any chain is broken **or if the sample came back empty**
+— an empty sample is not evidence of integrity, and without that check a drill
+would green-light an empty database. **Remaining:** executing the PITR restore
+drill in staging within RTO and correcting the runbook against it (the drill-log
+table is a placeholder), and putting the backup job + retention into the
+Helm/ops manifests.
+
 **Goal.** Postgres (the system of record for sessions, PCAs, blocked queue,
 operator tokens, and the audit log) can be restored to a defined RPO/RTO, and
 the restore has actually been performed.
@@ -974,8 +991,13 @@ satisfied:
       boot-enforced; chart ships PDB + topology spread + affinity + a drain-
       aware grace period. Remaining: capacity numbers from a load test, HPA on
       in-flight requests, the replica-loss/revocation drill, Postgres HA.*
-- [ ] **PR-8** PITR restore drill passed; RPO/RTO met; audit-chain verified
-      post-restore.
+- [~] **PR-8** PITR restore drill passed; RPO/RTO met; audit-chain verified
+      post-restore. *Procedure, RPO/RTO targets, migration-rollback policy and
+      DEK-separation rule published
+      ([backup-restore.md](../../docs/ops/runbooks/backup-restore.md)); the
+      post-restore integrity check exists as `proxilion-cli pic verify-sample`
+      (non-zero on a broken chain OR an empty sample). Remaining: run the drill
+      in staging and land the backup job in the manifests.*
 - [ ] **PR-9** `v0.1.0` tagged; compatibility/MSRV/upgrade policy published.
 - [~] **PR-10/11** Signed, SBOM'd, provenance-attested, scanned artifacts;
       proxy image published + digest-pinned. *PR-11 image pipeline landed

@@ -753,6 +753,18 @@ registered N executors with the Trust Plane and every restart added N more.
 period that outlasts the 30 s drain. Remaining: capacity numbers from a load
 test, an HPA keyed on in-flight requests, and the replica-loss drill.
 
+**PR-8 (backup & disaster recovery) — the procedure and the verification tool
+are published.** [docs/ops/runbooks/backup-restore.md](docs/ops/runbooks/backup-restore.md)
+states the targets (RPO ≤ 5 min, RTO ≤ 1 h), the WAL-archiving schedule sized
+for them, the PITR restore steps, the forward-only migration and
+expand/contract rollback policy, and the rule that keeps the token-encryption
+key out of the same trust domain as the database backups. A restore that
+silently lost `pca_cache` rows still starts and still looks healthy, so
+`proxilion-cli pic verify-sample` checks it explicitly: it verifies each
+distinct chain the recent action events reference and exits non-zero on a
+broken chain — or on an empty sample, which is not evidence of integrity.
+Remaining: running the drill in staging.
+
 **PR-4 (transport & trust-boundary hardening) is complete.** Ingress TLS is
 terminated by rustls/aws-lc-rs, which never negotiates below **TLS 1.2**;
 `PROXILION_TLS_MIN_VERSION=1.3` (Helm `proxy.tls.minVersion`) pins 1.3-only

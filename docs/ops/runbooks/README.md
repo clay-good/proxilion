@@ -24,6 +24,10 @@ These are referenced from the alert sections below and from each other:
 - **[db-failover.md](./db-failover.md)** — Postgres primary failover,
   connection exhaustion, and bad-migration rollback (expand/contract);
   interlinks PR-7/PR-8.
+- **[backup-restore.md](./backup-restore.md)** — WAL archiving + PITR, the
+  RPO/RTO targets, the restore procedure, post-restore audit-chain
+  verification (`proxilion-cli pic verify-sample`), and the forward-only
+  migration / expand-contract policy; interlinks PR-7/PR-8.
 - **[key-compromise.md](./key-compromise.md)** — emergency rotation per secret,
   blast radius, and audit-chain continuity (read
   [key-inventory.md](../key-inventory.md) first).

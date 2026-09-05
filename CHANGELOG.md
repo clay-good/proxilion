@@ -16,6 +16,25 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Backup / restore / DR procedure and a post-restore integrity check
+  (production-readiness.md PR-8).** New
+  [docs/ops/runbooks/backup-restore.md](docs/ops/runbooks/backup-restore.md)
+  publishes the targets (**RPO ≤ 5 min, RTO ≤ 1 h**), the WAL-archiving plus
+  base-backup schedule sized for them, the PITR restore procedure, the
+  forward-only migration and expand/contract rollback policy, and the rule
+  that keeps the token-encryption key out of the same trust domain as the
+  database backups — a backup *plus* the DEK is full impersonation of every
+  linked user. The acceptance criterion "verify audit-chain integrity
+  post-restore" now has a tool instead of a suggestion: **`proxilion-cli pic
+  verify-sample`** samples recent action events, verifies each **distinct**
+  chain they reference (a busy session writes many rows against one chain;
+  verifying it twenty times proves nothing extra), prints one line per chain,
+  and exits non-zero if any chain is broken **or if the sample came back
+  empty** — an empty sample is not evidence of integrity, and without that
+  check a drill would green-light an empty database. `--format json` for
+  drill scripts, with the `error` field omitted rather than emitted as `null`
+  so a naive `jq` truthiness check doesn't read a clean run as a failure.
+
 - **Zero-downtime rotation of the token-encryption key
   (production-readiness.md PR-3).** `TokenCipher` now holds one **active**
   key, which performs every encryption, plus up to four **retired** keys

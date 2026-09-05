@@ -217,6 +217,25 @@ enum PicCmd {
         /// Leaf PCA UUID.
         id: String,
     },
+    /// Sample recent action events and verify each distinct chain they
+    /// reference. This is the post-restore integrity check in the
+    /// backup/restore runbook (production-readiness.md PR-8): a PITR restore
+    /// that silently lost or corrupted `pca_cache` rows shows up here as a
+    /// broken chain, not months later at an audit. Non-zero exit when any
+    /// sampled chain is not intact (or could not be verified), so a drill
+    /// script can gate on it.
+    VerifySample {
+        /// How many recent action events to draw leaf PCAs from (1..=500).
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Cap on distinct chains actually verified. Verification is one
+        /// request per chain, so this bounds the wall-clock of a drill.
+        #[arg(long, default_value_t = 25)]
+        max_chains: usize,
+        /// Output: pretty (default) | json.
+        #[arg(long, default_value = "pretty")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1019,7 +1038,157 @@ async fn cmd_pic(http: &reqwest::Client, url: &str, token: &str, sub: PicCmd) ->
             }
             Ok(())
         }
+        PicCmd::VerifySample {
+            limit,
+            max_chains,
+            format,
+        } => cmd_verify_sample(http, url, token, limit, max_chains, &format).await,
     }
+}
+
+/// Distinct `leaf_pca_id`s from an `/api/v1/actions` page, newest first,
+/// capped at `max`.
+///
+/// Deduped because a busy session writes many action rows against the same
+/// leaf chain, and verifying one chain twenty times proves nothing extra
+/// while burning twenty round-trips of a drill's budget. Order is preserved
+/// (the API returns newest-first) so a small `--max-chains` samples the most
+/// recent activity — the rows a restore is most likely to have truncated.
+fn distinct_leaf_pcas(rows: &[Value], max: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(id) = row.get("leaf_pca_id").and_then(Value::as_str) else {
+            continue; // blocked/pre-mint events carry no chain
+        };
+        if seen.insert(id.to_string()) {
+            out.push(id.to_string());
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// One sampled chain's outcome. `intact: None` means the verify call itself
+/// failed (transport / non-2xx) — counted as a failure, never as a pass.
+#[derive(Debug, serde::Serialize)]
+struct SampledChain {
+    pca_id: String,
+    intact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl SampledChain {
+    fn is_ok(&self) -> bool {
+        self.intact == Some(true)
+    }
+}
+
+async fn cmd_verify_sample(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    limit: u32,
+    max_chains: usize,
+    format: &str,
+) -> Result<()> {
+    #[allow(non_snake_case)]
+    let (GREEN, RED, DIM, RESET, _) = colors();
+
+    let page: Value = auth_header(
+        http.get(format!(
+            "{url}/api/v1/actions?limit={}",
+            limit.clamp(1, 500)
+        )),
+        token,
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    let rows = page
+        .get("rows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ids = distinct_leaf_pcas(&rows, max_chains.max(1));
+
+    let mut results = Vec::with_capacity(ids.len());
+    for id in ids {
+        let res = auth_header(
+            http.get(format!("{url}/api/v1/pca/{}/verify", urlencode(&id))),
+            token,
+        )
+        .send()
+        .await
+        .and_then(|r| r.error_for_status());
+        let sampled = match res {
+            Ok(r) => match r.json::<Value>().await {
+                Ok(v) => SampledChain {
+                    pca_id: id,
+                    intact: Some(v.get("intact").and_then(Value::as_bool).unwrap_or(false)),
+                    error: None,
+                },
+                Err(e) => SampledChain {
+                    pca_id: id,
+                    intact: None,
+                    error: Some(e.to_string()),
+                },
+            },
+            Err(e) => SampledChain {
+                pca_id: id,
+                intact: None,
+                error: Some(e.to_string()),
+            },
+        };
+        results.push(sampled);
+    }
+
+    let passed = results.iter().filter(|r| r.is_ok()).count();
+    let failed = results.len() - passed;
+
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sampled_events": rows.len(),
+                "chains": results,
+                "passed": passed,
+                "failed": failed,
+            }))?
+        );
+    } else {
+        println!("chain verification sample — {} events scanned", rows.len());
+        for r in &results {
+            let (mark, color) = if r.is_ok() {
+                ("intact", GREEN)
+            } else {
+                ("BROKEN", RED)
+            };
+            let detail = r
+                .error
+                .as_deref()
+                .map(|e| format!(" {DIM}({e}){RESET}"))
+                .unwrap_or_default();
+            println!("  {color}{mark}{RESET}  {}{detail}", r.pca_id);
+        }
+        if results.is_empty() {
+            println!("  {DIM}no chains referenced in the sampled events{RESET}");
+        }
+        let color = if failed == 0 { GREEN } else { RED };
+        println!("{color}{passed} intact, {failed} failed{RESET}");
+    }
+
+    // A sample with nothing in it is not evidence of integrity — say so and
+    // exit non-zero, or a restore drill would "pass" against an empty DB.
+    if results.is_empty() || failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn cmd_killswitch(
@@ -3065,6 +3234,102 @@ mod simulate_tests {
         // Same middle-range hazard via the `humantime` path: `from_std` builds a
         // valid `Duration` that overflows the date subtraction. Must error.
         assert!(parse_since("100000000d").is_err());
+    }
+}
+
+#[cfg(test)]
+mod verify_sample_tests {
+    use super::*;
+
+    fn row(leaf: Option<&str>) -> Value {
+        match leaf {
+            Some(id) => json!({ "id": "e", "leaf_pca_id": id }),
+            None => json!({ "id": "e", "leaf_pca_id": null }),
+        }
+    }
+
+    #[test]
+    fn dedupes_and_preserves_newest_first_order() {
+        // A busy session writes many events against one leaf chain;
+        // verifying it twenty times proves nothing extra and burns a
+        // drill's round-trip budget.
+        let rows = vec![
+            row(Some("a")),
+            row(Some("a")),
+            row(Some("b")),
+            row(Some("a")),
+            row(Some("c")),
+        ];
+        assert_eq!(distinct_leaf_pcas(&rows, 10), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn skips_events_with_no_chain() {
+        // Blocked / pre-mint events carry a null leaf_pca_id.
+        let rows = vec![row(None), row(Some("a")), json!({ "id": "e" })];
+        assert_eq!(distinct_leaf_pcas(&rows, 10), vec!["a"]);
+    }
+
+    #[test]
+    fn honors_the_max_chains_cap_on_distinct_ids_not_rows() {
+        let rows = vec![
+            row(Some("a")),
+            row(Some("a")),
+            row(Some("b")),
+            row(Some("c")),
+        ];
+        assert_eq!(distinct_leaf_pcas(&rows, 2), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn empty_input_yields_no_chains() {
+        assert!(distinct_leaf_pcas(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn a_verify_failure_is_never_counted_as_a_pass() {
+        // `intact: None` means the verify call itself failed. Treating that
+        // as a pass would let a restore drill green-light a database whose
+        // /api/v1/pca route was erroring.
+        let ok = SampledChain {
+            pca_id: "a".into(),
+            intact: Some(true),
+            error: None,
+        };
+        let broken = SampledChain {
+            pca_id: "b".into(),
+            intact: Some(false),
+            error: None,
+        };
+        let unreachable = SampledChain {
+            pca_id: "c".into(),
+            intact: None,
+            error: Some("502".into()),
+        };
+        assert!(ok.is_ok());
+        assert!(!broken.is_ok());
+        assert!(!unreachable.is_ok());
+    }
+
+    #[test]
+    fn sampled_chain_json_omits_the_error_field_when_absent() {
+        // The drill's JSON output is parsed by scripts; an always-present
+        // `"error": null` reads as "an error occurred" to a naive `jq`
+        // truthiness check.
+        let v = serde_json::to_value(SampledChain {
+            pca_id: "a".into(),
+            intact: Some(true),
+            error: None,
+        })
+        .unwrap();
+        assert!(v.get("error").is_none(), "{v}");
+        let v = serde_json::to_value(SampledChain {
+            pca_id: "a".into(),
+            intact: None,
+            error: Some("boom".into()),
+        })
+        .unwrap();
+        assert_eq!(v.get("error").and_then(Value::as_str), Some("boom"));
     }
 }
 

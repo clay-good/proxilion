@@ -83,6 +83,26 @@
 # protected env while it is on. PROXILION_INSECURE_BRIDGE_STUB.
 # insecure_bridge_stub = true
 
+# --- Verified federation (production-readiness.md PR-1) ---------------
+# Set all three of issuer / audience / jwks_uri to enable in-process
+# id_token verification at /oauth/bridge/callback: the signature is checked
+# against the IdP's JWKS with the algorithm pinned server-side, and PCA_0 is
+# minted from the verified identity via Trust Plane POST /v1/pca/issue.
+# A partial configuration is treated as "not configured" (never a silent
+# fallback to the stub), and a protected `environment` refuses to boot
+# unless the stub is off AND all three are set.
+# PROXILION_IDP_ISSUER / _AUDIENCE / _JWKS_URI.
+# idp_issuer = "https://acme.okta.com"
+# idp_audience = "proxilion"
+# idp_jwks_uri = "https://acme.okta.com/oauth2/v1/keys"
+
+# Server-side algorithm allow-list for id_token verification. The token's own
+# `alg` header never selects the algorithm (RFC 8725 §3.1). Asymmetric only —
+# `none` and any HS* are refused at boot. Default: "RS256,ES256".
+# PROXILION_IDP_ALGORITHMS.
+# idp_algorithms = "RS256,ES256"
+
+
 # ============================================================================
 # Observability
 # ============================================================================

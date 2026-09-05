@@ -141,10 +141,25 @@ async fn authorize_inner(
 
 // ---------- 2. GET /oauth/bridge/callback ----------
 
+/// Callback query. Exactly one credential arrives, and which one selects
+/// the federation path (production-readiness.md PR-1):
+///
+/// * `id_token` — the verified path. Signature-checked against the IdP's
+///   JWKS before any authority is minted.
+/// * `federation_token` — the legacy payload-only stub, accepted only
+///   while `PROXILION_INSECURE_BRIDGE_STUB` is on (never in staging or
+///   production: `Config::federation_boot_refusal` refuses to boot).
+///
+/// Both are optional at the parse layer so a request carrying neither
+/// gets a `401 bridge_rejected` rather than a `400` deserialization error
+/// that skips the audit-relevant classification.
 #[derive(Debug, Deserialize)]
 struct BridgeCallback {
     state: Uuid,
-    federation_token: String,
+    #[serde(default)]
+    federation_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
 }
 
 #[instrument(skip(state, params), fields(session = %params.state))]
@@ -175,7 +190,47 @@ async fn bridge_callback_inner(
     state: OAuthState,
     params: BridgeCallback,
 ) -> Result<(Redirect, &'static str), (OAuthError, &'static str)> {
-    let claims = match validate_federation_token(&params.federation_token) {
+    // PR-1 verified path first: an `id_token` is only ever honored after a
+    // signature check, and it takes precedence so a caller cannot downgrade
+    // a verified deployment by *also* attaching a forged `federation_token`.
+    if let Some(id_token) = params.id_token.as_deref() {
+        let Some(federation) = state.federation.clone() else {
+            return Err((
+                OAuthError::BridgeRejected(
+                    "id_token presented but no verified federation path is configured".into(),
+                ),
+                "unknown",
+            ));
+        };
+        // The issuer is operator-configured, so the `idp` label is known
+        // before verification — unlike the stub path, where it comes from
+        // the (unverified) token itself.
+        let idp = super::bridge::infer_idp(Some(federation.issuer()));
+        let identity = match federation.verify(id_token).await {
+            Ok(i) => i,
+            Err(e) => return Err((e, idp)),
+        };
+        return verified_callback_body(state, params.state, id_token, identity)
+            .await
+            .map(|r| (r, idp))
+            .map_err(|e| (e, idp));
+    }
+
+    if !state.insecure_bridge_stub {
+        return Err((
+            OAuthError::BridgeRejected(
+                "no id_token on the callback and the insecure bridge stub is disabled".into(),
+            ),
+            "unknown",
+        ));
+    }
+    let Some(federation_token) = params.federation_token.clone() else {
+        return Err((
+            OAuthError::BridgeRejected("callback carried no federation credential".into()),
+            "unknown",
+        ));
+    };
+    let claims = match validate_federation_token(&federation_token) {
         Ok(c) => c,
         Err(e) => return Err((e, "unknown")),
     };
@@ -185,6 +240,101 @@ async fn bridge_callback_inner(
         Ok(r) => Ok((r, idp)),
         Err(e) => Err((e, idp)),
     }
+}
+
+/// The verified federation path (production-readiness.md PR-1, Approach A).
+///
+/// `identity` has already had its signature, `iss`, `aud`, `exp` and `nbf`
+/// checked. From here the proxy mints PCA_0 **in-process** via Trust Plane
+/// `POST /v1/pca/issue`, handing it the same verified credential — so the
+/// Trust Plane independently re-verifies rather than taking the proxy's
+/// word for the principal. There is no bridge→proxy token in this path,
+/// which is exactly why there is nothing to forge.
+async fn verified_callback_body(
+    state: OAuthState,
+    session_id: Uuid,
+    id_token: &str,
+    identity: crate::oauth::idp_verify::VerifiedIdentity,
+) -> Result<Redirect, OAuthError> {
+    // The requested ops come only from the signature-verified token's
+    // `pic_ops` claim. An absent/empty claim is refused rather than
+    // requesting unbounded authority and letting the Trust Plane decide.
+    if identity.ops.is_empty() {
+        return Err(OAuthError::BridgeRejected(
+            "verified id_token carries no pic_ops claim".into(),
+        ));
+    }
+
+    let resp = state
+        .pic
+        .mint_pca_0(id_token, "jwt", &identity.ops)
+        .await
+        .map_err(|e| match e {
+            crate::pic::ExecutorError::Invariant(msg) => OAuthError::PicInvariant(msg),
+            other => OAuthError::Internal(other.to_string()),
+        })?;
+    if resp.ops.is_empty() {
+        return Err(OAuthError::PicInvariant(
+            "Trust Plane issued PCA_0 with an empty ops set".into(),
+        ));
+    }
+    let pca_0_cbor = B64
+        .decode(&resp.pca)
+        .map_err(|_| OAuthError::Internal("bad PCA_0 base64".into()))?;
+    let pca_0_id = Uuid::new_v4();
+
+    // Bind the session BEFORE caching the PCA. Same one-shot semantics as
+    // the stub path (`pca_0_id IS NULL`): an id_token replayed onto an
+    // already-established session must not rebind its identity. Doing the
+    // UPDATE first means a rejected replay leaves no orphaned cache row.
+    let session = sqlx::query_as::<_, (String,)>(
+        "UPDATE oauth_sessions
+            SET pca_0_id = $1, p_0 = $2, granted_ops = $3
+          WHERE id = $4 AND expires_at > now() AND pca_0_id IS NULL
+        RETURNING agent_requested_scope",
+    )
+    .bind(pca_0_id)
+    .bind(&resp.p_0)
+    .bind(SqlxJson(serde_json::to_value(&resp.ops).unwrap()))
+    .bind(session_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((agent_requested_scope,)) = session else {
+        return Err(OAuthError::SessionGone);
+    };
+
+    crate::pic::PcaCache::new(state.db.clone())
+        .insert(&CachedPca {
+            pca_id: pca_0_id,
+            cbor: pca_0_cbor,
+            p_0: resp.p_0.clone(),
+            ops: resp.ops.clone(),
+            hop: 0,
+            predecessor_id: None,
+            signature: vec![],
+            pic_profile: crate::pic::cache::CURRENT_PIC_PROFILE.to_string(),
+        })
+        .await
+        .map_err(|e| OAuthError::Internal(e.to_string()))?;
+
+    info!(
+        session = %session_id,
+        issuer = %identity.issuer,
+        subject = %identity.subject,
+        ops = resp.ops.len(),
+        "federation identity verified in-process; PCA_0 minted"
+    );
+
+    let google_scope = intersect_scope_with_ops(&agent_requested_scope, &resp.ops);
+    let url = format!(
+        "{}?client_id={}&redirect_uri={}/oauth/google/callback&response_type=code&scope={}&state={}&access_type=offline&prompt=consent",
+        state.google.auth_url,
+        pct(&state.google.client_id),
+        pct(&state.proxy_base_url),
+        pct(&google_scope),
+        session_id,
+    );
+    Ok(Redirect::temporary(&url))
 }
 
 /// surface-delight-and-correctness.md §6.4 — the federation token's `state`
@@ -1416,14 +1566,14 @@ mod tests {
     }
 
     #[test]
-    fn bridge_callback_field_count_pinned_at_exactly_two_via_exhaustive_destructure_no_rest_pattern()
+    fn bridge_callback_field_count_pinned_at_exactly_three_via_exhaustive_destructure_no_rest_pattern()
      {
         // `BridgeCallback` is the `Query<T>` for `/oauth/bridge/callback`
         // — the federation-bridge → proxy hop the proxy reads only TWO
         // fields from: the opaque session `state` (a Uuid the proxy
         // minted in `/authorize`) and a `federation_token` JWT. Pin the
-        // field count at EXACTLY 2 via exhaustive destructure with NO
-        // `..` rest pattern. A regression that landed a 3rd field
+        // field count at EXACTLY 3 via exhaustive destructure with NO
+        // `..` rest pattern. A regression that landed a 4th field
         // (`pca_0_cbor_b64: Option<String>` lifting it out of the JWT
         // claims for raw-CBOR-out-of-band-injection OR
         // `error: Option<String>` federation-bridge-returns-error pass-
@@ -1433,11 +1583,13 @@ mod tests {
         // implementer rebuilt against the new struct.
         let p = BridgeCallback {
             state: Uuid::nil(),
-            federation_token: String::new(),
+            federation_token: None,
+            id_token: None,
         };
         let BridgeCallback {
             state: _,
             federation_token: _,
+            id_token: _,
         } = p;
     }
 
@@ -1597,7 +1749,127 @@ mod tests {
             },
             federation_bridge_authorize_url: "https://bridge.test/authorize".into(),
             proxy_base_url: "https://proxy.test".into(),
+            federation: None,
+            insecure_bridge_stub: true,
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // PR-1 path selection at `/oauth/bridge/callback`. These branches all
+    // return before touching Postgres, so a lazy (never-connected) pool is
+    // enough and they run in the default `cargo test` lane.
+    // ─────────────────────────────────────────────────────────────────
+
+    fn oauth_state_lazy() -> OAuthState {
+        // `connect_lazy` never opens a socket; any test using it must
+        // assert on a branch that returns before the first query.
+        oauth_state_for(
+            sqlx::PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused").unwrap(),
+        )
+    }
+
+    async fn callback_err(state: OAuthState, params: BridgeCallback) -> OAuthError {
+        bridge_callback_inner(state, params)
+            .await
+            .map(|_| ())
+            .expect_err("callback must be rejected")
+            .0
+    }
+
+    fn rejection_contains(err: &OAuthError, needle: &str) {
+        match err {
+            OAuthError::BridgeRejected(msg) => {
+                assert!(msg.contains(needle), "{msg:?} must mention {needle:?}")
+            }
+            other => panic!("expected BridgeRejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn id_token_is_refused_when_no_verified_federation_is_configured() {
+        // PR-1 fail-closed: an `id_token` is never honored on a deployment
+        // that has no issuer/JWKS to verify it against.
+        let err = callback_err(
+            oauth_state_lazy(),
+            BridgeCallback {
+                state: Uuid::new_v4(),
+                federation_token: None,
+                id_token: Some("header.payload.sig".into()),
+            },
+        )
+        .await;
+        rejection_contains(&err, "no verified federation path is configured");
+    }
+
+    #[tokio::test]
+    async fn an_id_token_cannot_be_downgraded_by_attaching_a_federation_token() {
+        // The attack this ordering exists to kill: on a verified deployment,
+        // also attaching a forged payload-only `federation_token` must not
+        // steer the callback onto the unverified path. The `id_token` wins
+        // even though the stub is enabled here.
+        let err = callback_err(
+            oauth_state_lazy(),
+            BridgeCallback {
+                state: Uuid::new_v4(),
+                federation_token: Some(forged_federation_token()),
+                id_token: Some("header.payload.sig".into()),
+            },
+        )
+        .await;
+        rejection_contains(&err, "no verified federation path is configured");
+    }
+
+    #[tokio::test]
+    async fn federation_token_is_refused_when_the_stub_is_disabled() {
+        let mut state = oauth_state_lazy();
+        state.insecure_bridge_stub = false;
+        let err = callback_err(
+            state,
+            BridgeCallback {
+                state: Uuid::new_v4(),
+                federation_token: Some(forged_federation_token()),
+                id_token: None,
+            },
+        )
+        .await;
+        rejection_contains(&err, "insecure bridge stub is disabled");
+    }
+
+    #[tokio::test]
+    async fn a_callback_carrying_no_credential_is_refused() {
+        // Deserializing both credentials as optional means "neither" reaches
+        // the handler as a classified 401 rather than a 400 that skips the
+        // `proxilion_oauth_callback_total{result="denied"}` accounting.
+        let err = callback_err(
+            oauth_state_lazy(),
+            BridgeCallback {
+                state: Uuid::new_v4(),
+                federation_token: None,
+                id_token: None,
+            },
+        )
+        .await;
+        rejection_contains(&err, "no federation credential");
+    }
+
+    /// A payload-only, unsigned federation token — exactly what the stub
+    /// path accepts and the verified path must never look at.
+    fn forged_federation_token() -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        let now = chrono::Utc::now().timestamp();
+        let payload = serde_json::json!({
+            "pca_0_id": Uuid::new_v4(),
+            "p_0": "mallory@evil.com",
+            "ops": ["drive:read:*"],
+            "state": Uuid::new_v4().to_string(),
+            "iat": now,
+            "exp": now + 300,
+        });
+        format!(
+            "{}.{}.sig",
+            B64URL.encode(br#"{"alg":"none","typ":"JWT"}"#),
+            B64URL.encode(payload.to_string().as_bytes()),
+        )
     }
 
     fn claims_for(state_str: String) -> crate::oauth::bridge::FederationClaims {
@@ -1636,7 +1908,8 @@ mod tests {
             oauth_state_for(pool.clone()),
             BridgeCallback {
                 state: sid,
-                federation_token: String::new(),
+                federation_token: None,
+                id_token: None,
             },
             claims,
         )
@@ -1665,7 +1938,8 @@ mod tests {
             oauth_state_for(pool.clone()),
             BridgeCallback {
                 state: sid,
-                federation_token: String::new(),
+                federation_token: None,
+                id_token: None,
             },
             {
                 let mut c = claims_for(sid.to_string());
@@ -1702,7 +1976,8 @@ mod tests {
             oauth_state_for(pool.clone()),
             BridgeCallback {
                 state: victim,
-                federation_token: String::new(),
+                federation_token: None,
+                id_token: None,
             },
             claims,
         )
@@ -1725,6 +2000,115 @@ mod tests {
             victim_pca.is_none(),
             "replay must not establish/modify the target session",
         );
+    }
+
+    #[tokio::test]
+    async fn db_backed_verified_callback_mints_pca_0_and_is_one_shot() {
+        // PR-1 verified path, end to end against real SQL: a verified
+        // identity mints PCA_0 through Trust Plane, binds the session to the
+        // *Trust-Plane-returned* principal and ops, caches the PCA_0 CBOR for
+        // the Google hop, and refuses a second establish on the same session.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let trust_plane = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pca/issue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pca": B64.encode(b"pca-0-cbor-bytes"),
+                "hop": 0,
+                "p_0": "alice@acme.com",
+                "ops": ["drive:read:engineering/*"],
+            })))
+            .mount(&trust_plane)
+            .await;
+
+        let mut state = oauth_state_for(pool.clone());
+        state.pic = crate::pic::PicExecutor::dev_ephemeral(trust_plane.uri()).unwrap();
+        let state_auth_url = state.google.auth_url.clone();
+
+        let sid = Uuid::new_v4();
+        seed_session(&pool, sid).await;
+
+        let redirect = verified_callback_body(state.clone(), sid, "id.token.sig", identity())
+            .await
+            .expect("verified callback must establish the session");
+        // The browser is sent on to Google with a non-empty scope narrowed
+        // against the ops Trust Plane actually granted. (`pct` escapes with
+        // NON_ALPHANUMERIC, so match on the encoded form.)
+        let response = redirect.into_response();
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect carries a Location header")
+            .to_string();
+        assert!(location.starts_with(&state_auth_url), "{location}");
+        assert!(location.contains(&format!("state={sid}")), "{location}");
+        assert!(
+            location
+                .contains("scope=https%3A%2F%2Fwww%2Egoogleapis%2Ecom%2Fauth%2Fdrive%2Ereadonly"),
+            "seeded session asked for drive.readonly and PCA_0 grants drive: — \
+             the intersection must survive into the Google hop: {location}",
+        );
+
+        let (bound_pca, bound_p0): (Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT pca_0_id, p_0 FROM oauth_sessions WHERE id = $1")
+                .bind(sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let pca_0_id = bound_pca.expect("pca_0_id written on bind");
+        assert_eq!(bound_p0.as_deref(), Some("alice@acme.com"));
+
+        let cached = crate::pic::PcaCache::new(pool.clone())
+            .get(pca_0_id)
+            .await
+            .unwrap()
+            .expect("PCA_0 must be cached for the Google hop");
+        assert_eq!(cached.cbor, b"pca-0-cbor-bytes");
+        assert_eq!(cached.hop, 0);
+
+        // Replay onto the already-established session: refused, identity
+        // untouched (the `pca_0_id IS NULL` one-shot).
+        let err = verified_callback_body(state, sid, "id.token.sig", identity())
+            .await
+            .expect_err("a second establish must be refused");
+        assert!(matches!(err, OAuthError::SessionGone), "got {err:?}");
+        let still: Option<Uuid> =
+            sqlx::query_scalar("SELECT pca_0_id FROM oauth_sessions WHERE id = $1")
+                .bind(sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still, Some(pca_0_id), "replay must not rebind the session");
+    }
+
+    #[tokio::test]
+    async fn verified_callback_refuses_an_identity_with_no_pic_ops() {
+        // Requesting authority with an empty ops set would ask Trust Plane
+        // for "whatever you think"; refuse before the call instead. Returns
+        // before any DB or Trust Plane use.
+        let mut id = identity();
+        id.ops.clear();
+        let err = verified_callback_body(oauth_state_lazy(), Uuid::new_v4(), "id.token.sig", id)
+            .await
+            .expect_err("empty pic_ops must be refused");
+        rejection_contains(&err, "no pic_ops claim");
+    }
+
+    fn identity() -> crate::oauth::idp_verify::VerifiedIdentity {
+        crate::oauth::idp_verify::VerifiedIdentity {
+            principal: "oidc:https://acme.okta.com#user-123".into(),
+            issuer: "https://acme.okta.com".into(),
+            subject: "user-123".into(),
+            expires_at: chrono::Utc::now().timestamp() + 300,
+            ops: vec!["drive:read:engineering/*".into()],
+        }
     }
 
     #[tokio::test]

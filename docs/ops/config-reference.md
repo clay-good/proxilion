@@ -93,7 +93,18 @@ See [key-inventory.md](key-inventory.md) for the per-secret classification
 | Env var | TOML key | Type | Default | Notes |
 |---|---|---|---|---|
 | `PROXILION_ENV` | `environment` | `development` \| `staging` \| `production` | `development` | Deployment environment. A **protected** env (`staging`/`production`) refuses to boot while the insecure federation stub is active. Unrecognized values leave the prior value intact (never silently downgrade a protected env). |
-| `PROXILION_INSECURE_BRIDGE_STUB` | `insecure_bridge_stub` | bool | `true` | Whether the payload-only federation stub (no signature verification) is active — the only federation path until PR-1's verified-issuance rewiring lands. `true` + protected `PROXILION_ENV` ⇒ **boot refusal** (`Config::federation_boot_refusal`). Leave `true` in dev; the production guard is the safety net. |
+| `PROXILION_INSECURE_BRIDGE_STUB` | `insecure_bridge_stub` | bool | `true` | Whether the payload-only `federation_token` stub (no signature verification) is accepted at `/oauth/bridge/callback`. `true` + protected `PROXILION_ENV` ⇒ **boot refusal** (`Config::federation_boot_refusal`). Leave `true` in dev; set `0` in production and configure the four `PROXILION_IDP_*` settings below. |
+| `PROXILION_IDP_ISSUER` | `idp_issuer` | URL | *(unset)* | Trusted OIDC issuer (`iss`) for the **verified** federation path. Set together with `_AUDIENCE` and `_JWKS_URI` to make `/oauth/bridge/callback` accept an `id_token` and verify its signature before any authority is minted. |
+| `PROXILION_IDP_AUDIENCE` | `idp_audience` | string | *(unset)* | The `aud` the IdP mints Proxilion `id_token`s for. Enforced by the verifier; a token for another audience is rejected. |
+| `PROXILION_IDP_JWKS_URI` | `idp_jwks_uri` | `https://` URL | *(unset)* | The issuer's JWKS endpoint. **Must be `https://`** — a plaintext URI is refused at boot. Cached for 1 hour; an unknown `kid` forces one throttled refresh, then fails closed. |
+| `PROXILION_IDP_ALGORITHMS` | `idp_algorithms` | comma-separated | `RS256,ES256` | Server-side algorithm allow-list. The token's own `alg` header never selects the algorithm (RFC 8725 §3.1). Asymmetric only — `none` and any `HS*` are refused at boot. Valid: `RS256/384/512`, `PS256/384/512`, `ES256/384`, `EdDSA`. |
+
+**Which path runs.** An `id_token` on the callback always takes the verified
+path (and is rejected outright when the `PROXILION_IDP_*` settings are absent,
+so a forged `federation_token` cannot downgrade a verified deployment). Only
+when no `id_token` is present, and the stub is enabled, is the legacy
+`federation_token` accepted. A protected `PROXILION_ENV` refuses to boot unless
+the stub is off **and** the verified path is fully configured.
 
 ## Token encryption & Google OAuth
 
@@ -211,6 +222,8 @@ these into the proxy Deployment's env. The non-obvious mappings:
 | `proxy.trustedProxies` | `PROXILION_TRUSTED_PROXIES` |
 | `proxy.publicUrl` | `PROXILION_PUBLIC_URL` |
 | `proxy.env` | `PROXILION_ENV` |
+| `proxy.env.idp.issuer` / `.audience` / `.jwksUri` / `.algorithms` | `PROXILION_IDP_ISSUER` / `_AUDIENCE` / `_JWKS_URI` / `_ALGORITHMS` |
+| `proxy.env.insecureBridgeStub` | `PROXILION_INSECURE_BRIDGE_STUB` |
 
 Secrets (`DATABASE_URL`, `PROXILION_TOKEN_ENCRYPTION_KEY`,
 `GOOGLE_CLIENT_SECRET`, the HMAC keys) are sourced from a Kubernetes `Secret`;

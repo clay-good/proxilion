@@ -146,14 +146,14 @@ fn file_config_fields() -> Vec<String> {
 
 #[test]
 fn file_config_extraction_reaches_the_last_declared_field() {
-    // Canary for silent truncation: `insecure_bridge_stub` is the LAST field
+    // Canary for silent truncation: `idp_algorithms` is the LAST field
     // in `struct FileConfig`, so it only appears here if extraction walked
     // the whole struct. The `>= 30` guard in the test below cannot catch a
-    // truncation that drops only the final field or two (there are 32), which
+    // truncation that drops only the final field or two (there are 36), which
     // is exactly what a `}` inside a field doc comment would cause.
     let fields = file_config_fields();
     assert!(
-        fields.iter().any(|f| f == "insecure_bridge_stub"),
+        fields.iter().any(|f| f == "idp_algorithms"),
         "extraction stopped before the last FileConfig field — it likely \
          truncated at a `}}` inside a doc comment. Got: {fields:?}",
     );

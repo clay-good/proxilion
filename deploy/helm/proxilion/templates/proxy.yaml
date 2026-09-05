@@ -48,6 +48,26 @@ spec:
             - name: PROXILION_ENV
               value: {{ .Values.proxy.env.environment | quote }}
             {{- end }}
+            {{- with .Values.proxy.env.idp }}
+            {{- if .issuer }}
+            # Verified federation (PR-1): in-process id_token signature
+            # verification against the IdP's JWKS. Required in staging/prod.
+            - name: PROXILION_IDP_ISSUER
+              value: {{ .issuer | quote }}
+            - name: PROXILION_IDP_AUDIENCE
+              value: {{ .audience | quote }}
+            - name: PROXILION_IDP_JWKS_URI
+              value: {{ .jwksUri | quote }}
+            {{- if .algorithms }}
+            - name: PROXILION_IDP_ALGORITHMS
+              value: {{ .algorithms | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.proxy.env.insecureBridgeStub }}
+            - name: PROXILION_INSECURE_BRIDGE_STUB
+              value: {{ .Values.proxy.env.insecureBridgeStub | quote }}
+            {{- end }}
             - name: PROXILION_LOG_FORMAT
               value: {{ .Values.proxy.env.logFormat | quote }}
             - name: PROXILION_CUSTOMER_DOMAIN

@@ -20,12 +20,23 @@
 //!    consumed, and return `{ access_token: pxl_live_…, token_type, expires_in,
 //!    scope }`.
 //!
-//! Federation-bridge JWT validation is currently *payload-only* (matches the
-//! Trust Plane stub described in §0.4 Status). Wire JWKS signature
-//! verification before production — see `bridge::validate_federation_token`.
+//! ## Two federation paths at step 2 (production-readiness.md PR-1)
+//!
+//! * **Verified (production).** Configure `PROXILION_IDP_ISSUER` /
+//!   `_AUDIENCE` / `_JWKS_URI`; the callback then takes an `id_token`,
+//!   verifies its signature against the IdP's JWKS with the algorithm
+//!   pinned server-side (`federation::VerifiedFederation`), and mints PCA_0
+//!   in-process via Trust Plane `POST /v1/pca/issue` from the verified
+//!   identity. There is no bridge→proxy token to forge.
+//! * **Insecure stub (development only).** The historical
+//!   `federation_token` path — `bridge::validate_federation_token` decodes
+//!   the payload and does **not** check the signature. Gated by
+//!   `PROXILION_INSECURE_BRIDGE_STUB` (default on) and refused at boot in
+//!   staging/production by `Config::federation_boot_refusal`.
 
 pub mod bridge;
 pub mod error;
+pub mod federation;
 pub mod idp_verify;
 pub mod jwks;
 pub mod routes;

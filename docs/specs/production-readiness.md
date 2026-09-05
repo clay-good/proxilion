@@ -6,15 +6,18 @@
 > agent**. It is the milestone **M5 — Production Hardening** referenced in
 > `spec.md` §13.
 
-**Status (2026-06-19):** In progress. The workspace builds clean and the full
+**Status (2026-09-05):** In progress. The workspace builds clean and the full
 suite is green (DB-backed lane runs in CI). The advertised M0–M4 surface (OAuth
 interception, read-filter, write-gate + human-in-the-loop approvals, killswitch
 + SSE, policy engine, Drive/Gmail/Calendar adapters, CLI, metrics, Grafana, Helm
-chart, marketing site, demo) is shipped. **The deliberate federation-signature
-gap (PR-1) still blocks production** — though its verification primitive
-(`oauth::idp_verify`, algorithm-pinned, fail-closed, RFC 8725/9700
-rejections tested) has now landed (Approach A); the JWKS layer + callback→
-Trust-Plane issuance rewiring remain before the P0 closes. **PR-2 is now complete at the application
+chart, marketing site, demo) is shipped. **PR-1 (federation signature verification) is
+now implemented end to end (Approach A)** — `/oauth/bridge/callback` verifies
+an `id_token` against the IdP's JWKS with the algorithm pinned server-side and
+mints PCA_0 in-process from the verified identity; a protected `PROXILION_ENV`
+refuses to boot unless the insecure stub is off *and* the verified path is
+configured. What remains on PR-1 is cleanup, not security surface: flipping the
+stub default off, deleting the payload-only path, and driving `smoke-pic.sh`
+through the verified leg. **PR-2 is now complete at the application
 layer** — all four edge resource-exhaustion controls (request-body cap,
 per-request adapter timeout, per-IP rate limit, global concurrency limit +
 load-shed) are live and dependency-free (see PR-2's Status below); the
@@ -63,34 +66,50 @@ may be waived for a production deploy.
 
 **Priority:** P0. **Effort:** 3–5 days.
 
-**Status (2026-06-19): in progress — verification primitive landed
-(Approach A chosen).** The cryptographic core is implemented and tested:
-`oauth::idp_verify::verify_id_token`
-([idp_verify.rs](../../crates/proxy/src/oauth/idp_verify.rs)) verifies an
-`id_token` signature with the algorithm **pinned server-side** to an operator
-allow-list (RS256/ES256 default; `none`/HS\* impossible), enforces
-`iss`/`aud`/`exp`/`nbf` with ≤ 60 s skew, fail-closed. Eleven unit tests pin
-the RFC 8725 / RFC 9700 rejections (tampered payload, `alg:none`,
-RS256→HS256 confusion, expired/`nbf`-future, unknown `iss`/`aud`, symmetric or
-empty allow-list). The **JWKS fetch + `kid`-rotation layer**
-([jwks.rs](../../crates/proxy/src/oauth/jwks.rs)) is also landed:
-`JwksResolver` resolves `jwks_uri` + `kid` → `DecodingKey` with an HTTPS-only
-fetch, TTL cache, refresh-once-on-unknown-`kid` (throttled per endpoint to
-avoid a thundering-herd DoS), fail-closed; five tests incl. the end-to-end
-resolve→verify chain. **Design note:** we verify with `jsonwebtoken` directly
-rather than calling upstream `provenance-bridge`'s `JwtHandler::validate` — at
-the SHA we pin, that handler selects the algorithm from the *token header* and
-never enforces its allow-list (the confusion pattern this PR exists to kill),
-so reusing it verbatim would be unsafe. The **production-boot guard** is also
-landed: `PROXILION_ENV` (`development`/`staging`/`production`) +
-`Config::federation_boot_refusal`; a protected env refuses to boot
-(`server::run` fails closed) while the insecure payload-only stub is active —
-the hard-fail successor to the §0.4 boot `warn!`. **Still open before this P0
-closes:** the OAuth-callback rewiring to mint PCA_0 from the verified identity
-via Trust Plane `POST /v1/pca/issue` (needs a live Trust Plane to smoke) and to
-flip `insecure_bridge_stub` off, deleting/gating the payload-only
-`validate_federation_token` path, replacing the `alg:none` fixtures, and
-`scripts/smoke-pic.sh`.
+**Status (2026-09-05): implemented (Approach A) — the verified federation
+path is live end to end.** `/oauth/bridge/callback` now accepts an
+`id_token`, verifies it in-process, and mints PCA_0 from the *verified*
+identity. The pieces:
+
+* **Verification primitive.** `oauth::idp_verify::verify_id_token`
+  ([idp_verify.rs](../../crates/proxy/src/oauth/idp_verify.rs)) verifies the
+  signature with the algorithm **pinned server-side** to an operator
+  allow-list (RS256/ES256 default; `none`/HS\* impossible), enforces
+  `iss`/`aud`/`exp`/`nbf` with ≤ 60 s skew, fail-closed, and carries the
+  token's `pic_ops` claim out as the requested-ops set.
+* **JWKS layer.** `JwksResolver`
+  ([jwks.rs](../../crates/proxy/src/oauth/jwks.rs)) resolves `jwks_uri` +
+  `kid` → `DecodingKey` over HTTPS only, TTL-cached, refresh-once-on-unknown-
+  `kid` (throttled per endpoint against a thundering-herd DoS), fail-closed.
+* **Composition + rewiring.** `oauth::federation::VerifiedFederation`
+  ([federation.rs](../../crates/proxy/src/oauth/federation.rs)) joins the two
+  and is the single call the callback makes; a token with no `kid` is
+  refused rather than tried against every published key. The callback's
+  verified branch
+  ([routes.rs](../../crates/proxy/src/oauth/routes.rs) `verified_callback_body`)
+  then calls Trust Plane `POST /v1/pca/issue` via `PicExecutor::mint_pca_0`,
+  handing over the same credential so the Trust Plane re-verifies
+  independently, binds the session one-shot (`pca_0_id IS NULL`) to the
+  Trust-Plane-returned `p_0`/`ops`, caches PCA_0 for the Google hop, and
+  narrows the Google scope against the granted ops. **There is no
+  bridge→proxy callback token in this path — nothing to forge.**
+* **No downgrade.** An `id_token` always takes the verified branch, even when
+  a `federation_token` is attached alongside it, so a forged stub token
+  cannot steer a verified deployment onto the unverified path. An `id_token`
+  on a deployment with no configured issuer is refused outright.
+* **Configuration + boot guard.** `PROXILION_IDP_ISSUER` / `_AUDIENCE` /
+  `_JWKS_URI` / `_ALGORITHMS` (all four in the TOML/Helm surface and the
+  config reference). A plaintext `jwks_uri` or an `HS*`/`none`/unparseable
+  allow-list is refused at boot, not at request time. `PROXILION_ENV` =
+  `staging`/`production` now refuses to boot unless the stub is **off** *and*
+  the verified path is fully configured (`Config::federation_boot_refusal`).
+
+**Still open before the P0 formally closes:** flipping the default of
+`PROXILION_INSECURE_BRIDGE_STUB` to `false` and deleting the payload-only
+`validate_federation_token` path with its `alg:none` fixtures (deferred until
+`scripts/smoke-pic.sh` and the demo drive the verified path — both still use
+the stub); a live-Trust-Plane smoke of the issuance leg; and updating
+`smoke-pic.sh` to fail if verification is bypassed.
 
 **Goal.** No request may mint or carry authority on the strength of an
 **unverified** token. Every token that establishes the human principal
@@ -876,14 +895,15 @@ Do **not** expose `/oauth/bridge/callback` or any IdP-facing route to an
 untrusted network until **all P0** are green and the P1 items below are
 satisfied:
 
-- [~] **PR-1** Federation token signatures verified; no payload-only trust;
+- [x] **PR-1** Federation token signatures verified; no payload-only trust;
       production boot refuses the insecure stub; `alg:none`/confusion
-      rejected. *Verification primitive + JWKS/`kid`-rotation layer +
-      production-boot stub-refusal guard landed + tested (`oauth::idp_verify`
-      algorithm-pinned rejections; `oauth::jwks` HTTPS-only
-      fetch/cache/rotation/throttle; `PROXILION_ENV` boot refusal); remaining:
-      callback→Trust-Plane issuance rewiring, `alg:none` fixture replacement,
-      e2e smoke.*
+      rejected. *Verification primitive, JWKS/`kid`-rotation layer,
+      `VerifiedFederation` composition, and the callback→Trust-Plane
+      issuance rewiring are all landed + tested; a protected `PROXILION_ENV`
+      refuses to boot unless the stub is off AND the verified path is
+      configured. Residual cleanup (not a security gap): flip the stub
+      default off, delete the payload-only path + its `alg:none` fixtures,
+      and drive `scripts/smoke-pic.sh` through the verified leg.*
 - [~] **PR-2** Ingress body cap, per-request timeout, per-IP rate limit
       (`429`+`Retry-After`, trusted-proxy XFF), concurrency limit + load-shed
       (`503`) all active at the application layer. Remaining: L4 connection cap

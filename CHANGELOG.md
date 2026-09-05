@@ -16,6 +16,30 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Verified in-process federation — the PR-1 P0 is closed
+  (production-readiness.md PR-1, Approach A).** `/oauth/bridge/callback` no
+  longer has to trust an unsigned token. It now accepts an IdP `id_token`,
+  verifies its **signature** against the issuer's published JWKS, and mints
+  PCA_0 in-process from the verified identity via Trust Plane
+  `POST /v1/pca/issue` — so the bridge→proxy callback token, the thing an
+  attacker could forge to invent an arbitrary `p_0`/`ops`, no longer exists on
+  this path. The verification algorithm is pinned **server-side** to an
+  operator allow-list (`PROXILION_IDP_ALGORITHMS`, default `RS256,ES256`,
+  asymmetric only): the token's own `alg` header never selects it, which makes
+  `alg:none` and the RS256→HS256 public-key-as-HMAC confusion structurally
+  impossible rather than merely rejected. `iss`/`aud`/`exp`/`nbf` are enforced
+  with ≤ 60 s skew, an unknown `kid` triggers one throttled JWKS refresh and
+  then fails closed, and every failure is a fail-closed `401` with the usual
+  `proxilion_oauth_callback_total{idp,result="denied"}` accounting. Session
+  binding keeps the one-shot `pca_0_id IS NULL` semantics, so a replayed
+  `id_token` cannot rebind an established session. New settings
+  `PROXILION_IDP_ISSUER` / `_AUDIENCE` / `_JWKS_URI` / `_ALGORITHMS` are in the
+  env, TOML, Helm, and config-reference surfaces; a plaintext `jwks_uri` or an
+  unsafe/unparseable allow-list is refused **at boot**, not per request.
+  **No downgrade:** an `id_token` always takes the verified branch even when a
+  forged `federation_token` is attached alongside it, and an `id_token` on a
+  deployment with no configured issuer is refused outright.
+
 - **Runbooks & incident response (production-readiness.md PR-6 — written set
   complete).** Every PR-5 paging alert now resolves to a full detection →
   diagnosis → mitigation → verification → escalation procedure
@@ -435,6 +459,18 @@ Until v0.1.0, the canonical reference is the most recent commit on
   show a throttled single-line stderr progress indicator (bytes/rows +
   elapsed), suppressed under `--format json`, a piped stderr, or
   `--color never`. No new dependency.
+
+### Changed
+
+- **The production boot guard now requires the verified federation path, not
+  just the absence of the stub (production-readiness.md PR-1).**
+  `PROXILION_ENV=staging|production` previously refused to boot only while
+  `PROXILION_INSECURE_BRIDGE_STUB` was on. It now also refuses when the stub is
+  off but `PROXILION_IDP_ISSUER` / `_AUDIENCE` / `_JWKS_URI` are not all set —
+  that combination leaves `/oauth/bridge/callback` with no way to establish a
+  human principal at all, which is an operator error worth failing at boot
+  rather than on every login. A partial IdP configuration is treated as "not
+  configured"; it never silently falls back to the stub.
 
 ### Fixed
 

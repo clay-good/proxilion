@@ -29,6 +29,7 @@ use crate::config::{Config, TlsMinVersion};
 use crate::crypto::TokenCipher;
 use crate::forwarder::{NatsBridge, SiemForwarder, SiemHmacKey, TeeStream};
 use crate::notifier::{BurstConfig, BurstSuppressor, WebhookNotifier, WebhookSecret};
+use crate::oauth::federation::VerifiedFederation;
 use crate::oauth::state::GoogleClient;
 use crate::oauth::{self, OAuthState};
 use crate::pic::{CatKeyRegistry, PcaCache, PicExecutor, PicVerifier};
@@ -292,19 +293,26 @@ pub async fn run(cfg: Config) -> Result<()> {
                     notifiers,
                 )?;
                 app = app.merge(oauth::router(oauth_state));
-                // The /oauth/bridge/callback route trusts the federation token's
-                // *payload* without verifying its signature (oauth/bridge.rs —
-                // M0/M1 stub; upstream provenance-bridge has no binary target
-                // yet). Anyone who can reach the callback can forge p_0/ops/PCA_0,
-                // which the proxy then launders into a validly CAT-signed chain.
-                // Warn loudly at boot — mirroring the PROXILION_DISABLE_OPERATOR_AUTH
-                // posture above — so this can never ship silently. Swap in a
-                // JWKS-backed `jsonwebtoken::decode` before any production deploy.
-                warn!(
-                    "federation-bridge token signatures are NOT verified \
-                     (oauth/bridge.rs M0/M1 stub) — /oauth/bridge/callback accepts \
-                     forgeable p_0/ops. Dev/CI/smoke only; never use in production."
-                );
+                // The legacy `federation_token` branch of
+                // /oauth/bridge/callback trusts the token's *payload* without
+                // verifying its signature (oauth/bridge.rs). Anyone who can
+                // reach the callback can forge p_0/ops/PCA_0, which the proxy
+                // then launders into a validly CAT-signed chain. Warn loudly
+                // at boot — mirroring the PROXILION_DISABLE_OPERATOR_AUTH
+                // posture above — so this can never ship silently. A protected
+                // PROXILION_ENV refuses to boot at all in this state
+                // (`federation_boot_refusal`), so this warn only ever fires in
+                // development.
+                if cfg.insecure_bridge_stub {
+                    warn!(
+                        "the insecure federation-bridge stub is ACTIVE — \
+                         /oauth/bridge/callback accepts an unsigned \
+                         `federation_token` with forgeable p_0/ops. Dev/CI/smoke \
+                         only. Set PROXILION_INSECURE_BRIDGE_STUB=0 and configure \
+                         PROXILION_IDP_ISSUER / _AUDIENCE / _JWKS_URI for the \
+                         verified path."
+                    );
+                }
                 app = app.merge(protected_router(auth_state.clone()));
                 // production-readiness.md PR-2 — per-request timeout on the
                 // agent-facing adapter routes. Scoped HERE (not globally) so
@@ -1228,7 +1236,45 @@ fn build_oauth_state(cfg: &Config, core: &CoreState) -> Option<OAuthState> {
         },
         federation_bridge_authorize_url: format!("{}/authorize", cfg.federation_bridge_url),
         proxy_base_url: cfg.proxy_base_url.clone(),
+        federation: build_verified_federation(cfg),
+        insecure_bridge_stub: cfg.insecure_bridge_stub,
     })
+}
+
+/// Build the PR-1 verified federation path when the operator configured
+/// all three of issuer / audience / JWKS URI. `None` means the callback
+/// refuses every `id_token` — never a silent fallback to the stub.
+///
+/// The algorithm allow-list and the `https://` JWKS URI were already
+/// validated by `ConfigBuilder::build`, so a parse failure here is
+/// unreachable; it degrades to the safe default rather than panicking.
+fn build_verified_federation(cfg: &Config) -> Option<Arc<VerifiedFederation>> {
+    let (issuer, audience, jwks_uri) = (
+        cfg.idp_issuer.as_deref()?,
+        cfg.idp_audience.as_deref()?,
+        cfg.idp_jwks_uri.as_deref()?,
+    );
+    let algorithms = crate::oauth::federation::parse_algorithms(&cfg.idp_algorithms)
+        .unwrap_or_else(|_| {
+            vec![
+                jsonwebtoken::Algorithm::RS256,
+                jsonwebtoken::Algorithm::ES256,
+            ]
+        });
+    // A dedicated client: JWKS fetches are on the login critical path and
+    // must not queue behind adapter traffic. Certificate verification is
+    // reqwest's default and is asserted by the PR-4 CI gate.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    info!(
+        issuer,
+        jwks_uri, "verified federation path enabled (PR-1 in-process id_token verification)"
+    );
+    Some(crate::oauth::federation::build(
+        issuer, audience, jwks_uri, algorithms, http,
+    ))
 }
 
 fn hex_decode_32(hex: &str) -> Result<[u8; 32]> {

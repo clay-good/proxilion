@@ -95,11 +95,27 @@ proxy:
   trustedProxies: []
   env:
     # Deployment environment (PROXILION_ENV): development | staging |
-    # production. In staging/production the proxy REFUSES TO BOOT while the
-    # insecure payload-only federation stub is active (production-readiness.md
-    # PR-1) — keep this "development" until PR-1's verified federation lands,
-    # then set "production". Empty = development (does not render the var).
+    # production. In staging/production the proxy REFUSES TO BOOT unless the
+    # insecure payload-only federation stub is OFF and the verified federation
+    # path below is fully configured (production-readiness.md PR-1).
+    # Empty = development (does not render the var).
     environment: ""
+    # Verified federation (PR-1). Set all three to enable in-process
+    # `id_token` verification at /oauth/bridge/callback: the signature is
+    # checked against the IdP's JWKS with the algorithm pinned server-side,
+    # then PCA_0 is minted from the verified identity. Required for
+    # environment: staging|production. jwksUri MUST be https://.
+    idp:
+      issuer: ""                          # e.g. https://acme.okta.com
+      audience: ""                        # e.g. proxilion
+      jwksUri: ""                         # e.g. https://acme.okta.com/oauth2/v1/keys
+      # Server-side algorithm allow-list. Asymmetric only — `none` and any
+      # HS* are refused at boot. Empty renders the RS256,ES256 default.
+      algorithms: ""
+    # Accept the legacy payload-only `federation_token` (NO signature check).
+    # Development only; leave false for any real deployment. Empty = the
+    # proxy default (true) — set explicitly to "0" alongside idp.* above.
+    insecureBridgeStub: ""
     # Customer's primary domain — drives `${customer_domain}` in policy.
     customerDomain: "example.com"
     logFormat: "json"

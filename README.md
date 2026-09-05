@@ -440,6 +440,7 @@ properties end-to-end:
 | Google token refresh, 50 concurrent | the per-bearer mutex coalesces a stampede: with an expired token, **50 concurrent** refreshers hit Google **exactly once** (asserted via wiremock's `received_requests`) and all see the fresh token |
 | Operator-auth boundary (the gate for all `/api/v1/*`) | the real `middleware` + `scope_check` composition, driven via `tower::oneshot` against seeded `operator_tokens`: valid+scope → 200, wildcard → 200, revoked → 401, unknown → 401, wrong scope → 403, missing/malformed → 401, and a successful auth touches `last_used_at` |
 | OAuth federation callback (replay binding) | a federation token whose `state` matches the callback session establishes it (`pca_0_id`/`p_0` written); a token minted for a *different* session is rejected (`BridgeRejected`, 401) and the target session stays untouched — session-fixation defense (§6.4); a *second* token naming the **same** already-bound session is rejected (`SessionGone`) without overwriting its identity — same-session re-bind defense (thirteenth-audit fix) |
+| OAuth federation callback (verified path, PR-1) | a signature-verified `id_token` mints PCA_0 through Trust Plane (wiremock `POST /v1/pca/issue`), binds the session to the *Trust-Plane-returned* `p_0`/`ops`, caches PCA_0 for the Google hop, and narrows the Google scope; a second establish on the same session is refused (`SessionGone`) without rebinding. Path selection is pinned too: an `id_token` on an unconfigured deployment is refused, a `federation_token` attached alongside an `id_token` cannot downgrade to the unverified path, and a `federation_token` with the stub disabled is refused |
 | OAuth Google callback (atomic credential persist) | the encrypted `google_tokens` row commits or rolls back atomically with the `agent_bearers` row that references it — a rolled-back transaction leaves **zero** rows, a committed one leaves exactly one (thirteenth-audit fix — the row was once written on the bare pool before the fallible Trust Plane mint, orphaning encrypted credentials on any failure) |
 | Slack approval `trigger_id` release | after a Slack approve/reject `Fresh`-claims the `trigger_id` on a `pending` row, a **failed** commit releases the claim so a fresh click re-claims cleanly (the action isn't wedged), while a release *after* the row committed is a no-op — the `status='pending'` guard never un-claims a row that did mutate (seventeenth-audit fix) |
 | Email approval link survives a failed commit | the public approval `submit` form runs `approve_inner` against a `pending` row naming an **absent** predecessor PCA → the commit fails, the row stays `pending`, and the single-use `notifier_tokens` row is **not** consumed (`consumed_at IS NULL`) so a fresh GET still renders the live form — the email sibling of the Slack-wedge fix (eighteenth-audit fix — the token was once burned regardless of outcome, wedging the link on any transient failure) |
@@ -682,17 +683,33 @@ column), and bounded the CLI live-tail's SSE reassembly buffer. This is a track
 record, not a guarantee — the threat-model table above states the honest ceiling
 of an interception proxy.
 
-**One known pre-production gap, by design.** The federation-bridge token
-signature is **not** verified in M0/M1 — upstream `provenance-bridge` ships no
-binary target yet, so `/oauth/bridge/callback` trusts the token payload
-(spec.md §0.4). Anyone who can reach that callback could forge `p_0`/`ops`, so
-the proxy emits a loud `warn!` at boot whenever the OAuth router is mounted and
-the route must not be exposed in production until the JWKS-backed
-`jsonwebtoken::decode` swap lands. The smoke/CI/demo flows use the stub
-deliberately.
+**Federation identity is verified in-process (PR-1, closed).**
+`/oauth/bridge/callback` verifies the IdP `id_token`'s **signature** against
+the issuer's published JWKS before any authority is minted, with the algorithm
+pinned **server-side** to an operator allow-list — the token's own `alg` header
+never selects it, so `alg:none` and the RS256→HS256 confusion attack are both
+structurally impossible. `iss`/`aud`/`exp`/`nbf` are enforced with ≤ 60 s skew;
+every failure is a fail-closed `401`. PCA_0 is then minted **in-process** from
+the verified identity via Trust Plane `POST /v1/pca/issue`, so there is no
+bridge→proxy callback token to forge at all. Configure it with:
 
-**Path to production (M5).** The full hardening breakdown to close that gap and
-make Proxilion safe to expose — federation signature verification (the P0
+| Setting | Meaning |
+|---|---|
+| `PROXILION_IDP_ISSUER` | trusted OIDC issuer (`iss`) |
+| `PROXILION_IDP_AUDIENCE` | the `aud` your IdP mints Proxilion tokens for |
+| `PROXILION_IDP_JWKS_URI` | the issuer's JWKS endpoint (**`https://` only**) |
+| `PROXILION_IDP_ALGORITHMS` | server-side allow-list, default `RS256,ES256` (asymmetric only) |
+
+The historical payload-only `federation_token` path still exists for the
+dev/CI/demo flows behind `PROXILION_INSECURE_BRIDGE_STUB` (default on). It is
+refused at boot in any protected environment: `PROXILION_ENV=staging` or
+`production` will not start unless the stub is **off** *and* all three IdP
+settings are present. An `id_token` always takes the verified branch even when
+a `federation_token` is attached alongside it, so the stub cannot be used to
+downgrade a verified deployment.
+
+**Path to production (M5).** The full hardening breakdown to
+make Proxilion safe to expose — federation signature verification (PR-1,
 above), edge DoS controls, key rotation, SLOs + runbooks, HA + DR, and a
 signed/SBOM'd `v0.1.0` — lives in
 [docs/specs/production-readiness.md](docs/specs/production-readiness.md) (PR-1

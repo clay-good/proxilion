@@ -17,8 +17,9 @@
 //! The fetch is behind the [`JwksSource`] trait so the cache/rotation/
 //! throttle logic is unit-tested without a network or a mock HTTP server;
 //! [`HttpJwksSource`] is the production reqwest-backed implementation.
-
-#![allow(dead_code)] // wired into the callback flow in the next PR-1 slice
+//!
+//! [`super::federation::VerifiedFederation`] composes this with
+//! [`super::idp_verify`] for the `/oauth/bridge/callback` verified path.
 
 use std::sync::Arc;
 use std::time::Duration;

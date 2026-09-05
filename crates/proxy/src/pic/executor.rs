@@ -132,10 +132,10 @@ impl PicExecutor {
 
     /// Mint PCA_0 from an external credential (e.g. an IdP JWT).
     ///
-    /// Currently not invoked from the OAuth flow because the federation-bridge
-    /// service is deferred (see spec.md §0.4 Status); kept here so the §1.2
-    /// bearer middleware and the future bridge wrapper can call it.
-    #[allow(dead_code)]
+    /// Called by the verified federation path at `/oauth/bridge/callback`
+    /// (production-readiness.md PR-1, Approach A) once the `id_token`'s
+    /// signature has been checked in-process. The credential is forwarded
+    /// verbatim so the Trust Plane re-verifies it independently.
     #[instrument(skip(self, credential))]
     pub async fn mint_pca_0(
         &self,

@@ -22,11 +22,10 @@
 //! `alg:none` bypass and the RS256→HS256 public-key-as-HMAC confusion.
 //!
 //! The JWKS fetch/cache + `kid` rotation layer (resolving a `kid` to the
-//! [`DecodingKey`] passed here) and the OAuth-callback rewiring that calls
-//! Trust Plane `POST /v1/pca/issue` from the verified identity are the
-//! next PR-1 slice; this module is the verification primitive they build on.
-
-#![allow(dead_code)] // wired into the callback flow in the next PR-1 slice
+//! [`DecodingKey`] passed here) lives in [`super::jwks`]; the two are
+//! composed by [`super::federation::VerifiedFederation`], which the
+//! `/oauth/bridge/callback` handler calls before minting PCA_0 from the
+//! verified identity via Trust Plane `POST /v1/pca/issue`.
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, errors::ErrorKind};
 use serde::Deserialize;
@@ -86,6 +85,13 @@ pub struct VerifiedIdentity {
     pub subject: String,
     /// `exp` (epoch seconds) of the verified token.
     pub expires_at: i64,
+    /// The `pic_ops` claim: the ops the IdP asserts this human holds.
+    /// Read **only** from the signature-verified token — it becomes the
+    /// requested-ops set for Trust Plane `POST /v1/pca/issue`, which
+    /// independently re-verifies the credential and is the authority on
+    /// what is actually granted. Absent claim → empty (the callback
+    /// rejects an empty set rather than requesting unbounded authority).
+    pub ops: Vec<String>,
 }
 
 /// Fail-closed verification outcomes. Every variant is a rejection; there
@@ -158,6 +164,7 @@ pub fn verify_id_token(
         issuer: claims.iss,
         subject: claims.sub,
         expires_at: claims.exp,
+        ops: claims.pic_ops,
     })
 }
 
@@ -168,6 +175,12 @@ struct IdTokenClaims {
     iss: String,
     sub: String,
     exp: i64,
+    /// Ops the IdP asserts for this human (Trust Plane's `pic_ops`
+    /// convention — see `provenance-plane` `api/handlers/issue.rs`).
+    /// Defaulted so an IdP that does not emit it still verifies; the
+    /// caller decides what an empty set means.
+    #[serde(default)]
+    pic_ops: Vec<String>,
 }
 
 fn classify(e: jsonwebtoken::errors::Error) -> IdpVerifyError {
@@ -215,6 +228,8 @@ TIXll0ZKNRpthchaY4xUFlizcONuRRPpt5QqHpVHRKZmTS7z/3iQNPnmPg==
         exp: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
         nbf: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pic_ops: Option<Vec<String>>,
     }
 
     fn now() -> i64 {
@@ -248,6 +263,7 @@ TIXll0ZKNRpthchaY4xUFlizcONuRRPpt5QqHpVHRKZmTS7z/3iQNPnmPg==
             aud: AUD.into(),
             exp: now() + 300,
             nbf: None,
+            pic_ops: None,
         }
     }
 
@@ -258,6 +274,20 @@ TIXll0ZKNRpthchaY4xUFlizcONuRRPpt5QqHpVHRKZmTS7z/3iQNPnmPg==
         assert_eq!(id.principal, format!("oidc:{ISS}#user-123"));
         assert_eq!(id.issuer, ISS);
         assert_eq!(id.subject, "user-123");
+        assert!(id.ops.is_empty(), "no pic_ops claim → empty ops");
+    }
+
+    #[test]
+    fn carries_pic_ops_claim_from_the_verified_token() {
+        // The ops that seed Trust Plane's PCA_0 request must come from the
+        // signature-verified token, never from an unverified source.
+        let mut claims = valid_claims();
+        claims.pic_ops = Some(vec![
+            "drive:read:engineering/*".into(),
+            "gmail:read:*".into(),
+        ]);
+        let id = verify_id_token(&sign_es256(&claims), &dec_key(), &cfg()).unwrap();
+        assert_eq!(id.ops, vec!["drive:read:engineering/*", "gmail:read:*"]);
     }
 
     #[test]

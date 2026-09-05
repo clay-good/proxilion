@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use super::federation::VerifiedFederation;
 use crate::crypto::TokenCipher;
 use crate::pic::PicExecutor;
 
@@ -21,6 +22,16 @@ pub struct OAuthState {
     /// Proxy's own public base URL — used to build redirect_uris we hand
     /// to upstream OAuth servers.
     pub proxy_base_url: String,
+    /// The PR-1 verified federation path, when configured
+    /// (`PROXILION_IDP_ISSUER` / `_AUDIENCE` / `_JWKS_URI`). `Some` means
+    /// `/oauth/bridge/callback` accepts an `id_token` and verifies its
+    /// signature before any authority is minted. Shared behind an `Arc`
+    /// so the JWKS cache is process-wide, not per-clone.
+    pub federation: Option<Arc<VerifiedFederation>>,
+    /// Whether the insecure payload-only `federation_token` path is still
+    /// accepted (`PROXILION_INSECURE_BRIDGE_STUB`, dev-only — the boot
+    /// guard refuses it in staging/production).
+    pub insecure_bridge_stub: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -506,8 +517,8 @@ mod tests {
     }
 
     #[test]
-    fn oauth_state_field_count_pinned_at_exactly_six_via_exhaustive_destructure() {
-        // Pin OAuthState's field count at EXACTLY 6 via an exhaustive
+    fn oauth_state_field_count_pinned_at_exactly_eight_via_exhaustive_destructure() {
+        // Pin OAuthState's field count at EXACTLY 8 via an exhaustive
         // destructure with NO `..` rest pattern. A future field landing
         // (e.g. an `audit_log_url` for cross-handler trace export, or a
         // 7th `oidc_discovery_cache`) without matching wiring at the
@@ -525,6 +536,8 @@ mod tests {
                 google: _,
                 federation_bridge_authorize_url: _,
                 proxy_base_url: _,
+                federation: _,
+                insecure_bridge_stub: _,
             } = s;
         }
     }
@@ -678,7 +691,7 @@ mod tests {
         // fans out per request AND silently change what the OAuth
         // callback handlers see. The existing `#[derive(Clone)]`
         // walks the trait; exhaustive destructure catches a
-        // runtime-only 7th field that doesn't surface through Clone
+        // runtime-only 9th field that doesn't surface through Clone
         // derivation. Use a fn-destructure witness since OAuthState
         // contains PgPool which requires a tokio runtime context
         // that #[test] doesn't provide.
@@ -691,6 +704,8 @@ mod tests {
                 google: _,
                 federation_bridge_authorize_url: _,
                 proxy_base_url: _,
+                federation: _,
+                insecure_bridge_stub: _,
             } = s;
         }
     }

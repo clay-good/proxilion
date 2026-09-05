@@ -158,6 +158,22 @@ pub struct Config {
     /// `environment` is protected (staging/production), the proxy refuses
     /// to boot (production-readiness.md PR-1). `PROXILION_INSECURE_BRIDGE_STUB`.
     pub insecure_bridge_stub: bool,
+    /// Trusted OIDC issuer (`iss`) for the verified federation path
+    /// (production-readiness.md PR-1). Set together with `idp_audience`
+    /// and `idp_jwks_uri` to enable `id_token` verification at
+    /// `/oauth/bridge/callback`. `PROXILION_IDP_ISSUER`.
+    pub idp_issuer: Option<String>,
+    /// Audience (`aud`) the IdP mints Proxilion `id_token`s for.
+    /// `PROXILION_IDP_AUDIENCE`.
+    pub idp_audience: Option<String>,
+    /// The issuer's JWKS endpoint. MUST be `https://` (enforced at fetch).
+    /// `PROXILION_IDP_JWKS_URI`.
+    pub idp_jwks_uri: Option<String>,
+    /// Server-side algorithm allow-list for `id_token` verification, as a
+    /// comma-separated list. Asymmetric only — `none` and HS\* are refused
+    /// at parse time (RFC 8725 §3.1/§3.2). Defaults to `RS256,ES256`.
+    /// `PROXILION_IDP_ALGORITHMS`.
+    pub idp_algorithms: String,
 }
 
 impl Config {
@@ -170,17 +186,38 @@ impl Config {
     /// federation token can mint arbitrary authority, so an unverified
     /// federation path must never be reachable in a protected environment.
     pub fn federation_boot_refusal(&self) -> Option<String> {
-        if self.insecure_bridge_stub && self.environment.is_protected() {
-            Some(format!(
+        if !self.environment.is_protected() {
+            return None;
+        }
+        if self.insecure_bridge_stub {
+            return Some(format!(
                 "refusing to boot: PROXILION_ENV={} forbids the insecure \
                  payload-only federation stub (it accepts unsigned tokens and \
-                 would let any caller forge an arbitrary principal). Complete \
-                 PR-1 verified federation, or run with PROXILION_ENV=development.",
+                 would let any caller forge an arbitrary principal). Set \
+                 PROXILION_INSECURE_BRIDGE_STUB=0 and configure the verified \
+                 federation path (PROXILION_IDP_ISSUER / _AUDIENCE / _JWKS_URI), \
+                 or run with PROXILION_ENV=development.",
                 self.environment.label()
-            ))
-        } else {
-            None
+            ));
         }
+        if !self.verified_federation_configured() {
+            return Some(format!(
+                "refusing to boot: PROXILION_ENV={} requires the verified \
+                 federation path, but PROXILION_IDP_ISSUER / \
+                 PROXILION_IDP_AUDIENCE / PROXILION_IDP_JWKS_URI are not all \
+                 set. Without them /oauth/bridge/callback has no way to \
+                 establish a human principal at all.",
+                self.environment.label()
+            ));
+        }
+        None
+    }
+
+    /// Is the PR-1 verified federation path fully configured? All three of
+    /// issuer / audience / JWKS URI are required — a partial configuration
+    /// is an operator error, never a silent fallback to the stub.
+    pub fn verified_federation_configured(&self) -> bool {
+        self.idp_issuer.is_some() && self.idp_audience.is_some() && self.idp_jwks_uri.is_some()
     }
 }
 
@@ -342,6 +379,10 @@ pub struct ConfigBuilder {
     tls_min_version: TlsMinVersion,
     environment: Environment,
     insecure_bridge_stub: bool,
+    idp_issuer: Option<String>,
+    idp_audience: Option<String>,
+    idp_jwks_uri: Option<String>,
+    idp_algorithms: String,
 }
 
 impl Default for ConfigBuilder {
@@ -399,6 +440,14 @@ impl ConfigBuilder {
             // verified-issuance rewiring lands; default true, refused in
             // protected environments by `federation_boot_refusal`.
             insecure_bridge_stub: true,
+            // Verified federation is opt-in by configuration; unset means
+            // "no verified path" (dev runs on the stub, protected envs
+            // refuse to boot via `federation_boot_refusal`).
+            idp_issuer: None,
+            idp_audience: None,
+            idp_jwks_uri: None,
+            // RFC 8725-safe asymmetric default, matching `IdpVerifyConfig::new`.
+            idp_algorithms: "RS256,ES256".to_string(),
         }
     }
 
@@ -568,6 +617,24 @@ impl ConfigBuilder {
                 _ => {}
             }
         }
+        for (var, slot) in [
+            ("PROXILION_IDP_ISSUER", &mut self.idp_issuer),
+            ("PROXILION_IDP_AUDIENCE", &mut self.idp_audience),
+            ("PROXILION_IDP_JWKS_URI", &mut self.idp_jwks_uri),
+        ] {
+            if let Ok(v) = env::var(var) {
+                let v = v.trim();
+                // An empty value clears the setting rather than configuring
+                // an empty issuer/audience that would match nothing.
+                *slot = (!v.is_empty()).then(|| v.to_string());
+            }
+        }
+        if let Ok(v) = env::var("PROXILION_IDP_ALGORITHMS") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.idp_algorithms = v.to_string();
+            }
+        }
         Ok(self)
     }
 
@@ -694,6 +761,18 @@ impl ConfigBuilder {
         if let Some(v) = file.insecure_bridge_stub {
             self.insecure_bridge_stub = v;
         }
+        if let Some(v) = file.idp_issuer {
+            self.idp_issuer = Some(v);
+        }
+        if let Some(v) = file.idp_audience {
+            self.idp_audience = Some(v);
+        }
+        if let Some(v) = file.idp_jwks_uri {
+            self.idp_jwks_uri = Some(v);
+        }
+        if let Some(v) = file.idp_algorithms {
+            self.idp_algorithms = v;
+        }
         Ok(self)
     }
 
@@ -767,6 +846,23 @@ impl ConfigBuilder {
             &self.federation_bridge_url,
         )?;
 
+        // PR-1 verified federation: validate the IdP settings at build time
+        // so a typo surfaces at boot rather than as a 401 on every callback.
+        if let Some(uri) = self.idp_jwks_uri.as_deref()
+            && !uri.starts_with("https://")
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "PROXILION_IDP_JWKS_URI",
+                reason: format!("must be an https:// URL, got {uri:?}"),
+            });
+        }
+        if let Err(reason) = crate::oauth::federation::parse_algorithms(&self.idp_algorithms) {
+            return Err(ConfigError::InvalidValue {
+                field: "PROXILION_IDP_ALGORITHMS",
+                reason,
+            });
+        }
+
         // dev_mode = false → cert + key must exist on disk now.
         if !self.dev_mode {
             if !self.tls_cert_path.exists() {
@@ -810,6 +906,10 @@ impl ConfigBuilder {
             tls_min_version: self.tls_min_version,
             environment: self.environment,
             insecure_bridge_stub: self.insecure_bridge_stub,
+            idp_issuer: self.idp_issuer,
+            idp_audience: self.idp_audience,
+            idp_jwks_uri: self.idp_jwks_uri,
+            idp_algorithms: self.idp_algorithms,
         })
     }
 }
@@ -862,6 +962,10 @@ struct FileConfig {
     tls_min_version: Option<String>,
     environment: Option<String>,
     insecure_bridge_stub: Option<bool>,
+    idp_issuer: Option<String>,
+    idp_audience: Option<String>,
+    idp_jwks_uri: Option<String>,
+    idp_algorithms: Option<String>,
 }
 
 /// Read a secret from `{var}` or, preferentially, the file named by
@@ -1772,6 +1876,10 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             tls_min_version: _,
             environment: _,
             insecure_bridge_stub: _,
+            idp_issuer: _,
+            idp_audience: _,
+            idp_jwks_uri: _,
+            idp_algorithms: _,
         } = c;
     }
 
@@ -1825,6 +1933,10 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             tls_min_version: _,
             environment: _,
             insecure_bridge_stub: _,
+            idp_issuer: _,
+            idp_audience: _,
+            idp_jwks_uri: _,
+            idp_algorithms: _,
         } = b;
     }
 
@@ -2019,11 +2131,74 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
         let mut b = ConfigBuilder::defaults().with_dev_mode(true);
         b.environment = Environment::Production;
         b.insecure_bridge_stub = false;
+        b.idp_issuer = Some("https://acme.okta.com".into());
+        b.idp_audience = Some("proxilion".into());
+        b.idp_jwks_uri = Some("https://acme.okta.com/oauth2/v1/keys".into());
         let c = b.build().unwrap();
+        assert!(
+            c.verified_federation_configured(),
+            "all three IdP settings present"
+        );
         assert!(
             c.federation_boot_refusal().is_none(),
             "stub-off production must boot"
         );
+    }
+
+    #[test]
+    fn protected_env_without_verified_federation_refuses_boot() {
+        // PR-1: turning the stub off is not enough. A protected env with no
+        // verified path has no way to establish a human principal at all —
+        // refuse at boot rather than 401 every login.
+        let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+        b.environment = Environment::Production;
+        b.insecure_bridge_stub = false;
+        let reason = b
+            .build()
+            .unwrap()
+            .federation_boot_refusal()
+            .expect("must refuse");
+        assert!(reason.contains("PROXILION_IDP_ISSUER"), "{reason}");
+    }
+
+    #[test]
+    fn partially_configured_verified_federation_is_not_configured() {
+        // Two of three is an operator error, never a silent fallback.
+        for (iss, aud, uri) in [
+            (Some("https://i"), Some("a"), None),
+            (Some("https://i"), None, Some("https://j")),
+            (None, Some("a"), Some("https://j")),
+        ] {
+            let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+            b.idp_issuer = iss.map(str::to_string);
+            b.idp_audience = aud.map(str::to_string);
+            b.idp_jwks_uri = uri.map(str::to_string);
+            assert!(!b.build().unwrap().verified_federation_configured());
+        }
+    }
+
+    #[test]
+    fn plaintext_jwks_uri_is_refused_at_build() {
+        let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+        b.idp_jwks_uri = Some("http://acme.okta.com/keys".into());
+        let err = b.build().unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if *field == "PROXILION_IDP_JWKS_URI"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unsafe_or_unparseable_algorithm_allow_list_is_refused_at_build() {
+        for raw in ["HS256", "none", "RS256,HS256", "", "nonsense"] {
+            let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+            b.idp_algorithms = raw.to_string();
+            let err = b.build().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { field, .. } if *field == "PROXILION_IDP_ALGORITHMS"),
+                "{raw:?} → {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,11 @@
 //!     new request is *shed* immediately with `503 Service Unavailable`
 //!     (`try_acquire`, never a queue) rather than buffering into memory
 //!     exhaustion under overload.
+//!   * **L4 connection cap** — the same idea one layer down. The three
+//!     controls above all run *after* the TLS handshake, so a flood of
+//!     connections that never send a request still costs a file descriptor
+//!     and an asymmetric handshake each. [`ConnectionLimit`] caps accepted
+//!     connections and refuses the excess **before** the handshake.
 //!
 //! Both are implemented as `axum::middleware::from_fn` layers (the same edge
 //! style as `request_span` / `count_edge_rejections`) and feed the existing
@@ -32,13 +37,16 @@
 //! (`cargo deny` / `cargo audit`) untouched.
 
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 const FORWARDED_FOR: &str = "x-forwarded-for";
@@ -255,12 +263,203 @@ pub async fn concurrency_limit(
     }
 }
 
+// =====================================================================
+// L4 connection cap
+// =====================================================================
+
+/// Caps concurrently-accepted TCP connections, refusing the excess *before*
+/// the TLS handshake (production-readiness.md PR-2).
+///
+/// **Why this is not just the concurrency limit again.** The request-level
+/// controls run after the handshake, so they never see a connection that is
+/// opened and left idle — yet each one still costs a file descriptor and an
+/// asymmetric handshake. A caller that opens 100k connections and sends
+/// nothing exhausts the process's FD budget while every request-level counter
+/// reads zero. Refusing at accept time is the only place that fault is
+/// visible.
+///
+/// Wired as an `axum_server` `Accept` implementation *inside* the rustls
+/// acceptor, so a refusal closes the TCP connection without paying for the
+/// handshake. The permit rides on the accepted stream and is released when
+/// the connection drops.
+#[derive(Clone)]
+pub struct ConnectionLimit {
+    sem: Arc<Semaphore>,
+}
+
+impl ConnectionLimit {
+    /// `max_connections` of `0` means unlimited: the semaphore is created
+    /// with `Semaphore::MAX_PERMITS` so the accept path stays one uniform
+    /// atomic operation rather than a branch (and the acceptor's type does
+    /// not change with the setting).
+    pub fn new(max_connections: usize) -> Self {
+        let permits = if max_connections == 0 {
+            Semaphore::MAX_PERMITS
+        } else {
+            max_connections.min(Semaphore::MAX_PERMITS)
+        };
+        Self {
+            sem: Arc::new(Semaphore::new(permits)),
+        }
+    }
+}
+
+/// An accepted stream that holds its connection permit. Dropping the stream
+/// (connection closed, however it ends) releases the slot.
+pub struct LimitedStream<I> {
+    inner: I,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<I, S> axum_server::accept::Accept<I, S> for ConnectionLimit
+where
+    I: AsyncRead + AsyncWrite + Unpin,
+{
+    type Stream = LimitedStream<I>;
+    type Service = S;
+    type Future = std::future::Ready<std::io::Result<(Self::Stream, Self::Service)>>;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        match self.sem.clone().try_acquire_owned() {
+            Ok(_permit) => std::future::ready(Ok((
+                LimitedStream {
+                    inner: stream,
+                    _permit,
+                },
+                service,
+            ))),
+            Err(_) => {
+                metrics::counter!(
+                    "proxilion_ingress_rejections_total",
+                    "reason" => "connection_limit",
+                )
+                .increment(1);
+                // `axum_server` drops the connection on an acceptor error, so
+                // the peer sees a closed TCP connection and no handshake.
+                std::future::ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "connection limit reached",
+                )))
+            }
+        }
+    }
+}
+
+// `LimitedStream` is a transparent pass-through; `I: Unpin` at every call
+// site (the acceptor bound), so the delegations need no pin projection.
+impl<I: AsyncRead + Unpin> AsyncRead for LimitedStream<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for LimitedStream<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    // ── L4 connection cap (PR-2) ─────────────────────────────────────────
+
+    use axum_server::accept::Accept;
+
+    /// Accept one connection through the limiter, returning the permitted
+    /// stream. `tokio::io::duplex` gives a real AsyncRead+AsyncWrite+Unpin
+    /// stream without a socket.
+    /// The permit rides on the accepted stream, so the peer half is
+    /// irrelevant to what these tests assert and is dropped immediately.
+    async fn try_accept(
+        limit: &ConnectionLimit,
+    ) -> std::io::Result<(LimitedStream<tokio::io::DuplexStream>, ())> {
+        let (client, _peer) = tokio::io::duplex(64);
+        limit.accept(client, ()).await
+    }
+
+    #[tokio::test]
+    async fn connection_limit_refuses_over_cap_and_releases_on_drop() {
+        let limit = ConnectionLimit::new(2);
+        let a = try_accept(&limit).await.expect("first connection");
+        let b = try_accept(&limit).await.expect("second connection");
+
+        let err = try_accept(&limit)
+            .await
+            .err()
+            .expect("third connection must be refused at the cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+
+        // The permit rides on the stream: closing a connection frees a slot.
+        drop(a);
+        let _c = try_accept(&limit).await.expect("slot freed by the drop");
+
+        // Still at the cap with b + c held.
+        assert!(try_accept(&limit).await.is_err(), "cap still enforced");
+        drop(b);
+    }
+
+    #[tokio::test]
+    async fn connection_limit_of_zero_is_unlimited() {
+        // `0` must not mean "refuse everything" — it is the documented
+        // disable sentinel, matching the other three PR-2 controls.
+        let limit = ConnectionLimit::new(0);
+        let mut held = Vec::new();
+        for i in 0..64 {
+            held.push(
+                try_accept(&limit).await.unwrap_or_else(|e| {
+                    panic!("connection {i} refused with an unlimited cap: {e}")
+                }),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_limit_caps_at_the_semaphore_maximum() {
+        // A wildly oversized configured value must not panic
+        // `Semaphore::new` (which asserts <= MAX_PERMITS).
+        let limit = ConnectionLimit::new(usize::MAX);
+        assert!(try_accept(&limit).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn limited_stream_passes_bytes_through_unchanged() {
+        // The wrapper must be transparent — it only carries the permit.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let limit = ConnectionLimit::new(1);
+        let (client, mut server) = tokio::io::duplex(64);
+        let (mut wrapped, ()) = limit.accept(client, ()).await.expect("accept");
+
+        wrapped.write_all(b"ping").await.expect("write through");
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.expect("peer reads");
+        assert_eq!(&buf, b"ping");
+
+        server.write_all(b"pong").await.expect("peer writes");
+        let mut back = [0u8; 4];
+        wrapped.read_exact(&mut back).await.expect("read through");
+        assert_eq!(&back, b"pong");
     }
 
     fn xff(value: &str) -> HeaderMap {

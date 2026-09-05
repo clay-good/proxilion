@@ -718,9 +718,9 @@ make Proxilion safe to expose — federation signature verification (PR-1,
 above), edge DoS controls, key rotation, SLOs + runbooks, HA + DR, and a
 signed/SBOM'd `v0.1.0` — lives in
 [docs/specs/production-readiness.md](docs/specs/production-readiness.md) (PR-1
-… PR-13) with a Go-Live Gate checklist. **PR-2 (edge DoS controls) is complete
-at the application layer** — four operator-tunable controls on the agent-facing
-ingress, each rejection feeding `proxilion_ingress_rejections_total{reason}`:
+… PR-13) with a Go-Live Gate checklist. **PR-2 (edge DoS controls) is complete** — five
+operator-tunable controls on the agent-facing ingress, each rejection feeding
+`proxilion_ingress_rejections_total{reason}`:
 
 | Control | Env var (default) | Reject |
 |---|---|---|
@@ -728,15 +728,20 @@ ingress, each rejection feeding `proxilion_ingress_rejections_total{reason}`:
 | Per-request timeout (adapter routes; SSE/streaming exempt) | `PROXILION_REQUEST_TIMEOUT_SECS` (30 s) | `408` |
 | Per-IP rate limit (token bucket) | `PROXILION_RATE_LIMIT_PER_SEC` (50) / `PROXILION_RATE_LIMIT_BURST` (100) | `429` + `Retry-After` |
 | Global concurrency limit + load-shed | `PROXILION_MAX_CONCURRENT_REQUESTS` (1024) | `503` |
+| L4 connection cap (at accept, **before** the TLS handshake) | `PROXILION_MAX_CONNECTIONS` (4096) | TCP close |
 
 Each takes `0` to disable. The rate limiter keys on a **trusted-proxy-aware**
 client IP: `X-Forwarded-For` is believed only when the TCP peer is in
 `PROXILION_TRUSTED_PROXIES` (default empty = trust nothing), walked
 right-to-left so a spoofed prefix is ignored. Rate-limit and load-shed are
 implemented dependency-free (token bucket on `moka`, semaphore on `tokio`).
-Remaining PR-2 work (interlinks PR-7): the L4 connection/handshake cap and the
-at-scale overload load test (the FD-ulimit guidance now lives in the
-[config reference](docs/ops/config-reference.md)).
+The connection cap is the one fault the other four cannot see: a caller that
+opens connections and never sends a request costs a file descriptor and an
+asymmetric handshake each, while every request-level counter reads zero. It is
+also what the FD budget should be sized against — an idle keep-alive connection
+costs an FD, an in-flight request does not (see the
+[config reference](docs/ops/config-reference.md)). Remaining PR-2 work
+(interlinks PR-7): the at-scale overload load test.
 
 **PR-7 (HA & horizontal scaling) — the statelessness audit is published.**
 [docs/ops/ha-and-scaling.md](docs/ops/ha-and-scaling.md) classifies every

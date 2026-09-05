@@ -244,3 +244,11 @@
 # queue) so overload fails fast instead of exhausting memory. Default: 1024.
 # Set to 0 to disable. PROXILION_MAX_CONCURRENT_REQUESTS.
 # max_concurrent_requests = 1024
+
+# Maximum concurrently-accepted TCP connections. Enforced at accept time,
+# BEFORE the TLS handshake, so a flood of connections that never send a
+# request cannot exhaust file descriptors while every request-level counter
+# reads zero. Each connection costs one FD — keep this comfortably below
+# `ulimit -n`. Default: 4096. Set to 0 to disable.
+# PROXILION_MAX_CONNECTIONS.
+# max_connections = 4096

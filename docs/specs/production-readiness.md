@@ -17,12 +17,11 @@ mints PCA_0 in-process from the verified identity; a protected `PROXILION_ENV`
 refuses to boot unless the insecure stub is off *and* the verified path is
 configured. What remains on PR-1 is cleanup, not security surface: flipping the
 stub default off, deleting the payload-only path, and driving `smoke-pic.sh`
-through the verified leg. **PR-2 is now complete at the application
-layer** — all four edge resource-exhaustion controls (request-body cap,
-per-request adapter timeout, per-IP rate limit, global concurrency limit +
-load-shed) are live and dependency-free (see PR-2's Status below); the
-remaining PR-2 surface is the L4 connection cap, FD-ulimit docs, and the
-at-scale overload load test, all interlinked with PR-7. **PR-4
+through the verified leg. **PR-2's edge controls are all live** — request-body
+cap, per-request adapter timeout, per-IP rate limit, global concurrency limit +
+load-shed, and the L4 connection cap (refused at accept, before the TLS
+handshake), all dependency-free (see PR-2's Status below); the remaining PR-2
+surface is the at-scale overload load test, interlinked with PR-7. **PR-4
 (transport & trust-boundary hardening) is now complete** — configurable
 ingress TLS floor (1.2 default, 1.3 opt-in), a CI gate proving every
 outbound client verifies certificates, trusted-proxy config, and a per-hop
@@ -238,9 +237,8 @@ RFC 7515 (JWS); upstream `provenance-bridge/src/handlers/jwt.rs`;
 
 **Priority:** P0. **Effort:** 2–3 days.
 
-**Status (2026-06-19): implemented (application-layer controls).** All four
-edge resource-exhaustion controls are live and operator-tunable (each with a
-`0` disable sentinel):
+**Status (2026-09-05): implemented.** All five edge resource-exhaustion
+controls are live and operator-tunable (each with a `0` disable sentinel):
 
 1. **Body cap** — `axum::extract::DefaultBodyLimit`, default 10 MiB,
    `PROXILION_MAX_REQUEST_BODY_BYTES`, → `413`, applied before any
@@ -261,6 +259,14 @@ edge resource-exhaustion controls are live and operator-tunable (each with a
    in-flight ceiling ([edge.rs](../../crates/proxy/src/edge.rs)), default 1024,
    `PROXILION_MAX_CONCURRENT_REQUESTS`, → `503` via `try_acquire` (fail-fast,
    never a queue).
+5. **L4 connection cap** — `edge::ConnectionLimit`, an `axum_server::Accept`
+   implementation composed *inside* the rustls acceptor, default 4096,
+   `PROXILION_MAX_CONNECTIONS`. An over-cap connection is refused at **accept**
+   time, so the TCP connection closes before the asymmetric TLS handshake. This
+   is the one fault the other three cannot see: a caller that opens connections
+   and never sends a request costs an FD and a handshake each while every
+   request-level counter reads zero. The permit rides on the accepted stream, so
+   a slot is released whenever the connection ends.
 
 All four rejections increment `proxilion_ingress_rejections_total{reason}`
 (`body_limit`/`timeout` counted at the outermost edge middleware;
@@ -274,11 +280,12 @@ to own than to bend a third-party key extractor around. See
 [edge.rs](../../crates/proxy/src/edge.rs), and
 [config.rs](../../crates/proxy/src/config.rs).
 
-**Still open (deferred to PR-7 / PR-13):** per-principal/per-session rate
-limiting (a documented fast-follow; per-IP is the P0), the L4 connection /
-TLS-handshake cap at the `axum-server` layer, the FD-ulimit deployment
-documentation, and the overload-shedding **load test** that exercises these
-controls at scale (PR-7's acceptance gate). The concurrency limit is
+**Still open (deferred to PR-7):** per-principal/per-session rate limiting (a
+documented fast-follow; per-IP is the P0) and the overload-shedding **load
+test** that exercises these controls at scale (PR-7's acceptance gate). The
+FD-ulimit sizing (which keys on `PROXILION_MAX_CONNECTIONS`, since an idle
+keep-alive connection costs an FD while an in-flight request does not) is in
+the [config reference](../ops/config-reference.md#fd--ulimit-deployment-not-an-env-var). The concurrency limit is
 per-replica; whether per-IP rate state must be centralized across replicas is
 the PR-7 statelessness-audit decision.
 
@@ -974,8 +981,10 @@ satisfied:
       and drive `scripts/smoke-pic.sh` through the verified leg.*
 - [~] **PR-2** Ingress body cap, per-request timeout, per-IP rate limit
       (`429`+`Retry-After`, trusted-proxy XFF), concurrency limit + load-shed
-      (`503`) all active at the application layer. Remaining: L4 connection cap
-      + FD-ulimit docs + at-scale overload load test (interlinks PR-7).
+      (`503`), and the L4 connection cap (refused at accept, before the TLS
+      handshake) all active; FD-ulimit sizing documented. Remaining: the
+      at-scale overload load test and per-principal rate limiting (interlinks
+      PR-7).
 - [~] **PR-3** Keys `zeroize`-wrapped; documented, tested zero-downtime
       rotation; production secret sourcing. *Memory hygiene (HMAC keys
       `Zeroizing` + redacted `Debug`; token key already scrubbed), key

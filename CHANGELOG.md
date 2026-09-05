@@ -16,6 +16,22 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **L4 connection cap — the last of PR-2's edge controls
+  (production-readiness.md PR-2).** The existing four controls all run *after*
+  the TLS handshake, so none of them can see the cheapest denial-of-service
+  there is: open connections and never send a request. Each one still costs a
+  file descriptor and an asymmetric handshake, and the process runs out of FDs
+  while every request-level counter reads zero. `PROXILION_MAX_CONNECTIONS`
+  (default 4096, `0` disables) caps concurrently-accepted connections at
+  **accept** time — the connection is closed before the handshake — via an
+  `axum_server::Accept` implementation composed inside the rustls acceptor.
+  The permit rides on the accepted stream, so a slot is released whenever the
+  connection ends, however it ends. Refusals feed
+  `proxilion_ingress_rejections_total{reason="connection_limit"}`. The
+  FD-ulimit guidance now keys on this setting rather than the in-flight
+  request limit, since an idle keep-alive connection costs an FD and an
+  in-flight request does not.
+
 - **Alertmanager routing, and a CI gate that proves it routes
   (production-readiness.md PR-5).** The alert rules said *what* fires; nothing
   said *who wakes up*. [ops/prometheus/alertmanager.yml](ops/prometheus/alertmanager.yml)

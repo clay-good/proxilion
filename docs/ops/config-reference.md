@@ -194,6 +194,7 @@ Each cap accepts `0` as an explicit *disable* sentinel.
 | `PROXILION_RATE_LIMIT_PER_SEC` | `rate_limit_per_sec` | req/s | `50` | `429` + `Retry-After` |
 | `PROXILION_RATE_LIMIT_BURST` | `rate_limit_burst` | tokens | `100` | (bucket capacity for the limiter above) |
 | `PROXILION_MAX_CONCURRENT_REQUESTS` | `max_concurrent_requests` | in-flight | `1024` | `503` (load-shed, never a queue) |
+| `PROXILION_MAX_CONNECTIONS` | `max_connections` | integer | `4096` | Maximum concurrently-accepted TCP connections, enforced at **accept** time — before the TLS handshake — so a flood of idle connections cannot exhaust file descriptors while every request-level counter reads zero. Each connection costs one FD; keep it comfortably below `ulimit -n`. Refusals increment `proxilion_ingress_rejections_total{reason="connection_limit"}`. `0` disables. |
 
 Every rejection increments `proxilion_ingress_rejections_total{reason}`.
 
@@ -206,13 +207,21 @@ Every rejection increments `proxilion_ingress_rejections_total{reason}`.
 
 ## FD / ulimit (deployment, not an env var)
 
-The proxy holds one file descriptor per in-flight connection plus the DB pool
-and upstream client sockets. Size the process `nofile` ulimit above
-`PROXILION_MAX_CONCURRENT_REQUESTS` + DB-pool + headroom (a `65536` soft limit
-is the usual floor). In Kubernetes this is the node/runtime default; for bare
-`systemd`, set `LimitNOFILE=65536`. The concurrency cap (`503` load-shed) is the
-in-process backstop, but the OS limit must sit above it so the cap — not
-`EMFILE` — is what sheds.
+The proxy holds one file descriptor per **open connection** (not per in-flight
+request — an idle keep-alive connection still costs an FD) plus the DB pool and
+upstream client sockets. The binding constraint is therefore
+`PROXILION_MAX_CONNECTIONS`, not `PROXILION_MAX_CONCURRENT_REQUESTS`:
+
+```text
+nofile  >  max_connections + db_pool_size + upstream_sockets + headroom
+```
+
+With the defaults (4096 connections) a `65536` soft limit is comfortable. In
+Kubernetes this is the node/runtime default; for bare `systemd`, set
+`LimitNOFILE=65536`. The connection cap and the concurrency cap are the
+in-process backstops, but the OS limit must sit above both so a *cap* — not
+`EMFILE` — is what sheds. `EMFILE` degrades everything at once, including the
+DB pool and the audit forwarders; the caps degrade only new work.
 
 ## CLI / test-only variables (not proxy config)
 

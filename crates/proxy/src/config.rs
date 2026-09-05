@@ -143,6 +143,14 @@ pub struct Config {
     /// immediately rather than queueing into memory exhaustion. Defaults to
     /// 1024. `0` disables the limit. `PROXILION_MAX_CONCURRENT_REQUESTS`.
     pub max_concurrent_requests: usize,
+    /// Maximum concurrently-accepted TCP connections on the agent-facing
+    /// ingress (production-readiness.md PR-2). Enforced at **accept** time,
+    /// before the TLS handshake, so a flood of idle connections cannot
+    /// exhaust the process's file descriptors while every request-level
+    /// counter reads zero. Each connection costs one FD, so keep this
+    /// comfortably below `ulimit -n`. Defaults to 4096. `0` disables.
+    /// `PROXILION_MAX_CONNECTIONS`.
+    pub max_connections: usize,
     /// Direct-peer IPs that are trusted to set `X-Forwarded-For`. When the TCP
     /// peer is one of these, the rate limiter reads the real client IP from
     /// the forwarded chain; otherwise the forwarded header is ignored and the
@@ -433,6 +441,7 @@ pub struct ConfigBuilder {
     rate_limit_per_sec: u32,
     rate_limit_burst: u32,
     max_concurrent_requests: usize,
+    max_connections: usize,
     trusted_proxies: Vec<std::net::IpAddr>,
     tls_min_version: TlsMinVersion,
     environment: Environment,
@@ -492,6 +501,9 @@ impl ConfigBuilder {
             rate_limit_per_sec: 50,
             rate_limit_burst: 100,
             max_concurrent_requests: 1024,
+            // 4096 FDs of connections leaves headroom under the common
+            // 8192 soft ulimit for the DB pool, upstream clients and logs.
+            max_connections: 4096,
             trusted_proxies: Vec::new(),
             // rustls already refuses < 1.2; default to the 1.2 floor
             // (accept 1.2 + 1.3), the prior behavior. Operators pin 1.3.
@@ -658,6 +670,11 @@ impl ConfigBuilder {
             && let Ok(n) = v.parse::<usize>()
         {
             self.max_concurrent_requests = n;
+        }
+        if let Ok(v) = env::var("PROXILION_MAX_CONNECTIONS")
+            && let Ok(n) = v.trim().parse()
+        {
+            self.max_connections = n;
         }
         if let Ok(v) = env::var("PROXILION_TRUSTED_PROXIES") {
             // Comma-separated IPs. Malformed entries are dropped (logged
@@ -830,6 +847,9 @@ impl ConfigBuilder {
         }
         if let Some(v) = file.max_concurrent_requests {
             self.max_concurrent_requests = v;
+        }
+        if let Some(v) = file.max_connections {
+            self.max_connections = v;
         }
         if let Some(v) = file.trusted_proxies {
             self.trusted_proxies = v.iter().filter_map(|s| s.parse().ok()).collect();
@@ -1033,6 +1053,7 @@ impl ConfigBuilder {
             rate_limit_per_sec: self.rate_limit_per_sec,
             rate_limit_burst: self.rate_limit_burst,
             max_concurrent_requests: self.max_concurrent_requests,
+            max_connections: self.max_connections,
             trusted_proxies: self.trusted_proxies,
             tls_min_version: self.tls_min_version,
             environment: self.environment,
@@ -1104,6 +1125,7 @@ struct FileConfig {
     rate_limit_per_sec: Option<u32>,
     rate_limit_burst: Option<u32>,
     max_concurrent_requests: Option<usize>,
+    max_connections: Option<usize>,
     trusted_proxies: Option<Vec<String>>,
     tls_min_version: Option<String>,
     environment: Option<String>,
@@ -2021,6 +2043,7 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             rate_limit_per_sec: _,
             rate_limit_burst: _,
             max_concurrent_requests: _,
+            max_connections: _,
             trusted_proxies: _,
             tls_min_version: _,
             environment: _,
@@ -2081,6 +2104,7 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             rate_limit_per_sec: _,
             rate_limit_burst: _,
             max_concurrent_requests: _,
+            max_connections: _,
             trusted_proxies: _,
             tls_min_version: _,
             environment: _,

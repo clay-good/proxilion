@@ -412,8 +412,24 @@ pub async fn run(cfg: Config) -> Result<()> {
         shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
     });
 
+    // production-readiness.md PR-2 — L4 connection cap, applied INSIDE the
+    // rustls acceptor so an over-cap connection is closed before the
+    // handshake. `0` yields an effectively-unlimited semaphore rather than a
+    // different acceptor type, so the accept path is one shape either way.
+    if cfg.max_connections == 0 {
+        warn!("L4 connection cap DISABLED (PROXILION_MAX_CONNECTIONS=0)");
+    } else {
+        info!(
+            max_connections = cfg.max_connections,
+            "L4 connection cap active — keep it below `ulimit -n`"
+        );
+    }
+    let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls)
+        .acceptor(crate::edge::ConnectionLimit::new(cfg.max_connections));
+
     info!(bind = %cfg.bind_addr, "proxy listening");
-    axum_server::bind_rustls(cfg.bind_addr, tls)
+    axum_server::bind(cfg.bind_addr)
+        .acceptor(acceptor)
         .handle(handle)
         // `with_connect_info` so the PR-2 rate-limit middleware can read the
         // real TCP peer (the trusted-proxy-aware key source) from

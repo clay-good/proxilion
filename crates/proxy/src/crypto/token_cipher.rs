@@ -3,10 +3,34 @@
 //! Key is exactly 32 bytes; nonce is 96-bit random per message. We persist
 //! nonce + ciphertext separately so the schema mirrors what AES-GCM actually
 //! produces (the auth tag is appended to the ciphertext by `aes-gcm`).
+//!
+//! ## Rotation with overlap (production-readiness.md PR-3)
+//!
+//! [`TokenCipher`] holds one **active** key used for every encryption, plus
+//! up to [`MAX_PREVIOUS_KEYS`] **previous** keys used only for decryption.
+//! That makes a rotation add → flip → drain → retire with no rejected
+//! in-flight request and, deliberately, **no ciphertext format change and no
+//! migration**: a stored row carries no key identifier, so decryption tries
+//! the active key and then each previous key in turn.
+//!
+//! Trial decryption is safe here precisely because AES-GCM is authenticated:
+//! a wrong key fails the tag check (forgery probability 2^-128 per attempt),
+//! so a success is unambiguous rather than a guess. The cost is bounded by
+//! [`MAX_PREVIOUS_KEYS`] AEAD operations on the miss path, which is why the
+//! list is capped rather than unbounded.
+//!
+//! `proxilion_token_decrypt_total{key="active"|"previous"}` tells the
+//! operator when the drain is done — once no row decrypts with a previous
+//! key, the old key can be retired.
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use thiserror::Error;
+
+/// Upper bound on simultaneously-accepted retired keys. One is enough for a
+/// normal rotation; the cap exists so a misconfiguration cannot turn every
+/// cache-cold decrypt into an unbounded run of AEAD operations.
+pub const MAX_PREVIOUS_KEYS: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum CipherError {
@@ -14,6 +38,8 @@ pub enum CipherError {
     BadKeyLen(usize),
     #[error("AES-GCM operation failed")]
     Aead,
+    #[error("at most {MAX_PREVIOUS_KEYS} previous keys may be accepted; got {0}")]
+    TooManyPreviousKeys(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -24,17 +50,33 @@ pub struct Ciphertext {
 
 /// Holds the master encryption key. Never derive Debug-print the inner key.
 pub struct TokenCipher {
+    /// Used for every encryption, and tried first on decryption.
     cipher: Aes256Gcm,
+    /// Retired keys still accepted for decryption during a rotation drain.
+    previous: Vec<Aes256Gcm>,
 }
 
 impl TokenCipher {
+    /// Single-key constructor — no rotation overlap. Production builds go
+    /// through [`Self::with_previous`]; this is the shorthand used by tests
+    /// and by embedders that never rotate.
+    #[allow(dead_code)]
     pub fn from_bytes(key: &[u8]) -> Result<Self, CipherError> {
-        if key.len() != 32 {
-            return Err(CipherError::BadKeyLen(key.len()));
+        Self::with_previous(key, &[])
+    }
+
+    /// Build a cipher whose `active` key encrypts and whose `previous` keys
+    /// are additionally accepted for decryption (rotation overlap).
+    pub fn with_previous(active: &[u8], previous: &[Vec<u8>]) -> Result<Self, CipherError> {
+        if previous.len() > MAX_PREVIOUS_KEYS {
+            return Err(CipherError::TooManyPreviousKeys(previous.len()));
         }
-        let key = Key::<Aes256Gcm>::from_slice(key);
         Ok(Self {
-            cipher: Aes256Gcm::new(key),
+            cipher: build(active)?,
+            previous: previous
+                .iter()
+                .map(|k| build(k))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -55,10 +97,36 @@ impl TokenCipher {
             return Err(CipherError::Aead);
         }
         let nonce = Nonce::from_slice(&ct.nonce);
-        self.cipher
-            .decrypt(nonce, ct.bytes.as_slice())
-            .map_err(|_| CipherError::Aead)
+        if let Ok(pt) = self.cipher.decrypt(nonce, ct.bytes.as_slice()) {
+            record_decrypt("active");
+            return Ok(pt);
+        }
+        // Rotation overlap: a row written before the last flip. The GCM tag
+        // makes each attempt a verification, not a guess.
+        for key in &self.previous {
+            if let Ok(pt) = key.decrypt(nonce, ct.bytes.as_slice()) {
+                record_decrypt("previous");
+                return Ok(pt);
+            }
+        }
+        record_decrypt("failed");
+        Err(CipherError::Aead)
     }
+}
+
+fn build(key: &[u8]) -> Result<Aes256Gcm, CipherError> {
+    if key.len() != 32 {
+        return Err(CipherError::BadKeyLen(key.len()));
+    }
+    Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key)))
+}
+
+/// `proxilion_token_decrypt_total{key="active"|"previous"|"failed"}` — the
+/// signal that tells an operator when a rotation drain is complete: once the
+/// `previous` series stops incrementing, the retired key can be dropped from
+/// `PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS`.
+fn record_decrypt(key: &'static str) {
+    metrics::counter!("proxilion_token_decrypt_total", "key" => key).increment(1);
 }
 
 #[cfg(test)]
@@ -92,6 +160,84 @@ mod tests {
             a.bytes, b.bytes,
             "ciphertext must differ across encryptions"
         );
+    }
+
+    fn key_n(n: u8) -> Vec<u8> {
+        vec![n; 32]
+    }
+
+    #[test]
+    fn rotation_overlap_decrypts_rows_written_under_a_retired_key() {
+        // The rotation this exists for: rows encrypted before the flip must
+        // keep decrypting after it, with no ciphertext format change and no
+        // migration.
+        let old = TokenCipher::from_bytes(&key_n(1)).unwrap();
+        let row_written_before_the_flip = old.encrypt(b"ya29.pre-rotation").unwrap();
+
+        let rotated = TokenCipher::with_previous(&key_n(2), &[key_n(1)]).unwrap();
+        assert_eq!(
+            rotated.decrypt(&row_written_before_the_flip).unwrap(),
+            b"ya29.pre-rotation",
+        );
+    }
+
+    #[test]
+    fn rotation_overlap_encrypts_only_with_the_active_key() {
+        // Every new write must land under the new key, else the drain never
+        // finishes and the retired key can never be retired.
+        let rotated = TokenCipher::with_previous(&key_n(2), &[key_n(1)]).unwrap();
+        let fresh = rotated.encrypt(b"ya29.post-rotation").unwrap();
+
+        let active_only = TokenCipher::from_bytes(&key_n(2)).unwrap();
+        assert_eq!(active_only.decrypt(&fresh).unwrap(), b"ya29.post-rotation");
+        let retired_only = TokenCipher::from_bytes(&key_n(1)).unwrap();
+        assert!(
+            retired_only.decrypt(&fresh).is_err(),
+            "a post-flip write must NOT be readable with the retired key",
+        );
+    }
+
+    #[test]
+    fn rotation_overlap_accepts_several_retired_keys_in_any_position() {
+        let rotated =
+            TokenCipher::with_previous(&key_n(9), &[key_n(1), key_n(2), key_n(3)]).unwrap();
+        for n in [1u8, 2, 3, 9] {
+            let ct = TokenCipher::from_bytes(&key_n(n))
+                .unwrap()
+                .encrypt(b"secret")
+                .unwrap();
+            assert_eq!(rotated.decrypt(&ct).unwrap(), b"secret", "key {n}");
+        }
+    }
+
+    #[test]
+    fn a_key_outside_the_overlap_set_still_fails_closed() {
+        let rotated = TokenCipher::with_previous(&key_n(2), &[key_n(1)]).unwrap();
+        let stranger = TokenCipher::from_bytes(&key_n(7)).unwrap();
+        let ct = stranger.encrypt(b"secret").unwrap();
+        assert!(
+            rotated.decrypt(&ct).is_err(),
+            "trial decryption must not become trial ACCEPTANCE",
+        );
+    }
+
+    #[test]
+    fn too_many_previous_keys_is_rejected() {
+        let previous: Vec<Vec<u8>> = (0..=MAX_PREVIOUS_KEYS as u8).map(key_n).collect();
+        assert!(matches!(
+            TokenCipher::with_previous(&key_n(99), &previous),
+            Err(CipherError::TooManyPreviousKeys(n)) if n == MAX_PREVIOUS_KEYS + 1
+        ));
+    }
+
+    #[test]
+    fn a_malformed_previous_key_is_rejected_rather_than_skipped() {
+        // Skipping it would look exactly like a finished drain until the
+        // first pre-rotation row failed to decrypt.
+        assert!(matches!(
+            TokenCipher::with_previous(&key_n(1), &[vec![0u8; 16]]),
+            Err(CipherError::BadKeyLen(16)),
+        ));
     }
 
     #[test]
@@ -459,24 +605,29 @@ mod tests {
     }
 
     #[test]
-    fn cipher_error_variant_count_pinned_at_exactly_two_via_exhaustive_match_no_underscore_fallback()
+    fn cipher_error_variant_count_pinned_at_exactly_three_via_exhaustive_match_no_underscore_fallback()
      {
-        // `CipherError` has EXACTLY two variants today (`BadKeyLen(usize)` /
-        // `Aead`). Pin the variant count at the type level via an exhaustive
-        // match with NO `_` fallback so a refactor that landed a third
-        // variant (e.g. `KeyRotationStale` for a future per-tenant key-rotation
-        // scheme, or `KmsUnreachable` for a remote-KMS plug-in) would surface
-        // here as a non-exhaustive-match compile error rather than silently
-        // adding a third operator-grep bucket to OAuth-token-persist alerts
-        // (the existing `bad_key_len_error_display_includes_actual_length` +
-        // `aead_error_display_is_stable_for_log_filters` pins anchor on two
-        // Display substrings; a third variant landing without those pins
-        // would silently drift the bucket count). Symmetric to round-191
-        // SlackInteractError + round-215 PkceError exhaustive-2-arm pins.
-        for e in [CipherError::BadKeyLen(0), CipherError::Aead] {
+        // `CipherError` has EXACTLY three variants today (`BadKeyLen(usize)`
+        // / `Aead` / `TooManyPreviousKeys(usize)`). Pin the variant count at
+        // the type level via an exhaustive match with NO `_` fallback so a
+        // refactor that landed a fourth variant (e.g. `KmsUnreachable` for a
+        // remote-KMS plug-in) would surface here as a non-exhaustive-match
+        // compile error rather than silently adding another operator-grep
+        // bucket to OAuth-token-persist alerts (the existing
+        // `bad_key_len_error_display_includes_actual_length` +
+        // `aead_error_display_is_stable_for_log_filters` pins anchor on
+        // Display substrings; a new variant landing without those pins would
+        // silently drift the bucket count). Symmetric to round-191
+        // SlackInteractError + round-215 PkceError exhaustive-arm pins.
+        for e in [
+            CipherError::BadKeyLen(0),
+            CipherError::Aead,
+            CipherError::TooManyPreviousKeys(9),
+        ] {
             match e {
                 CipherError::BadKeyLen(_) => {}
                 CipherError::Aead => {}
+                CipherError::TooManyPreviousKeys(_) => {}
             }
         }
     }

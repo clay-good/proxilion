@@ -10,7 +10,7 @@
 
 | Secret | Algorithm / length | Source (env / Helm) | Purpose | Blast radius if leaked | In-memory hygiene |
 |--------|--------------------|---------------------|---------|------------------------|-------------------|
-| **Token-encryption key** | AES-256-GCM, 32 bytes (64 hex) | `PROXILION_TOKEN_ENCRYPTION_KEY` / secret `token-encryption-key` | Encrypts upstream OAuth access/refresh tokens at rest in Postgres | Decrypt **every** stored upstream OAuth token (full impersonation of every linked user against the SaaS) | Held inside `Aes256Gcm` ([token_cipher.rs](../../crates/proxy/src/crypto/token_cipher.rs)), which zeroizes its key on drop (aes-gcm `zeroize` feature). `TokenCipher` has no `Debug`. |
+| **Token-encryption key** | AES-256-GCM, 32 bytes (64 hex) | `PROXILION_TOKEN_ENCRYPTION_KEY` (+ `_KEYS_PREVIOUS` during a rotation) / secret `token-encryption-key` | Encrypts upstream OAuth access/refresh tokens at rest in Postgres | Decrypt **every** stored upstream OAuth token (full impersonation of every linked user against the SaaS) | Held inside `Aes256Gcm` ([token_cipher.rs](../../crates/proxy/src/crypto/token_cipher.rs)), which zeroizes its key on drop (aes-gcm `zeroize` feature). `TokenCipher` has no `Debug`. |
 | **SIEM HMAC key** | HMAC-SHA256, ≥ 16 bytes | `PROXILION_SIEM_HMAC_KEY` / secret `siem-hmac-key` | Signs SIEM webhook bodies (`X-Proxilion-Signature`) | Forge SIEM event signatures (tamper with the audit feed an SOC trusts) | `Zeroizing<Vec<u8>>` — scrubbed on drop; explicit redacting `Debug` ([siem.rs](../../crates/proxy/src/forwarder/siem.rs)). |
 | **Blocked-action webhook HMAC key** | HMAC-SHA256, ≥ 16 bytes | `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY` | Signs blocked-action webhook bodies | Forge blocked-action webhook signatures | `Zeroizing<Vec<u8>>` + redacting `Debug` ([webhook.rs](../../crates/proxy/src/notifier/webhook.rs)). |
 | **Slack bot token** | Slack `xoxb-…` bearer token | `PROXILION_SLACK_BOT_TOKEN` | Calls Slack `views.open` for the Block Kit justification modal on approvals | Act as the Proxilion bot in the customer's Slack workspace (open modals, post as the app) | Read on demand via `secret_env`; not held in a long-lived struct. |
@@ -68,15 +68,40 @@ while External Secrets Operator / Vault is still populating it; treating that as
 a real (empty) secret would shadow a working env var and disable the dependent
 subsystem silently.
 
+## Rotating the token-encryption key (zero downtime)
+
+The cipher holds one **active** key that performs every encryption plus up to
+four **retired** keys accepted only for decryption, so a rotation is
+add → flip → drain → retire with no rejected in-flight request. There is no
+ciphertext format change and no migration: a stored row carries no key
+identifier, and decryption tries the active key then each retired key. Trial
+decryption is safe because AES-GCM is authenticated — a wrong key fails the
+tag check, so a success is a verification rather than a guess.
+
+1. **Add.** Generate the new key (`openssl rand -hex 32`). Set
+   `PROXILION_TOKEN_ENCRYPTION_KEY` to it and put the **old** key in
+   `PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS`.
+2. **Flip.** Roll the fleet. From this moment every new write uses the new
+   key; every old row still decrypts.
+3. **Drain.** Watch `proxilion_token_decrypt_total{key="previous"}`. Rows
+   re-encrypt themselves as upstream tokens refresh, and any row that never
+   refreshes expires with its session. The drain is done when the series
+   stops incrementing.
+4. **Retire.** Clear `PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS` and roll
+   again. Destroy the old key material.
+
+A malformed or over-long previous-key list is refused **at boot** rather than
+trimmed: a silently dropped retired key is indistinguishable from a finished
+drain until the first pre-rotation row fails to decrypt.
+
 ## Remaining PR-3 work
 
-The memory-hygiene, inventory, and file-sourcing steps are done; still open
-before PR-3 closes:
+The memory-hygiene, inventory, file-sourcing, and token-key rotation steps
+are done; still open before PR-3 closes:
 
-- **Versioned keys with overlap** (`kid`/version: active + N also-accept
-  predecessors) so rotation is add → flip → drain → retire with zero rejected
-  in-flight requests. Token-encryption rotation re-encrypts lazily or via a
-  one-shot `proxilion-cli` re-wrap command.
+- **Rotation overlap for the remaining keys.** The SIEM / blocked-webhook
+  HMAC keys and the PIC executor seed still rotate by flip-and-accept-the-gap;
+  give them the same active-plus-retired treatment.
 - **Envelope encryption** (KMS-wrapped DEK) for the token-encryption key as
   the recommended pattern (file/env stays the default).
 - **Rotation runbooks** (one per key; planned + emergency/compromise),

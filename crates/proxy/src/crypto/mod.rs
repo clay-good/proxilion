@@ -9,4 +9,4 @@ pub mod token_cipher;
 #[allow(unused_imports)]
 pub use bearer::{Bearer, BearerHash};
 pub use pkce::verify_pkce_s256;
-pub use token_cipher::{Ciphertext, TokenCipher};
+pub use token_cipher::{Ciphertext, MAX_PREVIOUS_KEYS, TokenCipher};

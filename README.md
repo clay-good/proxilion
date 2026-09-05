@@ -373,7 +373,10 @@ caps (production-readiness.md PR-2) add
 `proxilion_ingress_rejections_total{reason="body_limit"|"timeout"|"rate_limit"|"load_shed"}`
 — requests shed at the ingress before policy runs (oversize body → `413`,
 wedged adapter request → `408`, over-quota source IP → `429`, server at its
-concurrency ceiling → `503`).
+concurrency ceiling → `503`). Key rotation (PR-3) adds
+`proxilion_token_decrypt_total{key="active"|"previous"|"failed"}` — the
+`previous` series is the drain signal that says when a retired
+token-encryption key can finally be destroyed.
 
 Pull them with `proxilion-cli metrics sample` (top series by sample count) or
 scrape into Prometheus; the bundled Grafana dashboard lives in

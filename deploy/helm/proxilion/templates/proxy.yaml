@@ -145,6 +145,15 @@ spec:
                 secretKeyRef:
                   name: {{ include "proxilion.secretsName" . }}
                   key: token-encryption-key
+            {{- if .Values.secrets.inline.tokenEncryptionKeysPrevious }}
+            # Rotation overlap (PR-3): retired keys, decrypt-only. Clear once
+            # proxilion_token_decrypt_total{key="previous"} stops moving.
+            - name: PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: token-encryption-keys-previous
+            {{- end }}
             {{- if .Values.proxy.env.executorKid }}
             # Stable PIC executor identity (PR-7). Without it every replica
             # and every restart registers a NEW executor with the Trust

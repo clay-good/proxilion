@@ -127,6 +127,7 @@ the stub is off **and** the verified path is fully configured.
 | Env var | TOML key | Type | Default | Notes |
 |---|---|---|---|---|
 | `PROXILION_TOKEN_ENCRYPTION_KEY` | `token_encryption_key_hex` | 64 hex chars | none | AES-256-GCM key encrypting upstream OAuth refresh tokens at rest. Exactly 64 hex chars (32 bytes), validated at boot; `openssl rand -hex 32`. **secret** (`*_FILE`-capable). Scrubbed from memory on drop. |
+| `PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS` | `token_encryption_previous_keys_hex` | comma-separated 64-hex keys | empty | Retired keys still accepted for **decryption** during a rotation drain (max 4). Encryption always uses the active key above. A malformed or over-long list is refused at boot rather than trimmed — a silently dropped retired key looks exactly like a finished drain. **secret** (`*_FILE`-capable). See the rotation procedure in [key-inventory.md](key-inventory.md). |
 | `GOOGLE_CLIENT_ID` | `google_client_id` | string | none | Google OAuth client id for the Drive/Gmail/Calendar adapters. |
 | `GOOGLE_CLIENT_SECRET` | `google_client_secret` | string | none | Google OAuth client secret. **secret** (`*_FILE`-capable). |
 | `GOOGLE_AUTH_URL` | — | URL | `https://accounts.google.com/o/oauth2/v2/auth` | Authorization endpoint override. Defaulted; override only to point at a mock IdP in tests. |
@@ -240,6 +241,7 @@ these into the proxy Deployment's env. The non-obvious mappings:
 | `proxy.env` | `PROXILION_ENV` |
 | `proxy.env.idp.issuer` / `.audience` / `.jwksUri` / `.algorithms` | `PROXILION_IDP_ISSUER` / `_AUDIENCE` / `_JWKS_URI` / `_ALGORITHMS` |
 | `proxy.env.insecureBridgeStub` | `PROXILION_INSECURE_BRIDGE_STUB` |
+| secret `token-encryption-keys-previous` | `PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS` |
 | `proxy.env.executorKid` + secret `executor-key` | `PROXILION_EXECUTOR_KID` / `PROXILION_EXECUTOR_KEY` |
 
 Secrets (`DATABASE_URL`, `PROXILION_TOKEN_ENCRYPTION_KEY`,

@@ -132,6 +132,15 @@
 # rejected at boot. Generate with `openssl rand -hex 32`. No default.
 # token_encryption_key_hex = "<64 hex chars>"
 
+# Retired token-encryption keys still accepted for DECRYPTION while a
+# rotation drains (max 4). Encryption always uses the active key above, so
+# every new write lands under the new key and the drain finishes on its own.
+# Watch `proxilion_token_decrypt_total{key="previous"}` — once it stops
+# incrementing, clear this list to retire the old key. A malformed or
+# over-long list is refused at boot, never trimmed.
+# PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS (env: comma-separated).
+# token_encryption_previous_keys_hex = ["<64 hex chars>"]
+
 # Google OAuth client credentials — used by the Drive / Gmail / Calendar
 # adapters to refresh upstream access tokens. No defaults.
 # google_client_id     = "your-client.apps.googleusercontent.com"

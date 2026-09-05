@@ -1198,7 +1198,27 @@ async fn build_core_state(cfg: &Config) -> Result<Option<CoreState>> {
             b
         }
     };
-    let cipher = TokenCipher::from_bytes(&key_bytes).context("invalid token encryption key")?;
+    // PR-3 rotation overlap: retired keys decrypt rows written before the
+    // last flip. Shape-validated by `ConfigBuilder::build`, so a decode
+    // failure here is unreachable.
+    let previous: Vec<Vec<u8>> = cfg
+        .token_encryption_previous_keys_hex
+        .iter()
+        .map(|hex| {
+            hex_decode_32(hex)
+                .map(|k| k.to_vec())
+                .context("PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS entries must be 64 hex chars")
+        })
+        .collect::<Result<_>>()?;
+    if !previous.is_empty() {
+        info!(
+            previous_keys = previous.len(),
+            "token-encryption rotation overlap active — retire the old key once \
+             proxilion_token_decrypt_total{{key=\"previous\"}} stops incrementing"
+        );
+    }
+    let cipher = TokenCipher::with_previous(&key_bytes, &previous)
+        .context("invalid token encryption key")?;
 
     let pool = sqlx::PgPool::connect(db_url)
         .await

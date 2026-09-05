@@ -60,6 +60,13 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Hex-encoded 32-byte key for AES-256-GCM token encryption.
     pub token_encryption_key_hex: Option<String>,
+    /// Retired token-encryption keys still accepted for **decryption**
+    /// during a rotation drain (production-readiness.md PR-3). Each entry is
+    /// 64 hex chars; at most
+    /// [`crate::crypto::MAX_PREVIOUS_KEYS`]. Encryption always uses the
+    /// active `token_encryption_key_hex`.
+    /// `PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS` (comma-separated).
+    pub token_encryption_previous_keys_hex: Vec<String>,
     pub google_client_id: Option<String>,
     pub google_client_secret: Option<String>,
     /// Proxy's own public base URL (handed to upstream OAuth as redirect_uri).
@@ -402,6 +409,7 @@ pub struct ConfigBuilder {
     federation_bridge_url: String,
     log_format: LogFormat,
     token_encryption_key_hex: Option<String>,
+    token_encryption_previous_keys_hex: Vec<String>,
     google_client_id: Option<String>,
     google_client_secret: Option<String>,
     proxy_base_url: String,
@@ -454,6 +462,8 @@ impl ConfigBuilder {
             federation_bridge_url: "http://federation-bridge:8081".to_string(),
             log_format: LogFormat::Json,
             token_encryption_key_hex: None,
+            // Empty = no rotation in flight; the common steady state.
+            token_encryption_previous_keys_hex: Vec::new(),
             google_client_id: None,
             google_client_secret: None,
             proxy_base_url: "https://localhost:8443".to_string(),
@@ -549,6 +559,12 @@ impl ConfigBuilder {
         }
         if let Some(v) = secret_env("PROXILION_TOKEN_ENCRYPTION_KEY") {
             self.token_encryption_key_hex = Some(v);
+        }
+        // `secret_env` so the retired keys can come from the same kind of
+        // mounted secret as the active one. An empty value clears the list,
+        // which is how a rotation is finished.
+        if let Some(v) = secret_env("PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS") {
+            self.token_encryption_previous_keys_hex = parse_key_list(&v);
         }
         if let Ok(v) = env::var("GOOGLE_CLIENT_ID") {
             self.google_client_id = Some(v);
@@ -748,6 +764,9 @@ impl ConfigBuilder {
         if let Some(v) = file.token_encryption_key_hex {
             self.token_encryption_key_hex = Some(v);
         }
+        if let Some(v) = file.token_encryption_previous_keys_hex {
+            self.token_encryption_previous_keys_hex = v;
+        }
         if let Some(v) = file.google_client_id {
             self.google_client_id = Some(v);
         }
@@ -908,6 +927,32 @@ impl ConfigBuilder {
             });
         }
 
+        // Retired keys: same shape check, plus the overlap cap. Rejecting a
+        // malformed entry here (rather than dropping it) matters — a silently
+        // dropped previous key looks exactly like a completed drain until the
+        // first pre-rotation row fails to decrypt.
+        if self.token_encryption_previous_keys_hex.len() > crate::crypto::MAX_PREVIOUS_KEYS {
+            return Err(ConfigError::InvalidValue {
+                field: "PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS",
+                reason: format!(
+                    "at most {} retired keys may be accepted, got {}",
+                    crate::crypto::MAX_PREVIOUS_KEYS,
+                    self.token_encryption_previous_keys_hex.len()
+                ),
+            });
+        }
+        for hex in &self.token_encryption_previous_keys_hex {
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConfigError::InvalidValue {
+                    field: "PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS",
+                    reason: format!(
+                        "expected 64 hex chars (32 bytes) per key, got {} chars",
+                        hex.len()
+                    ),
+                });
+            }
+        }
+
         // URL shape — reject obvious typos. Allow either http:// or https://.
         check_http_url("PROXILION_TRUST_PLANE_URL", &self.trust_plane_url)?;
         check_http_url(
@@ -963,6 +1008,7 @@ impl ConfigBuilder {
             federation_bridge_url: self.federation_bridge_url,
             log_format: self.log_format,
             token_encryption_key_hex: self.token_encryption_key_hex,
+            token_encryption_previous_keys_hex: self.token_encryption_previous_keys_hex,
             google_client_id: self.google_client_id,
             google_client_secret: self.google_client_secret,
             proxy_base_url: self.proxy_base_url,
@@ -1000,6 +1046,18 @@ impl ConfigBuilder {
 /// Parse a comma-separated `X-Forwarded-For` trusted-proxy IP list. Blank
 /// entries and unparseable tokens are dropped; the result may be empty (the
 /// secure default of trusting no forwarded headers).
+/// Split a comma-separated key list, trimming blanks. Entries are NOT
+/// validated here — `build` rejects a malformed one loudly rather than
+/// dropping it, because a silently dropped retired key is indistinguishable
+/// from a finished drain until a pre-rotation row fails to decrypt.
+fn parse_key_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn parse_trusted_proxies(raw: &str) -> Vec<std::net::IpAddr> {
     raw.split(',')
         .filter_map(|s| s.trim().parse().ok())
@@ -1021,6 +1079,7 @@ struct FileConfig {
     federation_bridge_url: Option<String>,
     log_format: Option<String>,
     token_encryption_key_hex: Option<String>,
+    token_encryption_previous_keys_hex: Option<Vec<String>>,
     google_client_id: Option<String>,
     google_client_secret: Option<String>,
     proxy_base_url: Option<String>,
@@ -1937,6 +1996,7 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             federation_bridge_url: _,
             log_format: _,
             token_encryption_key_hex: _,
+            token_encryption_previous_keys_hex: _,
             google_client_id: _,
             google_client_secret: _,
             proxy_base_url: _,
@@ -1996,6 +2056,7 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             federation_bridge_url: _,
             log_format: _,
             token_encryption_key_hex: _,
+            token_encryption_previous_keys_hex: _,
             google_client_id: _,
             google_client_secret: _,
             proxy_base_url: _,
@@ -2288,6 +2349,43 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
                 "{raw:?} → {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn previous_token_keys_parse_from_a_comma_separated_list() {
+        let raw = format!("{}, {} ,,", "ab".repeat(32), "cd".repeat(32));
+        assert_eq!(
+            parse_key_list(&raw),
+            vec!["ab".repeat(32), "cd".repeat(32)],
+            "blanks dropped, entries trimmed",
+        );
+        assert!(parse_key_list("").is_empty(), "empty clears the list");
+    }
+
+    #[test]
+    fn malformed_previous_token_key_is_refused_at_build_not_dropped() {
+        // A silently dropped retired key looks exactly like a finished drain
+        // until the first pre-rotation row fails to decrypt.
+        let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+        b.token_encryption_previous_keys_hex = vec!["ab".repeat(32), "deadbeef".into()];
+        let err = b.build().unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if *field == "PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_previous_token_keys_is_refused_at_build() {
+        let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+        b.token_encryption_previous_keys_hex = (0..=crate::crypto::MAX_PREVIOUS_KEYS)
+            .map(|_| "ab".repeat(32))
+            .collect();
+        let err = b.build().unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if *field == "PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS"),
+            "got {err:?}"
+        );
     }
 
     #[test]

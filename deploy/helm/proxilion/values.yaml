@@ -253,6 +253,11 @@ secrets:
   inline:
     databaseUrl: ""
     tokenEncryptionKey: ""
+    # Retired token-encryption keys, comma-separated, accepted for DECRYPTION
+    # only while a rotation drains (max 4). Set during step 1 of the rotation
+    # in docs/ops/key-inventory.md; clear it once
+    # proxilion_token_decrypt_total{key="previous"} stops incrementing.
+    tokenEncryptionKeysPrevious: ""
     googleClientId: ""
     googleClientSecret: ""
     trustPlaneCatKey: ""

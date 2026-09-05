@@ -16,6 +16,26 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Zero-downtime rotation of the token-encryption key
+  (production-readiness.md PR-3).** `TokenCipher` now holds one **active**
+  key, which performs every encryption, plus up to four **retired** keys
+  accepted only for decryption
+  (`PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS`, comma-separated, `_FILE`-
+  mountable). A rotation becomes add → flip → drain → retire with no rejected
+  in-flight request, and — because trial decryption over an *authenticated*
+  cipher makes a stored key identifier unnecessary — **no ciphertext format
+  change and no migration**: a wrong key fails the GCM tag check, so a
+  successful decrypt is a verification rather than a guess. The drain is
+  observable:
+  `proxilion_token_decrypt_total{key="active"|"previous"|"failed"}` tells the
+  operator when the retired key can be destroyed. A malformed or over-long
+  previous-key list is refused **at boot** rather than trimmed, because a
+  silently dropped retired key is indistinguishable from a finished drain
+  until the first pre-rotation row fails to decrypt. The four-key cap keeps a
+  misconfiguration from turning every cold decrypt into an unbounded run of
+  AEAD operations. Procedure written up in
+  [docs/ops/key-inventory.md](docs/ops/key-inventory.md).
+
 - **HA & horizontal-scaling audit, and a stable PIC executor identity
   (production-readiness.md PR-7).** New
   [docs/ops/ha-and-scaling.md](docs/ops/ha-and-scaling.md) classifies every

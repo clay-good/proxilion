@@ -347,11 +347,24 @@ classifies every secret the proxy holds. **Production secret sourcing** is
 also landed: every secret reads from `<VAR>_FILE` (Docker/K8s mounted-secret
 convention) in preference to the env var, enabling External Secrets / Vault /
 KMS-backed Secret mounts (`secret_env` in
-[config.rs](../../crates/proxy/src/config.rs)). **Still open before this P0
-closes:** versioned keys with rotation overlap (`kid`/version, add → flip →
-drain → retire; lazy/`proxilion-cli` re-wrap for the token-encryption key),
-KMS envelope encryption for the DEK, and the per-key rotation runbooks
-(with PR-6).
+[config.rs](../../crates/proxy/src/config.rs)). **Zero-downtime rotation of
+the token-encryption key is now landed** (2026-09-05): `TokenCipher` holds one
+active key that performs every encryption plus up to four retired keys
+accepted only for decryption
+(`PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS`), so a rotation is
+add → flip → drain → retire with no rejected in-flight request and — because
+trial decryption over an authenticated cipher makes a key identifier
+unnecessary — **no ciphertext format change and no migration**. The drain is
+observable: `proxilion_token_decrypt_total{key="active"|"previous"|"failed"}`
+tells the operator when the retired key can go. A malformed or over-long
+previous-key list is refused at boot rather than trimmed, because a silently
+dropped retired key is indistinguishable from a finished drain. The procedure
+is written up in [key-inventory.md](../ops/key-inventory.md). The CAT
+verifying key also stopped being pinned for the process lifetime — it now
+refreshes on a 1 h TTL (see PR-7). **Still open before this P0 closes:** the
+same active-plus-retired treatment for the SIEM / blocked-webhook HMAC keys
+and the PIC executor seed, KMS envelope encryption for the DEK, and the
+per-key rotation runbooks (with PR-6).
 
 **Goal.** Every signing/encryption secret can be rotated without downtime,
 is sourced safely in production, and does not linger in process memory longer
@@ -933,8 +946,11 @@ satisfied:
 - [~] **PR-3** Keys `zeroize`-wrapped; documented, tested zero-downtime
       rotation; production secret sourcing. *Memory hygiene (HMAC keys
       `Zeroizing` + redacted `Debug`; token key already scrubbed), key
-      inventory doc, and `*_FILE` secret sourcing landed; remaining:
-      versioned-key rotation overlap, KMS envelope, rotation runbooks.*
+      inventory doc, `*_FILE` secret sourcing, and zero-downtime rotation of
+      the token-encryption key (active + up to 4 retired decrypt keys, no
+      ciphertext change, drain observable on
+      `proxilion_token_decrypt_total`) landed; remaining: the same overlap for
+      the HMAC keys and the executor seed, KMS envelope, rotation runbooks.*
 - [~] **PR-4** TLS ≥ 1.2 enforced (1.3 opt-in); outbound cert verification
       proven (CI gate); trusted-proxy config explicit; per-hop TLS/mTLS
       matrix documented. Remaining: staging nmap/testssl scan + mesh-wiring

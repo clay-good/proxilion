@@ -62,6 +62,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     if let Some(reason) = cfg.federation_boot_refusal() {
         anyhow::bail!("{reason}");
     }
+    // production-readiness.md PR-7: likewise refuse a protected deployment
+    // running on an ephemeral PIC executor identity — it would register a
+    // fresh executor key per replica and per restart.
+    if let Some(reason) = cfg.executor_boot_refusal() {
+        anyhow::bail!("{reason}");
+    }
 
     if cfg.dev_mode {
         ensure_dev_cert(&cfg.tls_cert_path, &cfg.tls_key_path).context("generating dev cert")?;
@@ -1202,14 +1208,56 @@ async fn build_core_state(cfg: &Config) -> Result<Option<CoreState>> {
         .await
         .context("running migrations")?;
 
-    let pic = PicExecutor::dev_ephemeral(cfg.trust_plane_url.clone())
-        .map_err(|e| anyhow::anyhow!("pic executor: {e}"))?;
+    let pic = build_pic_executor(cfg)?;
 
     Ok(Some(CoreState {
         db: pool,
         cipher: Arc::new(cipher),
         pic,
     }))
+}
+
+/// The PIC executor, keyed by a **stable** operator-supplied identity when
+/// one is configured (production-readiness.md PR-7).
+///
+/// Without `PROXILION_EXECUTOR_KID` + `PROXILION_EXECUTOR_KEY` each process
+/// mints its own throwaway Ed25519 keypair, so an N-replica fleet presents N
+/// distinct executors to the Trust Plane and a rolling restart adds N more.
+/// That is fine for dev and CI; `Config::executor_boot_refusal` blocks it in
+/// staging/production.
+fn build_pic_executor(cfg: &Config) -> Result<PicExecutor> {
+    match (cfg.executor_kid.as_deref(), cfg.executor_key_hex.as_deref()) {
+        (Some(kid), Some(hex)) => {
+            let seed = hex_decode_32(hex)
+                .context("PROXILION_EXECUTOR_KEY must be 64 hex chars (32 bytes)")?;
+            info!(
+                executor_kid = kid,
+                "PIC executor using the configured stable identity"
+            );
+            PicExecutor::new(cfg.trust_plane_url.clone(), kid.to_string(), &seed)
+                .map_err(|e| anyhow::anyhow!("pic executor: {e}"))
+        }
+        // A `kid` without a seed is the dangerous half-configuration: two
+        // replicas would register different public keys under one `kid`.
+        // Treat it as unconfigured and say so loudly.
+        (kid, key) => {
+            if kid.is_some() || key.is_some() {
+                warn!(
+                    "PROXILION_EXECUTOR_KID and PROXILION_EXECUTOR_KEY must BOTH be set \
+                     to pin the executor identity; only one is present, so an ephemeral \
+                     keypair is being generated instead."
+                );
+            } else {
+                warn!(
+                    "PROXILION_EXECUTOR_KID / PROXILION_EXECUTOR_KEY not set — generating an \
+                     ephemeral PIC executor keypair. Every replica and every restart \
+                     registers a new executor with the Trust Plane. Dev/CI only."
+                );
+            }
+            PicExecutor::dev_ephemeral(cfg.trust_plane_url.clone())
+                .map_err(|e| anyhow::anyhow!("pic executor: {e}"))
+        }
+    }
 }
 
 /// Google OAuth client config. Built when GOOGLE_CLIENT_ID / SECRET are set;

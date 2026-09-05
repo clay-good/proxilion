@@ -102,6 +102,18 @@
 # PROXILION_IDP_ALGORITHMS.
 # idp_algorithms = "RS256,ES256"
 
+# --- PIC executor identity (production-readiness.md PR-7) -------------
+# Stable signing identity for this deployment's PIC executor. Unset, every
+# process generates a throwaway Ed25519 keypair, so an N-replica fleet
+# presents N distinct executors to the Trust Plane and each rolling restart
+# adds N more — nothing stable to revoke, and audit hops attributed to
+# identities that no longer exist. A protected `environment` refuses to boot
+# without both. Generate the seed with `openssl rand -hex 32`, and prefer the
+# PROXILION_EXECUTOR_KEY_FILE mount form over an env var for the seed.
+# PROXILION_EXECUTOR_KID / PROXILION_EXECUTOR_KEY.
+# executor_kid = "proxy-prod-1"
+# executor_key_hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
 
 # ============================================================================
 # Observability

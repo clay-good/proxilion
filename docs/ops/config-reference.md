@@ -99,6 +99,22 @@ See [key-inventory.md](key-inventory.md) for the per-secret classification
 | `PROXILION_IDP_JWKS_URI` | `idp_jwks_uri` | `https://` URL | *(unset)* | The issuer's JWKS endpoint. **Must be `https://`** — a plaintext URI is refused at boot. Cached for 1 hour; an unknown `kid` forces one throttled refresh, then fails closed. |
 | `PROXILION_IDP_ALGORITHMS` | `idp_algorithms` | comma-separated | `RS256,ES256` | Server-side algorithm allow-list. The token's own `alg` header never selects the algorithm (RFC 8725 §3.1). Asymmetric only — `none` and any `HS*` are refused at boot. Valid: `RS256/384/512`, `PS256/384/512`, `ES256/384`, `EdDSA`. |
 
+### PIC executor identity (PR-7)
+
+| Env var | TOML key | Type | Default | Notes |
+|---|---|---|---|---|
+| `PROXILION_EXECUTOR_KID` | `executor_kid` | string | *(unset)* | Stable key id for this deployment's PIC executor signing key. Must be set together with `PROXILION_EXECUTOR_KEY`. |
+| `PROXILION_EXECUTOR_KEY` | `executor_key_hex` | 64 hex chars | *(unset)* | Ed25519 seed (32 bytes) for the executor signing key. Supports the `_FILE` mount form — prefer it; this is signing material. Generate with `openssl rand -hex 32`. |
+
+Unset, each process generates a **throwaway** keypair at boot, so an
+N-replica fleet presents N distinct executors to the Trust Plane and every
+rolling restart adds N more: nothing stable to revoke, and audit hops
+attributed to identities that no longer exist. Fine for dev and CI; a
+protected `PROXILION_ENV` **refuses to boot** without both settings
+(`Config::executor_boot_refusal`). Setting only one of the two is treated as
+unset and logged loudly — two replicas registering different public keys
+under one `kid` is worse than an honest ephemeral identity.
+
 **Which path runs.** An `id_token` on the callback always takes the verified
 path (and is rejected outright when the `PROXILION_IDP_*` settings are absent,
 so a forged `federation_token` cannot downgrade a verified deployment). Only
@@ -224,6 +240,7 @@ these into the proxy Deployment's env. The non-obvious mappings:
 | `proxy.env` | `PROXILION_ENV` |
 | `proxy.env.idp.issuer` / `.audience` / `.jwksUri` / `.algorithms` | `PROXILION_IDP_ISSUER` / `_AUDIENCE` / `_JWKS_URI` / `_ALGORITHMS` |
 | `proxy.env.insecureBridgeStub` | `PROXILION_INSECURE_BRIDGE_STUB` |
+| `proxy.env.executorKid` + secret `executor-key` | `PROXILION_EXECUTOR_KID` / `PROXILION_EXECUTOR_KEY` |
 
 Secrets (`DATABASE_URL`, `PROXILION_TOKEN_ENCRYPTION_KEY`,
 `GOOGLE_CLIENT_SECRET`, the HMAC keys) are sourced from a Kubernetes `Secret`;

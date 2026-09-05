@@ -601,6 +601,29 @@ PagerDuty Incident Response docs; existing `SECURITY.md`.
 
 **Priority:** P1. **Effort:** 4–6 days.
 
+**Status (2026-09-05): in progress — statelessness audit + HA primitives
+landed.** The audit is written and published as
+[docs/ops/ha-and-scaling.md](../../docs/ops/ha-and-scaling.md): every
+in-process cache is classified (A accelerator / B per-replica limit / C needs
+an operator decision), the killswitch bound is stated as **one request cycle**
+(a kill-cache *miss* always falls through to the DB, so there is no stale-
+positive window), and the settings that multiply by replica count are listed
+with the arithmetic. The audit surfaced one genuine correctness gap, now
+closed: **the PIC executor identity was ephemeral per process**, so an
+N-replica fleet registered N distinct executors with the Trust Plane and every
+rolling restart added N more — nothing stable to revoke and audit hops
+attributed to identities that exist nowhere else. `PROXILION_EXECUTOR_KID` +
+`PROXILION_EXECUTOR_KEY` (with `_FILE` secret sourcing) now pin it, and
+`Config::executor_boot_refusal` refuses to boot a protected `PROXILION_ENV`
+without both. The chart gained a `PodDisruptionBudget` (rendered only above
+one replica), node-level `topologySpreadConstraints`, a raw affinity
+passthrough, and a `terminationGracePeriodSeconds` that outlasts the 30 s
+in-process drain. **Remaining:** the capacity numbers (k6/vegeta at target
+load across ≥ 2 replicas), an HPA keyed on in-flight requests rather than CPU,
+the replica-loss / cross-replica revocation drill, Postgres HA + PgBouncer
+sizing (interlocks PR-8), and a TTL on the CAT-key `OnceCell` so a rotation
+does not require a fleet roll (interlocks PR-3).
+
 **Goal.** Proxilion runs as N replicas behind a load balancer with no shared
 in-process state that breaks correctness, survives a replica loss with no
 dropped guarantees, and has a documented capacity model.
@@ -928,8 +951,14 @@ satisfied:
       ([docs/ops/runbooks/](../ops/runbooks/README.md)). Remaining: execute the
       killswitch-propagation + DB-failover + PITR-restore drills in staging and
       correct the runbooks against reality (interlinks PR-7/PR-8).*
-- [ ] **PR-7** ≥ 2 replicas; statelessness audit done; killswitch propagates
-      across replicas within bound; capacity model published.
+- [~] **PR-7** ≥ 2 replicas; statelessness audit done; killswitch propagates
+      across replicas within bound; capacity model published. *Audit published
+      ([ha-and-scaling.md](../../docs/ops/ha-and-scaling.md)) with the
+      one-request-cycle killswitch bound and the per-replica-limit arithmetic;
+      the ephemeral-executor-identity gap it surfaced is closed and
+      boot-enforced; chart ships PDB + topology spread + affinity + a drain-
+      aware grace period. Remaining: capacity numbers from a load test, HPA on
+      in-flight requests, the replica-loss/revocation drill, Postgres HA.*
 - [ ] **PR-8** PITR restore drill passed; RPO/RTO met; audit-chain verified
       post-restore.
 - [ ] **PR-9** `v0.1.0` tagged; compatibility/MSRV/upgrade policy published.

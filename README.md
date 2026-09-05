@@ -733,6 +733,23 @@ Remaining PR-2 work (interlinks PR-7): the L4 connection/handshake cap and the
 at-scale overload load test (the FD-ulimit guidance now lives in the
 [config reference](docs/ops/config-reference.md)).
 
+**PR-7 (HA & horizontal scaling) — the statelessness audit is published.**
+[docs/ops/ha-and-scaling.md](docs/ops/ha-and-scaling.md) classifies every
+in-process cache: accelerators that fall through to Postgres on a miss (kill
+cache, chain-verification cache, JWKS cache), limits that are enforced *per
+replica* and therefore multiply by replica count (rate limit, concurrency
+ceiling, notification burst), and the one thing that needed an operator
+decision. The killswitch bound is **one request cycle**, not a cache TTL — a
+kill-cache miss always reads `agent_bearers`, so no replica can serve a revoked
+bearer from stale positive state. The audit found and closed one real gap: the
+PIC executor signing key was generated fresh per process, so an N-replica fleet
+registered N executors with the Trust Plane and every restart added N more.
+`PROXILION_EXECUTOR_KID` + `PROXILION_EXECUTOR_KEY` now pin it, and a protected
+`PROXILION_ENV` refuses to boot without both. The chart ships a
+`PodDisruptionBudget`, node-level topology spread, and a termination grace
+period that outlasts the 30 s drain. Remaining: capacity numbers from a load
+test, an HPA keyed on in-flight requests, and the replica-loss drill.
+
 **PR-4 (transport & trust-boundary hardening) is complete.** Ingress TLS is
 terminated by rustls/aws-lc-rs, which never negotiates below **TLS 1.2**;
 `PROXILION_TLS_MIN_VERSION=1.3` (Helm `proxy.tls.minVersion`) pins 1.3-only

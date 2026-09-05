@@ -32,6 +32,25 @@ proxy:
     digest: ""                           # e.g. sha256:abc123…
     pullPolicy: IfNotPresent
   replicaCount: 2
+  # SIGTERM drains for 30s in-process; give the kubelet headroom past that
+  # so in-flight agent requests finish rather than being SIGKILLed.
+  terminationGracePeriodSeconds: 45
+  # PR-7 high availability. See docs/ops/ha-and-scaling.md for the
+  # statelessness audit these settings assume.
+  ha:
+    podDisruptionBudget:
+      enabled: true
+      # Set exactly one of the two. minAvailable: 1 keeps a proxy serving
+      # through a node drain; only rendered when replicaCount > 1.
+      minAvailable: 1
+      maxUnavailable: ""
+    # Spread replicas across nodes (ScheduleAnyway, so a one-node dev
+    # cluster still schedules). Turn off only for a single-node cluster
+    # where the constraint is noise.
+    spreadAcrossNodes: true
+    # Optional raw affinity block, merged verbatim. Use for zone-level
+    # anti-affinity or node pool pinning.
+    affinity: {}
   resources:
     requests:
       cpu: 250m
@@ -112,6 +131,13 @@ proxy:
       # Server-side algorithm allow-list. Asymmetric only — `none` and any
       # HS* are refused at boot. Empty renders the RS256,ES256 default.
       algorithms: ""
+    # Stable PIC executor identity (PR-7). Set this alongside the
+    # `executorKey` secret; a protected `environment` REFUSES TO BOOT
+    # without both. Unset, every replica and every restart registers a new
+    # executor with the Trust Plane — nothing stable to revoke, and audit
+    # hops attributed to identities that no longer exist. Generate the seed
+    # with `openssl rand -hex 32`.
+    executorKid: ""                       # e.g. proxy-prod-1
     # Accept the legacy payload-only `federation_token` (NO signature check).
     # Development only; leave false for any real deployment. Empty = the
     # proxy default (true) — set explicitly to "0" alongside idp.* above.
@@ -231,6 +257,9 @@ secrets:
     googleClientSecret: ""
     trustPlaneCatKey: ""
     siemHmacKey: ""
+    # Ed25519 seed (64 hex chars) for the PIC executor signing key, required
+    # when proxy.env.executorKid is set. `openssl rand -hex 32`.
+    executorKey: ""
 
 # ─────────────────────────────────────────────────────────────────────────
 # Policy bundle (Layer-B YAML — spec.md §9)

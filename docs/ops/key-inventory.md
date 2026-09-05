@@ -14,6 +14,7 @@
 | **SIEM HMAC key** | HMAC-SHA256, ≥ 16 bytes | `PROXILION_SIEM_HMAC_KEY` / secret `siem-hmac-key` | Signs SIEM webhook bodies (`X-Proxilion-Signature`) | Forge SIEM event signatures (tamper with the audit feed an SOC trusts) | `Zeroizing<Vec<u8>>` — scrubbed on drop; explicit redacting `Debug` ([siem.rs](../../crates/proxy/src/forwarder/siem.rs)). |
 | **Blocked-action webhook HMAC key** | HMAC-SHA256, ≥ 16 bytes | `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY` | Signs blocked-action webhook bodies | Forge blocked-action webhook signatures | `Zeroizing<Vec<u8>>` + redacting `Debug` ([webhook.rs](../../crates/proxy/src/notifier/webhook.rs)). |
 | **Slack bot token** | Slack `xoxb-…` bearer token | `PROXILION_SLACK_BOT_TOKEN` | Calls Slack `views.open` for the Block Kit justification modal on approvals | Act as the Proxilion bot in the customer's Slack workspace (open modals, post as the app) | Read on demand via `secret_env`; not held in a long-lived struct. |
+| **PIC executor signing key** | Ed25519 seed, 32 bytes (64 hex) | `PROXILION_EXECUTOR_KID` + `PROXILION_EXECUTOR_KEY` / secret `executor-key` | Signs every Proof-of-Custody the proxy submits to the Trust Plane | Mint successor PCAs as this proxy — forge the custody chain for any authority the predecessor already carries | Held inside `provenance-core`'s `KeyPair` in `PicExecutor` ([executor.rs](../../crates/proxy/src/pic/executor.rs)); ed25519-dalek's `SigningKey` zeroizes on drop. `PicExecutor` has no `Debug`. |
 | **Ingress TLS private key** | cert/key PEM (rustls) | `PROXILION_TLS_KEY` / `proxy.tls.existingSecret` | Terminates agent/operator-facing TLS | Impersonate the proxy endpoint / MITM ingress | Loaded by rustls from a file/secret mount at boot; lives inside the rustls `ServerConfig`. See [tls-mtls-matrix.md](./tls-mtls-matrix.md). |
 
 ## What the proxy does NOT hold (clarifications)
@@ -35,6 +36,11 @@
 - **Replica-local, DB/secret-backed, zeroized on drop:** token-encryption
   key, SIEM HMAC, blocked-webhook HMAC. Decoded bytes are scrubbed on drop
   (PR-3 memory hygiene, this slice).
+- **Fleet-wide, must be identical on every replica:** the PIC executor seed.
+  Unlike the others this is an *identity*, not just material — a per-replica
+  value would register N executors with the Trust Plane and leave nothing
+  stable to revoke, so a protected `PROXILION_ENV` refuses to boot without it
+  (PR-7; see [ha-and-scaling.md](ha-and-scaling.md) §3).
 - **Verification-only / non-secret in the proxy:** CAT public key.
 - **Transport material:** TLS private key (file/secret mount; rotated via
   cert-manager, PR-4).

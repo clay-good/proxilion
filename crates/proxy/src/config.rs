@@ -174,6 +174,18 @@ pub struct Config {
     /// at parse time (RFC 8725 §3.1/§3.2). Defaults to `RS256,ES256`.
     /// `PROXILION_IDP_ALGORITHMS`.
     pub idp_algorithms: String,
+    /// Stable key id for this deployment's PIC executor signing key
+    /// (production-readiness.md PR-7). Set together with
+    /// `executor_key_hex`. Unset ⇒ every replica generates its own
+    /// ephemeral keypair at boot, which is fine for dev but makes the
+    /// Trust Plane executor registry grow without bound across restarts
+    /// and gives the audit trail a new executor identity per replica.
+    /// `PROXILION_EXECUTOR_KID`.
+    pub executor_kid: Option<String>,
+    /// Ed25519 seed for the PIC executor signing key, 64 hex chars (32
+    /// bytes). Sourced through `secret_env`, so `PROXILION_EXECUTOR_KEY_FILE`
+    /// works for a mounted secret. `PROXILION_EXECUTOR_KEY`.
+    pub executor_key_hex: Option<String>,
 }
 
 impl Config {
@@ -218,6 +230,41 @@ impl Config {
     /// is an operator error, never a silent fallback to the stub.
     pub fn verified_federation_configured(&self) -> bool {
         self.idp_issuer.is_some() && self.idp_audience.is_some() && self.idp_jwks_uri.is_some()
+    }
+
+    /// Is a stable executor identity configured? Both the `kid` and the
+    /// seed are required — a `kid` with a fresh random key each boot would
+    /// be worse than an honest ephemeral identity, because two replicas
+    /// would register *different* public keys under the *same* `kid`.
+    pub fn stable_executor_configured(&self) -> bool {
+        self.executor_kid.is_some() && self.executor_key_hex.is_some()
+    }
+
+    /// Production-boot safety guard (production-readiness.md PR-7): refuse
+    /// to start a protected deployment on an ephemeral executor identity.
+    /// Returns the operator-facing refusal reason, or `None` to proceed.
+    ///
+    /// Why this is a hard fail rather than a warning: with an ephemeral
+    /// key every replica and every restart registers a *new* executor
+    /// public key with the Trust Plane, so the registry grows without
+    /// bound, revocation of a compromised executor has nothing stable to
+    /// revoke, and the audit trail attributes hops to identities that no
+    /// longer exist anywhere. None of that is recoverable after the fact.
+    pub fn executor_boot_refusal(&self) -> Option<String> {
+        if self.environment.is_protected() && !self.stable_executor_configured() {
+            Some(format!(
+                "refusing to boot: PROXILION_ENV={} requires a stable PIC \
+                 executor identity, but PROXILION_EXECUTOR_KID and \
+                 PROXILION_EXECUTOR_KEY are not both set. An ephemeral key \
+                 registers a new executor with the Trust Plane on every \
+                 replica and every restart, leaves nothing stable to revoke, \
+                 and attributes audit hops to identities that no longer exist. \
+                 Generate a seed with `openssl rand -hex 32`.",
+                self.environment.label()
+            ))
+        } else {
+            None
+        }
     }
 }
 
@@ -383,6 +430,8 @@ pub struct ConfigBuilder {
     idp_audience: Option<String>,
     idp_jwks_uri: Option<String>,
     idp_algorithms: String,
+    executor_kid: Option<String>,
+    executor_key_hex: Option<String>,
 }
 
 impl Default for ConfigBuilder {
@@ -448,6 +497,10 @@ impl ConfigBuilder {
             idp_jwks_uri: None,
             // RFC 8725-safe asymmetric default, matching `IdpVerifyConfig::new`.
             idp_algorithms: "RS256,ES256".to_string(),
+            // Unset ⇒ an ephemeral per-process executor keypair (dev only;
+            // `executor_boot_refusal` refuses it in a protected env).
+            executor_kid: None,
+            executor_key_hex: None,
         }
     }
 
@@ -635,6 +688,16 @@ impl ConfigBuilder {
                 self.idp_algorithms = v.to_string();
             }
         }
+        if let Ok(v) = env::var("PROXILION_EXECUTOR_KID") {
+            let v = v.trim();
+            self.executor_kid = (!v.is_empty()).then(|| v.to_string());
+        }
+        // `secret_env` so a mounted `PROXILION_EXECUTOR_KEY_FILE` works —
+        // the seed is signing material and belongs in a secret mount, not
+        // an env var readable via /proc/<pid>/environ.
+        if let Some(v) = secret_env("PROXILION_EXECUTOR_KEY") {
+            self.executor_key_hex = Some(v);
+        }
         Ok(self)
     }
 
@@ -773,6 +836,12 @@ impl ConfigBuilder {
         if let Some(v) = file.idp_algorithms {
             self.idp_algorithms = v;
         }
+        if let Some(v) = file.executor_kid {
+            self.executor_kid = Some(v);
+        }
+        if let Some(v) = file.executor_key_hex {
+            self.executor_key_hex = Some(v);
+        }
         Ok(self)
     }
 
@@ -846,6 +915,18 @@ impl ConfigBuilder {
             &self.federation_bridge_url,
         )?;
 
+        // PR-7 stable executor identity: same cheap shape check as the
+        // token-encryption key, so a truncated seed fails at boot rather
+        // than at the first mint.
+        if let Some(hex) = self.executor_key_hex.as_ref()
+            && (hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "PROXILION_EXECUTOR_KEY",
+                reason: format!("expected 64 hex chars (32 bytes), got {} chars", hex.len()),
+            });
+        }
+
         // PR-1 verified federation: validate the IdP settings at build time
         // so a typo surfaces at boot rather than as a 401 on every callback.
         if let Some(uri) = self.idp_jwks_uri.as_deref()
@@ -910,6 +991,8 @@ impl ConfigBuilder {
             idp_audience: self.idp_audience,
             idp_jwks_uri: self.idp_jwks_uri,
             idp_algorithms: self.idp_algorithms,
+            executor_kid: self.executor_kid,
+            executor_key_hex: self.executor_key_hex,
         })
     }
 }
@@ -966,6 +1049,8 @@ struct FileConfig {
     idp_audience: Option<String>,
     idp_jwks_uri: Option<String>,
     idp_algorithms: Option<String>,
+    executor_kid: Option<String>,
+    executor_key_hex: Option<String>,
 }
 
 /// Read a secret from `{var}` or, preferentially, the file named by
@@ -1880,6 +1965,8 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             idp_audience: _,
             idp_jwks_uri: _,
             idp_algorithms: _,
+            executor_kid: _,
+            executor_key_hex: _,
         } = c;
     }
 
@@ -1937,6 +2024,8 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             idp_audience: _,
             idp_jwks_uri: _,
             idp_algorithms: _,
+            executor_kid: _,
+            executor_key_hex: _,
         } = b;
     }
 
@@ -2196,6 +2285,60 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             let err = b.build().unwrap_err();
             assert!(
                 matches!(&err, ConfigError::InvalidValue { field, .. } if *field == "PROXILION_IDP_ALGORITHMS"),
+                "{raw:?} → {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_env_without_a_stable_executor_identity_refuses_boot() {
+        // PR-7: an ephemeral executor key registers a new identity per
+        // replica and per restart — nothing stable to revoke, and audit hops
+        // attributed to identities that no longer exist.
+        let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+        b.environment = Environment::Production;
+        let reason = b
+            .build()
+            .unwrap()
+            .executor_boot_refusal()
+            .expect("must refuse");
+        assert!(reason.contains("PROXILION_EXECUTOR_KID"), "{reason}");
+    }
+
+    #[test]
+    fn protected_env_with_a_stable_executor_identity_allows_boot() {
+        let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+        b.environment = Environment::Production;
+        b.executor_kid = Some("proxy-prod-1".into());
+        b.executor_key_hex = Some("ab".repeat(32));
+        let c = b.build().unwrap();
+        assert!(c.stable_executor_configured());
+        assert!(c.executor_boot_refusal().is_none());
+    }
+
+    #[test]
+    fn half_configured_executor_identity_is_not_configured() {
+        // A `kid` with no seed is worse than no config at all: two replicas
+        // would register DIFFERENT public keys under the SAME kid.
+        for (kid, key) in [
+            (Some("proxy-1"), None),
+            (None, Some("ab".repeat(32)).as_deref()),
+        ] {
+            let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+            b.executor_kid = kid.map(str::to_string);
+            b.executor_key_hex = key.map(str::to_string);
+            assert!(!b.build().unwrap().stable_executor_configured());
+        }
+    }
+
+    #[test]
+    fn malformed_executor_key_is_refused_at_build() {
+        for raw in ["deadbeef", &"zz".repeat(32), &"ab".repeat(33)] {
+            let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+            b.executor_key_hex = Some(raw.to_string());
+            let err = b.build().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { field, .. } if *field == "PROXILION_EXECUTOR_KEY"),
                 "{raw:?} → {err:?}"
             );
         }

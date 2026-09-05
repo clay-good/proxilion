@@ -26,6 +26,26 @@ spec:
       imagePullSecrets: {{ toYaml . | nindent 8 }}
       {{- end }}
       securityContext: {{ toYaml .Values.proxy.podSecurityContext | nindent 8 }}
+      # The proxy drains for 30s on SIGTERM (server.rs graceful_shutdown).
+      # Give the kubelet more than that so in-flight agent requests finish
+      # instead of being SIGKILLed mid-forward.
+      terminationGracePeriodSeconds: {{ .Values.proxy.terminationGracePeriodSeconds }}
+      {{- if .Values.proxy.ha.spreadAcrossNodes }}
+      # PR-7 HA: keep replicas off one node so a node loss cannot take the
+      # whole fleet. `ScheduleAnyway` so a single-node dev cluster still
+      # schedules.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "proxilion.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: proxy
+      {{- end }}
+      {{- with .Values.proxy.ha.affinity }}
+      affinity: {{ toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: proxy
           {{- if .Values.proxy.image.digest }}
@@ -125,6 +145,18 @@ spec:
                 secretKeyRef:
                   name: {{ include "proxilion.secretsName" . }}
                   key: token-encryption-key
+            {{- if .Values.proxy.env.executorKid }}
+            # Stable PIC executor identity (PR-7). Without it every replica
+            # and every restart registers a NEW executor with the Trust
+            # Plane; a protected PROXILION_ENV refuses to boot.
+            - name: PROXILION_EXECUTOR_KID
+              value: {{ .Values.proxy.env.executorKid | quote }}
+            - name: PROXILION_EXECUTOR_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "proxilion.secretsName" . }}
+                  key: executor-key
+            {{- end }}
             - name: GOOGLE_CLIENT_ID
               valueFrom:
                 secretKeyRef:
@@ -220,4 +252,28 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.proxy.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if and .Values.proxy.ha.podDisruptionBudget.enabled (gt (int .Values.proxy.replicaCount) 1) }}
+---
+# PR-7 HA: keep at least one proxy serving through a voluntary disruption
+# (node drain, cluster upgrade). Only rendered above one replica — a PDB on a
+# single-replica Deployment blocks node drains outright.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "proxilion.proxy.fullname" . }}
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  {{- with .Values.proxy.ha.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ . }}
+  {{- end }}
+  {{- with .Values.proxy.ha.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "proxilion.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: proxy
 {{- end }}

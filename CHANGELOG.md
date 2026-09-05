@@ -16,6 +16,31 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **HA & horizontal-scaling audit, and a stable PIC executor identity
+  (production-readiness.md PR-7).** New
+  [docs/ops/ha-and-scaling.md](docs/ops/ha-and-scaling.md) classifies every
+  in-process cache the proxy holds as an accelerator that falls through to
+  Postgres on a miss, a *limit* that is enforced per replica and therefore
+  multiplies by replica count, or something needing an explicit operator
+  decision — plus the arithmetic for the settings in the middle group, and the
+  killswitch propagation bound stated precisely: **one request cycle**, not a
+  cache TTL, because a kill-cache miss always reads `agent_bearers`, so no
+  replica can serve a revoked bearer from stale positive state. The audit
+  surfaced one real gap and this change closes it: the PIC executor signing
+  key was generated fresh **per process**, so an N-replica fleet registered N
+  distinct executors with the Trust Plane and every rolling restart added N
+  more — nothing stable to revoke if an executor is compromised, and audit
+  hops attributed to identities that exist nowhere else. `PROXILION_EXECUTOR_KID`
+  + `PROXILION_EXECUTOR_KEY` (64 hex, `_FILE`-mountable like every other
+  secret) now pin it; setting only one is treated as unset and logged loudly,
+  because two replicas registering different public keys under one `kid` is
+  worse than an honest ephemeral identity. The Helm chart gained a
+  `PodDisruptionBudget` (rendered only above one replica — a PDB on a
+  single-replica Deployment blocks node drains outright), node-level
+  `topologySpreadConstraints`, a raw affinity passthrough, and a
+  `terminationGracePeriodSeconds` that outlasts the proxy's 30 s in-process
+  drain so in-flight agent requests are not SIGKILLed mid-forward.
+
 - **Verified in-process federation — the PR-1 P0 is closed
   (production-readiness.md PR-1, Approach A).** `/oauth/bridge/callback` no
   longer has to trust an unsigned token. It now accepts an IdP `id_token`,
@@ -462,6 +487,13 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Changed
 
+- **A protected `PROXILION_ENV` now also refuses to boot on an ephemeral PIC
+  executor identity (production-readiness.md PR-7).** `staging`/`production`
+  require `PROXILION_EXECUTOR_KID` + `PROXILION_EXECUTOR_KEY`. This is a hard
+  fail rather than a warning because none of what an ephemeral key costs you
+  is recoverable after the fact: the Trust Plane's executor registry has
+  already grown, the compromised key has already signed, and the audit trail
+  already names identities that no longer exist.
 - **The production boot guard now requires the verified federation path, not
   just the absence of the stub (production-readiness.md PR-1).**
   `PROXILION_ENV=staging|production` previously refused to boot only while

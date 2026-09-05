@@ -76,7 +76,12 @@ jobs:
           sbom: true         # SBOM attestation
 
       - name: Trivy scan (gate on fixable HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+        # Pinned by commit SHA, not tag (v0.36.0), unlike the other actions
+        # here: the Trivy release channel was briefly compromised at
+        # <0.35.0 (GHSA / Dependabot alert), and a mutable tag on a repo
+        # with that history is exactly the thing worth not trusting. To
+        # bump, resolve the new tag to a SHA and replace both below.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           format: table

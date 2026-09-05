@@ -181,6 +181,12 @@ You should see a JSON `PCA_0` with `p_0`, granted ops, and a base64 COSE
 signature. Open <https://localhost:8443/admin/> in a browser to paste that
 PCA id into the chain inspector.
 
+**That is the dev stack, not a deployment.** It opts into the unsigned
+federation stub and disables operator auth. For a real one, follow
+[docs/install/production.md](docs/install/production.md) and finish with the
+[go-live checklist](docs/ops/go-live-checklist.md) — a protected
+`PROXILION_ENV` will refuse to boot until you have.
+
 ## Three deployment modes, one PIC fabric
 
 A single architecture can't cover every managed-agent platform. Proxilion
@@ -209,6 +215,8 @@ proxilion/
 │   └── shared-types/       # re-exports of upstream provenance-core
 ├── site/                   # proxilion.com (static HTML, no build) — landing + /pic explainer
 ├── docs/specs/spec.md      # the design doc
+├── docs/install/           # production deployment guide + artifact verification
+├── docs/ops/               # config reference, SLOs, runbooks, go-live checklist
 ├── ops/                    # Prometheus scrape config + Grafana JSON
 ├── docker/                 # Dockerfiles for proxy and trust-plane
 ├── migrations/             # postgres SQL for OAuth + PCA + audit tables

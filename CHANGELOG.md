@@ -16,6 +16,23 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Production deployment guide and a fillable go-live PRR
+  (production-readiness.md PR-13).**
+  [docs/install/production.md](docs/install/production.md) is the ordered path
+  from nothing to a deployment you can put in front of a managed agent. It is
+  deliberately a *sequence and its decisions*, linking to the document that
+  owns each detail rather than restating it — a guide that duplicates the
+  config reference goes stale against it, and a stale deployment guide is worse
+  than none. It leads with the two boot refusals an operator will hit
+  (unconfigured federation, ephemeral executor identity) because both are
+  unrecoverable after the fact.
+  [docs/ops/go-live-checklist.md](docs/ops/go-live-checklist.md) is the
+  reviewable PRR: P0 rows that block exposing an IdP-facing route at all
+  (including presenting a **tampered** `id_token` by hand and confirming the
+  `401` — the product's whole thesis in one check), P1 rows that block a real
+  user population, P2 before GA, a sign-off block, and a known-accepted-risks
+  table whose emptiness is itself a claim that nothing was waived.
+
 - **Opt-in logical-backup CronJob in the Helm chart (production-readiness.md
   PR-8).** `backup.enabled` (off by default) schedules a `pg_dump`, gzips it to
   a PVC, and prunes past `backup.retentionDays`, reading the same

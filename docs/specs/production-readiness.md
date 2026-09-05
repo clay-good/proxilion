@@ -957,8 +957,18 @@ undocumented variable, and asserts every `FileConfig` field is shown in the
 example TOML — the "config reference matches `config.rs` (CI drift check)"
 acceptance criterion. Authoring it caught real drift: `tls_min_version`,
 `environment`, and `insecure_bridge_stub` were settable TOML fields missing
-from the example template (now added). **Still open:** the end-to-end
-deployment guide and the signed go-live PRR checklist.
+from the example template (now added). **The deployment guide and PRR
+checklist are now landed** (2026-09-05):
+[docs/install/production.md](../install/production.md) is the ordered path from
+nothing to a production deployment — deliberately a *sequence and its
+decisions*, linking to the document that owns each detail rather than
+restating it, because a guide that duplicates the config reference goes stale
+against it. [docs/ops/go-live-checklist.md](../ops/go-live-checklist.md) is the
+fillable PRR: P0 rows that block exposing an IdP-facing route at all, P1 rows
+that block a real user population, P2 before GA, a sign-off block, and a
+known-accepted-risks table whose emptiness is itself a claim. **Still open:**
+standing up a fresh staging environment *solely* from the guide, which is the
+only way to find what the guide leaves out.
 
 **Goal.** A new operator can stand up a production-grade Proxilion from one
 authoritative guide, and there is a formal go-live gate.
@@ -1058,10 +1068,12 @@ satisfied:
       pentest criticals/highs remediated (required for GA / first design
       partner, may trail a locked-down pilot).
 - [~] **PR-13** Deployment guide + config reference + signed PRR. *Config
-      reference + CI doc-drift gate landed
-      ([config-reference.md](../ops/config-reference.md),
-      [config_docs.rs](../../crates/proxy/tests/config_docs.rs)); remaining:
-      end-to-end deployment guide + signed go-live PRR checklist.*
+      reference + CI doc-drift gate, the end-to-end deployment guide
+      ([production.md](../../docs/install/production.md)), and the fillable PRR
+      ([go-live-checklist.md](../../docs/ops/go-live-checklist.md)) all landed;
+      remaining: stand up a staging environment from the guide alone — the only
+      way to find what it leaves out — and sign the checklist for a real
+      deploy.*
 
 ## Out of scope (explicitly deferred to v2)
 

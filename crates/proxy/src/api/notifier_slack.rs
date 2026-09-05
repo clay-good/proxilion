@@ -535,10 +535,14 @@ fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 /// Slack bot token (`xoxb-…`) used to call `views.open`. `None` when unset or
 /// empty — the modal flow is then skipped entirely.
+///
+/// Read through `secret_env` so it honours the `*_FILE` mounted-secret
+/// convention like every other secret (production-readiness.md PR-3). It is
+/// marked **secret** in the config reference and grants Slack Web API access
+/// as the bot, so it must not be forced to live in the process environment,
+/// where it leaks via `/proc/<pid>/environ`, crash dumps, and `docker inspect`.
 fn slack_bot_token() -> Option<String> {
-    std::env::var("PROXILION_SLACK_BOT_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
+    crate::config::secret_env("PROXILION_SLACK_BOT_TOKEN").filter(|t| !t.is_empty())
 }
 
 /// Slack Web API base. Overridable via `PROXILION_SLACK_API_BASE` so tests can

@@ -438,6 +438,37 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **The one secret that could not be file-sourced: `PROXILION_SLACK_BOT_TOKEN`.**
+  [config-reference.md](docs/ops/config-reference.md) marks it **secret** and
+  states that every variable so marked can be mounted from a file, and
+  [key-inventory.md](docs/ops/key-inventory.md) claims "every secret above can be
+  sourced from a mounted file" — but the token was read with a plain
+  `env::var`, so it had no `*_FILE` path and was missing from the inventory
+  table entirely. An operator who mounted all five documented secrets still had
+  a live Slack bearer token sitting in the process environment, readable via
+  `/proc/<pid>/environ`, `docker inspect`, and crash dumps — the exact exposure
+  PR-3 exists to close. Now read through `secret_env`, added to the inventory
+  with its blast radius, and listed as `*_FILE`-capable in both documents.
+- **An empty mounted secret file no longer shadows a working env var.**
+  `secret_env` treated unreadable `<VAR>_FILE` as "fall back to `<VAR>`" but
+  treated *readable-but-empty* as a real, empty secret. A mount can legitimately
+  exist unpopulated while External Secrets Operator / Vault fills it. With
+  `PROXILION_SIEM_HMAC_KEY_FILE` pointing at such a file, the SIEM forwarder was
+  disabled for the life of the process behind a single boot warning naming
+  `PROXILION_SIEM_HMAC_KEY` — a variable the operator never set — so every SIEM
+  audit event was dropped and the log pointed at the wrong thing. Empty is now
+  treated exactly like unreadable. Covered by a regression test that fails
+  against the old behavior. [config.rs](crates/proxy/src/config.rs)
+- **PR-13 doc-drift gate could silently stop gating.** `file_config_fields()`
+  sliced `struct FileConfig` at the first `}` rather than the matching one, so a
+  `}` inside a field doc comment (this tree documents fields heavily, and
+  `{var}_FILE` is already an idiom in `config.rs`) would drop every field
+  declared after it. The `fields.len() >= 30` guard cannot catch that — there
+  are 32 fields, so up to two could vanish with the test still green, letting
+  exactly the drift this gate prevents ship undetected. Now stops at the
+  struct's own closing brace, plus a canary test asserting extraction reaches
+  the last declared field. [config_docs.rs](crates/proxy/tests/config_docs.rs)
+
 - **CI unblocked: `main` had been red since 2026-08-17 on `cargo clippy -D
   warnings`.** No code changed to cause it — the CI toolchain is `stable`,
   which floated to Rust 1.97, whose `clippy::for_kv_map` now fires on the

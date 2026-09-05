@@ -113,7 +113,17 @@ fn file_config_fields() -> Vec<String> {
         .find("struct FileConfig {")
         .expect("FileConfig struct must exist");
     let body = &src[start..];
-    let end = body.find('}').expect("FileConfig must close");
+    // Stop at the struct's OWN closing brace — a line that is exactly `}` at
+    // column 0. `body.find('}')` would stop at the first brace anywhere,
+    // including one inside a field doc comment (this codebase documents
+    // fields heavily, and `{var}_FILE` is an idiom already used in
+    // config.rs), silently dropping every field declared after it from the
+    // check below. The `fields.len() >= 30` guard only catches gross
+    // truncation, so that failure mode would pass CI while the gate quietly
+    // stopped covering the tail of the struct.
+    let end = body
+        .find("\n}")
+        .expect("FileConfig must close with a `}` at column 0");
     let body = &body[..end];
 
     body.lines()
@@ -132,6 +142,21 @@ fn file_config_fields() -> Vec<String> {
             }
         })
         .collect()
+}
+
+#[test]
+fn file_config_extraction_reaches_the_last_declared_field() {
+    // Canary for silent truncation: `insecure_bridge_stub` is the LAST field
+    // in `struct FileConfig`, so it only appears here if extraction walked
+    // the whole struct. The `>= 30` guard in the test below cannot catch a
+    // truncation that drops only the final field or two (there are 32), which
+    // is exactly what a `}` inside a field doc comment would cause.
+    let fields = file_config_fields();
+    assert!(
+        fields.iter().any(|f| f == "insecure_bridge_stub"),
+        "extraction stopped before the last FileConfig field — it likely \
+         truncated at a `}}` inside a doc comment. Got: {fields:?}",
+    );
 }
 
 #[test]

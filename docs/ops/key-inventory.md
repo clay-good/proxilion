@@ -13,6 +13,7 @@
 | **Token-encryption key** | AES-256-GCM, 32 bytes (64 hex) | `PROXILION_TOKEN_ENCRYPTION_KEY` / secret `token-encryption-key` | Encrypts upstream OAuth access/refresh tokens at rest in Postgres | Decrypt **every** stored upstream OAuth token (full impersonation of every linked user against the SaaS) | Held inside `Aes256Gcm` ([token_cipher.rs](../../crates/proxy/src/crypto/token_cipher.rs)), which zeroizes its key on drop (aes-gcm `zeroize` feature). `TokenCipher` has no `Debug`. |
 | **SIEM HMAC key** | HMAC-SHA256, ≥ 16 bytes | `PROXILION_SIEM_HMAC_KEY` / secret `siem-hmac-key` | Signs SIEM webhook bodies (`X-Proxilion-Signature`) | Forge SIEM event signatures (tamper with the audit feed an SOC trusts) | `Zeroizing<Vec<u8>>` — scrubbed on drop; explicit redacting `Debug` ([siem.rs](../../crates/proxy/src/forwarder/siem.rs)). |
 | **Blocked-action webhook HMAC key** | HMAC-SHA256, ≥ 16 bytes | `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY` | Signs blocked-action webhook bodies | Forge blocked-action webhook signatures | `Zeroizing<Vec<u8>>` + redacting `Debug` ([webhook.rs](../../crates/proxy/src/notifier/webhook.rs)). |
+| **Slack bot token** | Slack `xoxb-…` bearer token | `PROXILION_SLACK_BOT_TOKEN` | Calls Slack `views.open` for the Block Kit justification modal on approvals | Act as the Proxilion bot in the customer's Slack workspace (open modals, post as the app) | Read on demand via `secret_env`; not held in a long-lived struct. |
 | **Ingress TLS private key** | cert/key PEM (rustls) | `PROXILION_TLS_KEY` / `proxy.tls.existingSecret` | Terminates agent/operator-facing TLS | Impersonate the proxy endpoint / MITM ingress | Loaded by rustls from a file/secret mount at boot; lives inside the rustls `ServerConfig`. See [tls-mtls-matrix.md](./tls-mtls-matrix.md). |
 
 ## What the proxy does NOT hold (clarifications)
@@ -48,8 +49,15 @@ process environment (where it can leak via `/proc/<pid>/environ`, crash
 dumps, or `docker inspect`) and lets an operator back it with External
 Secrets Operator / Vault / a cloud-KMS-backed Kubernetes Secret. Applies to
 `PROXILION_TOKEN_ENCRYPTION_KEY`, `DATABASE_URL`, `GOOGLE_CLIENT_SECRET`,
-`PROXILION_SIEM_HMAC_KEY`, and `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY`
+`PROXILION_SIEM_HMAC_KEY`, `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY`, and
+`PROXILION_SLACK_BOT_TOKEN`
 (e.g. `PROXILION_TOKEN_ENCRYPTION_KEY_FILE=/var/run/secrets/token-key`).
+
+An **empty** secret file is treated exactly like an unreadable one — the proxy
+falls through to the direct `<VAR>`. A mount can legitimately exist-but-be-empty
+while External Secrets Operator / Vault is still populating it; treating that as
+a real (empty) secret would shadow a working env var and disable the dependent
+subsystem silently.
 
 ## Remaining PR-3 work
 

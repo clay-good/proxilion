@@ -45,13 +45,18 @@ the proxy reads the secret from that file (trailing newline trimmed), in
 [`config.rs`](../../crates/proxy/src/config.rs)). This keeps secrets out of
 `/proc/<pid>/environ`, crash dumps, and `docker inspect`, and lets you back the
 mount with the External Secrets Operator, Vault, or a cloud-KMS-backed
-Kubernetes `Secret`. If `<VAR>_FILE` is set but unreadable, the proxy falls
-back to `<VAR>` (the missing-secret error then surfaces at the specific
-consumer, which is more actionable than a generic boot failure).
+Kubernetes `Secret`. If `<VAR>_FILE` is set but unreadable — **or readable but
+empty** — the proxy falls back to `<VAR>` (the missing-secret error then
+surfaces at the specific consumer, which is more actionable than a generic boot
+failure). Empty is treated like unreadable on purpose: a mount can exist but be
+unpopulated while External Secrets Operator / Vault is still filling it, and
+honouring that as a real empty secret would shadow a working `<VAR>` and
+silently disable the subsystem that needs it.
 
 The `*_FILE`-capable variables are: `DATABASE_URL_FILE`,
 `PROXILION_TOKEN_ENCRYPTION_KEY_FILE`, `GOOGLE_CLIENT_SECRET_FILE`,
-`PROXILION_SIEM_HMAC_KEY_FILE`, `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY_FILE`.
+`PROXILION_SIEM_HMAC_KEY_FILE`, `PROXILION_BLOCKED_WEBHOOK_HMAC_KEY_FILE`,
+`PROXILION_SLACK_BOT_TOKEN_FILE`.
 
 See [key-inventory.md](key-inventory.md) for the per-secret classification
 (algorithm, length, blast radius, rotation).
@@ -141,7 +146,7 @@ See [key-inventory.md](key-inventory.md) for the per-secret classification
 
 | Env var | TOML key | Type | Default | Notes |
 |---|---|---|---|---|
-| `PROXILION_SLACK_BOT_TOKEN` | — | `xoxb-…` | none | Bot token for the Slack `views.open` approval modal. Unset/empty ⇒ the modal flow is skipped (the incoming-webhook direct-commit path is unchanged — the modal is purely additive). **secret.** |
+| `PROXILION_SLACK_BOT_TOKEN` | — | `xoxb-…` | none | Bot token for the Slack `views.open` approval modal. Unset/empty ⇒ the modal flow is skipped (the incoming-webhook direct-commit path is unchanged — the modal is purely additive). **secret** (`*_FILE`-capable). |
 | `PROXILION_SLACK_API_BASE` | — | URL | `https://slack.com/api` | Slack Web API base. Override only to point `views.open` at a mock server in tests. |
 
 ## Operator auth — ui-less-surfaces.md §4.4

@@ -871,17 +871,30 @@ struct FileConfig {
 /// cloud-KMS-backed Secret without ever placing it in an env var (which can
 /// leak via `/proc/<pid>/environ`, crash dumps, or a `docker inspect`).
 ///
-/// Precedence: `{var}_FILE` wins when set and readable; otherwise the direct
-/// `{var}`. A trailing newline (the usual artifact of `echo`-ing a secret
-/// into a file) is trimmed. If `{var}_FILE` is set but unreadable, falls back
-/// to `{var}` rather than failing the whole load — the missing-secret error
-/// then surfaces at the specific consumer (e.g. `TokenCipher`), which is more
-/// actionable than a generic boot error.
-fn secret_env(var: &str) -> Option<String> {
+/// Precedence: `{var}_FILE` wins when set and readable and non-empty;
+/// otherwise the direct `{var}`. A trailing newline (the usual artifact of
+/// `echo`-ing a secret into a file) is trimmed. If `{var}_FILE` is set but
+/// unreadable, falls back to `{var}` rather than failing the whole load — the
+/// missing-secret error then surfaces at the specific consumer (e.g.
+/// `TokenCipher`), which is more actionable than a generic boot error.
+///
+/// An **empty** secret file is treated exactly like an unreadable one. A
+/// secret mount can legitimately exist-but-be-empty while External Secrets
+/// Operator / Vault is still populating it, or when a `Secret` key was
+/// created without a value. Returning `Some("")` there would *shadow* a
+/// correctly-set direct `{var}` and, worse, degrade silently: an empty
+/// `PROXILION_SIEM_HMAC_KEY_FILE` used to disable the SIEM forwarder for the
+/// life of the process behind one boot warning that named `..._HMAC_KEY` —
+/// a variable the operator never set. Falling through keeps the direct env
+/// var usable and makes the failure name the thing that is actually missing.
+pub(crate) fn secret_env(var: &str) -> Option<String> {
     if let Ok(path) = env::var(format!("{var}_FILE")) {
         if !path.is_empty() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
-                return Some(read_secret_trim(&contents));
+                let secret = read_secret_trim(&contents);
+                if !secret.is_empty() {
+                    return Some(secret);
+                }
             }
         }
     }
@@ -1917,6 +1930,74 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             assert!(refusal.contains(env.label()));
             assert!(refusal.contains("refusing to boot"));
         }
+    }
+
+    #[test]
+    fn secret_env_falls_through_to_env_var_when_secret_file_is_empty() {
+        // A secret mount can exist-but-be-empty while External Secrets
+        // Operator / Vault is still populating it, or when a `Secret` key was
+        // created without a value. Returning `Some("")` there shadowed a
+        // correctly-set direct env var and degraded silently: an empty
+        // `PROXILION_SIEM_HMAC_KEY_FILE` disabled the SIEM forwarder for the
+        // life of the process behind one warning naming `..._HMAC_KEY`, a
+        // variable the operator never set. Empty must behave like unreadable.
+        // Held in a const, not a literal at the call site: the PR-13 doc-drift
+        // scanner matches only a bare quoted UPPER_SNAKE argument, so this
+        // test-only variable stays out of the operator-facing config surface
+        // — the same device `test_support::TEST_DB_ENV` uses.
+        const VAR: &str = "PROXILION_SECRET_ENV_SELFTEST";
+        const VAR_FILE: &str = "PROXILION_SECRET_ENV_SELFTEST_FILE";
+
+        let dir = std::env::temp_dir().join(format!("proxilion-secret-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let empty = dir.join("empty-secret");
+        std::fs::write(&empty, "").expect("write empty secret file");
+        let newline_only = dir.join("newline-only-secret");
+        std::fs::write(&newline_only, "\n").expect("write newline-only secret file");
+        let real = dir.join("real-secret");
+        std::fs::write(&real, "from-file\n").expect("write real secret file");
+
+        // SAFETY: single-threaded test scope; vars are unique to this test.
+        unsafe {
+            env::set_var(VAR, "from-env");
+
+            // Empty file → fall through to the env var, not Some("").
+            env::set_var(VAR_FILE, &empty);
+            assert_eq!(
+                secret_env(VAR).as_deref(),
+                Some("from-env"),
+                "an empty secret file must not shadow the direct env var"
+            );
+
+            // A file holding only a newline trims to empty → same rule.
+            env::set_var(VAR_FILE, &newline_only);
+            assert_eq!(
+                secret_env(VAR).as_deref(),
+                Some("from-env"),
+                "a newline-only secret file trims to empty and must fall through"
+            );
+
+            // Unreadable path → fall through (pre-existing documented rule).
+            env::set_var(VAR_FILE, dir.join("does-not-exist"));
+            assert_eq!(secret_env(VAR).as_deref(), Some("from-env"));
+
+            // A populated file still wins over the env var.
+            env::set_var(VAR_FILE, &real);
+            assert_eq!(
+                secret_env(VAR).as_deref(),
+                Some("from-file"),
+                "a populated secret file must still take precedence"
+            );
+
+            // With no direct env var and an empty file, the secret is absent
+            // rather than present-but-empty.
+            env::remove_var(VAR);
+            env::set_var(VAR_FILE, &empty);
+            assert_eq!(secret_env(VAR), None);
+
+            env::remove_var(VAR_FILE);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

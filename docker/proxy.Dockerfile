@@ -11,7 +11,7 @@
 # also Trivy-scans the result and emits the digest to pin in Helm values.
 
 # ── Builder ──────────────────────────────────────────────────────────────
-# Pinned to the toolchain we test against (>= MSRV 1.85). cargo build with
+# Pinned at the workspace MSRV (1.88 — see Cargo.toml). cargo build with
 # --locked so the image reproduces from Cargo.lock exactly.
 FROM rust:1.88-bookworm AS builder
 WORKDIR /build

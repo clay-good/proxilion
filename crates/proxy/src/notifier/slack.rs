@@ -154,15 +154,15 @@ impl SlackNotifier {
         slack_user_id: Option<&str>,
         slack_username: Option<&str>,
     ) -> Option<String> {
-        if let Some(id) = slack_user_id {
-            if let Some(v) = self.user_map.get(id) {
-                return Some(v.clone());
-            }
+        if let Some(id) = slack_user_id
+            && let Some(v) = self.user_map.get(id)
+        {
+            return Some(v.clone());
         }
-        if let Some(u) = slack_username {
-            if let Some(v) = self.user_map.get(u) {
-                return Some(v.clone());
-            }
+        if let Some(u) = slack_username
+            && let Some(v) = self.user_map.get(u)
+        {
+            return Some(v.clone());
         }
         None
     }
@@ -177,12 +177,12 @@ impl SlackNotifier {
 
     /// POST a Block Kit message to the incoming webhook. Best-effort.
     pub async fn notify(&self, n: &BlockedNotification<'_>) {
-        if let Some(b) = &self.burst {
-            if !b.admit(n, Instant::now()).await {
-                // Suppressed — the flush loop will emit a thread-style
-                // summary message for this bucket.
-                return;
-            }
+        if let Some(b) = &self.burst
+            && !b.admit(n, Instant::now()).await
+        {
+            // Suppressed — the flush loop will emit a thread-style
+            // summary message for this bucket.
+            return;
         }
         // §4.3 — absolute expiry computed at send so it doesn't drift as the
         // message sits unread.

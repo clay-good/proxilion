@@ -343,10 +343,10 @@ pub async fn approve_inner(
             "justification must be at least 20 characters".into(),
         ));
     }
-    if let Some(t) = body.ttl_minutes {
-        if !(1..=1440).contains(&t) {
-            return Err(ApiError::BadRequest("ttl_minutes must be 1..=1440".into()));
-        }
+    if let Some(t) = body.ttl_minutes
+        && !(1..=1440).contains(&t)
+    {
+        return Err(ApiError::BadRequest("ttl_minutes must be 1..=1440".into()));
     }
 
     // Load row, lock against double-approve via SELECT … FOR UPDATE inside

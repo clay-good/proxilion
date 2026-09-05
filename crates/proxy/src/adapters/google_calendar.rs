@@ -751,10 +751,10 @@ async fn proxy_request(
 
     let mut builder = Response::builder().status(status);
     let resp_headers = builder.headers_mut().expect("fresh builder has headers");
-    if let Some(ct) = content_type.as_deref() {
-        if let Ok(v) = HeaderValue::from_str(ct) {
-            resp_headers.insert(CONTENT_TYPE, v);
-        }
+    if let Some(ct) = content_type.as_deref()
+        && let Ok(v) = HeaderValue::from_str(ct)
+    {
+        resp_headers.insert(CONTENT_TYPE, v);
     }
     insert_proxy_headers(resp_headers, request_id, &outcome, pca2_id);
     if let Ok(v) = HeaderValue::from_str(&policy_trace.trace_id.to_string()) {
@@ -817,10 +817,10 @@ fn insert_proxy_headers(
         HeaderName::from_static("x-proxilion-pca-id"),
         HeaderValue::from_str(&pca_id.to_string()).expect("uuid"),
     );
-    if let Some(pid) = outcome.matched_policy_id.as_deref() {
-        if let Ok(v) = HeaderValue::from_str(pid) {
-            headers.insert(HeaderName::from_static("x-proxilion-policy"), v);
-        }
+    if let Some(pid) = outcome.matched_policy_id.as_deref()
+        && let Ok(v) = HeaderValue::from_str(pid)
+    {
+        headers.insert(HeaderName::from_static("x-proxilion-policy"), v);
     }
 }
 

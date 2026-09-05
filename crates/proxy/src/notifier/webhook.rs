@@ -37,7 +37,7 @@ impl WebhookSecret {
         if hex.is_empty() {
             return Err(NotifierBuildError("hmac secret is empty".into()));
         }
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return Err(NotifierBuildError(
                 "hmac secret hex length must be even".into(),
             ));
@@ -139,12 +139,12 @@ impl WebhookNotifier {
     }
 
     pub async fn notify(&self, n: &BlockedNotification<'_>) {
-        if let Some(b) = &self.burst {
-            if !b.admit(n, Instant::now()).await {
-                // Suppressed — the periodic flush will emit a summary
-                // for this bucket.
-                return;
-            }
+        if let Some(b) = &self.burst
+            && !b.admit(n, Instant::now()).await
+        {
+            // Suppressed — the periodic flush will emit a summary
+            // for this bucket.
+            return;
         }
         let body = match serde_json::to_vec(n) {
             Ok(b) => b,

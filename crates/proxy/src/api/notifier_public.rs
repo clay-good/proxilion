@@ -178,15 +178,14 @@ async fn submit(
     // `approve_inner`'s own `SELECT … FOR UPDATE` + `status='pending'` guard
     // is the canonical double-execution protection, so a retry re-locks,
     // re-checks pending, and re-attempts cleanly.
-    if action_outcome.is_ok() {
-        if let Err(e) =
+    if action_outcome.is_ok()
+        && let Err(e) =
             sqlx::query("UPDATE notifier_tokens SET consumed_at = now() WHERE token_id = $1")
                 .bind(form.t)
                 .execute(&mut *tx)
                 .await
-        {
-            tracing::warn!(error = %e, "notifier_token: failed to mark consumed");
-        }
+    {
+        tracing::warn!(error = %e, "notifier_token: failed to mark consumed");
     }
     if let Err(e) = tx.commit().await {
         tracing::warn!(error = %e, "notifier_token: commit failed");

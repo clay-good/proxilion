@@ -94,15 +94,23 @@ A malformed or over-long previous-key list is refused **at boot** rather than
 trimmed: a silently dropped retired key is indistinguishable from a finished
 drain until the first pre-rotation row fails to decrypt.
 
+The full per-secret procedure — including which secrets can overlap at all —
+is [runbooks/key-rotation.md](./runbooks/key-rotation.md).
+
 ## Remaining PR-3 work
 
-The memory-hygiene, inventory, file-sourcing, and token-key rotation steps
-are done; still open before PR-3 closes:
+The memory-hygiene, inventory, file-sourcing, token-key rotation overlap, and
+the planned/emergency rotation runbooks are done; still open before PR-3
+closes:
 
-- **Rotation overlap for the remaining keys.** The SIEM / blocked-webhook
-  HMAC keys and the PIC executor seed still rotate by flip-and-accept-the-gap;
-  give them the same active-plus-retired treatment.
 - **Envelope encryption** (KMS-wrapped DEK) for the token-encryption key as
   the recommended pattern (file/env stays the default).
-- **Rotation runbooks** (one per key; planned + emergency/compromise),
-  landing with PR-6.
+- **The staging rotation drill** — a token-key rotation completed with zero
+  rejected in-flight requests (the PR-3 acceptance criterion). The drill-log
+  table in [key-rotation.md](./runbooks/key-rotation.md) is a placeholder.
+
+Not on the list, deliberately: overlap for the SIEM / blocked-webhook HMAC
+keys. Those sign **outbound** bodies, so the accepting side is the verifier —
+no amount of proxy-side overlap removes the need for a coordinated cutover,
+and dual-signing would change the wire contract every receiver already
+implements.

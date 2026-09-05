@@ -16,6 +16,19 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Planned key-rotation runbook, and a correction to the compromise one
+  (production-readiness.md PR-3 / PR-6).** New
+  [docs/ops/runbooks/key-rotation.md](docs/ops/runbooks/key-rotation.md) gives
+  the scheduled procedure per secret and, more usefully, says which secrets can
+  overlap at all: the token-encryption key can (both keys are ours to hold),
+  the executor seed cannot (the Trust Plane registry is the coordination
+  point), and the SIEM / blocked-webhook HMAC keys cannot *by construction* —
+  they sign outbound bodies, so the receiver is the verifier and no proxy-side
+  overlap removes the coordinated cutover. Planned and emergency rotation stay
+  deliberately separate procedures, because a planned rotation keeps the old
+  key accepted for a drain window and that is precisely what a leaked key must
+  not get: overlap buys zero downtime, not containment.
+
 - **CI gate on the Helm chart (production-readiness.md PR-11).** The chart is
   the production deployment artifact and nothing checked it: a template that
   failed to render, a values key renamed on one side only, or an env var wired
@@ -617,6 +630,17 @@ Until v0.1.0, the canonical reference is the most recent commit on
   configured"; it never silently falls back to the stub.
 
 ### Fixed
+
+- **`key-compromise.md` described a rotation path that no longer exists.** It
+  told an incident responder that versioned-key overlap "hasn't shipped" and
+  that the token-key rotation therefore needed a decrypt-then-re-encrypt
+  maintenance pass. Overlap has since shipped, so the runbook now gives the
+  real choice — a *minutes-long* re-wrap window with the leaked key temporarily
+  accepted, or (the default, and mandatory if the key may already be in use) a
+  burn with no overlap at all, forcing fresh OAuth consent. It also gained the
+  PIC executor seed, which did not exist as a stable identity when the runbook
+  was written and is the one secret whose revocation depends on the `kid` being
+  stable.
 
 - **Declared MSRV corrected from 1.85 to 1.88, and the lints that unlocked.**
   `time`, `home`, `async-nats` and `jsonwebtoken` all declare

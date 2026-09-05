@@ -372,10 +372,16 @@ previous-key list is refused at boot rather than trimmed, because a silently
 dropped retired key is indistinguishable from a finished drain. The procedure
 is written up in [key-inventory.md](../ops/key-inventory.md). The CAT
 verifying key also stopped being pinned for the process lifetime — it now
-refreshes on a 1 h TTL (see PR-7). **Still open before this P0 closes:** the
-same active-plus-retired treatment for the SIEM / blocked-webhook HMAC keys
-and the PIC executor seed, KMS envelope encryption for the DEK, and the
-per-key rotation runbooks (with PR-6).
+refreshes on a 1 h TTL (see PR-7). The **rotation runbooks** are also
+landed: [key-rotation.md](../ops/runbooks/key-rotation.md) is the planned
+per-secret procedure and [key-compromise.md](../ops/runbooks/key-compromise.md)
+is the emergency one, kept deliberately distinct — a planned rotation keeps the
+old key accepted for a drain window, which is exactly what a leaked key must
+not get. **Still open before this P0 closes:** KMS envelope encryption for the
+DEK, and the staging rotation drill (a token-key rotation with zero rejected
+in-flight requests). *Not* open, deliberately: overlap for the SIEM /
+blocked-webhook HMAC keys — those sign **outbound** bodies, so the receiver is
+the verifier and no proxy-side overlap removes the coordinated cutover.
 
 **Goal.** Every signing/encryption secret can be rotated without downtime,
 is sourced safely in production, and does not linger in process memory longer
@@ -1003,8 +1009,8 @@ satisfied:
       inventory doc, `*_FILE` secret sourcing, and zero-downtime rotation of
       the token-encryption key (active + up to 4 retired decrypt keys, no
       ciphertext change, drain observable on
-      `proxilion_token_decrypt_total`) landed; remaining: the same overlap for
-      the HMAC keys and the executor seed, KMS envelope, rotation runbooks.*
+      `proxilion_token_decrypt_total`) plus the planned/emergency rotation
+      runbooks landed; remaining: KMS envelope and the staging rotation drill.*
 - [~] **PR-4** TLS ≥ 1.2 enforced (1.3 opt-in); outbound cert verification
       proven (CI gate); trusted-proxy config explicit; per-hop TLS/mTLS
       matrix documented. Remaining: staging nmap/testssl scan + mesh-wiring

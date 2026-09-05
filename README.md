@@ -807,7 +807,10 @@ diagnosis → mitigation → verification → escalation procedure in
 critical-procedure runbooks for the
 [killswitch](docs/ops/runbooks/killswitch.md) (with the one-request-cycle
 cross-replica propagation guarantee), [DB failover](docs/ops/runbooks/db-failover.md),
-[key compromise](docs/ops/runbooks/key-compromise.md), and
+[key rotation](docs/ops/runbooks/key-rotation.md) and
+[key compromise](docs/ops/runbooks/key-compromise.md) (kept separate — a
+planned rotation keeps the old key accepted for a drain window, which is
+exactly what a leaked key must not get), and
 [security incident response](docs/ops/runbooks/incident-response.md) (an
 incident-commander checklist that preserves the tamper-evident audit log as
 evidence *before* mitigating), and

@@ -28,8 +28,11 @@ These are referenced from the alert sections below and from each other:
   RPO/RTO targets, the restore procedure, post-restore audit-chain
   verification (`proxilion-cli pic verify-sample`), and the forward-only
   migration / expand-contract policy; interlinks PR-7/PR-8.
-- **[key-compromise.md](./key-compromise.md)** — emergency rotation per secret,
-  blast radius, and audit-chain continuity (read
+- **[key-rotation.md](./key-rotation.md)** — the *planned* rotation procedure
+  per secret: which support overlap and which are a coordinated cutover, and
+  why a planned rotation and a compromise response are deliberately different.
+- **[key-compromise.md](./key-compromise.md)** — *emergency* rotation per
+  secret, blast radius, and audit-chain continuity (read
   [key-inventory.md](../key-inventory.md) first).
 - **[incident-response.md](./incident-response.md)** — security incident
   response plan + incident-commander checklist + evidence preservation

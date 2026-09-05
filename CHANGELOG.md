@@ -16,6 +16,28 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **CycloneDX SBOMs and cosign signatures on release artifacts
+  (production-readiness.md PR-10).** The release workflow gained an
+  `sbom-and-sign` job: a CycloneDX 1.5 SBOM per workspace crate (with every
+  dependency's version and license, so "am I affected by CVE-X" is a `jq`
+  away), and cosign **keyless** signatures — no key material, bound to this
+  repo's release-workflow OIDC identity — on every `.tar.gz` *and* every SBOM.
+  Each signed file gets a `.cosign.bundle` carrying the signature, the Fulcio
+  certificate and the Rekor inclusion proof together, so an operator verifies
+  with one `cosign verify-blob --bundle` rather than three flags and three
+  downloads. [docs/install/verifying-artifacts.md](docs/install/verifying-artifacts.md)
+  has the copy-paste commands, including the
+  `--certificate-identity-regexp` without which you have proved only that
+  *somebody* signed the file.
+- **`cargo auditable` embedding is deliberately not shipped, and the doc says
+  why.** The release build goes through `taiki-e/upload-rust-binary-action`,
+  which fixes the build tool to `cargo`/`cross`/`cargo-zigbuild`, and
+  `cargo auditable` must wrap the build command — it refuses to run as a
+  `RUSTC_WORKSPACE_WRAPPER` (tested, not assumed). Embedding it would mean
+  hand-rolling the cross-compile, archive and checksum steps that action
+  provides, which is a real reliability regression for information the attached
+  SBOM already carries.
+
 - **Production deployment guide and a fillable go-live PRR
   (production-readiness.md PR-13).**
   [docs/install/production.md](docs/install/production.md) is the ordered path

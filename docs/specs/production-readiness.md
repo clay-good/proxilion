@@ -806,10 +806,20 @@ cosign-keyless signature + SLSA provenance + SBOM (PR-11). For the
 now emits **SLSA build provenance** via `actions/attest-build-provenance`
 (keyless, verified with `gh attestation verify`), and
 [docs/install/verifying-artifacts.md](../install/verifying-artifacts.md)
-documents the verification commands for both. **Still open:** CycloneDX SBOMs
-attached to the GitHub Release (`cargo-cyclonedx`), `cargo auditable`
-dependency data embedded in the shipped binaries, and cosign signatures on the
-`.tar.gz` archives.
+documents the verification commands for both. **CycloneDX SBOMs and cosign
+signatures are now landed** (2026-09-05): the release workflow gained an
+`sbom-and-sign` job that emits a CycloneDX 1.5 SBOM per workspace crate and
+cosign-keyless-signs every `.tar.gz` **and** every SBOM, attaching a
+`.cosign.bundle` (signature + Fulcio cert + Rekor proof in one file) so
+verification is a single `cosign verify-blob --bundle`.
+**Deliberately not shipped:** `cargo auditable` embedding. The release build
+goes through `taiki-e/upload-rust-binary-action`, which fixes the build tool to
+`cargo`/`cross`/`cargo-zigbuild`, and `cargo auditable` must wrap the build
+command — it refuses to run as a `RUSTC_WORKSPACE_WRAPPER` (verified, not
+assumed). Embedding it would mean hand-rolling the cross-compile, archive and
+checksum steps that action provides, a reliability regression for information
+the attached SBOM already carries. **Still open:** nothing until the first real
+tag exercises the job.
 
 **Goal.** Every released artifact is verifiable: an operator can confirm
 *what* is inside it and *that this project's CI built it*.
@@ -1062,8 +1072,11 @@ satisfied:
 - [~] **PR-10/11** Signed, SBOM'd, provenance-attested, scanned artifacts;
       proxy image published + digest-pinned. *PR-11 image pipeline landed
       (distroless non-root multi-arch + Trivy + cosign + SBOM/provenance +
-      Helm digest pin); publishes on the first `v*.*.*` tag. PR-10 (CLI
-      signing/SLSA/cargo-auditable) still open.*
+      Helm digest pin) and the chart is CI-gated on lint + render assertions;
+      PR-10 landed for the CLI too (SLSA attestation, CycloneDX 1.5 SBOM per
+      crate, cosign-keyless `.cosign.bundle` on every archive and SBOM).
+      `cargo auditable` embedding is deliberately not shipped — see PR-10's
+      Status. Both publish on the first `v*.*.*` tag, which is what remains.*
 - [ ] **PR-12** Threat model refreshed; ASVS L2 zero-criticals; external
       pentest criticals/highs remediated (required for GA / first design
       partner, may trail a locked-down pilot).

@@ -46,9 +46,47 @@ gh attestation verify ./proxilion-cli --repo clay-good/proxilion
 `clay-good/proxilion` release workflow on a GitHub-hosted runner — a forged or
 tampered binary fails verification.
 
-## Still open (PR-10)
+## Release archives + SBOMs (cosign keyless)
 
-CycloneDX SBOMs attached to the GitHub Release, `cargo auditable` dependency
-data embedded in the shipped binaries, and cosign signatures on the `.tar.gz`
-archives are tracked follow-ups; the image (above) already carries SBOM +
-provenance + signature today.
+Every `.tar.gz` on the Release, and every SBOM next to it, is signed with
+cosign keyless — no key material, the signature is bound to this repo's
+release workflow identity. Each signed file has a `.cosign.bundle` beside it
+carrying the signature, the Fulcio certificate and the Rekor inclusion proof
+together, so verification is one command rather than three downloads:
+
+```sh
+cosign verify-blob proxilion-cli-<target>.tar.gz \
+  --bundle proxilion-cli-<target>.tar.gz.cosign.bundle \
+  --certificate-identity-regexp '^https://github\.com/clay-good/proxilion/\.github/workflows/release\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The `--certificate-identity-regexp` is the part that matters: without it you
+have proved only that *somebody* signed the file through Sigstore.
+
+## SBOMs
+
+A CycloneDX 1.5 SBOM is attached per workspace crate
+(`proxilion-cli-<tag>.cdx.json`, `proxy-<tag>.cdx.json`, and the two library
+crates). It lists every dependency with its version and license, so "am I
+affected by CVE-X" is a `jq` away:
+
+```sh
+jq -r '.components[] | select(.name=="openssl") | .version' proxy-v0.1.0.cdx.json
+```
+
+The dependency set comes from `Cargo.lock`, so one SBOM describes the source
+graph every target was built from (modulo platform-conditional crates). Verify
+the SBOM itself with the same `cosign verify-blob` command as above.
+
+## Not shipped: `cargo auditable` embedding
+
+Dependency data is **not** embedded inside the CLI binaries, so
+`cargo audit bin proxilion-cli` will report an incomplete graph. The release
+build goes through `taiki-e/upload-rust-binary-action`, which fixes the build
+tool to `cargo`/`cross`/`cargo-zigbuild`; `cargo auditable` must wrap the build
+command and cannot be injected through `RUSTC_WORKSPACE_WRAPPER` (it refuses to
+run as a rustc wrapper). Embedding it would mean hand-rolling the
+cross-compilation, archiving and checksum steps that action provides — a real
+reliability regression for information the attached SBOM already carries. Use
+the SBOM.

@@ -116,3 +116,79 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: target/${{ matrix.target }}/release/proxilion-cli
+
+  # ── SBOM + signatures (production-readiness.md PR-10) ──────────────────
+  #
+  # Runs after every arch has uploaded, because the signing step signs the
+  # archives that are already on the Release.
+  sbom-and-sign:
+    name: sbom + cosign
+    needs: build-and-upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      # Keyless signing: the OIDC token IS the identity. No key material.
+      id-token: write
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: install rust toolchain
+        run: rustup toolchain install stable --no-self-update && rustup default stable
+
+      - name: install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      # One SBOM per workspace member. `cargo cyclonedx` writes one file into
+      # each member's directory per invocation, so this is a single pass.
+      #
+      # The dependency set comes from Cargo.lock, so it is the same across our
+      # four unix targets modulo platform-conditional crates: the SBOM
+      # describes the source graph the release was built from, which is what an
+      # operator needs to answer "am I affected by CVE-X".
+      - name: generate CycloneDX SBOMs
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          cargo cyclonedx --format json --spec-version 1.5 --override-filename sbom
+          for f in crates/*/sbom.json; do
+            pkg="$(jq -r '.metadata.component.name' "$f")"
+            mv "$f" "sbom/${pkg}-${TAG}.cdx.json"
+          done
+          ls -lh sbom/
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: download release archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" --dir dist --pattern '*.tar.gz'
+          ls -lh dist/
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # `--bundle` puts the signature, the Fulcio certificate and the Rekor
+      # inclusion proof in ONE file, so verification is a single
+      # `cosign verify-blob --bundle` rather than three flags and three
+      # downloads.
+      - name: cosign sign archives and SBOMs
+        run: |
+          set -euo pipefail
+          for f in dist/*.tar.gz sbom/*.cdx.json; do
+            cosign sign-blob --yes "$f" --bundle "$f.cosign.bundle"
+          done
+          ls -lh dist/ sbom/
+
+      - name: upload SBOMs + signatures to the release
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --clobber \
+            sbom/*.cdx.json sbom/*.cosign.bundle dist/*.cosign.bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

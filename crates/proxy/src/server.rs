@@ -1626,7 +1626,7 @@ mod tests {
         };
         require_static_str(h.version);
         // And the BTreeMap key type is also &'static str.
-        for (k, _) in h.checks.iter() {
+        for k in h.checks.keys() {
             require_static_str(k);
         }
     }

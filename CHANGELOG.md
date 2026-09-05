@@ -438,6 +438,15 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Fixed
 
+- **CI unblocked: `main` had been red since 2026-08-17 on `cargo clippy -D
+  warnings`.** No code changed to cause it — the CI toolchain is `stable`,
+  which floated to Rust 1.97, whose `clippy::for_kv_map` now fires on the
+  `.iter()` form. One test in [server.rs](crates/proxy/src/server.rs) walked a
+  `BTreeMap` as `for (k, _) in h.checks.iter()` purely to pin the key type as
+  `&'static str`; it is now `for k in h.checks.keys()`, which pins the exact
+  same type. The map under test is empty, so the loop body never ran either
+  way — this is a lint fix with no behavior change. Swept the workspace for
+  the same pattern: this was the only instance.
 - *No new reachable **security** defects from the **twenty-ninth multi-subsystem
   audit pass** (2026-06-16). Five general-purpose auditors swept the lanes in
   parallel — OAuth/federation/session+PIC-crypto, adapters/forwarders/audit-body,

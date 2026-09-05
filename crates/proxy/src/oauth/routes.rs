@@ -2003,6 +2003,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn db_backed_verified_callback_through_the_real_router() {
+        // The strongest PR-1 test: drive `/oauth/bridge/callback` through the
+        // actual axum router — query parsing, path selection, JWKS `kid`
+        // resolution, signature verification, Trust Plane issuance, session
+        // bind, redirect — rather than calling the handler body directly.
+        // Everything below the HTTPS fetch itself is real.
+        let Some(pool) = crate::test_support::pool().await else {
+            eprintln!("skipping: {} unset", crate::test_support::TEST_DB_ENV);
+            return;
+        };
+        use tower::ServiceExt; // oneshot
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let trust_plane = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pca/issue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pca": B64.encode(b"pca-0-cbor"),
+                "hop": 0,
+                "p_0": "alice@acme.com",
+                "ops": ["drive:read:engineering/*"],
+            })))
+            .mount(&trust_plane)
+            .await;
+
+        let mut state = oauth_state_for(pool.clone());
+        state.pic = crate::pic::PicExecutor::dev_ephemeral(trust_plane.uri()).unwrap();
+        state.federation = Some(test_federation());
+        // The stub stays ON to prove the `id_token` branch wins anyway.
+        state.insecure_bridge_stub = true;
+
+        let sid = Uuid::new_v4();
+        seed_session(&pool, sid).await;
+
+        // 1. A properly-signed id_token establishes the session.
+        let req = axum::http::Request::get(format!(
+            "/oauth/bridge/callback?state={sid}&id_token={}",
+            signed_test_id_token()
+        ))
+        .body(axum::body::Body::empty())
+        .unwrap();
+        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "verified callback must 307 on to Google"
+        );
+        let bound: Option<Uuid> =
+            sqlx::query_scalar("SELECT pca_0_id FROM oauth_sessions WHERE id = $1")
+                .bind(sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(bound.is_some(), "session must be established");
+
+        // 2. A tampered id_token on a fresh session is refused with 401 and
+        //    leaves the session unbound. This is the product's whole thesis
+        //    exercised through the real route.
+        let victim = Uuid::new_v4();
+        seed_session(&pool, victim).await;
+        let mut parts: Vec<String> = signed_test_id_token()
+            .split('.')
+            .map(str::to_string)
+            .collect();
+        let last = parts[1].pop().unwrap();
+        parts[1].push(if last == 'A' { 'B' } else { 'A' });
+        let req = axum::http::Request::get(format!(
+            "/oauth/bridge/callback?state={victim}&id_token={}",
+            parts.join(".")
+        ))
+        .body(axum::body::Body::empty())
+        .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a tampered id_token must be rejected fail-closed"
+        );
+        let victim_pca: Option<Uuid> =
+            sqlx::query_scalar("SELECT pca_0_id FROM oauth_sessions WHERE id = $1")
+                .bind(victim)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            victim_pca.is_none(),
+            "a forged token must establish nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn db_backed_verified_callback_mints_pca_0_and_is_one_shot() {
         // PR-1 verified path, end to end against real SQL: a verified
         // identity mints PCA_0 through Trust Plane, binds the session to the
@@ -2099,6 +2191,74 @@ mod tests {
             .await
             .expect_err("empty pic_ops must be refused");
         rejection_contains(&err, "no pic_ops claim");
+    }
+
+    // A `VerifiedFederation` backed by a static JWKS. Everything except the
+    // HTTPS fetch is the production path — the resolver, the `kid` lookup and
+    // `verify_id_token` are the real ones. (`HttpJwksSource` is https-only by
+    // design, which a wiremock server cannot satisfy.)
+    fn test_federation() -> std::sync::Arc<crate::oauth::federation::VerifiedFederation> {
+        use crate::oauth::federation::VerifiedFederation;
+        use crate::oauth::idp_verify::IdpVerifyConfig;
+        use crate::oauth::jwks::{JwksError, JwksResolver, JwksSource};
+        use jsonwebtoken::jwk::JwkSet;
+
+        struct StaticJwks(JwkSet);
+        #[async_trait::async_trait]
+        impl JwksSource for StaticJwks {
+            async fn fetch(&self, _uri: &str) -> Result<JwkSet, JwksError> {
+                Ok(self.0.clone())
+            }
+        }
+        let jwks: JwkSet = serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-256", "kid": TEST_KID, "use": "sig", "alg": "ES256",
+                "x": "xuX2AQVewVsfZjjUTeHCn0AesanZTIXll0ZKNRpthcg",
+                "y": "WmOMVBZYs3DjbkUT6beUKh6VR0SmZk0u8_94kDT55j4",
+            }]
+        }))
+        .expect("static test JWKS");
+        let mut verify = IdpVerifyConfig::new(TEST_ISS, TEST_AUD);
+        verify.algorithms = vec![jsonwebtoken::Algorithm::ES256];
+        std::sync::Arc::new(VerifiedFederation::new(
+            "https://idp.test/jwks",
+            JwksResolver::new(std::sync::Arc::new(StaticJwks(jwks))),
+            verify,
+        ))
+    }
+
+    const TEST_KID: &str = "test-1";
+    const TEST_ISS: &str = "https://acme.okta.com";
+    const TEST_AUD: &str = "proxilion";
+    const TEST_EC_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg/cMFpcJsolBgFOlZ
+vzaoxlWrL34DXi590Q6YbUlWd46hRANCAATG5fYBBV7BWx9mONRN4cKfQB6xqdlM
+heWXRko1Gm2FyFpjjFQWWLNw425FE+m3lCoelUdEpmZNLvP/eJA0+eY+
+-----END PRIVATE KEY-----";
+
+    fn signed_test_id_token() -> String {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            iss: String,
+            sub: String,
+            aud: String,
+            exp: i64,
+            pic_ops: Vec<String>,
+        }
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(TEST_KID.to_string());
+        jsonwebtoken::encode(
+            &header,
+            &Claims {
+                iss: TEST_ISS.into(),
+                sub: "user-123".into(),
+                aud: TEST_AUD.into(),
+                exp: chrono::Utc::now().timestamp() + 300,
+                pic_ops: vec!["drive:read:engineering/*".into()],
+            },
+            &jsonwebtoken::EncodingKey::from_ec_pem(TEST_EC_PRIV_PEM.as_bytes()).unwrap(),
+        )
+        .expect("sign test id_token")
     }
 
     fn identity() -> crate::oauth::idp_verify::VerifiedIdentity {

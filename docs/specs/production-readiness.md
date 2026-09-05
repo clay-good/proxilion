@@ -848,7 +848,19 @@ workflow builds **multi-arch** (amd64 + arm64) on a `v*.*.*` tag, pushes to
 GHCR, **Trivy-scans** (gating on fixable HIGH/CRITICAL), **cosign-keyless
 signs**, and attaches **SLSA provenance + SBOM** via buildx. The Helm chart
 gains `proxy.image.digest` for digest-pinned, signed deploys, and the chart
-README documents `cosign verify`. **Still open:** the actual publish + digest
+README documents `cosign verify`. **The chart itself is now CI-gated** (2026-09-05):
+[`helm-chart`](../../.github/workflows/helm-chart.yml) runs `helm lint` plus
+render assertions on every change under `deploy/helm/`. Lint alone would not
+have caught the wiring mistakes the chart can actually make, so each assertion
+pins a promise the chart docs make: every rendered manifest parses as YAML with
+a `kind`; the HA primitives render and the termination grace period exceeds the
+proxy's 30 s in-process drain; the `PodDisruptionBudget` is **absent** at one
+replica (a PDB on a single-replica Deployment blocks node drains outright); the
+three `PROXILION_IDP_*` variables render together or not at all; setting
+`proxy.env.executorKid` without its secret is **refused** (two replicas
+registering different public keys under one `kid` is worse than an ephemeral
+identity); and the token-key rotation overlap stays opt-in.
+**Still open:** the actual publish + digest
 record happen on the first real `v0.1.0` tag (PR-9), and the local build
 couldn't be exercised in this environment (no Docker daemon) — CI is the
 verification path. The CLI-artifact half of signing/SBOM is PR-10.

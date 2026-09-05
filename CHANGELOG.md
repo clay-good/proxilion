@@ -16,6 +16,22 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **CI gate on the Helm chart (production-readiness.md PR-11).** The chart is
+  the production deployment artifact and nothing checked it: a template that
+  failed to render, a values key renamed on one side only, or an env var wired
+  to a secret key the `Secret` template never emits would all merge silently
+  and surface as a failed `helm install` in someone's cluster. The new
+  [`helm-chart`](.github/workflows/helm-chart.yml) workflow runs `helm lint`
+  plus render assertions on every change under `deploy/helm/`. Lint alone
+  cannot see the wiring mistakes the chart can actually make, so each assertion
+  pins a promise the docs make: every rendered manifest parses as YAML with a
+  `kind`; the HA primitives render and `terminationGracePeriodSeconds` exceeds
+  the proxy's 30 s in-process drain; the `PodDisruptionBudget` is **absent** at
+  one replica (a PDB on a single-replica Deployment blocks node drains
+  outright); the three `PROXILION_IDP_*` variables render together or not at
+  all; `proxy.env.executorKid` without its secret is **refused**; and the
+  token-key rotation overlap stays opt-in.
+
 - **L4 connection cap — the last of PR-2's edge controls
   (production-readiness.md PR-2).** The existing four controls all run *after*
   the TLS handshake, so none of them can see the cheapest denial-of-service

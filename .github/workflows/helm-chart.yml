@@ -1,0 +1,138 @@
+name: helm-chart
+
+# The Helm chart is the production deployment artifact (production-readiness.md
+# PR-11), and until now nothing checked it: a template that failed to render, a
+# values key renamed on one side only, or an env var wired to a secret key that
+# the Secret template never emits would all merge silently and surface as a
+# failed `helm install` in someone's cluster.
+#
+# `helm lint` catches malformed charts. The render assertions below catch the
+# wiring mistakes lint cannot see — each one pins a behavior the chart docs
+# promise.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/helm/**"
+      - ".github/workflows/helm-chart.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/helm/**"
+      - ".github/workflows/helm-chart.yml"
+
+jobs:
+  helm:
+    name: helm lint + render assertions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CHART: deploy/helm/proxilion
+      # Minimum values for the inline-secret path (production deploys use
+      # secrets.existingSecret and pre-create the Secret out of band).
+      MINIMAL: >-
+        --set secrets.existingSecret=
+        --set secrets.inline.databaseUrl=postgres://u:p@db:5432/proxilion
+        --set secrets.inline.tokenEncryptionKey=0000000000000000000000000000000000000000000000000000000000000000
+        --set secrets.inline.trustPlaneCatKey=0000000000000000000000000000000000000000000000000000000000000000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: helm lint
+        run: helm lint "$CHART" $MINIMAL
+
+      - name: renders with the default values
+        run: helm template t "$CHART" $MINIMAL > /tmp/default.yaml
+
+      - name: rendered manifests are valid YAML
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+          docs = [d for d in yaml.safe_load_all(open("/tmp/default.yaml")) if d]
+          assert docs, "chart rendered nothing"
+          for d in docs:
+              assert d.get("kind"), f"manifest with no kind: {d}"
+          print(f"ok: {len(docs)} manifests, kinds="
+                f"{sorted({d['kind'] for d in docs})}")
+          PY
+
+      - name: HA primitives render (PR-7)
+        run: |
+          set -euo pipefail
+          grep -q "kind: PodDisruptionBudget" /tmp/default.yaml
+          grep -q "topologySpreadConstraints" /tmp/default.yaml
+          # The proxy drains for 30s on SIGTERM (server.rs). The kubelet must
+          # wait longer or in-flight agent requests are SIGKILLed.
+          grace="$(awk '/terminationGracePeriodSeconds:/ {print $2; exit}' /tmp/default.yaml)"
+          [ "${grace:-0}" -gt 30 ] || {
+            echo "terminationGracePeriodSeconds=$grace must exceed the 30s drain" >&2
+            exit 1
+          }
+          echo "ok: PDB + topology spread + ${grace}s grace period"
+
+      - name: PDB is NOT rendered at one replica
+        # A PodDisruptionBudget on a single-replica Deployment blocks node
+        # drains outright, which is worse than having none.
+        run: |
+          set -euo pipefail
+          helm template t "$CHART" $MINIMAL --set proxy.replicaCount=1 > /tmp/one.yaml
+          if grep -q "kind: PodDisruptionBudget" /tmp/one.yaml; then
+            echo "PDB must not render at replicaCount=1" >&2
+            exit 1
+          fi
+          echo "ok: no PDB at one replica"
+
+      - name: verified-federation env is all-or-nothing (PR-1)
+        run: |
+          set -euo pipefail
+          # Unset issuer → none of the three render (a partial IdP config is
+          # an operator error, never a silent fallback to the insecure stub).
+          for v in PROXILION_IDP_ISSUER PROXILION_IDP_AUDIENCE PROXILION_IDP_JWKS_URI; do
+            if grep -q "$v" /tmp/default.yaml; then
+              echo "$v rendered with no issuer configured" >&2
+              exit 1
+            fi
+          done
+          helm template t "$CHART" $MINIMAL \
+            --set proxy.env.idp.issuer=https://acme.okta.com \
+            --set proxy.env.idp.audience=proxilion \
+            --set proxy.env.idp.jwksUri=https://acme.okta.com/oauth2/v1/keys \
+            > /tmp/idp.yaml
+          for v in PROXILION_IDP_ISSUER PROXILION_IDP_AUDIENCE PROXILION_IDP_JWKS_URI; do
+            grep -q "$v" /tmp/idp.yaml || { echo "$v missing" >&2; exit 1; }
+          done
+          echo "ok: IdP env renders together, or not at all"
+
+      - name: executor identity requires its secret (PR-7)
+        # Setting the kid without the seed would have two replicas registering
+        # DIFFERENT public keys under the SAME kid. The chart must refuse.
+        run: |
+          set -euo pipefail
+          helm template t "$CHART" $MINIMAL \
+            --set proxy.env.executorKid=proxy-prod-1 \
+            --set secrets.inline.executorKey=0000000000000000000000000000000000000000000000000000000000000000 \
+            > /tmp/exec.yaml
+          grep -q "PROXILION_EXECUTOR_KID" /tmp/exec.yaml
+          grep -q "executor-key:" /tmp/exec.yaml
+          if helm template t "$CHART" $MINIMAL \
+               --set proxy.env.executorKid=proxy-prod-1 > /dev/null 2>&1; then
+            echo "chart must refuse executorKid without secrets.inline.executorKey" >&2
+            exit 1
+          fi
+          echo "ok: executor kid + seed render together; kid alone is refused"
+
+      - name: token-key rotation overlap renders when set (PR-3)
+        run: |
+          set -euo pipefail
+          if grep -q "PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS" /tmp/default.yaml; then
+            echo "rotation overlap must not render when unset" >&2
+            exit 1
+          fi
+          helm template t "$CHART" $MINIMAL \
+            --set secrets.inline.tokenEncryptionKeysPrevious=1111111111111111111111111111111111111111111111111111111111111111 \
+            | grep -q "PROXILION_TOKEN_ENCRYPTION_KEYS_PREVIOUS"
+          echo "ok: rotation overlap is opt-in"

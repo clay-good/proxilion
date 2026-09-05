@@ -16,6 +16,21 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Added
 
+- **Opt-in logical-backup CronJob in the Helm chart (production-readiness.md
+  PR-8).** `backup.enabled` (off by default) schedules a `pg_dump`, gzips it to
+  a PVC, and prunes past `backup.retentionDays`, reading the same
+  `database-url` secret the proxy does. It is deliberately documented as a
+  **floor, not point-in-time recovery**: `pg_dump` captures the state at the
+  moment it ran, so the RPO is the schedule interval rather than the ≤ 5
+  minutes the runbook targets, and reaching that target needs WAL archiving on
+  the Postgres side — which this chart cannot do, because it does not own
+  Postgres. `concurrencyPolicy: Forbid` so a slow dump cannot stack up behind
+  itself and double the load on the primary, and with no PVC configured the
+  dumps land on ephemeral storage and die with the pod (enough to prove the job
+  runs, useless for recovery — the values file says so). The `helm-chart` CI
+  gate asserts it stays opt-in and stays wired to the secret rather than a
+  literal connection string.
+
 - **Planned key-rotation runbook, and a correction to the compromise one
   (production-readiness.md PR-3 / PR-6).** New
   [docs/ops/runbooks/key-rotation.md](docs/ops/runbooks/key-rotation.md) gives

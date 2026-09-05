@@ -268,6 +268,36 @@ secrets:
     executorKey: ""
 
 # ─────────────────────────────────────────────────────────────────────────
+# Logical backup CronJob (production-readiness.md PR-8)
+# ─────────────────────────────────────────────────────────────────────────
+# OFF by default: this chart does not own Postgres (the database is external),
+# and a managed Postgres almost always has better backups than a pg_dump from
+# a pod. Turn this on when you self-host the database and want a floor under
+# it.
+#
+# It IS a floor, not point-in-time recovery: pg_dump captures the state at the
+# moment it ran, so your RPO is the schedule interval — not the <= 5 minutes
+# docs/ops/runbooks/backup-restore.md targets. Meeting that needs WAL
+# archiving on the Postgres side (pgBackRest). See the runbook.
+backup:
+  enabled: false
+  schedule: "0 2 * * *"                  # daily at 02:00 UTC
+  # Delete dumps older than this many days, in the same job that writes one.
+  retentionDays: 14
+  # Where dumps land. WITHOUT a PVC they go to ephemeral pod storage and die
+  # with the pod — enough to prove the job runs, useless for recovery. Set
+  # this (or replace the volume in the template) before relying on it.
+  persistentVolumeClaim: ""
+  image:
+    repository: postgres
+    tag: "16-alpine"                     # must be >= your server's major
+    pullPolicy: IfNotPresent
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  backoffLimit: 2
+
+# ─────────────────────────────────────────────────────────────────────────
 # Policy bundle (Layer-B YAML — spec.md §9)
 # ─────────────────────────────────────────────────────────────────────────
 # Mounted into the proxy at /config/policy.yaml. The chart renders a

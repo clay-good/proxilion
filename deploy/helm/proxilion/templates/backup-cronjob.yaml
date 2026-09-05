@@ -1,0 +1,96 @@
+{{/*
+Logical backup CronJob (production-readiness.md PR-8).
+
+OFF by default, and deliberately so: this chart does not own Postgres — the
+database is external (`secrets.inline.databaseUrl` / the `database-url`
+secret key), and a managed Postgres almost always has better backups than a
+`pg_dump` from a pod. Turn this on when you self-host the database and want a
+floor under it.
+
+It is a FLOOR, not point-in-time recovery. `pg_dump` gives you the state at
+the moment it ran, so your RPO is the schedule interval — not the ≤ 5 minutes
+docs/ops/runbooks/backup-restore.md targets. Meeting that target needs WAL
+archiving on the Postgres side (pgBackRest); see the runbook.
+*/}}
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "proxilion.fullname" . }}-backup
+  labels:
+    {{- include "proxilion.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  # Never let a slow dump stack up behind itself — two concurrent dumps
+  # double the load on the primary for no extra durability.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.backup.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "proxilion.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: Never
+          securityContext: {{ toYaml .Values.proxy.podSecurityContext | nindent 12 }}
+          containers:
+            - name: pg-dump
+              image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              securityContext: {{ toYaml .Values.proxy.containerSecurityContext | nindent 16 }}
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "proxilion.secretsName" . }}
+                      key: database-url
+                - name: RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  # `set -o pipefail` is not POSIX sh; pipe through a file
+                  # instead so a failing pg_dump cannot be masked by a
+                  # succeeding gzip and leave a truncated "backup".
+                  out="/backup/proxilion-$(date -u +%Y%m%dT%H%M%SZ).sql"
+                  echo "dumping to ${out}.gz"
+                  pg_dump --no-owner --no-privileges --format=plain \
+                    --file="$out" "$DATABASE_URL"
+                  gzip "$out"
+                  echo "pruning dumps older than ${RETENTION_DAYS}d"
+                  find /backup -name 'proxilion-*.sql.gz' -type f \
+                    -mtime "+${RETENTION_DAYS}" -print -delete
+                  ls -lh /backup
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+                {{- if .Values.proxy.containerSecurityContext.readOnlyRootFilesystem }}
+                # pg_dump writes nothing outside /backup, but libpq wants a
+                # writable HOME for a .pgpass probe.
+                - name: tmp
+                  mountPath: /tmp
+                {{- end }}
+          volumes:
+            - name: backup
+              {{- if .Values.backup.persistentVolumeClaim }}
+              persistentVolumeClaim:
+                claimName: {{ .Values.backup.persistentVolumeClaim }}
+              {{- else }}
+              # No PVC configured: dumps land on ephemeral pod storage and
+              # die with the pod. Useful only to prove the job runs — set
+              # backup.persistentVolumeClaim (or swap in your own volume)
+              # before relying on this for recovery.
+              emptyDir: {}
+              {{- end }}
+            {{- if .Values.proxy.containerSecurityContext.readOnlyRootFilesystem }}
+            - name: tmp
+              emptyDir: {}
+            {{- end }}
+{{- end }}

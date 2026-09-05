@@ -125,6 +125,34 @@ jobs:
           fi
           echo "ok: executor kid + seed render together; kid alone is refused"
 
+      - name: backup CronJob is opt-in and wired to the DB secret (PR-8)
+        run: |
+          set -euo pipefail
+          if grep -q "kind: CronJob" /tmp/default.yaml; then
+            echo "the backup CronJob must be off by default" >&2
+            exit 1
+          fi
+          helm template t "$CHART" $MINIMAL \
+            --set backup.enabled=true \
+            --set backup.persistentVolumeClaim=pg-dumps > /tmp/backup.yaml
+          python3 - <<'PY'
+          import yaml
+          docs = [d for d in yaml.safe_load_all(open("/tmp/backup.yaml")) if d]
+          cj = next(d for d in docs if d["kind"] == "CronJob")
+          spec = cj["spec"]
+          # Two concurrent dumps double the load on the primary for no extra
+          # durability.
+          assert spec["concurrencyPolicy"] == "Forbid", spec["concurrencyPolicy"]
+          pod = spec["jobTemplate"]["spec"]["template"]["spec"]
+          env = {e["name"]: e for e in pod["containers"][0]["env"]}
+          # The dump must read the same secret the proxy does, not a literal.
+          ref = env["DATABASE_URL"]["valueFrom"]["secretKeyRef"]
+          assert ref["key"] == "database-url", ref
+          vols = {v["name"]: v for v in pod["volumes"]}
+          assert "persistentVolumeClaim" in vols["backup"], vols["backup"]
+          print("ok: CronJob opt-in, Forbid, secret-wired, PVC-backed")
+          PY
+
       - name: token-key rotation overlap renders when set (PR-3)
         run: |
           set -euo pipefail

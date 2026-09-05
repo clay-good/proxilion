@@ -722,10 +722,14 @@ now has a tool rather than a suggestion: `proxilion-cli pic verify-sample`
 samples recent action events, verifies each **distinct** chain they reference,
 and exits non-zero if any chain is broken **or if the sample came back empty**
 — an empty sample is not evidence of integrity, and without that check a drill
-would green-light an empty database. **Remaining:** executing the PITR restore
-drill in staging within RTO and correcting the runbook against it (the drill-log
-table is a placeholder), and putting the backup job + retention into the
-Helm/ops manifests.
+would green-light an empty database. The chart also gained an **opt-in logical-backup
+CronJob** (`backup.enabled`, off by default, `pg_dump` → gzip → PVC with
+`retentionDays` pruning and `concurrencyPolicy: Forbid`), documented explicitly
+as a *floor* rather than PITR: the RPO is the schedule interval, and reaching
+the ≤ 5 min target needs WAL archiving on the Postgres side, which this chart
+does not own. **Remaining:** executing the PITR restore drill in staging within
+RTO and correcting the runbook against it (the drill-log table is a
+placeholder).
 
 **Goal.** Postgres (the system of record for sessions, PCAs, blocked queue,
 operator tokens, and the audit log) can be restored to a defined RPO/RTO, and
@@ -1041,8 +1045,9 @@ satisfied:
       DEK-separation rule published
       ([backup-restore.md](../../docs/ops/runbooks/backup-restore.md)); the
       post-restore integrity check exists as `proxilion-cli pic verify-sample`
-      (non-zero on a broken chain OR an empty sample). Remaining: run the drill
-      in staging and land the backup job in the manifests.*
+      (non-zero on a broken chain OR an empty sample); the chart ships an
+      opt-in logical-backup CronJob (a floor, not PITR — it does not own
+      Postgres). Remaining: run the drill in staging.*
 - [ ] **PR-9** `v0.1.0` tagged; compatibility/MSRV/upgrade policy published.
 - [~] **PR-10/11** Signed, SBOM'd, provenance-attested, scanned artifacts;
       proxy image published + digest-pinned. *PR-11 image pipeline landed

@@ -41,6 +41,25 @@ An RPO of 5 minutes is met with room to spare by a 60-second `archive_timeout`;
 the slack is there because WAL shipping to object storage is the part that
 fails quietly.
 
+### The chart's CronJob is a floor, not PITR
+
+The Helm chart ships an **opt-in** logical-backup CronJob
+(`backup.enabled`, off by default) that runs `pg_dump` on a schedule, gzips
+the result to a PVC, and prunes past `backup.retentionDays`. It exists so a
+self-hosted database has *something* rather than nothing.
+
+It is not point-in-time recovery. `pg_dump` captures the state at the moment
+it ran, so your RPO is the schedule interval — 24 hours at the default, not
+the 5 minutes targeted above. Reaching the target needs WAL archiving on the
+Postgres side, which is the database operator's job and not something a
+Proxilion pod can do for you. The chart does not own Postgres.
+
+Two defaults worth knowing before you rely on it: `concurrencyPolicy: Forbid`,
+so a slow dump cannot stack up behind itself and double the load on the
+primary; and, with no `backup.persistentVolumeClaim` set, dumps land on
+ephemeral pod storage and die with the pod — enough to prove the job runs,
+useless for recovery.
+
 ## 3. PITR restore procedure
 
 1. **Stop writing.** Scale the proxy Deployment to zero

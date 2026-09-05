@@ -60,11 +60,18 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 regorus = "0.5"
 
 # OAuth / crypto / encoding
-# JWT/OIDC id_token verification for in-process federation (PR-1). Pinned to
-# the same major as upstream `provenance-bridge` uses; we verify with
-# server-side-pinned algorithms rather than reusing the upstream handler
-# (which selects the algorithm from the token header — see oauth/idp_verify.rs).
-jsonwebtoken = "10"
+# JWT/OIDC id_token verification for in-process federation (PR-1). We verify
+# with server-side-pinned algorithms rather than reusing the upstream
+# `provenance-bridge` handler (which selects the algorithm from the token
+# header — see oauth/idp_verify.rs), so our major need not track upstream's.
+# jsonwebtoken 10 made the crypto backend pluggable and ships NO provider in
+# its default features — without one, every `encode`/`decode` panics at
+# runtime ("Could not automatically determine the process-level
+# CryptoProvider"). We select `aws_lc_rs` to match the `rustls` backend this
+# workspace already builds, so the process has exactly one crypto stack. The
+# alternative, `rust_crypto`, would route RS* signature verification through
+# the pure-Rust `rsa` crate (RUSTSEC-2023-0071, Marvin timing side channel).
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 # Scrub decoded secret key material from memory on drop (PR-3 memory hygiene).
 # Already in the tree transitively (aes-gcm/ed25519-dalek); pinned direct so
 # the HMAC-secret newtypes can wrap their bytes in `Zeroizing`.

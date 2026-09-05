@@ -526,6 +526,16 @@ Until v0.1.0, the canonical reference is the most recent commit on
 
 ### Changed
 
+- **BREAKING (dev/self-hosted defaults): `PROXILION_INSECURE_BRIDGE_STUB` now
+  defaults to `false`.** The unsigned `federation_token` path at
+  `/oauth/bridge/callback` is opt-in rather than opt-out, matching the posture
+  of `PROXILION_DISABLE_OPERATOR_AUTH`: a deployment that never sets the
+  variable cannot accept a forgeable federation token at all. Now that the
+  verified `id_token` path exists (see PR-1 above), defaulting the unsigned
+  path *on* meant every fresh deployment shipped with the confused-deputy hole
+  open unless the operator knew to close it. **If you drive the stub path,
+  set `PROXILION_INSECURE_BRIDGE_STUB=1` explicitly** — `docker-compose.yml`
+  now does, and the smoke and demo flows go through it.
 - **The Trust Plane CAT verifying key is cached with a TTL instead of for the
   process lifetime (production-readiness.md PR-3 / PR-7).** It was a
   `OnceCell`: fetched once and never refreshed, so picking up a CAT key

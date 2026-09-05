@@ -104,11 +104,15 @@ identity. The pieces:
   `staging`/`production` now refuses to boot unless the stub is **off** *and*
   the verified path is fully configured (`Config::federation_boot_refusal`).
 
-**Still open before the P0 formally closes:** flipping the default of
-`PROXILION_INSECURE_BRIDGE_STUB` to `false` and deleting the payload-only
+`PROXILION_INSECURE_BRIDGE_STUB` now defaults to **false**, so a deployment
+that never sets it cannot accept an unsigned federation token at all; the dev
+compose stack opts in explicitly, the same way it does for
+`PROXILION_DISABLE_OPERATOR_AUTH`.
+
+**Still open before the P0 formally closes:** deleting the payload-only
 `validate_federation_token` path with its `alg:none` fixtures (deferred until
-`scripts/smoke-pic.sh` and the demo drive the verified path — both still use
-the stub); a live-Trust-Plane smoke of the issuance leg; and updating
+`scripts/smoke-pic.sh` and the demo drive the verified path — both still opt
+into the stub); a live-Trust-Plane smoke of the issuance leg; and updating
 `smoke-pic.sh` to fail if verification is bypassed.
 
 **Goal.** No request may mint or carry authority on the strength of an

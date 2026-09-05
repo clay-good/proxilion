@@ -139,8 +139,9 @@ proxy:
     # with `openssl rand -hex 32`.
     executorKid: ""                       # e.g. proxy-prod-1
     # Accept the legacy payload-only `federation_token` (NO signature check).
-    # Development only; leave false for any real deployment. Empty = the
-    # proxy default (true) — set explicitly to "0" alongside idp.* above.
+    # Development only. Empty = the proxy default, which is OFF; set "1" only
+    # for a dev cluster, and never alongside environment: staging|production
+    # (the proxy refuses to boot in that combination).
     insecureBridgeStub: ""
     # Customer's primary domain — drives `${customer_domain}` in policy.
     customerDomain: "example.com"

@@ -704,7 +704,9 @@ bridge→proxy callback token to forge at all. Configure it with:
 | `PROXILION_IDP_ALGORITHMS` | server-side allow-list, default `RS256,ES256` (asymmetric only) |
 
 The historical payload-only `federation_token` path still exists for the
-dev/CI/demo flows behind `PROXILION_INSECURE_BRIDGE_STUB` (default on). It is
+dev/CI/demo flows behind `PROXILION_INSECURE_BRIDGE_STUB`, which is **off by
+default** — an unsigned token lets any caller forge an arbitrary principal, so
+it is opt-in, like `PROXILION_DISABLE_OPERATOR_AUTH`. It is additionally
 refused at boot in any protected environment: `PROXILION_ENV=staging` or
 `production` will not start unless the stub is **off** *and* all three IdP
 settings are present. An `id_token` always takes the verified branch even when

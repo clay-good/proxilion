@@ -76,12 +76,14 @@
 # arbitrary authority). Default: "development". PROXILION_ENV.
 # environment = "production"
 
-# Whether the insecure payload-only federation stub (no signature
-# verification) is active — the only federation path until PR-1's verified
-# issuance rewiring lands. Default: true. Leave true in dev; the
-# production-boot guard above is the safety net that refuses to start a
-# protected env while it is on. PROXILION_INSECURE_BRIDGE_STUB.
-# insecure_bridge_stub = true
+# Whether the insecure payload-only federation stub is accepted at
+# /oauth/bridge/callback (NO signature check — an unsigned token lets any
+# caller forge an arbitrary principal). Default: false; opt in explicitly for
+# a dev stack, the same way you would PROXILION_DISABLE_OPERATOR_AUTH. The
+# production-boot guard above refuses to start a protected env while it is
+# on. Production uses the verified id_token path below.
+# PROXILION_INSECURE_BRIDGE_STUB.
+# insecure_bridge_stub = false
 
 # --- Verified federation (production-readiness.md PR-1) ---------------
 # Set all three of issuer / audience / jwks_uri to enable in-process

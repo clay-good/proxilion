@@ -160,10 +160,13 @@ pub struct Config {
     pub environment: Environment,
     /// Whether the insecure payload-only federation bridge stub
     /// (`oauth::bridge::validate_federation_token`, no signature check) is
-    /// active. Defaults to `true` — it is the only federation path until
-    /// PR-1's verified-issuance rewiring lands. When `true` and
-    /// `environment` is protected (staging/production), the proxy refuses
-    /// to boot (production-readiness.md PR-1). `PROXILION_INSECURE_BRIDGE_STUB`.
+    /// accepted at `/oauth/bridge/callback`. Defaults to `false` — the
+    /// verified `id_token` path is the supported one, and an unsigned
+    /// federation token lets any caller forge an arbitrary principal, so it
+    /// must be opted into explicitly (the same posture as
+    /// `PROXILION_DISABLE_OPERATOR_AUTH`). When `true` and `environment` is
+    /// protected (staging/production), the proxy refuses to boot
+    /// (production-readiness.md PR-1). `PROXILION_INSECURE_BRIDGE_STUB`.
     pub insecure_bridge_stub: bool,
     /// Trusted OIDC issuer (`iss`) for the verified federation path
     /// (production-readiness.md PR-1). Set together with `idp_audience`
@@ -495,10 +498,11 @@ impl ConfigBuilder {
             tls_min_version: TlsMinVersion::V1_2,
             // Dev by default; CI/tests never trip the production-boot guard.
             environment: Environment::Development,
-            // The payload-only stub is the only federation path until PR-1's
-            // verified-issuance rewiring lands; default true, refused in
-            // protected environments by `federation_boot_refusal`.
-            insecure_bridge_stub: true,
+            // Secure by default: the unsigned `federation_token` path is
+            // opt-in, not opt-out. Dev/CI/demo stacks set
+            // PROXILION_INSECURE_BRIDGE_STUB=1 explicitly, the same way they
+            // set PROXILION_DISABLE_OPERATOR_AUTH.
+            insecure_bridge_stub: false,
             // Verified federation is opt-in by configuration; unset means
             // "no verified path" (dev runs on the stub, protected envs
             // refuse to boot via `federation_boot_refusal`).
@@ -2149,11 +2153,27 @@ blocked_webhook_hmac_key_hex = "ffeeddccbbaa99887766554433221100"
             .build()
             .unwrap();
         assert_eq!(c.environment, Environment::Development);
-        assert!(c.insecure_bridge_stub, "stub active by default today");
-        // Development is unprotected → stub is tolerated → boot proceeds.
+        assert!(
+            !c.insecure_bridge_stub,
+            "the unsigned federation_token path must be opt-in, not opt-out",
+        );
+        // Development is unprotected → boot proceeds even unconfigured.
         assert!(
             c.federation_boot_refusal().is_none(),
             "dev boot must not be blocked"
+        );
+    }
+
+    #[test]
+    fn the_insecure_stub_must_be_opted_into_explicitly() {
+        // Flipping the default off is the whole point: a deployment that
+        // never sets the var cannot accept an unsigned federation token.
+        assert!(!ConfigBuilder::defaults().insecure_bridge_stub);
+        let mut b = ConfigBuilder::defaults().with_dev_mode(true);
+        b.insecure_bridge_stub = true;
+        assert!(
+            b.build().unwrap().insecure_bridge_stub,
+            "opt-in still works"
         );
     }
 

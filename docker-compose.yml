@@ -96,6 +96,12 @@ services:
       # to DISABLED so existing demo/stress scripts run unauthenticated.
       # Production deployments leave this unset (default = enforced).
       PROXILION_DISABLE_OPERATOR_AUTH: "${PROXILION_DISABLE_OPERATOR_AUTH:-1}"
+      # Dev stack only. Accepts an UNSIGNED `federation_token` at
+      # /oauth/bridge/callback (no signature check), which is what the smoke
+      # and demo flows drive. Production uses the verified `id_token` path
+      # (PROXILION_IDP_ISSUER / _AUDIENCE / _JWKS_URI) and a protected
+      # PROXILION_ENV refuses to boot with this set.
+      PROXILION_INSECURE_BRIDGE_STUB: "${PROXILION_INSECURE_BRIDGE_STUB:-1}"
     depends_on:
       postgres:
         condition: service_healthy

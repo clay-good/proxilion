@@ -1576,6 +1576,29 @@ Until v0.1.0, the canonical reference is the most recent commit on
   body, so a real fleet-wide kill would have been rejected by the server's
   `confirm` gate. Surfaced while wiring §3.3 dry-run.
 
+### Security
+
+- **RustSec advisory sweep — 3 vulnerabilities and 4 denied warnings cleared.**
+  `cargo audit --deny warnings` had gone red on `main` from advisories
+  published after the last dependency touch; all seven resolved inside their
+  existing semver ranges, so this is a `Cargo.lock` change only.
+  **Vulnerabilities:** `quinn-proto` 0.11.14 → 0.11.17 (RUSTSEC-2026-0185,
+  7.5 high — remote memory exhaustion from unbounded out-of-order stream
+  reassembly, reachable via `reqwest`); `h2` 0.4.14 → 0.4.19
+  (RUSTSEC-2026-0258 — unbounded empty DATA frames); `crossbeam-epoch`
+  0.9.18 → 0.9.21 (RUSTSEC-2026-0204 — invalid pointer dereference in the
+  `fmt::Pointer` impl). **Denied warnings:** `anyhow` 1.0.104
+  (RUSTSEC-2026-0190, `Error::downcast_mut()` unsoundness), `event-listener`
+  5.4.2 (RUSTSEC-2026-0221, `!Send` tags crossing thread boundaries),
+  plus yanked `chacha20` 0.10.0 → 0.10.2 and `spin` 0.9.8 → 0.9.9.
+- **Trivy scan action moved off the compromised release channel and pinned by
+  digest** — `aquasecurity/trivy-action` 0.24.0 → v0.36.0, referenced by
+  commit SHA rather than the mutable tag every other action here uses. The
+  Trivy release channel was briefly compromised below 0.35.0, and a tag on a
+  repo with that history is worth not trusting. All five inputs the image
+  workflow passes still exist in v0.36.0, so the fixable-HIGH/CRITICAL gate
+  behaves as before. [.github/workflows/image.yml](.github/workflows/image.yml)
+
 ### Added — earlier this cycle
 
 - **CLI: shell completion** (surface-delight-and-correctness.md §3.4) —
